@@ -137,10 +137,12 @@ func main() {
 		}
 	}
 
-	// Start Unix socket server for URL forwarding
-	if err := urllauncher.ListenAndServe(handleDownloadURL); err != nil {
-		log.Fatalf("urllauncher server: %v", err)
-	}
+	// Start Unix socket server for URL forwarding (non-blocking)
+	go func() {
+		if err := urllauncher.ListenAndServe(handleDownloadURL); err != nil {
+			log.Printf("urllauncher server error: %v", err)
+		}
+	}()
 
 	// Handle URLs passed as arguments (via --open-url or positional args)
 	for _, u := range urls {
