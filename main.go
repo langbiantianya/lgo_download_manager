@@ -1,49 +1,57 @@
 // ldm (Local Download Manager) is the single binary that runs the full
-// download manager: SQLite store, scheduler, gRPC service, and Fyne GUI.
+// download manager: SQLite store, scheduler, and Fyne GUI.
 //
-// Threading model:
-//
-//	main goroutine            Fyne app.Run() + event loop
-//	  │                          fyne.Do() for thread-safe GUI updates
-//	  ▼
-//	Scheduler                  owns task map + background flusher goroutine
-//	  │
-//	  ├── Store                SQLite via modernc.org/sqlite
-//	  ├── Engine               concurrent WriteAt over pre-allocated files
-//	  └── Protocol drivers     HTTP / FTP / WebDAV
-//
-//	gRPC service (:50051)      separate goroutine; AddTask calls Scheduler.Add
+// URL scheme: lgom://download?url=<encoded>[&name=<encoded>[&ua=<encoded>[&headers=<encoded>[&cookies=<encoded>]]]]
 package main
 
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
-	"runtime"
+	"strings"
 	"syscall"
 
 	"fyne.io/fyne/v2/app"
 
-	"lgo_download_manager/internal/grpcsvc"
+	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 	"lgo_download_manager/internal/ui"
+	"lgo_download_manager/internal/urllauncher"
 )
 
 const (
-	defaultDBPath   = "ldm.sqlite"
-	defaultGRPCAddr = ":50051"
+	defaultDBPath = "ldm.sqlite"
 )
 
 func main() {
 	dbPath := flag.String("db", defaultDBPath, "path to SQLite database")
-	grpcAddr := flag.String("grpc", defaultGRPCAddr, "gRPC listen address")
-	noGUI := flag.Bool("no-gui", false, "start without the Fyne GUI (gRPC service only)")
+	noGUI := flag.Bool("no-gui", false, "start without the Fyne GUI")
+	openURL := flag.String("open-url", "", "download URL (lgom://... format)")
 	flag.Parse()
+
+	// Single-instance lock
+	isPrimary, release, err := urllauncher.AcquireLock()
+	if err != nil {
+		log.Fatalf("urllauncher: %v", err)
+	}
+	if !isPrimary {
+		// Another instance is running; forward the URL and exit
+		if *openURL != "" {
+			if err := urllauncher.SendURL(*openURL); err != nil {
+				log.Fatalf("failed to forward URL: %v", err)
+			}
+			log.Println("URL forwarded to primary instance")
+		} else {
+			log.Println("another instance is already running")
+		}
+		os.Exit(0)
+		return
+	}
+	defer release()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -59,45 +67,93 @@ func main() {
 	sc := scheduler.New(st)
 	go sc.Run(ctx) // background flusher; cancelled via ctx
 
-	// gRPC server — runs until ctx is cancelled
-	grpcErr := make(chan error, 1)
-	go func() {
-		if err := grpcsvc.Register(ctx, *grpcAddr, sc); err != nil {
-			grpcErr <- fmt.Errorf("grpc: %w", err)
+	// URL handler: add download task from URL request
+	handleDownloadURL := func(rawURL string) {
+		req, err := urllauncher.HandleURL(rawURL)
+		if err != nil {
+			log.Printf("invalid URL: %v", err)
+			return
 		}
-	}()
+		log.Printf("adding download: %s", req.URL)
+
+		// Detect protocol
+		proto, err := protocol.DetectKind(req.URL, "")
+		if err != nil {
+			log.Printf("invalid URL: %v", err)
+			return
+		}
+
+		// Use default save dir, or configured one
+		saveDir := defaultSaveDir()
+		if ui.GlobalSettings.DefaultSaveDir != "" {
+			saveDir = ui.GlobalSettings.DefaultSaveDir
+		}
+
+		// Filename from URL if not provided
+		filename := req.Name
+		if filename == "" {
+			filename = filepath.Base(req.URL)
+			// Remove query string from filename
+			if idx := strings.IndexByte(filename, '?'); idx != -1 {
+				filename = filename[:idx]
+			}
+		}
+		savePath := filepath.Join(saveDir, filename)
+
+		auth := protocol.AuthOptions{
+			UserAgent: req.UA,
+			Cookies:   req.Cookies,
+		}
+
+		tk, err := sc.Add(scheduler.AddTaskInput{
+			URL:        req.URL,
+			SavePath:   savePath,
+			Protocol:   proto,
+			Auth:       auth,
+			ChunkCount: 4,
+		})
+		if err != nil {
+			log.Printf("failed to add task: %v", err)
+			return
+		}
+
+		// Start the download
+		if err := sc.Start(tk.ID); err != nil {
+			log.Printf("failed to start task: %v", err)
+		}
+	}
+
+	// Start Unix socket server for URL forwarding
+	if err := urllauncher.ListenAndServe(handleDownloadURL); err != nil {
+		log.Fatalf("urllauncher server: %v", err)
+	}
+
+	// Handle --open-url if provided (direct call, not via socket)
+	if *openURL != "" {
+		handleDownloadURL(*openURL)
+	}
 
 	// GUI — must run on the main goroutine where Fyne's Run() executes.
 	if !*noGUI {
 		a := app.NewWithID("com.ldm")
 		// Construct the window AFTER the app is created so widget constructors
 		// can resolve fyne.CurrentApp() (list.go calls it during setup).
-		win := ui.NewMainWindow(a, sc, *grpcAddr)
+		win := ui.NewMainWindow(a, sc)
 		win.Show()
 		a.Run()
 		cancel()
 	}
 
-	// Wait for shutdown signal or gRPC error
+	// Wait for shutdown signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case <-quit:
-		log.Println("shutting down...")
-		cancel()
-	case err := <-grpcErr:
-		log.Fatal(err)
-	}
+	<-quit
+	log.Println("shutting down...")
+	cancel()
 }
 
 // defaultSaveDir returns a platform-appropriate download directory.
 func defaultSaveDir() string {
 	home, _ := os.UserHomeDir()
-	switch runtime.GOOS {
-	case "windows", "darwin":
-		return filepath.Join(home, "Downloads")
-	default:
-		return filepath.Join(home, "Downloads")
-	}
+	return filepath.Join(home, "Downloads")
 }

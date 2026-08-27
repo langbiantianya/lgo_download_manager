@@ -26,7 +26,6 @@ type MainWindow struct {
 	sc       *scheduler.Scheduler
 	win      fyne.Window
 	content  *fyne.Container
-	grpcAddr string
 
 	filter    binding.String
 	taskList  *taskList
@@ -40,13 +39,12 @@ type MainWindow struct {
 // This MUST be called on the Fyne event thread (typically the main goroutine
 // after app.New…() and before a.Run()), because widget constructors rely on
 // fyne.CurrentApp() resolving to the just-created app.
-func NewMainWindow(a fyne.App, sc *scheduler.Scheduler, grpcAddr string) *MainWindow {
+func NewMainWindow(a fyne.App, sc *scheduler.Scheduler) *MainWindow {
 	setGlobalScheduler(sc)
 	m := &MainWindow{
-		app:      a,
-		sc:       sc,
-		grpcAddr: grpcAddr,
-		filter:   binding.NewString(),
+		app:    a,
+		sc:     sc,
+		filter: binding.NewString(),
 	}
 	m.taskList = newTaskList(sc, m.filter)
 	m.statusBar = newStatusBar()
@@ -98,9 +96,8 @@ func (m *MainWindow) buildSettingsHeader() fyne.CanvasObject {
 
 // buildSettingsContent returns the settings form content.
 func (m *MainWindow) buildSettingsContent() fyne.CanvasObject {
-	return buildSettingsContent(m.sc, m.grpcAddr)
+	return buildSettingsContent(m.sc)
 }
-
 // buildToolbar packs the action buttons, search and the settings shortcut.
 func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 	newBtn := widget.NewButtonWithIcon("新建任务", theme.ContentAddIcon(), func() {
@@ -320,9 +317,9 @@ func (sb *statusBar) setDiskSpace(free, total int64) {
 	sb.diskLabel.SetText(fmt.Sprintf("磁盘空间: 可用 %s / 总计 %s",
 		humanBytes(free), humanBytes(total)))
 }
-// refreshDiskSpace updates the disk space display from globalSettings.DefaultSaveDir.
+// refreshDiskSpace updates the disk space display from GlobalSettings.DefaultSaveDir.
 func (sb *statusBar) refreshDiskSpace() {
-	dir := globalSettings.DefaultSaveDir
+	dir := GlobalSettings.DefaultSaveDir
 	if dir == "" {
 		sb.setDiskSpace(0, 0)
 		return

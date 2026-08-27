@@ -21,7 +21,7 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 	urlEntry.Validator = notEmptyValidator()
 
 	savePathEntry := widget.NewEntry()
-	savePathEntry.SetText(filepath.Join(globalSettings.DefaultSaveDir, "download.bin"))
+	savePathEntry.SetText(filepath.Join(GlobalSettings.DefaultSaveDir, "download.bin"))
 
 	browseBtn := widget.NewButton("浏览...", func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
@@ -86,8 +86,7 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 			user = usernameEntry.Text
 			pass = passwordEntry.Text
 		}
-
-		chunkCount := globalSettings.DefaultThreads
+		chunkCount := GlobalSettings.DefaultThreads
 		if s := threadsEntry.Text; s != "" {
 			if n, err := parseThreadCount(s); err == nil && n > 0 {
 				chunkCount = n
@@ -101,9 +100,9 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 			Auth: protocol.AuthOptions{
 				Username:   user,
 				Password:   pass,
-				UserAgent:  globalSettings.UserAgent,
-				Cookies:    globalSettings.Cookies,
-				FTPPassive: globalSettings.FTPPassive,
+				UserAgent:  GlobalSettings.UserAgent,
+				Cookies:    GlobalSettings.Cookies,
+				FTPPassive: GlobalSettings.FTPPassive,
 			},
 			ChunkCount: chunkCount,
 		})

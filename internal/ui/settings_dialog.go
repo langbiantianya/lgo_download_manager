@@ -9,7 +9,6 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
-	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"lgo_download_manager/internal/scheduler"
@@ -25,15 +24,15 @@ type settings struct {
 	Prealloc       bool
 }
 
-// globalSettings is the live settings used by "新建任务" when prefilling fields.
-// Initialised once via init() before any widget code runs.
-var globalSettings settings
+// GlobalSettings is the live settings used by "新建任务" when prefilling fields
+// and by the URL launcher in main.go.
+var GlobalSettings settings
 
 func init() {
 	home, _ := os.UserHomeDir()
 	saveDir := filepath.Join(home, "Downloads")
 	_ = runtime.GOOS // reserved for future platform-specific tweaks
-	globalSettings = settings{
+	GlobalSettings = settings{
 		DefaultSaveDir: saveDir,
 		DefaultThreads: 4,
 		UserAgent:      "",
@@ -42,48 +41,41 @@ func init() {
 		Prealloc:       true,
 	}
 }
-// buildSettingsContent returns the settings form as a scrollable page.
-// Changes are saved immediately on each field change.
-func buildSettingsContent(sc *scheduler.Scheduler, grpcAddr string) fyne.CanvasObject {
+func buildSettingsContent(sc *scheduler.Scheduler) fyne.CanvasObject {
 	dirEntry := widget.NewEntry()
-	dirEntry.SetText(globalSettings.DefaultSaveDir)
+	dirEntry.SetText(GlobalSettings.DefaultSaveDir)
 	dirEntry.SetPlaceHolder("/path/to/Downloads")
-	dirEntry.OnChanged = func(s string) { globalSettings.DefaultSaveDir = s }
-
-	grpcLabel := widget.NewLabel(fmt.Sprintf("gRPC 服务已启动 (%s)", grpcAddr))
-	grpcLabel.TextStyle.Italic = true
-	grpcInfo := container.NewHBox(widget.NewIcon(theme.InfoIcon()), grpcLabel)
+	dirEntry.OnChanged = func(s string) { GlobalSettings.DefaultSaveDir = s }
 
 	threadsEntry := widget.NewEntry()
-	threadsEntry.SetText(fmt.Sprintf("%d", globalSettings.DefaultThreads))
+	threadsEntry.SetText(fmt.Sprintf("%d", GlobalSettings.DefaultThreads))
 	threadsEntry.OnChanged = func(s string) {
 		if n, err := parseThreadCount(s); err == nil && n > 0 {
-			globalSettings.DefaultThreads = n
+			GlobalSettings.DefaultThreads = n
 		}
 	}
 
 	uaEntry := widget.NewEntry()
-	uaEntry.SetText(globalSettings.UserAgent)
+	uaEntry.SetText(GlobalSettings.UserAgent)
 	uaEntry.SetPlaceHolder("可选，自定义 User-Agent")
-	uaEntry.OnChanged = func(s string) { globalSettings.UserAgent = s }
+	uaEntry.OnChanged = func(s string) { GlobalSettings.UserAgent = s }
 
 	cookiesEntry := widget.NewEntry()
-	cookiesEntry.SetText(globalSettings.Cookies)
+	cookiesEntry.SetText(GlobalSettings.Cookies)
 	cookiesEntry.SetPlaceHolder("可选，Cookie 字符串")
-	cookiesEntry.OnChanged = func(s string) { globalSettings.Cookies = s }
+	cookiesEntry.OnChanged = func(s string) { GlobalSettings.Cookies = s }
 
 	ftpPassive := widget.NewCheck("启用 FTP PASV 被动模式", func(checked bool) {
-		globalSettings.FTPPassive = checked
+		GlobalSettings.FTPPassive = checked
 	})
-	ftpPassive.SetChecked(globalSettings.FTPPassive)
+	ftpPassive.SetChecked(GlobalSettings.FTPPassive)
 
 	prealloc := widget.NewCheck("下载时磁盘预分配（连续大文件更稳定）", func(checked bool) {
-		globalSettings.Prealloc = checked
+		GlobalSettings.Prealloc = checked
 	})
-	prealloc.SetChecked(globalSettings.Prealloc)
+	prealloc.SetChecked(GlobalSettings.Prealloc)
 
 	form := widget.NewForm(
-		widget.NewFormItem("gRPC 服务", grpcInfo),
 		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, widget.NewButton("浏览...", func() {
 			dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
 				if err != nil || uri == nil {
