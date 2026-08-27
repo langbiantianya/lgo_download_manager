@@ -6,7 +6,6 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
-	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"lgo_download_manager/internal/scheduler"
@@ -139,12 +138,3 @@ func (tl *taskList) refreshEmptyState() {
 func (tl *taskList) onEvent(ev scheduler.Event) {
 	tl.refresh()
 }
-
-// task iconography helpers (kept here to consolidate icons referenced by row).
-var (
-	iconDownloading = theme.DownloadIcon()
-	iconCompleted   = theme.CheckButtonCheckedIcon()
-	iconFailed      = theme.ErrorIcon()
-	iconPaused      = theme.MediaPauseIcon()
-	iconPending     = theme.MediaRecordIcon()
-)

@@ -92,8 +92,13 @@ func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 	searchEntry.OnChanged = func(s string) { m.taskList.setSearch(s) }
 
 	left := container.NewHBox(newBtn, pauseAllBtn, resumeAllBtn)
-	right := container.NewHBox(searchEntry, settingsBtn)
-	return container.NewBorder(nil, nil, left, right, layout.NewSpacer())
+	return container.NewBorder(
+		nil,         // top
+		nil,         // bottom
+		left,        // left：按钮组
+		settingsBtn, // right：设置按钮
+		searchEntry, // center：搜索框自动撑满剩余空间
+	)
 }
 
 // buildMainSplit creates the horizontal split between sidebar and task list.
@@ -143,8 +148,9 @@ func (m *MainWindow) buildSidebar() fyne.CanvasObject {
 }
 
 // Show displays the main window.
+// Called from main goroutine before a.Run(), so no fyne.Do() needed.
 func (m *MainWindow) Show() {
-	fyne.Do(func() { m.win.Show() })
+	m.win.Show()
 }
 
 // Close tears down subscriptions.
@@ -169,9 +175,10 @@ func (m *MainWindow) subscribe() {
 	}()
 }
 
-// SetGRPCStatus updates the gRPC status label (call from main after server starts).
+// SetGRPCStatus updates the gRPC status label.
+// Called from main goroutine before a.Run(), so no fyne.Do() needed.
 func (m *MainWindow) SetGRPCStatus(s string) {
-	fyne.Do(func() { m.statusBar.setGRPC(s) })
+	m.statusBar.setGRPC(s)
 }
 
 // statusBar shows gRPC service status and task counts.
