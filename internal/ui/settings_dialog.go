@@ -9,18 +9,20 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"lgo_download_manager/internal/scheduler"
 )
 
 // settings holds user-tunable defaults applied to new downloads.
 type settings struct {
-	DefaultSaveDir  string
-	DefaultThreads  int
-	DefaultProtocol string
-	UserAgent       string
-	Cookies         string
-	FTPPassive      bool
-	Prealloc        bool
+	DefaultSaveDir string
+	DefaultThreads int
+	UserAgent      string
+	Cookies        string
+	FTPPassive     bool
+	Prealloc       bool
 }
 
 // globalSettings is the live settings used by "新建任务" when prefilling fields.
@@ -32,85 +34,74 @@ func init() {
 	saveDir := filepath.Join(home, "Downloads")
 	_ = runtime.GOOS // reserved for future platform-specific tweaks
 	globalSettings = settings{
-		DefaultSaveDir:  saveDir,
-		DefaultThreads:  4,
-		DefaultProtocol: "HTTPS",
-		UserAgent:       "",
-		Cookies:         "",
-		FTPPassive:      true,
-		Prealloc:        true,
+		DefaultSaveDir: saveDir,
+		DefaultThreads: 4,
+		UserAgent:      "",
+		Cookies:        "",
+		FTPPassive:     true,
+		Prealloc:       true,
 	}
 }
-
-// showSettings opens a modal settings dialog bound to the global settings
-// value. Changes apply immediately on confirm.
-func showSettings(win fyne.Window) {
+// buildSettingsContent returns the settings form as a scrollable page.
+// Changes are saved immediately on each field change.
+func buildSettingsContent(sc *scheduler.Scheduler, grpcAddr string) fyne.CanvasObject {
 	dirEntry := widget.NewEntry()
 	dirEntry.SetText(globalSettings.DefaultSaveDir)
 	dirEntry.SetPlaceHolder("/path/to/Downloads")
+	dirEntry.OnChanged = func(s string) { globalSettings.DefaultSaveDir = s }
 
-	diskInfo := widget.NewLabel(diskSpaceAt(globalSettings.DefaultSaveDir))
-
-	browseBtn := widget.NewButton("浏览...", func() {
-		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
-			if err != nil || uri == nil {
-				return
-			}
-			dirEntry.SetText(uri.Path())
-			diskInfo.SetText(diskSpaceAt(uri.Path()))
-		}, win)
-	})
+	grpcLabel := widget.NewLabel(fmt.Sprintf("gRPC 服务已启动 (%s)", grpcAddr))
+	grpcLabel.TextStyle.Italic = true
+	grpcInfo := container.NewHBox(widget.NewIcon(theme.InfoIcon()), grpcLabel)
 
 	threadsEntry := widget.NewEntry()
 	threadsEntry.SetText(fmt.Sprintf("%d", globalSettings.DefaultThreads))
-
-	protoRadio := widget.NewRadioGroup([]string{"HTTP", "HTTPS", "FTP", "WebDAV"}, nil)
-	protoRadio.Selected = globalSettings.DefaultProtocol
-	protoRadio.Horizontal = true
+	threadsEntry.OnChanged = func(s string) {
+		if n, err := parseThreadCount(s); err == nil && n > 0 {
+			globalSettings.DefaultThreads = n
+		}
+	}
 
 	uaEntry := widget.NewEntry()
 	uaEntry.SetText(globalSettings.UserAgent)
 	uaEntry.SetPlaceHolder("可选，自定义 User-Agent")
+	uaEntry.OnChanged = func(s string) { globalSettings.UserAgent = s }
 
 	cookiesEntry := widget.NewEntry()
 	cookiesEntry.SetText(globalSettings.Cookies)
 	cookiesEntry.SetPlaceHolder("可选，Cookie 字符串")
+	cookiesEntry.OnChanged = func(s string) { globalSettings.Cookies = s }
 
-	ftpPassive := widget.NewCheck("启用 FTP PASV 被动模式", nil)
+	ftpPassive := widget.NewCheck("启用 FTP PASV 被动模式", func(checked bool) {
+		globalSettings.FTPPassive = checked
+	})
 	ftpPassive.SetChecked(globalSettings.FTPPassive)
 
-	prealloc := widget.NewCheck("下载时磁盘预分配（连续大文件更稳定）", nil)
+	prealloc := widget.NewCheck("下载时磁盘预分配（连续大文件更稳定）", func(checked bool) {
+		globalSettings.Prealloc = checked
+	})
 	prealloc.SetChecked(globalSettings.Prealloc)
 
-	dirRow := container.NewBorder(nil, nil, nil, browseBtn, dirEntry)
-
-	formItems := []*widget.FormItem{
-		widget.NewFormItem("默认保存目录", dirRow),
-		widget.NewFormItem("磁盘剩余空间", diskInfo),
-		widget.NewFormItem("默认协议", protoRadio),
+	form := widget.NewForm(
+		widget.NewFormItem("gRPC 服务", grpcInfo),
+		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, widget.NewButton("浏览...", func() {
+			dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
+				if err != nil || uri == nil {
+					return
+				}
+				dirEntry.SetText(uri.Path())
+			}, globalWin)
+		}), dirEntry)),
 		widget.NewFormItem("默认并发线程数", threadsEntry),
 		widget.NewFormItem("默认 User-Agent", uaEntry),
 		widget.NewFormItem("默认 Cookie", cookiesEntry),
 		widget.NewFormItem("FTP 模式", ftpPassive),
 		widget.NewFormItem("磁盘预分配", prealloc),
-	}
+	)
 
-	dlg := dialog.NewForm("设置", "保存", "取消", formItems, func(confirmed bool) {
-		if !confirmed {
-			return
-		}
-		globalSettings.DefaultSaveDir = dirEntry.Text
-		globalSettings.DefaultProtocol = protoRadio.Selected
-		globalSettings.UserAgent = uaEntry.Text
-		globalSettings.Cookies = cookiesEntry.Text
-		globalSettings.FTPPassive = ftpPassive.Checked
-		globalSettings.Prealloc = prealloc.Checked
-		if n, err := parseThreadCount(threadsEntry.Text); err == nil && n > 0 {
-			globalSettings.DefaultThreads = n
-		}
-	}, win)
-	dlg.Resize(fyne.NewSize(560, 520))
-	dlg.Show()
+	scroll := container.NewScroll(form)
+	scroll.SetMinSize(fyne.NewSize(500, 400))
+	return scroll
 }
 
 // diskSpaceAt reports the free bytes on the filesystem holding path.

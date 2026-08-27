@@ -72,10 +72,8 @@ func main() {
 		a := app.NewWithID("com.ldm")
 		// Construct the window AFTER the app is created so widget constructors
 		// can resolve fyne.CurrentApp() (list.go calls it during setup).
-		win := ui.NewMainWindow(a, sc)
-		win.SetGRPCStatus(fmt.Sprintf("已启动 (%s)", *grpcAddr))
+		win := ui.NewMainWindow(a, sc, *grpcAddr)
 		win.Show()
-		// a.Run() blocks the main goroutine and drives the Fyne event loop.
 		a.Run()
 		cancel()
 	}

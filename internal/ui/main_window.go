@@ -4,7 +4,12 @@
 package ui
 
 import (
+	"fmt"
+	"image/color"
+	"path/filepath"
+
 	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/layout"
@@ -17,9 +22,11 @@ import (
 
 // MainWindow holds all GUI state and the top-level Fyne window.
 type MainWindow struct {
-	app fyne.App
-	sc  *scheduler.Scheduler
-	win fyne.Window
+	app      fyne.App
+	sc       *scheduler.Scheduler
+	win      fyne.Window
+	content  *fyne.Container
+	grpcAddr string
 
 	filter    binding.String
 	taskList  *taskList
@@ -33,35 +40,65 @@ type MainWindow struct {
 // This MUST be called on the Fyne event thread (typically the main goroutine
 // after app.New…() and before a.Run()), because widget constructors rely on
 // fyne.CurrentApp() resolving to the just-created app.
-func NewMainWindow(a fyne.App, sc *scheduler.Scheduler) *MainWindow {
+func NewMainWindow(a fyne.App, sc *scheduler.Scheduler, grpcAddr string) *MainWindow {
 	setGlobalScheduler(sc)
 	m := &MainWindow{
-		app:    a,
-		sc:     sc,
-		filter: binding.NewString(),
+		app:      a,
+		sc:       sc,
+		grpcAddr: grpcAddr,
+		filter:   binding.NewString(),
 	}
 	m.taskList = newTaskList(sc, m.filter)
 	m.statusBar = newStatusBar()
-	m.buildWindow()
+	m.buildMainUI()
+	m.statusBar.refreshDiskSpace()
 	m.subscribe()
 	setGlobalWindow(m.win)
 	return m
 }
-
-func (m *MainWindow) buildWindow() {
-	m.win = m.app.NewWindow("Go Download Manager")
-	m.win.SetMaster()
-
-	content := container.NewBorder(
+// buildMainUI assembles the main window and stores the content container
+// for page-switching (e.g., to settings page).
+func (m *MainWindow) buildMainUI() {
+	m.win = m.app.NewWindow("下载管理器")
+	m.content = container.NewBorder(
 		m.buildToolbar(),
 		m.statusBar.container(),
 		nil, nil,
 		m.buildMainSplit(),
 	)
-	m.win.SetContent(content)
+	m.win.SetContent(m.content)
 	m.win.Resize(fyne.NewSize(1000, 640))
 	m.win.CenterOnScreen()
 	m.win.SetOnClosed(func() { m.Close() })
+}
+
+// showSettingsPage switches the main content to the settings page.
+func (m *MainWindow) showSettingsPage() {
+	m.win.SetContent(container.NewBorder(
+		m.buildSettingsHeader(),
+		nil, nil, nil,
+		m.buildSettingsContent(),
+	))
+}
+
+// showMainPage switches the main content back to the main view.
+func (m *MainWindow) showMainPage() {
+	m.win.SetContent(m.content)
+}
+
+// buildSettingsHeader returns a header bar with a back button and title.
+func (m *MainWindow) buildSettingsHeader() fyne.CanvasObject {
+	backBtn := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
+		m.showMainPage()
+	})
+	title := widget.NewLabel("设置")
+	title.TextStyle.Bold = true
+	return container.NewBorder(nil, nil, backBtn, nil, container.NewHBox(title, layout.NewSpacer()))
+}
+
+// buildSettingsContent returns the settings form content.
+func (m *MainWindow) buildSettingsContent() fyne.CanvasObject {
+	return buildSettingsContent(m.sc, m.grpcAddr)
 }
 
 // buildToolbar packs the action buttons, search and the settings shortcut.
@@ -84,7 +121,7 @@ func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 		}
 	})
 	settingsBtn := widget.NewButtonWithIcon("设置", theme.SettingsIcon(), func() {
-		showSettings(m.win)
+		m.showSettingsPage()
 	})
 
 	searchEntry := widget.NewEntry()
@@ -135,13 +172,11 @@ func (m *MainWindow) buildSidebar() fyne.CanvasObject {
 	radios.Required = true
 	radios.SetSelected("全部")
 	radios.Horizontal = false
-
 	header := widget.NewLabelWithStyle("任务筛选", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-	footer := widget.NewLabelWithStyle("Go Download Manager", fyne.TextAlignCenter, fyne.TextStyle{Italic: true})
 
 	return container.NewBorder(
 		container.NewVBox(header, widget.NewSeparator()),
-		container.NewVBox(widget.NewSeparator(), footer),
+		nil,
 		nil, nil,
 		radios,
 	)
@@ -169,86 +204,137 @@ func (m *MainWindow) subscribe() {
 			ev := ev
 			fyne.Do(func() {
 				m.taskList.onEvent(ev)
-				m.statusBar.onEvent(ev)
 			})
 		}
 	}()
 }
 
-// SetGRPCStatus updates the gRPC status label.
-// Called from main goroutine before a.Run(), so no fyne.Do() needed.
-func (m *MainWindow) SetGRPCStatus(s string) {
-	m.statusBar.setGRPC(s)
+// diskBar is a thin colored bar showing disk usage (green→red).
+type diskBar struct {
+	widget.BaseWidget
+	progress float64 // 0.0 to 1.0
+
+	bg   *canvas.Rectangle
+	fill *canvas.Rectangle
 }
 
-// statusBar shows gRPC service status and task counts.
+func newDiskBar() *diskBar {
+	db := &diskBar{}
+	db.ExtendBaseWidget(db)
+	return db
+}
+
+func (db *diskBar) setProgress(frac float64) {
+	if frac < 0 {
+		frac = 0
+	}
+	if frac > 1 {
+		frac = 1
+	}
+	db.progress = frac
+	db.Refresh()
+}
+
+func (db *diskBar) CreateRenderer() fyne.WidgetRenderer {
+	db.bg = canvas.NewRectangle(theme.Color(theme.ColorNameInputBackground))
+	db.fill = canvas.NewRectangle(colorForProgress(db.progress))
+	return &diskBarRenderer{db, db.bg, db.fill}
+}
+
+func (db *diskBar) MinSize() fyne.Size {
+	return fyne.NewSize(200, 4)
+}
+
+func (db *diskBar) Refresh() {
+	db.fill.FillColor = colorForProgress(db.progress)
+	db.fill.Refresh()
+}
+
+type diskBarRenderer struct {
+	b    *diskBar
+	bg   *canvas.Rectangle
+	fill *canvas.Rectangle
+}
+
+func (r *diskBarRenderer) Layout(size fyne.Size) {
+	r.bg.Resize(size)
+	barW := float32(r.b.progress) * size.Width
+	if barW < 0 {
+		barW = 0
+	}
+	r.fill.Resize(fyne.NewSize(barW, size.Height))
+}
+
+func (r *diskBarRenderer) MinSize() fyne.Size  { return r.b.MinSize() }
+func (r *diskBarRenderer) Objects() []fyne.CanvasObject { return []fyne.CanvasObject{r.bg, r.fill} }
+func (r *diskBarRenderer) Destroy()              {}
+func (r *diskBarRenderer) Refresh()              {}
+func colorForProgress(frac float64) color.Color {
+	// green: #4CAF50, yellow: #FFEB3B, red: #F44336
+	var r, g, b_ float64
+	if frac < 0.5 {
+		t := frac * 2
+		r = t*255 + (1-t)*76
+		g = t*235 + (1-t)*175
+		b_ = t*59 + (1-t)*80
+	} else {
+		t := (frac - 0.5) * 2
+		r = t*244 + (1-t)*255
+		g = t*67 + (1-t)*235
+		b_ = t*54 + (1-t)*59
+	}
+	return color.RGBA{R: uint8(r), G: uint8(g), B: uint8(b_), A: 255}
+}
+
+// statusBar shows disk usage.
 type statusBar struct {
-	grpcStatus *widget.Label
-	countLabel *widget.Label
+	diskBar   *diskBar
+	diskLabel *widget.Label
 }
 
 func newStatusBar() *statusBar {
+	diskLabel := widget.NewLabel("磁盘空间: 检测中...")
+	diskLabel.SizeName = theme.SizeNameCaptionText
+
 	return &statusBar{
-		grpcStatus: widget.NewLabel("gRPC 服务: 启动中..."),
-		countLabel: widget.NewLabel("任务总数: 0"),
+		diskBar:   newDiskBar(),
+		diskLabel: diskLabel,
 	}
 }
 
 func (sb *statusBar) container() fyne.CanvasObject {
-	return container.NewVBox(
+	return container.New(layout.NewCustomPaddedVBoxLayout(0),
 		widget.NewSeparator(),
-		container.NewHBox(
-			sb.grpcStatus,
-			layout.NewSpacer(),
-			sb.countLabel,
-		),
+		sb.diskLabel,
+		sb.diskBar,
 	)
 }
-
-func (sb *statusBar) setGRPC(s string) { sb.grpcStatus.SetText("gRPC 服务: " + s) }
-
-func (sb *statusBar) onEvent(ev scheduler.Event) {
-	if sc := globalSc; sc != nil {
-		if tks, err := sc.List(); err == nil {
-			sb.countLabel.SetText(formatTaskSummary(tks))
-		}
-	}
-	_ = ev
-}
-
-func formatTaskSummary(tks []*store.Task) string {
-	var total, active, paused, done, failed int
-	for _, t := range tks {
-		total++
-		switch t.Status {
-		case store.StatusDownloading:
-			active++
-		case store.StatusPaused:
-			paused++
-		case store.StatusCompleted:
-			done++
-		case store.StatusFailed:
-			failed++
-		}
-	}
+func (sb *statusBar) setDiskSpace(free, total int64) {
 	if total == 0 {
-		return "任务总数: 0"
+		sb.diskLabel.SetText("磁盘空间: 不可用")
+		sb.diskBar.setProgress(0)
+		return
 	}
-	return "共 " + itoa(total) + " 个 | 下载 " + itoa(active) +
-		" | 暂停 " + itoa(paused) + " | 完成 " + itoa(done) +
-		" | 失败 " + itoa(failed)
+	frac := 1.0 - float64(free)/float64(total)
+	sb.diskBar.setProgress(frac)
+	sb.diskLabel.SetText(fmt.Sprintf("磁盘空间: 可用 %s / 总计 %s",
+		humanBytes(free), humanBytes(total)))
 }
-
-func itoa(n int) string {
-	if n == 0 {
-		return "0"
+// refreshDiskSpace updates the disk space display from globalSettings.DefaultSaveDir.
+func (sb *statusBar) refreshDiskSpace() {
+	dir := globalSettings.DefaultSaveDir
+	if dir == "" {
+		sb.setDiskSpace(0, 0)
+		return
 	}
-	var buf [20]byte
-	i := len(buf)
-	for n > 0 {
-		i--
-		buf[i] = byte('0' + n%10)
-		n /= 10
+	d := filepath.Dir(dir)
+	if d == "" {
+		d = "."
 	}
-	return string(buf[i:])
+	free, total, err := diskUsage(d)
+	if err != nil {
+		sb.setDiskSpace(0, 0)
+		return
+	}
+	sb.setDiskSpace(free, total)
 }

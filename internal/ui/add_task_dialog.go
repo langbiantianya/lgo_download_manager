@@ -32,10 +32,6 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 		}, win)
 	})
 
-	protoRadio := widget.NewRadioGroup([]string{"HTTP", "HTTPS", "FTP", "WebDAV"}, nil)
-	protoRadio.Selected = globalSettings.DefaultProtocol
-	protoRadio.Horizontal = true
-
 	threadsEntry := widget.NewEntry()
 	threadsEntry.SetText("")
 
@@ -66,7 +62,6 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 	formItems := []*widget.FormItem{
 		widget.NewFormItem("下载链接 (URL)", urlEntry),
 		widget.NewFormItem("保存路径", container.NewBorder(nil, nil, nil, browseBtn, savePathEntry)),
-		widget.NewFormItem("协议", protoRadio),
 		widget.NewFormItem("并发线程数（留空使用全局默认）", threadsEntry),
 		widget.NewFormItem("身份认证", authBox),
 	}
@@ -80,32 +75,21 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 		if url == "" || savePath == "" {
 			return
 		}
-
-		var proto protocol.ProtocolKind
-		switch protoRadio.Selected {
-		case "HTTP":
-			proto = protocol.ProtoHTTP
-		case "HTTPS":
-			proto = protocol.ProtoHTTPS
-		case "FTP":
-			proto = protocol.ProtoFTP
-		case "WebDAV":
-			proto = protocol.ProtoWebDAV
-		default:
-			proto = protocol.ProtoHTTPS
+		proto, err := protocol.DetectKind(url, "")
+		if err != nil {
+			dialog.ShowError(err, win)
+			return
 		}
 
-		auth := protocol.AuthOptions{
-			Username:   usernameEntry.Text,
-			Password:   passwordEntry.Text,
-			UserAgent:  globalSettings.UserAgent,
-			Cookies:    globalSettings.Cookies,
-			FTPPassive: globalSettings.FTPPassive,
+		var user, pass string
+		if authCheck.Checked {
+			user = usernameEntry.Text
+			pass = passwordEntry.Text
 		}
 
 		chunkCount := globalSettings.DefaultThreads
-		if threadsEntry.Text != "" {
-			if n, err := parseThreadCount(threadsEntry.Text); err == nil && n > 0 {
+		if s := threadsEntry.Text; s != "" {
+			if n, err := parseThreadCount(s); err == nil && n > 0 {
 				chunkCount = n
 			}
 		}
@@ -114,7 +98,13 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 			URL:        url,
 			SavePath:   savePath,
 			Protocol:   proto,
-			Auth:       auth,
+			Auth: protocol.AuthOptions{
+				Username:   user,
+				Password:   pass,
+				UserAgent:  globalSettings.UserAgent,
+				Cookies:    globalSettings.Cookies,
+				FTPPassive: globalSettings.FTPPassive,
+			},
 			ChunkCount: chunkCount,
 		})
 		if err != nil {
