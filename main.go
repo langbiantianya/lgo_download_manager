@@ -33,18 +33,32 @@ func main() {
 	openURL := flag.String("open-url", "", "download URL (lgom://... format)")
 	flag.Parse()
 
+	// Collect URLs from --open-url flag and positional arguments.
+	// Some desktop environments pass the URL as a positional arg.
+	var urls []string
+	if *openURL != "" {
+		urls = append(urls, *openURL)
+	}
+	for _, arg := range flag.Args() {
+		if strings.HasPrefix(arg, "lgom://") {
+			urls = append(urls, arg)
+		}
+	}
+
 	// Single-instance lock
 	isPrimary, release, err := urllauncher.AcquireLock()
 	if err != nil {
 		log.Fatalf("urllauncher: %v", err)
 	}
 	if !isPrimary {
-		// Another instance is running; forward the URL and exit
-		if *openURL != "" {
-			if err := urllauncher.SendURL(*openURL); err != nil {
-				log.Fatalf("failed to forward URL: %v", err)
+		// Another instance is running; forward all URLs and exit
+		if len(urls) > 0 {
+			for _, u := range urls {
+				if err := urllauncher.SendURL(u); err != nil {
+					log.Fatalf("failed to forward URL: %v", err)
+				}
 			}
-			log.Println("URL forwarded to primary instance")
+			log.Printf("forwarded %d URL(s) to primary instance", len(urls))
 		} else {
 			log.Println("another instance is already running")
 		}
@@ -128,9 +142,9 @@ func main() {
 		log.Fatalf("urllauncher server: %v", err)
 	}
 
-	// Handle --open-url if provided (direct call, not via socket)
-	if *openURL != "" {
-		handleDownloadURL(*openURL)
+	// Handle URLs passed as arguments (via --open-url or positional args)
+	for _, u := range urls {
+		handleDownloadURL(u)
 	}
 
 	// GUI — must run on the main goroutine where Fyne's Run() executes.
