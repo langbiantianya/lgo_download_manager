@@ -1,0 +1,158 @@
+package ui
+
+import (
+	"path/filepath"
+
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/widget"
+
+	"lgo_download_manager/internal/protocol"
+	"lgo_download_manager/internal/scheduler"
+)
+
+// showAddTaskDialog opens the "新建下载任务" dialog with global settings
+// pre-populated. Only essential fields appear here; advanced options live
+// in the Settings dialog.
+func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
+	urlEntry := widget.NewEntry()
+	urlEntry.SetPlaceHolder("https://...")
+	urlEntry.Validator = notEmptyValidator()
+
+	savePathEntry := widget.NewEntry()
+	savePathEntry.SetText(filepath.Join(globalSettings.DefaultSaveDir, "download.bin"))
+
+	browseBtn := widget.NewButton("浏览...", func() {
+		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
+			if err != nil || uri == nil {
+				return
+			}
+			savePathEntry.SetText(filepath.Join(uri.Path(), "download.bin"))
+		}, win)
+	})
+
+	protoRadio := widget.NewRadioGroup([]string{"HTTP", "HTTPS", "FTP", "WebDAV"}, nil)
+	protoRadio.Selected = globalSettings.DefaultProtocol
+	protoRadio.Horizontal = true
+
+	threadsEntry := widget.NewEntry()
+	threadsEntry.SetText("")
+
+	// Auth (collapsible — only expanded when needed)
+	usernameEntry := widget.NewEntry()
+	usernameEntry.SetPlaceHolder("可选")
+	passwordEntry := widget.NewPasswordEntry()
+	passwordEntry.SetPlaceHolder("可选")
+
+	authCheck := widget.NewCheck("需要身份认证", func(checked bool) {
+		if checked {
+			usernameEntry.Show()
+			passwordEntry.Show()
+		} else {
+			usernameEntry.Hide()
+			passwordEntry.Hide()
+		}
+	})
+	usernameEntry.Hide()
+	passwordEntry.Hide()
+
+	authBox := container.NewVBox(
+		authCheck,
+		usernameEntry,
+		passwordEntry,
+	)
+
+	formItems := []*widget.FormItem{
+		widget.NewFormItem("下载链接 (URL)", urlEntry),
+		widget.NewFormItem("保存路径", container.NewBorder(nil, nil, nil, browseBtn, savePathEntry)),
+		widget.NewFormItem("协议", protoRadio),
+		widget.NewFormItem("并发线程数（留空使用全局默认）", threadsEntry),
+		widget.NewFormItem("身份认证", authBox),
+	}
+
+	dialog.NewForm("新建下载任务", "开始下载", "取消", formItems, func(confirmed bool) {
+		if !confirmed {
+			return
+		}
+		url := urlEntry.Text
+		savePath := savePathEntry.Text
+		if url == "" || savePath == "" {
+			return
+		}
+
+		var proto protocol.ProtocolKind
+		switch protoRadio.Selected {
+		case "HTTP":
+			proto = protocol.ProtoHTTP
+		case "HTTPS":
+			proto = protocol.ProtoHTTPS
+		case "FTP":
+			proto = protocol.ProtoFTP
+		case "WebDAV":
+			proto = protocol.ProtoWebDAV
+		default:
+			proto = protocol.ProtoHTTPS
+		}
+
+		auth := protocol.AuthOptions{
+			Username:   usernameEntry.Text,
+			Password:   passwordEntry.Text,
+			UserAgent:  globalSettings.UserAgent,
+			Cookies:    globalSettings.Cookies,
+			FTPPassive: globalSettings.FTPPassive,
+		}
+
+		chunkCount := globalSettings.DefaultThreads
+		if threadsEntry.Text != "" {
+			if n, err := parseThreadCount(threadsEntry.Text); err == nil && n > 0 {
+				chunkCount = n
+			}
+		}
+
+		tk, err := sc.Add(scheduler.AddTaskInput{
+			URL:        url,
+			SavePath:   savePath,
+			Protocol:   proto,
+			Auth:       auth,
+			ChunkCount: chunkCount,
+		})
+		if err != nil {
+			dialog.ShowError(err, win)
+			return
+		}
+		_ = sc.Start(tk.ID)
+	}, win).Show()
+}
+
+func notEmptyValidator() fyne.StringValidator {
+	return func(s string) error {
+		if s == "" {
+			return errEmpty
+		}
+		return nil
+	}
+}
+
+var errEmpty = errEmptyField{}
+
+type errEmptyField struct{}
+
+func (errEmptyField) Error() string { return "required" }
+
+func parseThreadCount(s string) (int, error) {
+	var n int
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return 0, errBadThreadCount
+		}
+		n = n*10 + int(c-'0')
+	}
+	return n, nil
+}
+
+var errBadThreadCount = badThreadCountErr{}
+
+type badThreadCountErr struct{}
+
+func (badThreadCountErr) Error() string { return "bad thread count" }

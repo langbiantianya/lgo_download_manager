@@ -1,0 +1,6 @@
+ldm
+ldm.sqlite
+ldm.sqlite-shm
+ldm.sqlite-wal
+downloads/
+*.tmp

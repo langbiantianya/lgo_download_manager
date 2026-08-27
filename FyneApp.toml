@@ -1,0 +1,10 @@
+[Details]
+  Name = "Go Download Manager"
+  ID = "com.ldm"
+  Version = "0.1.0"
+  Build = 1
+
+[Development]
+
+[Migrations]
+  fyneDo = true
