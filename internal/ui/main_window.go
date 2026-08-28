@@ -51,6 +51,7 @@ func NewMainWindow(a fyne.App, sc *scheduler.Scheduler) *MainWindow {
 	m.buildMainUI()
 	m.statusBar.refreshDiskSpace()
 	m.subscribe()
+	m.setupTray()
 	setGlobalWindow(m.win)
 	return m
 }
@@ -189,6 +190,23 @@ func (m *MainWindow) Show() {
 func (m *MainWindow) Close() {
 	if m.unsub != nil {
 		m.unsub()
+	}
+}
+// setupTray adds a system tray icon with Show menu item.
+func (m *MainWindow) setupTray() {
+	openItem := fyne.NewMenuItem("Open", func() {
+		m.win.Show()
+		m.win.RequestFocus()
+	})
+	trayMenu := fyne.NewMenu("", openItem)
+
+	// SetSystemTrayMenu/SetSystemTrayWindow are desktop-only methods on *fyneApp.
+	if desk, ok := m.app.(interface {
+		SetSystemTrayMenu(*fyne.Menu)
+		SetSystemTrayWindow(fyne.Window)
+	}); ok {
+		desk.SetSystemTrayMenu(trayMenu)
+		desk.SetSystemTrayWindow(m.win)
 	}
 }
 

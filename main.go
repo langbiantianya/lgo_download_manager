@@ -158,6 +158,7 @@ func main() {
 		win.Show()
 		a.Run()
 		cancel()
+		os.Exit(0)
 	}
 
 	// Wait for shutdown signal
