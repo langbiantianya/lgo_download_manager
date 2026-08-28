@@ -33,6 +33,11 @@ type Options struct {
 	ProgressEvery time.Duration
 	TaskID        string
 	OnChunkCountDecreased func(newCount int)
+	// OnPlanChanged fires when the engine collapses or re-plans its
+	// chunks (e.g. when a server doesn't support byte ranges and the
+	// engine falls back to a single streaming chunk). The hook is
+	// invoked with the new [start0,end0,start1,end1,...] range pairs.
+	OnPlanChanged func(ranges []int64)
 	Logger        Logger
 }
 
@@ -252,13 +257,28 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 
 	if isStreaming {
 		j.mu.Lock()
-		c := j.chunks[0]
-		j.mu.Unlock()
-		off := c.progress
-		stopErr := j.driver.DownloadFallback(ctx, off, j.dest, func(n int) {
+		// Collapse the plan to a single chunk covering the entire file so
+		// Chunks() reports progress on one chunk rather than N chunks
+		// where only chunks[0] was actually written to. Without this,
+		// the scheduler would read e.g. [N, 0, 0, 0] from a server that
+		// doesn't advertise Accept-Ranges — the UI would only ever
+		// light up the first tile's worth of mosaic.
+		var progress int64
+		if len(j.chunks) > 0 {
+			progress = j.chunks[0].progress
+		}
+		end := int64(-1)
+		if j.total > 0 {
+			end = j.total - 1
+		}
+		j.chunks = []chunk{{idx: 0, start: progress, end: end, progress: progress}}
+		c := &j.chunks[0]
+		if j.opts.OnPlanChanged != nil {
+			j.opts.OnPlanChanged([]int64{c.start, c.end})
+		}
+		stopErr := j.driver.DownloadFallback(ctx, c.progress, j.dest, func(n int) {
 			bytesDone.Add(int64(n))
-			off += int64(n)
-			atomic.StoreInt64(&c.progress, off)
+			atomic.AddInt64(&c.progress, int64(n))
 			emit(0)
 		})
 		if j.opts.Progress != nil {
@@ -433,9 +453,14 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		}
 		j.opts.ResumeFrom = progress
 		j.plan()
+		if j.opts.OnPlanChanged != nil {
+			ranges := make([]int64, 0, 2*len(j.chunks))
+			for _, c := range j.chunks {
+				ranges = append(ranges, c.start, c.end)
+			}
+			j.opts.OnPlanChanged(ranges)
+		}
 		j.mu.Unlock()
-
-		j.log.Infof("re-planned with %d chunks  backing off 1s", activeCount)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

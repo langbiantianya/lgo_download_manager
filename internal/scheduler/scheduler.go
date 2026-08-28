@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -179,7 +180,6 @@ func (s *Scheduler) Start(taskID string) error {
 	resume := make([]int64, len(tk.ChunkProgress))
 	copy(resume, tk.ChunkProgress)
 
-
 	job := engine.NewJob(driver, caps.TotalSize, dest, engine.Options{
 		ChunkCount:    tk.ChunkCount,
 		MinChunkSize:  tk.MinChunkSize, // 0 means "use engine default"
@@ -189,8 +189,25 @@ func (s *Scheduler) Start(taskID string) error {
 			s.markProgress(tk.ID, p)
 		},
 		TaskID: tk.ID,
+		OnPlanChanged: func(ranges []int64) {
+			tk.ChunkRanges = ranges
+			if err := s.st.UpdateTaskChunkRanges(tk.ID, ranges); err != nil {
+				log.Printf("scheduler: persist chunk ranges: %v", err)
+			}
+		},
 	})
-
+	// Snapshot the engine's actual chunk layout (depends on MinChunkSize +
+	// total size, not just ChunkCount) so the UI can render the chunk
+	// mosaic against the real byte ranges.
+	cs := job.Chunks()
+	ranges := make([]int64, 0, len(cs)*2)
+	for _, c := range cs {
+		ranges = append(ranges, c.Start, c.End)
+	}
+	tk.ChunkRanges = ranges
+	if err := s.st.UpdateTaskChunkRanges(tk.ID, ranges); err != nil {
+		log.Printf("scheduler: persist chunk ranges: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	rj := &runningJob{
 		task:    tk,
@@ -201,6 +218,7 @@ func (s *Scheduler) Start(taskID string) error {
 	s.mu.Lock()
 	s.jobs[tk.ID] = rj
 	s.mu.Unlock()
+
 
 	if err := s.st.UpdateTaskProgress(tk.ID, sumInts(tk.ChunkProgress), tk.ChunkProgress, store.StatusDownloading, ""); err != nil {
 		// Non-fatal — biler flush will catch up.

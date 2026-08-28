@@ -60,6 +60,7 @@ type Task struct {
 	ChunkCount    int       `json:"chunk_count"`
 	MinChunkSize  int64     `json:"min_chunk_size"` // engine chunk lower-bound (bytes)
 	ChunkProgress []int64   `json:"chunk_progress"` // per-chunk offset-from-start
+	ChunkRanges   []int64   `json:"chunk_ranges"`   // [start0,end0,start1,end1,...] — actual engine chunk layout
 	Status        Status    `json:"status"`
 	AuthData      string    `json:"auth_data"`  // JSON: {username,password,...}
 	ErrorMessage  string    `json:"error_message"`
@@ -104,7 +105,8 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// migrate creates the tables on a fresh DB. Idempotent.
+// migrate creates the tables on a fresh DB and applies idempotent column
+// migrations for older databases.
 func (s *Store) migrate() error {
 	const ddl = `CREATE TABLE IF NOT EXISTS tasks (
 		id              TEXT PRIMARY KEY,
@@ -133,8 +135,40 @@ func (s *Store) migrate() error {
 		ftp_passive         INTEGER NOT NULL DEFAULT 1,
 		prealloc            INTEGER NOT NULL DEFAULT 1
 	);`
-	_, err := s.db.Exec(ddl)
-	return err
+	if _, err := s.db.Exec(ddl); err != nil {
+		return err
+	}
+	// Idempotent column migrations: add new columns to existing tasks
+	// tables without dropping data.
+	if err := s.addColumnIfMissing("tasks", "chunk_ranges", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// addColumnIfMissing adds a column to an existing table when it isn't
+// already present. modernc.org/sqlite exposes table_info via PRAGMA.
+func (s *Store) addColumnIfMissing(table, col, decl string) error {
+	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var cid int
+		var name, ctype string
+		var notnull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
+			return err
+		}
+		if name == col {
+			return nil
+		}
+	}
+	if _, err := s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + col + ` ` + decl); err != nil {
+		return fmt.Errorf("alter %s add %s: %w", table, col, err)
+	}
+	return nil
 }
 
 // Close releases the DB handle. The engine should defer this on shutdown.
@@ -153,18 +187,22 @@ func (s *Store) CreateTask(t *Task) error {
 	if t.ChunkProgress == nil {
 		t.ChunkProgress = []int64{}
 	}
+	if t.ChunkRanges == nil {
+		t.ChunkRanges = []int64{}
+	}
 	cpJSON, _ := json.Marshal(t.ChunkProgress)
+	rgJSON, _ := json.Marshal(t.ChunkRanges)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO tasks (
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		is_allocated,chunk_count,chunk_progress,status,auth_data,
-		error_message,created_at,updated_at
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		is_allocated,chunk_count,chunk_progress,chunk_ranges,status,
+		auth_data,error_message,created_at,updated_at
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		t.ID, t.URL, t.SavePath, t.Protocol, t.TotalSize, t.Downloaded,
 		boolToInt(t.SupportRange), boolToInt(t.IsAllocated), t.ChunkCount,
-		string(cpJSON), string(t.Status), t.AuthData, t.ErrorMessage,
-		t.CreatedAt, t.UpdatedAt,
+		string(cpJSON), string(rgJSON), string(t.Status), t.AuthData,
+		t.ErrorMessage, t.CreatedAt, t.UpdatedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("store insert: %w", err)
@@ -204,8 +242,8 @@ func (s *Store) UpdateTaskMeta(id string, totalSize int64, supportRange, isAlloc
 func (s *Store) GetTask(id string) (*Task, error) {
 	row := s.db.QueryRow(`SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		is_allocated,chunk_count,chunk_progress,status,auth_data,
-		error_message,created_at,updated_at
+		is_allocated,chunk_count,chunk_progress,chunk_ranges,status,
+		auth_data,error_message,created_at,updated_at
 		FROM tasks WHERE id=?`, id)
 	return scanTask(row)
 }
@@ -214,8 +252,8 @@ func (s *Store) GetTask(id string) (*Task, error) {
 func (s *Store) ListTasks() ([]*Task, error) {
 	rows, err := s.db.Query(`SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		is_allocated,chunk_count,chunk_progress,status,auth_data,
-		error_message,created_at,updated_at
+		is_allocated,chunk_count,chunk_progress,chunk_ranges,status,
+		auth_data,error_message,created_at,updated_at
 		FROM tasks ORDER BY updated_at DESC`)
 	if err != nil {
 		return nil, fmt.Errorf("store list: %w", err)
@@ -231,6 +269,7 @@ func (s *Store) ListTasks() ([]*Task, error) {
 	}
 	return out, rows.Err()
 }
+
 // Clone deep-copies the task. Used when handing a Task to a UI consumer
 // that might mutate it without affecting the running engine's view.
 func (t *Task) Clone() *Task {
@@ -241,15 +280,34 @@ func (t *Task) Clone() *Task {
 	if t.ChunkProgress != nil {
 		cp.ChunkProgress = append([]int64(nil), t.ChunkProgress...)
 	}
+	if t.ChunkRanges != nil {
+		cp.ChunkRanges = append([]int64(nil), t.ChunkRanges...)
+	}
 	return &cp
 }
-
 
 // DeleteTask removes a task by ID.
 func (s *Store) DeleteTask(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`DELETE FROM tasks WHERE id=?`, id)
+	return err
+}
+
+// UpdateTaskChunkRanges records the engine's actual chunk layout for a
+// task. Called once per Start(), after the engine has planned its chunks
+// (see engine.Options.ChunkCount + MinChunkSize). Persisted so the UI
+// can render the chunk-details mosaic against the real byte ranges
+// instead of guessing per-thread layout.
+func (s *Store) UpdateTaskChunkRanges(id string, ranges []int64) error {
+	if ranges == nil {
+		ranges = []int64{}
+	}
+	rgJSON, _ := json.Marshal(ranges)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE tasks SET chunk_ranges=?, updated_at=? WHERE id=?`,
+		string(rgJSON), time.Now().UTC(), id)
 	return err
 }
 
@@ -260,13 +318,13 @@ type scanner interface {
 func scanTask(s scanner) (*Task, error) {
 	var (
 		t          Task
-		cp         string
+		cp, rg     string
 		support    int
 		alloc      int
 		total, dwn int64
 	)
 	err := s.Scan(&t.ID, &t.URL, &t.SavePath, &t.Protocol, &total, &dwn,
-		&support, &alloc, &t.ChunkCount, &cp, &t.Status, &t.AuthData,
+		&support, &alloc, &t.ChunkCount, &cp, &rg, &t.Status, &t.AuthData,
 		&t.ErrorMessage, &t.CreatedAt, &t.UpdatedAt)
 	if err != nil {
 		return nil, err
@@ -278,6 +336,10 @@ func scanTask(s scanner) (*Task, error) {
 	t.ChunkProgress = []int64{}
 	if cp != "" {
 		_ = json.Unmarshal([]byte(cp), &t.ChunkProgress)
+	}
+	t.ChunkRanges = []int64{}
+	if rg != "" {
+		_ = json.Unmarshal([]byte(rg), &t.ChunkRanges)
 	}
 	return &t, nil
 }

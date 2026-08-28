@@ -52,7 +52,7 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 
 	mosaic := newChunkMosaic(t.ID, sc)
 	mosaic.resizeForTotal(t.TotalSize)
-	mosaic.update(t.ChunkProgress, t.TotalSize)
+	mosaic.update(t.ChunkProgress, t.ChunkRanges, t.TotalSize)
 
 	header := container.NewVBox(
 		widget.NewLabel(titleStr),
@@ -81,7 +81,7 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 				continue
 			}
 			fyne.Do(func() {
-				mosaic.update(ev.Task.ChunkProgress, ev.Task.TotalSize)
+				mosaic.update(ev.Task.ChunkProgress, ev.Task.ChunkRanges, ev.Task.TotalSize)
 			})
 		}
 	}()
@@ -138,8 +138,14 @@ func (m *chunkMosaic) resizeForTotal(total int64) {
 	m.Refresh()
 }
 
-// update repaints each tile based on per-thread chunkProgress.
-func (m *chunkMosaic) update(chunkProgress []int64, totalSize int64) {
+// update repaints each tile based on the engine's actual chunk layout
+// (chunkRanges, [start0,end0,start1,end1,...]) and per-chunk progress
+// (chunkProgress, offset-from-start for each chunk). When chunkRanges
+// is empty or mismatched (e.g. a task created before the feature,
+// or a row that hasn't been updated since streaming collapsed the
+// plan), falls back to a per-thread even-split so the window still
+// renders something useful.
+func (m *chunkMosaic) update(chunkProgress, chunkRanges []int64, totalSize int64) {
 	if totalSize != m.total {
 		m.total = totalSize
 		m.resizeForTotal(totalSize)
@@ -147,46 +153,72 @@ func (m *chunkMosaic) update(chunkProgress []int64, totalSize int64) {
 	if totalSize <= 0 || m.blocks == 0 {
 		return
 	}
-	threads := len(chunkProgress)
-	if threads == 0 {
-		threads = 4
+
+	ranges := chunkRanges
+	progress := chunkProgress
+	if len(ranges) == 0 || len(ranges) != 2*len(progress) {
+		threads := len(progress)
+		if threads == 0 {
+			for i := range m.tiles {
+				m.tiles[i].FillColor = theme.Color(theme.ColorNameBackground)
+				m.tiles[i].Refresh()
+			}
+			return
+		}
+		base := totalSize / int64(threads)
+		rem := totalSize % int64(threads)
+		ranges = make([]int64, 0, 2*threads)
+		cur := int64(0)
+		for ti := 0; ti < threads; ti++ {
+			size := base
+			if ti == threads-1 {
+				size += rem
+			}
+			ranges = append(ranges, cur, cur+size-1)
+			cur += size
+		}
 	}
-	base := totalSize / int64(threads)
-	rem := totalSize % int64(threads)
+
 	for b := 0; b < m.blocks; b++ {
 		tileStart := int64(b) * m.blockSz
 		tileEnd := tileStart + m.blockSz
 		if tileEnd > totalSize {
 			tileEnd = totalSize
 		}
-		done := false
-		cur := int64(0)
-		for ti := 0; ti < threads; ti++ {
-			tSize := base
-			if ti == threads-1 {
-				tSize += rem
+		allDone := true
+		matched := false
+		for i := 0; i+1 < len(ranges); i += 2 {
+			cStart := ranges[i]
+			cEnd := ranges[i+1] + 1 // inclusive end → half-open
+			if cEnd <= tileStart || cStart >= tileEnd {
+				continue
 			}
-			tEnd := cur + tSize
-			if tileStart >= cur && tileStart < tEnd {
-				var prog int64
-				if ti < len(chunkProgress) {
-					prog = chunkProgress[ti]
-				}
-				absoluteDownloaded := cur + prog
-				if absoluteDownloaded >= tileEnd {
-					done = true
-				}
+			matched = true
+			overlapEnd := min64(cEnd, tileEnd)
+			var prog int64
+			if i/2 < len(progress) {
+				prog = progress[i/2]
+			}
+			writtenThrough := cStart + prog
+			if writtenThrough < overlapEnd {
+				allDone = false
 				break
 			}
-			cur = tEnd
 		}
-		if done {
+		if matched && allDone {
 			m.tiles[b].FillColor = theme.Color(theme.ColorNameSuccess)
 		} else {
 			m.tiles[b].FillColor = theme.Color(theme.ColorNameBackground)
 		}
 		m.tiles[b].Refresh()
 	}
+}
+
+func min64(a, b int64) int64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // CreateRenderer returns a renderer that always reflects m.grid so the
@@ -199,7 +231,7 @@ type mosaicRenderer struct {
 	r fyne.WidgetRenderer
 }
 
-func (r *mosaicRenderer) Destroy()       { r.r.Destroy() }
+func (r *mosaicRenderer) Destroy() { r.r.Destroy() }
 func (r *mosaicRenderer) Layout(s fyne.Size) { r.r.Layout(s) }
 func (r *mosaicRenderer) MinSize() fyne.Size { return r.r.MinSize() }
 func (r *mosaicRenderer) Objects() []fyne.CanvasObject { return r.r.Objects() }
