@@ -2,6 +2,7 @@ package ui
 
 import (
 	"fmt"
+	"log/slog"
 	"path/filepath"
 
 	"fyne.io/fyne/v2"
@@ -105,6 +106,11 @@ func (r *taskRow) build() {
 }
 
 func (r *taskRow) onProgress(ev scheduler.Event) {
+	slog.Info("task_row progress",
+		"taskID", ev.Task.ID,
+		"speed", ev.SpeedBPS,
+		"downloaded", ev.Task.Downloaded,
+	)
 	r.task = ev.Task
 	if ev.SpeedBPS > 0 {
 		r.curSpeed = ev.SpeedBPS
