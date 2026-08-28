@@ -50,7 +50,27 @@ type Options struct {
 	// OnChunkCountDecreased is called whenever the engine reduces the
 	// active chunk count (e.g. server rejected concurrent connections).
 	OnChunkCountDecreased func(newCount int)
+
+	// Logger receives human-readable phase messages. A no-op logger is used
+	// when nil.
+	Logger Logger
 }
+
+// Logger is the logging interface accepted by Options.Logger.
+type Logger interface {
+	// Infof writes an informational message.
+	Infof(format string, args ...any)
+	// Warnf writes a warning message.
+	Warnf(format string, args ...any)
+}
+
+// noOpLogger is the default logger when Options.Logger is nil.
+var noOpLogger Logger = noOpFn{}
+
+type noOpFn struct{}
+
+func (noOpFn) Infof(string, ...any) {}
+func (noOpFn) Warnf(string, ...any) {}
 
 func (o *Options) defaults() {
 	if o.ChunkCount <= 0 {
@@ -75,6 +95,7 @@ type Job struct {
 
 	mu         sync.Mutex // protects planned chunks during re-plan
 	chunkCount int        // current planned chunk count
+	log        Logger     // defaults to noOpLogger
 }
 
 // chunk holds the byte range a goroutine owns and its current write
@@ -89,12 +110,16 @@ type chunk struct {
 // NewJob plans the byte ranges for a download using opts.
 func NewJob(driver protocol.ProtocolDriver, total int64, dest *os.File, opts Options) *Job {
 	opts.defaults()
+	if opts.Logger == nil {
+		opts.Logger = noOpLogger
+	}
 	j := &Job{
 		driver:     driver,
 		dest:       dest,
 		total:      total,
 		opts:       opts,
 		chunkCount: opts.ChunkCount,
+		log:        opts.Logger,
 	}
 	j.plan()
 	return j
@@ -196,6 +221,10 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		return err
 	}
 
+	j.mu.Lock()
+	j.log.Infof("starting download  total=%d bytes  range=%v  chunks=%d", j.total, useRange, j.chunkCount)
+	j.mu.Unlock()
+
 	var (
 		bytesDone   atomic.Int64
 		chunksDone  atomic.Int32
@@ -270,9 +299,11 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			}
 			start := atomic.LoadInt64(&c.progress)
 			if start > c.end {
+				j.log.Infof("chunk %d finished  range=%d-%d", idx, c.start, c.end)
 				return
 			}
 
+			j.log.Infof("chunk %d downloading  range=%d-%d  offset=%d", idx, c.start, c.end, start)
 			chunkCtx, cancel := context.WithCancel(ctx)
 			err := j.driver.DownloadChunk(chunkCtx, start, c.end, j.dest, func(n int) {
 				bytesDone.Add(int64(n))
@@ -285,6 +316,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 				if j.stopped.Load() || ctx.Err() != nil {
 					return
 				}
+				j.log.Warnf("chunk %d error: %v  backing off %v", idx, err, backoff)
 				select {
 				case errCh <- err:
 				default:
@@ -309,6 +341,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 
 	for {
 		j.mu.Lock()
+		j.log.Infof("round starting  chunks=%d", j.chunkCount)
 		chunks := j.chunks
 		wg := sync.WaitGroup{}
 		for i := range chunks {
@@ -322,6 +355,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		wg.Wait()
 
 		if j.stopped.Load() || ctx.Err() != nil {
+			j.log.Infof("download stopped")
 			break
 		}
 
@@ -337,6 +371,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		}
 
 		if lastErr == nil {
+			j.log.Infof("download completed  %d bytes", bytesDone.Load())
 			break
 		}
 
@@ -346,6 +381,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		j.mu.Unlock()
 
 		if currentCount <= 1 {
+			j.log.Warnf("all chunks failed, giving up: %v", lastErr)
 			return lastErr
 		}
 
@@ -353,6 +389,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		if newCount < 1 {
 			newCount = 1
 		}
+		j.log.Warnf("reducing chunks %d -> %d  last error: %v", currentCount, newCount, lastErr)
 
 		j.mu.Lock()
 		j.chunkCount = newCount
@@ -372,7 +409,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		j.plan()
 		j.mu.Unlock()
 
-		// Back off before reconnecting.
+		j.log.Infof("re-planned with %d chunks  backing off 1s before retry", newCount)
 		select {
 		case <-ctx.Done():
 			return lastErr
@@ -380,6 +417,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		}
 	}
 
+	j.log.Infof("download finished  bytesDone=%d", bytesDone.Load())
 	if j.opts.Progress != nil {
 		j.opts.Progress(Progress{
 			TaskID:          j.opts.TaskID,
