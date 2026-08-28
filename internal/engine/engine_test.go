@@ -142,6 +142,87 @@ func TestFallback(t *testing.T) {
 	}
 }
 
+// TestRealDownload exercises the engine against a live HTTP server with
+// Content-Length and Range support. Skipped in short mode or when the
+// server is unreachable.
+func TestRealDownload(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping real download in short mode")
+	}
+
+	const url = "https://mirrors.tuna.tsinghua.edu.cn/github-release/atom/atom/LatestRelease/atom-amd64.tar.gz"
+
+	// Probe server for Content-Length and Range support.
+	headResp, err := http.Head(url)
+	if err != nil {
+		t.Skipf("skipping: cannot reach server: %v", err)
+	}
+	headResp.Body.Close()
+	if headResp.StatusCode != http.StatusOK {
+		t.Skipf("skipping: server returned %s", headResp.Status)
+	}
+
+	totalSize := headResp.ContentLength
+	if totalSize <= 0 {
+		t.Skip("skipping: server did not advertise Content-Length")
+	}
+
+	// Limit to first 512 KiB to keep test time reasonable.
+	const maxSize = 512 * 1024
+	if totalSize > maxSize {
+		totalSize = maxSize
+	}
+
+	driver, err := protocol.New(url, protocol.ProtoHTTP, protocol.Auth{})
+	if err != nil {
+		t.Fatalf("driver: %v", err)
+	}
+	defer driver.Close()
+
+	dir := t.TempDir()
+	destPath := filepath.Join(dir, "out.bin")
+	dest, err := prealloc.Preallocate(destPath, totalSize)
+	if err != nil {
+		t.Fatalf("prealloc: %v", err)
+	}
+	defer dest.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var progressCalls atomic.Int32
+	var lastProg Progress
+	job := NewJob(driver, totalSize, dest, Options{
+		ChunkCount:    4,
+		ProgressEvery: 500 * time.Millisecond,
+		Progress: func(p Progress) {
+			progressCalls.Add(1)
+			lastProg = p
+		},
+	})
+
+	if err := job.Run(ctx, true); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if err := job.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	fi, err := os.Stat(destPath)
+	if err != nil {
+		t.Fatalf("stat dest: %v", err)
+	}
+	if fi.Size() != totalSize {
+		t.Fatalf("dest size=%d want %d", fi.Size(), totalSize)
+	}
+	if progressCalls.Load() == 0 {
+		t.Fatal("progress never fired")
+	}
+	if lastProg.DownloadedBytes != totalSize {
+		t.Fatalf("last progress DownloadedBytes=%d want %d", lastProg.DownloadedBytes, totalSize)
+	}
+}
+
 // parseRange handles "bytes=START-END" with sizes clipped to total-1.
 func parseRange(s string, total int64) (int64, int64, error) {
 	if !strings.HasPrefix(s, "bytes=") {
