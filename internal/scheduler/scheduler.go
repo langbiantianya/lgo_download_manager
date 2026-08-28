@@ -338,9 +338,18 @@ func (s *Scheduler) markProgress(taskID string, p engine.Progress) {
 	// up-to-date Downloaded + chunk offsets + status to the UI and store.
 	rj.task.Downloaded = p.DownloadedBytes
 	rj.task.Status = store.StatusDownloading
-	if len(rj.task.ChunkProgress) == 0 && p.CompletedChunks > 0 {
-		// Initialise chunk progress array from engine chunks.
-		rj.task.ChunkProgress = make([]int64, p.CompletedChunks)
+	// Mirror engine's per-chunk offsets back into the task so a quick Pause
+	// (before the next flushAll tick) sees fresh values via rj.task.
+	cs := rj.job.Chunks()
+	if len(cs) > 0 {
+		cp := make([]int64, len(cs))
+		for i, c := range cs {
+			cp[i] = c.Progress - c.Start
+			if cp[i] < 0 {
+				cp[i] = 0
+			}
+		}
+		rj.task.ChunkProgress = cp
 	}
 	rj.dirtyMu.Unlock()
 	s.publish(Event{Why: "progress", Task: rj.task.Clone(), SpeedBPS: p.SpeedBPS})
@@ -361,7 +370,19 @@ func (s *Scheduler) markStatus(taskID string, st store.Status) error {
 	if hasRJ && rj != nil {
 		rj.dirtyMu.Lock()
 		downloaded = rj.task.Downloaded
-		chunkProg = append([]int64(nil), rj.task.ChunkProgress...)
+		// Prefer fresh engine chunk offsets over stale task snapshot.
+		cs := rj.job.Chunks()
+		if len(cs) > 0 {
+			chunkProg = make([]int64, len(cs))
+			for i, c := range cs {
+				chunkProg[i] = c.Progress - c.Start
+				if chunkProg[i] < 0 {
+					chunkProg[i] = 0
+				}
+			}
+		} else {
+			chunkProg = append([]int64(nil), rj.task.ChunkProgress...)
+		}
 		errMsg = rj.task.ErrorMessage
 		rj.dirtyMu.Unlock()
 	} else {
