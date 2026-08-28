@@ -16,7 +16,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -112,11 +111,9 @@ func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 // Start begins (or resumes) a task. If the task has chunk_progress already
 // from a prior run, the engine picks up at those offsets.
 func (s *Scheduler) Start(taskID string) error {
-	slog.Info("scheduler Start", "taskID", taskID)
 	s.mu.Lock()
 	if _, ok := s.jobs[taskID]; ok {
 		s.mu.Unlock()
-		slog.Info("scheduler Start: already running", "taskID", taskID)
 		return errors.New("scheduler: task already running")
 	}
 	s.mu.Unlock()
@@ -135,7 +132,6 @@ func (s *Scheduler) Start(taskID string) error {
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	caps, err := driver.Probe(probeCtx)
 	probeCancel()
-	slog.Info("scheduler Start: probe", "err", err, "size", caps.TotalSize, "range", caps.SupportRange)
 	if err != nil {
 		_ = driver.Close()
 		s.fail(tk, err)
