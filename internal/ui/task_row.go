@@ -2,7 +2,6 @@ package ui
 
 import (
 	"fmt"
-	"log/slog"
 	"path/filepath"
 
 	"fyne.io/fyne/v2"
@@ -85,32 +84,25 @@ func (r *taskRow) build() {
 		container.NewHBox(r.size, r.statusLbl),
 		r.name,
 	)
-
-	// Row 2: progress (expand) [speed][eta]
+	// Row 2: progress (expand) [eta]
 	row2 := container.NewBorder(
 		nil, nil, nil,
-		container.NewHBox(r.speed, r.remTime),
+		r.remTime,
 		container.NewStack(r.progress),
 	)
 
-	// Row 3: buttons aligned right
-	row3 := container.NewHBox(
+	// Row 3: speed on the left, buttons aligned right
+	row3 := container.NewBorder(
+		nil, nil,
+		container.NewHBox(r.startBtn, r.pauseBtn, r.cancelBtn, r.detailsBtn),
+		r.speed,
 		layout.NewSpacer(),
-		r.startBtn,
-		r.pauseBtn,
-		r.cancelBtn,
-		r.detailsBtn,
 	)
 
 	r.inner = container.NewVBox(row1, row2, row3)
 }
 
 func (r *taskRow) onProgress(ev scheduler.Event) {
-	slog.Info("task_row progress",
-		"taskID", ev.Task.ID,
-		"speed", ev.SpeedBPS,
-		"downloaded", ev.Task.Downloaded,
-	)
 	r.task = ev.Task
 	if ev.SpeedBPS > 0 {
 		r.curSpeed = ev.SpeedBPS
@@ -119,7 +111,6 @@ func (r *taskRow) onProgress(ev scheduler.Event) {
 }
 
 func (r *taskRow) bind(t *store.Task, sc *scheduler.Scheduler) {
-	// Preserve the most recent non-snapshot fields across list re-binds:
 	//   - curSpeed: not in Task struct, only updated by progress events.
 	r.task = t
 	r.sc = sc
