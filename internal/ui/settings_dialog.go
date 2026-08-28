@@ -35,7 +35,7 @@ func init() {
 	GlobalSettings = settings{
 		DefaultSaveDir:  saveDir,
 		DefaultThreads:  16,
-		UserAgent:      "",
+		UserAgent:      "Wget/1.21.3",
 		Cookies:        "",
 		FTPPassive:     true,
 		Prealloc:       true,

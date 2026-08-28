@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,14 @@ type noOpFn struct{}
 func (noOpFn) Infof(string, ...any) {}
 func (noOpFn) Warnf(string, ...any) {}
 
+// logLogger is the default when Options.Logger is nil.
+var logLogger Logger = logFn{}
+
+type logFn struct{}
+
+func (logFn) Infof(format string, args ...any) { log.Printf("[engine] "+format, args...) }
+func (logFn) Warnf(format string, args ...any) { log.Printf("[engine] WARN: "+format, args...) }
+
 func (o *Options) defaults() {
 	if o.ChunkCount <= 0 {
 		o.ChunkCount = 4
@@ -81,7 +90,7 @@ type chunk struct {
 func NewJob(driver protocol.ProtocolDriver, total int64, dest *os.File, opts Options) *Job {
 	opts.defaults()
 	if opts.Logger == nil {
-		opts.Logger = noOpLogger
+		opts.Logger = logLogger
 	}
 	j := &Job{
 		driver:     driver,
@@ -347,7 +356,6 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			j.mu.Unlock()
 			if allDone {
 				j.log.Infof("download completed  %d bytes", bytesDone.Load())
-				j.log.Infof("download finished  bytesDone=%d", bytesDone.Load())
 				if j.opts.Progress != nil {
 					j.opts.Progress(Progress{
 						TaskID:          j.opts.TaskID,
