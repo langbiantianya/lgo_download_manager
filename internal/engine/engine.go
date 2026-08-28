@@ -113,10 +113,15 @@ func (j *Job) plan() {
 		j.chunks = append(j.chunks, chunk{idx: 0, start: 0, end: -1})
 		return
 	}
-	n := j.chunkCount
-	maxUseful := int(j.total / j.opts.MinChunkSize)
-	if maxUseful > 0 && maxUseful < n {
-		n = maxUseful
+	// ChunkCount is the MAXIMUM number of concurrent connections. The
+	// actual chunk count is sized by MinChunkSize — each chunk is at
+	// least MinChunkSize bytes unless the file itself is smaller.
+	n := int(j.total / j.opts.MinChunkSize)
+	if j.total%j.opts.MinChunkSize != 0 {
+		n++
+	}
+	if j.chunkCount > 0 && n > j.chunkCount {
+		n = j.chunkCount
 	}
 	if n < 1 {
 		n = 1
