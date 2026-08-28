@@ -16,13 +16,20 @@ import (
 // pre-populated. Only essential fields appear here; advanced options live
 // in the Settings dialog.
 func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
+	// Build a vertically laid-out form with left-aligned labels.
+	makeRow := func(label string, w fyne.CanvasObject) *fyne.Container {
+		lbl := widget.NewLabel(label)
+		lbl.Alignment = fyne.TextAlignLeading
+		lbl.TextStyle.Bold = true
+		return container.NewBorder(nil, nil, lbl, nil, w)
+	}
+
 	urlEntry := widget.NewEntry()
 	urlEntry.SetPlaceHolder("https://...")
 	urlEntry.Validator = notEmptyValidator()
 
 	savePathEntry := widget.NewEntry()
 	savePathEntry.SetText(filepath.Join(GlobalSettings.DefaultSaveDir, "download.bin"))
-
 	browseBtn := widget.NewButton("浏览...", func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
 			if err != nil || uri == nil {
@@ -35,7 +42,6 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 	threadsEntry := widget.NewEntry()
 	threadsEntry.SetText("")
 
-	// Auth (collapsible — only expanded when needed)
 	usernameEntry := widget.NewEntry()
 	usernameEntry.SetPlaceHolder("可选")
 	passwordEntry := widget.NewPasswordEntry()
@@ -53,21 +59,17 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 	usernameEntry.Hide()
 	passwordEntry.Hide()
 
-	authBox := container.NewVBox(
+	formContent := container.NewVBox(
+		makeRow("下载链接 (URL)", urlEntry),
+		makeRow("保存路径", container.NewBorder(nil, nil, nil, browseBtn, savePathEntry)),
+		makeRow("并发线程数（留空使用全局默认）", threadsEntry),
 		authCheck,
-		usernameEntry,
-		passwordEntry,
+		container.NewBorder(nil, nil, widget.NewLabel("用户名"), nil, usernameEntry),
+		container.NewBorder(nil, nil, widget.NewLabel("密码"), nil, passwordEntry),
 	)
 
-	formItems := []*widget.FormItem{
-		widget.NewFormItem("下载链接 (URL)", urlEntry),
-		widget.NewFormItem("保存路径", container.NewBorder(nil, nil, nil, browseBtn, savePathEntry)),
-		widget.NewFormItem("并发线程数（留空使用全局默认）", threadsEntry),
-		widget.NewFormItem("身份认证", authBox),
-	}
-
-	dialog.NewForm("新建下载任务", "开始下载", "取消", formItems, func(confirmed bool) {
-		if !confirmed {
+	dialog.NewCustomConfirm("新建下载任务", "开始下载", "取消", formContent, func(c bool) {
+		if !c {
 			return
 		}
 		url := urlEntry.Text
@@ -94,9 +96,9 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 		}
 
 		tk, err := sc.Add(scheduler.AddTaskInput{
-			URL:        url,
-			SavePath:   savePath,
-			Protocol:   proto,
+			URL:      url,
+			SavePath: savePath,
+			Protocol: proto,
 			Auth: protocol.AuthOptions{
 				Username:   user,
 				Password:   pass,
