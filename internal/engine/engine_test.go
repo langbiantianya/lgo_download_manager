@@ -150,10 +150,14 @@ func TestRealDownload(t *testing.T) {
 		t.Skip("skipping real download in short mode")
 	}
 
-	const url = "https://mirrors.tuna.tsinghua.edu.cn/github-release/atom/atom/LatestRelease/atom-amd64.tar.gz"
+	// Use the Go tarball from a CDN — small, fast, and reliably serves
+	// byte-range requests.
+	const url = "https://dl.google.com/go/go1.22.3.src.tar.gz"
 
 	// Probe server for Content-Length and Range support.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	headResp, err := http.Head(url)
+	cancel()
 	if err != nil {
 		t.Skipf("skipping: cannot reach server: %v", err)
 	}
@@ -167,8 +171,8 @@ func TestRealDownload(t *testing.T) {
 		t.Skip("skipping: server did not advertise Content-Length")
 	}
 
-	// Limit to first 512 KiB to keep test time reasonable.
-	const maxSize = 512 * 1024
+	// Limit to first 256 KiB to keep test time reasonable.
+	const maxSize = 256 * 1024
 	if totalSize > maxSize {
 		totalSize = maxSize
 	}
@@ -187,14 +191,15 @@ func TestRealDownload(t *testing.T) {
 	}
 	defer dest.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// Give the download up to 2 minutes — mirrors can be slow to connect.
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
 	var progressCalls atomic.Int32
 	var lastProg Progress
 	job := NewJob(driver, totalSize, dest, Options{
 		ChunkCount:    4,
-		ProgressEvery: 500 * time.Millisecond,
+		ProgressEvery: 1 * time.Second,
 		Progress: func(p Progress) {
 			progressCalls.Add(1)
 			lastProg = p
