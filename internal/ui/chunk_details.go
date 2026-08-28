@@ -45,7 +45,6 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 	}
 
 	mosaic := newChunkMosaic(t.ID, sc, chunkCount)
-	// Initial paint using the snapshot we just received.
 	mosaic.update(t.ChunkProgress, t.TotalSize, chunkCount)
 
 	header := container.NewVBox(
@@ -68,7 +67,6 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 	w.Resize(fyne.NewSize(640, 460))
 	w.Show()
 
-	// Subscribe to live progress events while the window is open.
 	ch, unsub := sc.Subscribe()
 	go func() {
 		for ev := range ch {
@@ -87,7 +85,7 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 func newChunkMosaic(taskID string, sc *scheduler.Scheduler, chunkCount int) *chunkMosaic {
 	m := &chunkMosaic{
 		tiles:    make([]*canvas.Rectangle, chunkCount),
-		tileSize: 56,
+		tileSize: 24,
 		taskID:   taskID,
 		sc:       sc,
 	}
@@ -131,23 +129,11 @@ func (m *chunkMosaic) update(chunkProgress []int64, totalSize int64, chunkCount 
 
 // CreateRenderer lays the tiles out as a flex-wrap row.
 func (m *chunkMosaic) CreateRenderer() fyne.WidgetRenderer {
-	grid := container.NewGridWithColumns(8)
+	grid := container.NewGridWithColumns(16)
 	for _, t := range m.tiles {
 		grid.Add(container.NewGridWrap(fyne.NewSize(m.tileSize, m.tileSize), t))
 	}
 	return widget.NewSimpleRenderer(grid)
-}
-
-// MinSize returns the natural minimum size for the mosaic.
-func (m *chunkMosaic) MinSize() fyne.Size {
-	cols := 8
-	if cols > len(m.tiles) {
-		cols = len(m.tiles)
-	}
-	if cols < 1 {
-		cols = 1
-	}
-	return fyne.NewSize(float32(cols)*m.tileSize+float32(cols-1)*2, m.tileSize)
 }
 
 // uaForTask returns the User-Agent string applied to the task's downloads.
