@@ -254,3 +254,6 @@ func setGlobalScheduler(sc *scheduler.Scheduler) { globalSc = sc }
 var globalWin fyne.Window
 
 func setGlobalWindow(win fyne.Window) { globalWin = win }
+var globalStore *store.Store
+
+func setGlobalStore(st *store.Store) { globalStore = st }

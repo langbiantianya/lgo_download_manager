@@ -6,8 +6,8 @@ package ui
 import (
 	"fmt"
 	"image/color"
+	"log"
 	"path/filepath"
-
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
@@ -39,7 +39,11 @@ type MainWindow struct {
 // This MUST be called on the Fyne event thread (typically the main goroutine
 // after app.New…() and before a.Run()), because widget constructors rely on
 // fyne.CurrentApp() resolving to the just-created app.
-func NewMainWindow(a fyne.App, sc *scheduler.Scheduler) *MainWindow {
+func NewMainWindow(a fyne.App, st *store.Store, sc *scheduler.Scheduler) *MainWindow {
+	setGlobalStore(st)
+	if err := LoadSettings(st); err != nil {
+		log.Printf("ui: load settings: %v", err)
+	}
 	setGlobalScheduler(sc)
 	m := &MainWindow{
 		app:    a,

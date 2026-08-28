@@ -68,7 +68,8 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 				Cookies:    GlobalSettings.Cookies,
 				FTPPassive: GlobalSettings.FTPPassive,
 			},
-			ChunkCount: GlobalSettings.DefaultThreads,
+			ChunkCount:   GlobalSettings.DefaultThreads,
+			MinChunkSize: GlobalSettings.MinChunkSize,
 		})
 		if err != nil {
 			dialog.ShowError(err, win)
@@ -95,19 +96,3 @@ type errEmptyField struct{}
 
 func (errEmptyField) Error() string { return "required" }
 
-var errBadThreadCount = badThreadCountErr{}
-
-type badThreadCountErr struct{}
-
-func (badThreadCountErr) Error() string { return "bad thread count" }
-
-func parseThreadCount(s string) (int, error) {
-	var n int
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			return 0, errBadThreadCount
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n, nil
-}

@@ -2,9 +2,11 @@ package ui
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
-	"runtime"
+	"strconv"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -12,79 +14,132 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"lgo_download_manager/internal/scheduler"
+	"lgo_download_manager/internal/store"
 )
 
-// settings holds user-tunable defaults applied to new downloads.
-type settings struct {
-	DefaultSaveDir string
-	DefaultThreads int
-	UserAgent      string
-	Cookies        string
-	FTPPassive     bool
-	Prealloc       bool
-}
+const mib = int64(1 << 20)
 
 // GlobalSettings is the live settings used by "新建任务" when prefilling fields
-// and by the URL launcher in main.go.
-var GlobalSettings settings
+// and by the URL launcher in main.go. It mirrors the persisted row in the
+// settings table of the SQLite store and is loaded by LoadSettings on startup.
+var GlobalSettings store.Settings
 
-func init() {
-	home, _ := os.UserHomeDir()
-	saveDir := filepath.Join(home, "Downloads")
-	_ = runtime.GOOS // reserved for future platform-specific tweaks
-	GlobalSettings = settings{
-		DefaultSaveDir:  saveDir,
-		DefaultThreads:  16,
-		UserAgent:      "Wget/1.21.3",
-		Cookies:        "",
-		FTPPassive:     true,
-		Prealloc:       true,
+// LoadSettings reads the persisted settings from the store and overlays
+// them onto GlobalSettings. Defaults are applied for fields whose zero
+// value is ambiguous (empty string / 0) — the row-level "no value
+// stored" sentinel is empty DefaultSaveDir on the very first run. After
+// the first save, every field persists verbatim.
+func LoadSettings(st *store.Store) error {
+	persisted, err := st.LoadSettings()
+	if err != nil {
+		return err
 	}
+	firstRun := persisted.DefaultSaveDir == ""
+	if firstRun {
+		home, _ := os.UserHomeDir()
+		persisted.DefaultSaveDir = filepath.Join(home, "Downloads")
+		persisted.DefaultThreads = 16
+		persisted.MinChunkSize = 1 * mib
+		persisted.UserAgent = "Wget/1.21.3"
+		persisted.FTPPassive = true
+		persisted.Prealloc = true
+	}
+	GlobalSettings = persisted
+	if firstRun {
+		// Persist the defaults so subsequent loads find a real row.
+		_ = st.SaveSettings(persisted)
+	}
+	return nil
 }
+
+// SaveSettings writes GlobalSettings to the store. Safe to call after
+// every UI mutation.
+func SaveSettings(st *store.Store) error {
+	return st.SaveSettings(GlobalSettings)
+}
+
 func buildSettingsContent(sc *scheduler.Scheduler) fyne.CanvasObject {
+	persist := func() {
+		if globalStore == nil {
+			return
+		}
+		if err := SaveSettings(globalStore); err != nil {
+			log.Printf("ui: save settings: %v", err)
+		}
+	}
+
 	dirEntry := widget.NewEntry()
 	dirEntry.SetText(GlobalSettings.DefaultSaveDir)
 	dirEntry.SetPlaceHolder("/path/to/Downloads")
-	dirEntry.OnChanged = func(s string) { GlobalSettings.DefaultSaveDir = s }
+	dirEntry.OnChanged = func(s string) {
+		GlobalSettings.DefaultSaveDir = s
+		persist()
+	}
 
 	threadsEntry := widget.NewEntry()
 	threadsEntry.SetText(fmt.Sprintf("%d", GlobalSettings.DefaultThreads))
 	threadsEntry.OnChanged = func(s string) {
-		if n, err := parseThreadCount(s); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
 			GlobalSettings.DefaultThreads = n
+			persist()
 		}
 	}
+
+	// Chunk size is exposed as MiB (decimal integer, e.g. "4"). The static
+	// "MB" label on the right is purely cosmetic — the value is always
+	// multiplied by 1<<20 before reaching the engine.
+	chunkSizeEntry := widget.NewEntry()
+	chunkSizeEntry.SetText(fmt.Sprintf("%d", GlobalSettings.MinChunkSize/mib))
+	chunkSizeEntry.SetPlaceHolder("整数 MiB")
+	chunkSizeEntry.OnChanged = func(s string) {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+			GlobalSettings.MinChunkSize = int64(n) * mib
+			persist()
+		}
+	}
+	chunkSizeRow := container.NewBorder(nil, nil, nil, widget.NewLabel("MB"), chunkSizeEntry)
 
 	uaEntry := widget.NewEntry()
 	uaEntry.SetText(GlobalSettings.UserAgent)
 	uaEntry.SetPlaceHolder("可选，自定义 User-Agent")
-	uaEntry.OnChanged = func(s string) { GlobalSettings.UserAgent = s }
+	uaEntry.OnChanged = func(s string) {
+		GlobalSettings.UserAgent = s
+		persist()
+	}
 
 	cookiesEntry := widget.NewEntry()
 	cookiesEntry.SetText(GlobalSettings.Cookies)
 	cookiesEntry.SetPlaceHolder("可选，Cookie 字符串")
-	cookiesEntry.OnChanged = func(s string) { GlobalSettings.Cookies = s }
+	cookiesEntry.OnChanged = func(s string) {
+		GlobalSettings.Cookies = s
+		persist()
+	}
 
 	ftpPassive := widget.NewCheck("启用 FTP PASV 被动模式", func(checked bool) {
 		GlobalSettings.FTPPassive = checked
+		persist()
 	})
 	ftpPassive.SetChecked(GlobalSettings.FTPPassive)
 
 	prealloc := widget.NewCheck("下载时磁盘预分配（连续大文件更稳定）", func(checked bool) {
 		GlobalSettings.Prealloc = checked
+		persist()
 	})
 	prealloc.SetChecked(GlobalSettings.Prealloc)
 
+	browseBtn := widget.NewButton("浏览...", func() {
+		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
+			if err != nil || uri == nil {
+				return
+			}
+			dirEntry.SetText(uri.Path())
+		}, globalWin)
+	})
+
 	form := widget.NewForm(
-		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, widget.NewButton("浏览...", func() {
-			dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
-				if err != nil || uri == nil {
-					return
-				}
-				dirEntry.SetText(uri.Path())
-			}, globalWin)
-		}), dirEntry)),
+		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
 		widget.NewFormItem("默认并发线程数", threadsEntry),
+		widget.NewFormItem("最小分块大小", chunkSizeRow),
 		widget.NewFormItem("默认 User-Agent", uaEntry),
 		widget.NewFormItem("默认 Cookie", cookiesEntry),
 		widget.NewFormItem("FTP 模式", ftpPassive),

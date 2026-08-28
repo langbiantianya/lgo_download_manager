@@ -120,11 +120,12 @@ func main() {
 		}
 
 		tk, err := sc.Add(scheduler.AddTaskInput{
-			URL:        req.URL,
-			SavePath:   savePath,
-			Protocol:   proto,
-			Auth:       auth,
-			ChunkCount: 4,
+			URL:         req.URL,
+			SavePath:    savePath,
+			Protocol:    proto,
+			Auth:        auth,
+			ChunkCount:  4,
+			MinChunkSize: ui.GlobalSettings.MinChunkSize,
 		})
 		if err != nil {
 			log.Printf("failed to add task: %v", err)
@@ -154,7 +155,7 @@ func main() {
 		a := app.NewWithID("com.ldm")
 		// Construct the window AFTER the app is created so widget constructors
 		// can resolve fyne.CurrentApp() (list.go calls it during setup).
-		win := ui.NewMainWindow(a, sc)
+		win := ui.NewMainWindow(a, st, sc)
 		win.Show()
 		a.Run()
 		cancel()

@@ -58,6 +58,7 @@ type Task struct {
 	SupportRange  bool      `json:"support_range"`
 	IsAllocated   bool      `json:"is_allocated"`
 	ChunkCount    int       `json:"chunk_count"`
+	MinChunkSize  int64     `json:"min_chunk_size"` // engine chunk lower-bound (bytes)
 	ChunkProgress []int64   `json:"chunk_progress"` // per-chunk offset-from-start
 	Status        Status    `json:"status"`
 	AuthData      string    `json:"auth_data"`  // JSON: {username,password,...}
@@ -103,7 +104,7 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// migrate creates the tasks table on a fresh DB. Idempotent.
+// migrate creates the tables on a fresh DB. Idempotent.
 func (s *Store) migrate() error {
 	const ddl = `CREATE TABLE IF NOT EXISTS tasks (
 		id              TEXT PRIMARY KEY,
@@ -121,7 +122,17 @@ func (s *Store) migrate() error {
 		error_message   TEXT NOT NULL DEFAULT '',
 		created_at      DATETIME NOT NULL,
 		updated_at      DATETIME NOT NULL
-	)`
+	);
+	CREATE TABLE IF NOT EXISTS settings (
+		id              INTEGER PRIMARY KEY CHECK (id = 1),
+		default_save_dir    TEXT NOT NULL DEFAULT '',
+		default_threads     INTEGER NOT NULL DEFAULT 4,
+		min_chunk_size      INTEGER NOT NULL DEFAULT 1048576,
+		user_agent          TEXT NOT NULL DEFAULT '',
+		cookies             TEXT NOT NULL DEFAULT '',
+		ftp_passive         INTEGER NOT NULL DEFAULT 1,
+		prealloc            INTEGER NOT NULL DEFAULT 1
+	);`
 	_, err := s.db.Exec(ddl)
 	return err
 }
@@ -269,6 +280,84 @@ func scanTask(s scanner) (*Task, error) {
 		_ = json.Unmarshal([]byte(cp), &t.ChunkProgress)
 	}
 	return &t, nil
+}
+
+// Settings is the persisted user-tunable defaults. Stored as a single row
+// in the settings table (id = 1). Zero values are valid (the table DEFAULTs
+// cover them on first load).
+type Settings struct {
+	DefaultSaveDir string
+	DefaultThreads int
+	MinChunkSize   int64
+	UserAgent      string
+	Cookies        string
+	FTPPassive     bool
+	Prealloc       bool
+}
+
+// LoadSettings returns the persisted settings row. If no row exists yet,
+// it inserts one with all-zero values (the caller is responsible for
+// applying defaults) and returns the zero-valued Settings.
+func (s *Store) LoadSettings() (Settings, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var (
+		saveDir  string
+		threads  int
+		minChunk int64
+		ua       string
+		cookies  string
+		passive  int
+		prealloc int
+	)
+	err := s.db.QueryRow(`SELECT default_save_dir, default_threads, min_chunk_size,
+		user_agent, cookies, ftp_passive, prealloc FROM settings WHERE id=1`,
+	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc)
+	if errors.Is(err, sql.ErrNoRows) {
+		// First run: insert a zero row so subsequent LoadSettings returns it.
+		_, ierr := s.db.Exec(`INSERT OR IGNORE INTO settings (id) VALUES (1)`)
+		if ierr != nil {
+			return Settings{}, fmt.Errorf("settings init: %w", ierr)
+		}
+		return Settings{}, nil
+	}
+	if err != nil {
+		return Settings{}, fmt.Errorf("settings load: %w", err)
+	}
+	return Settings{
+		DefaultSaveDir: saveDir,
+		DefaultThreads: threads,
+		MinChunkSize:   minChunk,
+		UserAgent:      ua,
+		Cookies:        cookies,
+		FTPPassive:     passive != 0,
+		Prealloc:       prealloc != 0,
+	}, nil
+}
+
+// SaveSettings upserts the persisted settings row.
+func (s *Store) SaveSettings(s2 Settings) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`INSERT INTO settings (id, default_save_dir, default_threads,
+		min_chunk_size, user_agent, cookies, ftp_passive, prealloc)
+		VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			default_save_dir=excluded.default_save_dir,
+			default_threads=excluded.default_threads,
+			min_chunk_size=excluded.min_chunk_size,
+			user_agent=excluded.user_agent,
+			cookies=excluded.cookies,
+			ftp_passive=excluded.ftp_passive,
+			prealloc=excluded.prealloc`,
+		s2.DefaultSaveDir, s2.DefaultThreads, s2.MinChunkSize,
+		s2.UserAgent, s2.Cookies, boolToInt(s2.FTPPassive), boolToInt(s2.Prealloc),
+	)
+	if err != nil {
+		return fmt.Errorf("settings save: %w", err)
+	}
+	return nil
 }
 
 func boolToInt(b bool) int {

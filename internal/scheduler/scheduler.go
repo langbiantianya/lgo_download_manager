@@ -75,6 +75,7 @@ type AddTaskInput struct {
 	Protocol     protocol.ProtocolKind
 	Auth         protocol.AuthOptions
 	ChunkCount   int
+	MinChunkSize int64 // bytes; <=0 falls back to engine default (1 MiB)
 }
 
 // Add records a new task in the store and returns its generated ID.
@@ -89,6 +90,9 @@ func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 	if in.ChunkCount <= 0 {
 		in.ChunkCount = 4
 	}
+	if in.MinChunkSize <= 0 {
+		in.MinChunkSize = 1 << 20 // 1 MiB; matches engine default
+	}
 	id := newID()
 	authBlob, _ := json.Marshal(in.Auth)
 	tk := &store.Task{
@@ -97,6 +101,7 @@ func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 		SavePath:      in.SavePath,
 		Protocol:      string(in.Protocol),
 		ChunkCount:    in.ChunkCount,
+		MinChunkSize:  in.MinChunkSize,
 		Status:        store.StatusPending,
 		ChunkProgress: make([]int64, in.ChunkCount),
 		AuthData:      string(authBlob),
@@ -169,14 +174,15 @@ func (s *Scheduler) Start(taskID string) error {
 		s.fail(tk, err)
 		return err
 	}
-
 	// Resume offsets come from chunk_progress (each = bytes already
 	// written into that chunk).
 	resume := make([]int64, len(tk.ChunkProgress))
 	copy(resume, tk.ChunkProgress)
 
+
 	job := engine.NewJob(driver, caps.TotalSize, dest, engine.Options{
 		ChunkCount:    tk.ChunkCount,
+		MinChunkSize:  tk.MinChunkSize, // 0 means "use engine default"
 		ResumeFrom:    resume,
 		ProgressEvery: 250 * time.Millisecond,
 		Progress: func(p engine.Progress) {
