@@ -27,11 +27,12 @@ const maxBlocks = 512
 type chunkMosaic struct {
 	widget.BaseWidget
 	tiles    []*canvas.Rectangle
+	grid     *fyne.Container
 	tileSize float32
 	taskID   string
 	sc       *scheduler.Scheduler
 	total    int64
-	blocks   int // current number of tiles
+	blocks   int
 	blockSz  int64
 }
 
@@ -95,19 +96,19 @@ func newChunkMosaic(taskID string, sc *scheduler.Scheduler) *chunkMosaic {
 		tileSize: 18,
 		taskID:   taskID,
 		sc:       sc,
+		grid:     container.NewGridWithColumns(32),
 	}
 	m.ExtendBaseWidget(m)
 	return m
 }
 
-// resizeForTotal reallocates the tile grid based on the file size. Each
-// tile represents blockSize bytes (or more for very large files so we
-// stay within maxBlocks tiles).
+// resizeForTotal reallocates the tile grid based on the file size.
 func (m *chunkMosaic) resizeForTotal(total int64) {
 	if total <= 0 {
 		m.blocks = 0
 		m.blockSz = 0
 		m.tiles = nil
+		m.grid = container.NewGridWithColumns(32)
 		m.Refresh()
 		return
 	}
@@ -126,18 +127,18 @@ func (m *chunkMosaic) resizeForTotal(total int64) {
 	}
 	m.blocks = blocks
 	m.tiles = make([]*canvas.Rectangle, blocks)
+	m.grid = container.NewGridWithColumns(32)
 	for i := range m.tiles {
 		r := canvas.NewRectangle(theme.Color(theme.ColorNameBackground))
 		r.StrokeColor = theme.Color(theme.ColorNameForeground)
 		r.StrokeWidth = 1.5
 		m.tiles[i] = r
+		m.grid.Add(container.NewGridWrap(fyne.NewSize(m.tileSize, m.tileSize), r))
 	}
 	m.Refresh()
 }
 
-// update repaints each tile. chunkProgress is per-thread offset-from-start;
-// the engine writes contiguous byte ranges, so block completion =
-// (thread_idx * threadSize) + thread_progress within a thread.
+// update repaints each tile based on per-thread chunkProgress.
 func (m *chunkMosaic) update(chunkProgress []int64, totalSize int64) {
 	if totalSize != m.total {
 		m.total = totalSize
@@ -146,7 +147,6 @@ func (m *chunkMosaic) update(chunkProgress []int64, totalSize int64) {
 	if totalSize <= 0 || m.blocks == 0 {
 		return
 	}
-	// Derive thread ranges from a fresh chunk plan mirroring engine.plan().
 	threads := len(chunkProgress)
 	if threads == 0 {
 		threads = 4
@@ -154,13 +154,11 @@ func (m *chunkMosaic) update(chunkProgress []int64, totalSize int64) {
 	base := totalSize / int64(threads)
 	rem := totalSize % int64(threads)
 	for b := 0; b < m.blocks; b++ {
-		// Absolute byte range this tile covers.
 		tileStart := int64(b) * m.blockSz
 		tileEnd := tileStart + m.blockSz
 		if tileEnd > totalSize {
 			tileEnd = totalSize
 		}
-		// Find which thread owns this byte range and how much of it is downloaded.
 		done := false
 		cur := int64(0)
 		for ti := 0; ti < threads; ti++ {
@@ -191,14 +189,21 @@ func (m *chunkMosaic) update(chunkProgress []int64, totalSize int64) {
 	}
 }
 
-// CreateRenderer lays the tiles out as a flex-wrap grid.
+// CreateRenderer returns a renderer that always reflects m.grid so the
+// tile grid can be rebuilt by resizeForTotal.
 func (m *chunkMosaic) CreateRenderer() fyne.WidgetRenderer {
-	grid := container.NewGridWithColumns(32)
-	for _, t := range m.tiles {
-		grid.Add(container.NewGridWrap(fyne.NewSize(m.tileSize, m.tileSize), t))
-	}
-	return widget.NewSimpleRenderer(grid)
+	return &mosaicRenderer{r: widget.NewSimpleRenderer(m.grid)}
 }
+
+type mosaicRenderer struct {
+	r fyne.WidgetRenderer
+}
+
+func (r *mosaicRenderer) Destroy()       { r.r.Destroy() }
+func (r *mosaicRenderer) Layout(s fyne.Size) { r.r.Layout(s) }
+func (r *mosaicRenderer) MinSize() fyne.Size { return r.r.MinSize() }
+func (r *mosaicRenderer) Objects() []fyne.CanvasObject { return r.r.Objects() }
+func (r *mosaicRenderer) Refresh()       { r.r.Refresh() }
 
 // uaForTask returns the User-Agent string applied to the task's downloads.
 func uaForTask(t *store.Task) string {
