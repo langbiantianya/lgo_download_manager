@@ -315,8 +315,9 @@ func (s *Scheduler) markProgress(taskID string, p engine.Progress) {
 	rj.status = store.StatusDownloading
 
 	// Sync engine's byte counts into the task snapshot so the Event carries
-	// up-to-date Downloaded + chunk offsets to the UI and store.
+	// up-to-date Downloaded + chunk offsets + status to the UI and store.
 	rj.task.Downloaded = p.DownloadedBytes
+	rj.task.Status = store.StatusDownloading
 	if len(rj.task.ChunkProgress) == 0 && p.CompletedChunks > 0 {
 		// Initialise chunk progress array from engine chunks.
 		rj.task.ChunkProgress = make([]int64, p.CompletedChunks)
