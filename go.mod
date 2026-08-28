@@ -5,8 +5,6 @@ go 1.26.6
 require (
 	fyne.io/fyne/v2 v2.8.1
 	github.com/jlaffaye/ftp v0.2.4
-	google.golang.org/grpc v1.66.0
-	google.golang.org/protobuf v1.34.2
 	modernc.org/sqlite v1.57.0
 )
 
@@ -54,5 +52,4 @@ require (
 	golang.org/x/net v0.35.0 // indirect
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.22.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20240604185151-ef581f913117 // indirect
 )

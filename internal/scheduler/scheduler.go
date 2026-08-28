@@ -135,10 +135,12 @@ func (s *Scheduler) Start(taskID string) error {
 	caps, err := driver.Probe(probeCtx)
 	probeCancel()
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[scheduler] probe failed for %s: %v\n", tk.URL, err)
 		_ = driver.Close()
 		s.fail(tk, err)
 		return err
 	}
+	fmt.Fprintf(os.Stderr, "[scheduler] probe OK for %s: size=%d range=%v\n", tk.URL, caps.TotalSize, caps.SupportRange)
 	if caps.TotalSize > 0 {
 		if err := s.st.UpdateTaskMeta(tk.ID, caps.TotalSize, caps.SupportRange, tk.IsAllocated, tk.ChunkCount); err != nil {
 			_ = driver.Close()
@@ -204,6 +206,8 @@ func (s *Scheduler) Start(taskID string) error {
 	}
 	s.publish(Event{Why: "started", Task: tk.Clone()})
 
+	fmt.Fprintf(os.Stderr, "[scheduler] engine goroutine starting for task %s\n", tk.ID)
+
 	// Run the job synchronously inside a goroutine; the goroutine stays
 	// until completion or cancel.
 	go func() {
@@ -214,7 +218,10 @@ func (s *Scheduler) Start(taskID string) error {
 			s.mu.Unlock()
 			_ = dest.Close()
 		}()
+		fmt.Fprintf(os.Stderr, "[scheduler] calling job.Run for task %s\n", tk.ID)
+		fmt.Fprintf(os.Stderr, "[scheduler] calling job.Run for task %s\n", tk.ID)
 		err := job.Run(ctx, caps.SupportRange && caps.TotalSize > 0)
+		fmt.Fprintf(os.Stderr, "[scheduler] job.Run returned for task %s: err=%v\n", tk.ID, err)
 		if err != nil && ctx.Err() == nil {
 			s.fail(tk, err)
 			return
