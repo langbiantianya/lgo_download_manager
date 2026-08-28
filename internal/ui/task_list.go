@@ -95,7 +95,8 @@ func (tl *taskList) build() *fyne.Container {
 	tl.headerRow = tl.buildHeader()
 
 	listWithHeader := container.NewBorder(tl.headerRow, nil, nil, nil, tl.list)
-	content := container.NewStack(listWithHeader, tl.emptyLabel)
+	emptyLabel := container.NewCenter(container.NewMax(tl.emptyLabel))
+	content := container.NewStack(listWithHeader, emptyLabel)
 	tl.refreshEmptyState()
 	return content
 }
