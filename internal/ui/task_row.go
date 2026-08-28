@@ -189,8 +189,8 @@ func (r *taskRow) refresh() {
 		r.statusLbl.SetText("失败")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
-		r.pauseBtn.Show()
-		r.startBtn.Hide()
+		r.startBtn.Show()
+		r.pauseBtn.Hide()
 	}
 	r.progress.SetValue(pct)
 }
