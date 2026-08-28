@@ -39,13 +39,9 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 		}, win)
 	})
 
-	threadsEntry := widget.NewEntry()
-	threadsEntry.SetText("")
-
 	formContent := container.NewVBox(
 		makeRow("下载链接 (URL)", urlEntry),
 		makeRow("保存路径", container.NewBorder(nil, nil, nil, browseBtn, savePathEntry)),
-		makeRow("并发线程数（留空使用全局默认）", threadsEntry),
 	)
 
 	d := dialog.NewCustomConfirm("新建下载任务", "开始下载", "取消", formContent, func(c bool) {
@@ -63,13 +59,6 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 			return
 		}
 
-		chunkCount := GlobalSettings.DefaultThreads
-		if s := threadsEntry.Text; s != "" {
-			if n, err := parseThreadCount(s); err == nil && n > 0 {
-				chunkCount = n
-			}
-		}
-
 		tk, err := sc.Add(scheduler.AddTaskInput{
 			URL:      url,
 			SavePath: savePath,
@@ -79,7 +68,7 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 				Cookies:    GlobalSettings.Cookies,
 				FTPPassive: GlobalSettings.FTPPassive,
 			},
-			ChunkCount: chunkCount,
+			ChunkCount: GlobalSettings.DefaultThreads,
 		})
 		if err != nil {
 			dialog.ShowError(err, win)
@@ -106,6 +95,12 @@ type errEmptyField struct{}
 
 func (errEmptyField) Error() string { return "required" }
 
+var errBadThreadCount = badThreadCountErr{}
+
+type badThreadCountErr struct{}
+
+func (badThreadCountErr) Error() string { return "bad thread count" }
+
 func parseThreadCount(s string) (int, error) {
 	var n int
 	for _, c := range s {
@@ -116,9 +111,3 @@ func parseThreadCount(s string) (int, error) {
 	}
 	return n, nil
 }
-
-var errBadThreadCount = badThreadCountErr{}
-
-type badThreadCountErr struct{}
-
-func (badThreadCountErr) Error() string { return "bad thread count" }
