@@ -7,14 +7,11 @@ import (
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
-
-// showChunkDetails opens a dialog showing per-thread chunk progress and
 // connection info for a task. The dialog has a single 关闭 button.
 func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window) {
 	title := fmt.Sprintf("任务详情: %s", taskName(t))
@@ -72,7 +69,10 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 	scroll := container.NewScroll(infoBox)
 	scroll.SetMinSize(fyne.NewSize(560, 360))
 
-	dialog.ShowCustom("任务详情", "关闭", scroll, parent)
+	w := fyne.CurrentApp().NewWindow(title)
+	w.SetContent(scroll)
+	w.Resize(fyne.NewSize(640, 420))
+	w.Show()
 }
 
 // uaForTask returns the User-Agent string applied to the task's downloads.
