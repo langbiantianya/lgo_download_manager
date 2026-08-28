@@ -2,6 +2,7 @@ package ui
 
 import (
 	"strings"
+	"sync"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -23,10 +24,19 @@ type taskList struct {
 	panel      *fyne.Container
 	headerRow  *fyne.Container
 	emptyLabel *widget.Label
+
+	// rowMap maps taskID -> live taskRow for O(1) event dispatch.
+	rowMu  sync.Mutex
+	rowMap map[string]*taskRow
 }
 
 func newTaskList(sc *scheduler.Scheduler, filter binding.String) *taskList {
-	tl := &taskList{sc: sc, filter: filter, searchQ: binding.NewString()}
+	tl := &taskList{
+		sc:      sc,
+		filter:  filter,
+		searchQ: binding.NewString(),
+		rowMap:  map[string]*taskRow{},
+	}
 	tl.panel = tl.build()
 	return tl
 }
@@ -85,6 +95,7 @@ func (tl *taskList) build() *fyne.Container {
 			}
 			row := obj.(*taskRow)
 			row.bind(tasks[int(id)], tl.sc)
+			tl.bindRow(row, tasks[int(id)].ID)
 		},
 	)
 	tl.list.OnSelected = func(id widget.ListItemID) { tl.list.Unselect(id) }
@@ -100,6 +111,7 @@ func (tl *taskList) build() *fyne.Container {
 	tl.refreshEmptyState()
 	return content
 }
+
 // buildHeader renders the column labels above the list rows.
 func (tl *taskList) buildHeader() *fyne.Container {
 	mkHdr := func(text string, w float32) fyne.CanvasObject {
@@ -115,6 +127,13 @@ func (tl *taskList) buildHeader() *fyne.Container {
 		row,
 		widget.NewSeparator(),
 	)
+}
+
+// bindRow registers row in rowMap under taskID.
+func (tl *taskList) bindRow(row *taskRow, taskID string) {
+	tl.rowMu.Lock()
+	tl.rowMap[taskID] = row
+	tl.rowMu.Unlock()
 }
 
 func (tl *taskList) setSearch(s string) {
@@ -135,7 +154,17 @@ func (tl *taskList) refreshEmptyState() {
 	}
 }
 
-// onEvent refreshes the list when scheduler events arrive.
+// onEvent refreshes the list and dispatches progress events to the matching row.
 func (tl *taskList) onEvent(ev scheduler.Event) {
-	tl.refresh()
+	if ev.Task == nil {
+		return
+	}
+	tl.rowMu.Lock()
+	row, ok := tl.rowMap[ev.Task.ID]
+	tl.rowMu.Unlock()
+	if ok && ev.Why == "progress" {
+		row.onProgress(ev)
+	} else {
+		tl.refresh()
+	}
 }
