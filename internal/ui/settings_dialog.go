@@ -33,8 +33,8 @@ func init() {
 	saveDir := filepath.Join(home, "Downloads")
 	_ = runtime.GOOS // reserved for future platform-specific tweaks
 	GlobalSettings = settings{
-		DefaultSaveDir: saveDir,
-		DefaultThreads: 4,
+		DefaultSaveDir:  saveDir,
+		DefaultThreads:  16,
 		UserAgent:      "",
 		Cookies:        "",
 		FTPPassive:     true,

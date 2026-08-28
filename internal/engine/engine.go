@@ -46,6 +46,10 @@ type Options struct {
 
 	// TaskID is echoed into Progress so the UI can correlate. Optional.
 	TaskID string
+
+	// OnChunkCountDecreased is called whenever the engine reduces the
+	// active chunk count (e.g. server rejected concurrent connections).
+	OnChunkCountDecreased func(newCount int)
 }
 
 func (o *Options) defaults() {
@@ -60,7 +64,7 @@ func (o *Options) defaults() {
 	}
 }
 
-// Job runs one download end to end.
+// Job runs a download end to end.
 type Job struct {
 	driver  protocol.ProtocolDriver
 	dest    *os.File
@@ -68,6 +72,9 @@ type Job struct {
 	opts    Options
 	chunks  []chunk
 	stopped atomic.Bool
+
+	mu         sync.Mutex // protects planned chunks during re-plan
+	chunkCount int        // current planned chunk count
 }
 
 // chunk holds the byte range a goroutine owns and its current write
@@ -83,10 +90,11 @@ type chunk struct {
 func NewJob(driver protocol.ProtocolDriver, total int64, dest *os.File, opts Options) *Job {
 	opts.defaults()
 	j := &Job{
-		driver: driver,
-		dest:   dest,
-		total:  total,
-		opts:   opts,
+		driver:     driver,
+		dest:       dest,
+		total:      total,
+		opts:       opts,
+		chunkCount: opts.ChunkCount,
 	}
 	j.plan()
 	return j
@@ -95,6 +103,10 @@ func NewJob(driver protocol.ProtocolDriver, total int64, dest *os.File, opts Opt
 // plan divides total into chunks. If ResumeFrom[i] is provided, chunk i
 // starts at chunk.start + ResumeFrom[i].
 func (j *Job) plan() {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.chunks = nil
+
 	if len(j.opts.ChunkSizes) > 0 {
 		for i := 0; i+1 < len(j.opts.ChunkSizes); i += 2 {
 			start := j.opts.ChunkSizes[i]
@@ -107,7 +119,7 @@ func (j *Job) plan() {
 		j.chunks = append(j.chunks, chunk{idx: 0, start: 0, end: -1})
 		return
 	}
-	n := j.opts.ChunkCount
+	n := j.chunkCount
 	maxUseful := int(j.total / j.opts.MinChunkSize)
 	if maxUseful > 0 && maxUseful < n {
 		n = maxUseful
@@ -168,12 +180,18 @@ func (j *Job) IsStopped() bool { return j.stopped.Load() }
 // Stop signals the running job to abort. Idempotent.
 func (j *Job) Stop() { j.stopped.Store(true) }
 
-// Run executes the planned chunks concurrently.
+// Run executes the planned chunks concurrently, adapting chunk count down
+// when servers reject concurrent connections.
 func (j *Job) Run(ctx context.Context, useRange bool) error {
 	j.stopped.Store(false)
+
+	j.mu.Lock()
 	if len(j.chunks) == 0 {
+		j.mu.Unlock()
 		return errors.New("engine: empty chunk plan")
 	}
+	j.mu.Unlock()
+
 	if err := j.sanityCheck(); err != nil {
 		return err
 	}
@@ -211,14 +229,15 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		}
 	}
 
-	// Single-chunk unknown-size case: streaming fallback path.
-	streaming := j.total <= 0 || !useRange ||
-		(len(j.chunks) == 1 && j.chunks[0].end == -1)
-	if streaming {
-		if len(j.chunks) > 1 {
-			return errors.New("engine: unknown size needs single chunk")
-		}
-		c := &j.chunks[0]
+	// Streaming fallback for unknown total size or single-chunk case.
+	j.mu.Lock()
+	isStreaming := j.total <= 0 || !useRange || (len(j.chunks) == 1 && j.chunks[0].end == -1)
+	j.mu.Unlock()
+
+	if isStreaming {
+		j.mu.Lock()
+		c := j.chunks[0]
+		j.mu.Unlock()
 		off := c.progress
 		stopErr := j.driver.DownloadFallback(ctx, off, j.dest, func(n int) {
 			bytesDone.Add(int64(n))
@@ -238,62 +257,129 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		return stopErr
 	}
 
-	// Concurrent chunked path. Each goroutine loops until its chunk is
-	// fully written or Stop is called. Progress is recorded through the
-	// onData callback that drivers invoke on each read; we reflect that
-	// back to chunk.progress.
-	var wg sync.WaitGroup
-	errs := make([]error, len(j.chunks))
-	for i := range j.chunks {
-		i := i
-		c := &j.chunks[i]
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for !j.stopped.Load() {
-				if atomic.LoadInt64(&c.progress) > c.end {
-					chunksDone.Add(1)
-					return
-				}
-				// Compute the next start we need to fetch.
-				start := atomic.LoadInt64(&c.progress)
-				if start > c.end {
-					chunksDone.Add(1)
-					return
-				}
-				chunkCtx, cancel := context.WithCancel(ctx)
-				// Stop quick path: cancel inner ctx immediately if outer stop.
-				err := j.driver.DownloadChunk(chunkCtx, start, c.end, j.dest, func(n int) {
-					bytesDone.Add(int64(n))
-					atomic.AddInt64(&c.progress, int64(n))
-					emit(i)
-				})
-				cancel()
-				if err != nil {
-					if j.stopped.Load() || ctx.Err() != nil {
-						return
-					}
-					// Transient: back off briefly and retry.
-					select {
-					case <-ctx.Done():
-						return
-					case <-time.After(500 * time.Millisecond):
-					}
-					errs[i] = err
-					continue
-				}
-				chunksDone.Add(1)
+	// downloadChunk runs the inner retry loop for one chunk.
+	downloadChunk := func(c *chunk, idx int, errCh chan<- error) {
+		defer func() {
+			chunksDone.Add(1)
+		}()
+
+		backoff := 500 * time.Millisecond
+		for {
+			if j.stopped.Load() || ctx.Err() != nil {
 				return
 			}
-		}()
-	}
-	wg.Wait()
+			start := atomic.LoadInt64(&c.progress)
+			if start > c.end {
+				return
+			}
 
-	for _, e := range errs {
-		if e != nil && ctx.Err() == nil && !j.stopped.Load() {
-			return e
+			chunkCtx, cancel := context.WithCancel(ctx)
+			err := j.driver.DownloadChunk(chunkCtx, start, c.end, j.dest, func(n int) {
+				bytesDone.Add(int64(n))
+				atomic.AddInt64(&c.progress, int64(n))
+				emit(idx)
+			})
+			cancel()
+
+			if err != nil {
+				if j.stopped.Load() || ctx.Err() != nil {
+					return
+				}
+				select {
+				case errCh <- err:
+				default:
+				}
+				wait := backoff
+				backoff *= 2
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(wait):
+				}
+				continue
+			}
+			return
 		}
 	}
+
+	errCh := make(chan error, 1)
+
+	for {
+		j.mu.Lock()
+		chunks := j.chunks
+		wg := sync.WaitGroup{}
+		for i := range chunks {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				downloadChunk(&chunks[idx], idx, errCh)
+			}(i)
+		}
+		j.mu.Unlock()
+		wg.Wait()
+
+		if j.stopped.Load() || ctx.Err() != nil {
+			break
+		}
+
+		// Drain errCh.
+		var lastErr error
+		for {
+			select {
+			case e := <-errCh:
+				lastErr = e
+			default:
+			}
+			break
+		}
+
+		if lastErr == nil {
+			break
+		}
+
+		// Reduce chunk count.
+		j.mu.Lock()
+		currentCount := j.chunkCount
+		j.mu.Unlock()
+
+		if currentCount <= 1 {
+			return lastErr
+		}
+
+		newCount := currentCount / 2
+		if newCount < 1 {
+			newCount = 1
+		}
+
+		j.mu.Lock()
+		j.chunkCount = newCount
+		j.mu.Unlock()
+
+		if j.opts.OnChunkCountDecreased != nil {
+			j.opts.OnChunkCountDecreased(newCount)
+		}
+
+		// Re-plan: collect progress and redistribute.
+		j.mu.Lock()
+		progress := make([]int64, len(j.chunks))
+		for i, c := range j.chunks {
+			progress[i] = atomic.LoadInt64(&c.progress) - c.start
+		}
+		j.opts.ResumeFrom = progress
+		j.plan()
+		j.mu.Unlock()
+
+		// Back off before reconnecting.
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(1 * time.Second):
+		}
+	}
+
 	if j.opts.Progress != nil {
 		j.opts.Progress(Progress{
 			TaskID:          j.opts.TaskID,
@@ -308,15 +394,12 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 
 // sanityCheck confirms the destination file size is at least `total`.
 func (j *Job) sanityCheck() error {
-	if j.total <= 0 || len(j.chunks) == 0 {
-		return nil
-	}
-	st, err := j.dest.Stat()
+	stat, err := j.dest.Stat()
 	if err != nil {
-		return fmt.Errorf("engine dest stat: %w", err)
+		return err
 	}
-	if st.Size() < j.total {
-		return fmt.Errorf("engine: dest size %d < total %d (call prealloc first)", st.Size(), j.total)
+	if stat.Size() < j.total {
+		return fmt.Errorf("engine: dest file size %d < expected total %d", stat.Size(), j.total)
 	}
 	return nil
 }
