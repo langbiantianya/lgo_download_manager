@@ -68,7 +68,7 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 		container.NewBorder(nil, nil, widget.NewLabel("密码"), nil, passwordEntry),
 	)
 
-	dialog.NewCustomConfirm("新建下载任务", "开始下载", "取消", formContent, func(c bool) {
+	d := dialog.NewCustomConfirm("新建下载任务", "开始下载", "取消", formContent, func(c bool) {
 		if !c {
 			return
 		}
@@ -113,7 +113,9 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 			return
 		}
 		_ = sc.Start(tk.ID)
-	}, win).Show()
+	}, win)
+	d.Resize(fyne.NewSize(600, d.MinSize().Height))
+	d.Show()
 }
 
 func notEmptyValidator() fyne.StringValidator {
