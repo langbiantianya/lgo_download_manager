@@ -119,15 +119,8 @@ func (r *taskRow) onProgress(ev scheduler.Event) {
 }
 
 func (r *taskRow) bind(t *store.Task, sc *scheduler.Scheduler) {
-	// Preserve live task state (Downloaded, Status) across bind re-entries
-	// when a newer in-memory copy exists. The store copy may lag the
-	// scheduler's in-memory task by up to FlushInterval.
-	if r.task != nil && t != nil && r.task.Status != store.StatusPending {
-		// In-memory task is authoritative; just refresh.
-		r.refresh()
-		r.bindButtons(t, sc)
-		return
-	}
+	// Preserve the most recent non-snapshot fields across list re-binds:
+	//   - curSpeed: not in Task struct, only updated by progress events.
 	r.task = t
 	r.sc = sc
 	r.refresh()

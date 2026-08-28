@@ -208,6 +208,9 @@ func (s *Scheduler) Start(taskID string) error {
 	// Run the job synchronously inside a goroutine; the goroutine stays
 	// until completion or cancel.
 	go func() {
+		// rjRef keeps a reference to the running job for the lifetime of
+		// the goroutine so status/finalise calls can read live ChunkProgress.
+		rjRef := rj
 		defer func() {
 			// Reap on exit.
 			s.mu.Lock()
@@ -221,10 +224,10 @@ func (s *Scheduler) Start(taskID string) error {
 			return
 		}
 		if ctx.Err() != nil {
-			s.markStatus(tk.ID, store.StatusPaused)
+			s.markStatusFromJob(tk.ID, store.StatusPaused, rjRef)
 			return
 		}
-		s.completeFromEngine(tk.ID)
+		s.completeFromEngine(tk.ID, rjRef)
 	}()
 	return nil
 }
@@ -326,13 +329,35 @@ func (s *Scheduler) markProgress(taskID string, p engine.Progress) {
 	s.publish(Event{Why: "progress", Task: rj.task.Clone(), SpeedBPS: p.SpeedBPS})
 }
 
-// markStatus (Paused/Completed/Failed) is a synchronous, immediate write.
+// markStatus (Paused/Completed/Failed) writes the latest in-memory task state
+// to the store and publishes a status event. rj is optional; when non-nil it
+// is the live runningJob used to read fresh ChunkProgress/Downloaded.
 func (s *Scheduler) markStatus(taskID string, st store.Status) error {
-	tk, err := s.st.GetTask(taskID)
-	if err != nil {
-		return err
+	var downloaded int64
+	var chunkProg []int64
+	var errMsg string
+
+	s.mu.Lock()
+	rj, hasRJ := s.jobs[taskID]
+	s.mu.Unlock()
+
+	if hasRJ && rj != nil {
+		rj.dirtyMu.Lock()
+		downloaded = rj.task.Downloaded
+		chunkProg = append([]int64(nil), rj.task.ChunkProgress...)
+		errMsg = rj.task.ErrorMessage
+		rj.dirtyMu.Unlock()
+	} else {
+		tk, err := s.st.GetTask(taskID)
+		if err != nil {
+			return err
+		}
+		downloaded = tk.Downloaded
+		chunkProg = tk.ChunkProgress
+		errMsg = tk.ErrorMessage
 	}
-	if err := s.st.UpdateTaskProgress(taskID, tk.Downloaded, tk.ChunkProgress, st, tk.ErrorMessage); err != nil {
+
+	if err := s.st.UpdateTaskProgress(taskID, downloaded, chunkProg, st, errMsg); err != nil {
 		return err
 	}
 	if tk2, err := s.st.GetTask(taskID); err == nil {
@@ -341,13 +366,44 @@ func (s *Scheduler) markStatus(taskID string, st store.Status) error {
 	return nil
 }
 
+// markStatusFromJob writes a status using a runningJob reference that's been
+// removed from s.jobs but is still alive in the goroutine. This avoids losing
+// the latest bytes on Pause/Fail.
+func (s *Scheduler) markStatusFromJob(taskID string, st store.Status, rj *runningJob) {
+	if rj == nil {
+		_ = s.markStatus(taskID, st)
+		return
+	}
+	rj.dirtyMu.Lock()
+	cs := rj.job.Chunks()
+	progress := make([]int64, len(cs))
+	for i, c := range cs {
+		progress[i] = c.Progress - c.Start
+		if progress[i] < 0 {
+			progress[i] = 0
+		}
+	}
+	downloaded := rj.task.Downloaded
+	errMsg := rj.task.ErrorMessage
+	rj.dirtyMu.Unlock()
+
+	if err := s.st.UpdateTaskProgress(taskID, downloaded, progress, st, errMsg); err != nil {
+		fmt.Fprintln(os.Stderr, "scheduler markStatusFromJob:", err)
+	}
+	if tk2, err := s.st.GetTask(taskID); err == nil {
+		s.publish(Event{Why: statusWhy(st), Task: tk2})
+	}
+}
+
 // completeFromEngine flushes the final per-chunk offsets and total bytes
 // from the engine's authoritative state, then marks the task Completed.
-func (s *Scheduler) completeFromEngine(taskID string) {
-	s.mu.Lock()
-	rj, ok := s.jobs[taskID]
-	s.mu.Unlock()
-	if !ok {
+func (s *Scheduler) completeFromEngine(taskID string, rj *runningJob) {
+	if rj == nil {
+		s.mu.Lock()
+		rj, _ = s.jobs[taskID]
+		s.mu.Unlock()
+	}
+	if rj == nil {
 		s.markStatus(taskID, store.StatusCompleted)
 		return
 	}
