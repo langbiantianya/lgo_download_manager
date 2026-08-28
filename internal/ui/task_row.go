@@ -177,8 +177,8 @@ func (r *taskRow) refresh() {
 		r.statusLbl.SetText("已暂停")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
-		r.pauseBtn.Show()
-		r.startBtn.Hide()
+		r.startBtn.Show()
+		r.pauseBtn.Hide()
 	case store.StatusCompleted:
 		r.statusLbl.SetText("已完成")
 		r.speed.SetText("--")
