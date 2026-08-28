@@ -194,6 +194,21 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		lastTickVal atomic.Int64
 	)
 
+	// resumedBytes is the total already on disk before this session started.
+	// bytesDone is per-session; the Progress callback reports the cumulative
+	// total so the UI doesn't snap back to 0 on Resume.
+	var resumedBytes int64
+	for _, off := range j.opts.ResumeFrom {
+		if off > 0 {
+			resumedBytes += off
+		}
+	}
+	if len(j.opts.ChunkSizes) > 0 {
+		for i := 0; i+1 < len(j.opts.ChunkSizes); i += 2 {
+			resumedBytes += j.opts.ChunkSizes[i]
+		}
+	}
+
 	emit := func(activeIdx int) {
 		now := time.Now()
 		if now.Sub(lastTickAt) < j.opts.ProgressEvery {
@@ -210,7 +225,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		lastTickAt = now
 		slog.Info("engine progress",
 			"taskID", j.opts.TaskID,
-			"downloaded", cur,
+			"downloaded", cur+resumedBytes,
 			"total", j.total,
 			"speed", bps,
 		)
@@ -218,7 +233,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			j.opts.Progress(Progress{
 				TaskID:           j.opts.TaskID,
 				TotalSize:        j.total,
-				DownloadedBytes:  cur,
+				DownloadedBytes:  cur + resumedBytes,
 				SpeedBPS:         bps,
 				CompletedChunks:  int(chunksDone.Load()),
 				ActiveChunkIndex: activeIdx,
@@ -244,8 +259,8 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		if j.opts.Progress != nil {
 			j.opts.Progress(Progress{
 				TaskID:          j.opts.TaskID,
-				TotalSize:       bytesDone.Load(),
-				DownloadedBytes: bytesDone.Load(),
+				TotalSize:       bytesDone.Load() + resumedBytes,
+				DownloadedBytes: bytesDone.Load() + resumedBytes,
 				SpeedBPS:        0,
 				CompletedChunks: 1,
 			})
@@ -353,12 +368,12 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			}
 			j.mu.Unlock()
 			if allDone {
-				j.log.Infof("download completed  %d bytes", bytesDone.Load())
+				j.log.Infof("download completed  %d bytes", bytesDone.Load()+resumedBytes)
 				if j.opts.Progress != nil {
 					j.opts.Progress(Progress{
 						TaskID:          j.opts.TaskID,
 						TotalSize:       j.total,
-						DownloadedBytes: bytesDone.Load(),
+						DownloadedBytes: bytesDone.Load() + resumedBytes,
 						SpeedBPS:        0,
 						CompletedChunks: int(chunksDone.Load()),
 					})
