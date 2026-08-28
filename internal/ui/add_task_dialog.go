@@ -42,30 +42,10 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 	threadsEntry := widget.NewEntry()
 	threadsEntry.SetText("")
 
-	usernameEntry := widget.NewEntry()
-	usernameEntry.SetPlaceHolder("可选")
-	passwordEntry := widget.NewPasswordEntry()
-	passwordEntry.SetPlaceHolder("可选")
-
-	authCheck := widget.NewCheck("需要身份认证", func(checked bool) {
-		if checked {
-			usernameEntry.Show()
-			passwordEntry.Show()
-		} else {
-			usernameEntry.Hide()
-			passwordEntry.Hide()
-		}
-	})
-	usernameEntry.Hide()
-	passwordEntry.Hide()
-
 	formContent := container.NewVBox(
 		makeRow("下载链接 (URL)", urlEntry),
 		makeRow("保存路径", container.NewBorder(nil, nil, nil, browseBtn, savePathEntry)),
 		makeRow("并发线程数（留空使用全局默认）", threadsEntry),
-		authCheck,
-		container.NewBorder(nil, nil, widget.NewLabel("用户名"), nil, usernameEntry),
-		container.NewBorder(nil, nil, widget.NewLabel("密码"), nil, passwordEntry),
 	)
 
 	d := dialog.NewCustomConfirm("新建下载任务", "开始下载", "取消", formContent, func(c bool) {
@@ -83,11 +63,6 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 			return
 		}
 
-		var user, pass string
-		if authCheck.Checked {
-			user = usernameEntry.Text
-			pass = passwordEntry.Text
-		}
 		chunkCount := GlobalSettings.DefaultThreads
 		if s := threadsEntry.Text; s != "" {
 			if n, err := parseThreadCount(s); err == nil && n > 0 {
@@ -100,8 +75,6 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 			SavePath: savePath,
 			Protocol: proto,
 			Auth: protocol.AuthOptions{
-				Username:   user,
-				Password:   pass,
 				UserAgent:  GlobalSettings.UserAgent,
 				Cookies:    GlobalSettings.Cookies,
 				FTPPassive: GlobalSettings.FTPPassive,
