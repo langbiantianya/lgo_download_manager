@@ -84,18 +84,14 @@ func (r *taskRow) build() {
 		container.NewHBox(r.size, r.statusLbl),
 		r.name,
 	)
-	// Row 2: progress (expand) [eta]
-	row2 := container.NewBorder(
-		nil, nil, nil,
-		r.remTime,
-		container.NewStack(r.progress),
-	)
+	// Row 2: progress (expand) full width
+	row2 := container.NewStack(r.progress)
 
-	// Row 3: speed on the left, buttons aligned right
+	// Row 3: speed + ETA on the left, buttons aligned right
 	row3 := container.NewBorder(
 		nil, nil,
 		container.NewHBox(r.startBtn, r.pauseBtn, r.cancelBtn, r.detailsBtn),
-		r.speed,
+		container.NewHBox(r.speed, r.remTime),
 		layout.NewSpacer(),
 	)
 
