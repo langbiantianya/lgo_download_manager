@@ -132,9 +132,7 @@ func (r *taskRow) bindButtons(t *store.Task, sc *scheduler.Scheduler) {
 		return
 	}
 	taskID := t.ID
-	r.startBtn.OnTapped = func() { _ = sc.Start(taskID) }
-	r.pauseBtn.OnTapped = func() { _ = sc.Pause(taskID) }
-	r.cancelBtn.OnTapped = func() { _ = sc.Cancel(taskID) }
+	r.cancelBtn.OnTapped = func() { _ = sc.Delete(taskID) }
 	r.detailsBtn.OnTapped = func() { showChunkDetails(t, sc, globalWin) }
 }
 

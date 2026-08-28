@@ -267,6 +267,26 @@ func (s *Scheduler) Cancel(taskID string) error {
 	return nil
 }
 
+// Delete cancels a running task (if any), removes its partial file, and
+// permanently removes the row from the store.
+func (s *Scheduler) Delete(taskID string) error {
+	s.mu.Lock()
+	rj, ok := s.jobs[taskID]
+	s.mu.Unlock()
+	if ok {
+		rj.cancel()
+	}
+	tk, err := s.st.GetTask(taskID)
+	if err == nil && tk != nil && tk.SavePath != "" {
+		_ = os.Remove(tk.SavePath)
+	}
+	if err := s.st.DeleteTask(taskID); err != nil {
+		return err
+	}
+	s.publish(Event{Why: "deleted", Task: nil})
+	return nil
+}
+
 // List returns all known tasks from the store. The store is the source
 // of truth for the UI's sidebar.
 func (s *Scheduler) List() ([]*store.Task, error) { return s.st.ListTasks() }

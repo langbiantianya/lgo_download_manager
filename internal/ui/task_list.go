@@ -156,15 +156,14 @@ func (tl *taskList) refreshEmptyState() {
 
 // onEvent refreshes the list and dispatches progress events to the matching row.
 func (tl *taskList) onEvent(ev scheduler.Event) {
-	if ev.Task == nil {
-		return
+	if ev.Task != nil {
+		tl.rowMu.Lock()
+		row, ok := tl.rowMap[ev.Task.ID]
+		tl.rowMu.Unlock()
+		if ok && ev.Why == "progress" {
+			row.onProgress(ev)
+			return
+		}
 	}
-	tl.rowMu.Lock()
-	row, ok := tl.rowMap[ev.Task.ID]
-	tl.rowMu.Unlock()
-	if ok && ev.Why == "progress" {
-		row.onProgress(ev)
-	} else {
-		tl.refresh()
-	}
+	tl.refresh()
 }
