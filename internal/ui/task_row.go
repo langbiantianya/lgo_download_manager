@@ -101,7 +101,7 @@ func (r *taskRow) build() {
 	// 第三行：左侧为速度 + 剩余时间，右侧对齐按钮
 	row3 := container.NewBorder(
 		nil, nil,
-		container.NewHBox(r.startBtn, r.pauseBtn, r.cancelBtn, r.detailsBtn, r.openFolderBtn, r.openFileBtn),
+		container.NewHBox(r.startBtn, r.pauseBtn, r.openFolderBtn, r.openFileBtn, r.detailsBtn, r.cancelBtn),
 		container.NewHBox(r.speed, r.remTime),
 		layout.NewSpacer(),
 	)
