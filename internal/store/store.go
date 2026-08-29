@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -91,21 +92,21 @@ const (
 	FilterFileLost  StatusFilter = "filelost"
 )
 
-// Match 判断任务状态是否匹配该筛选器。
+// Match 判断任务状态是否匹配该筛选器。比较时大小写不敏感。
 func (f StatusFilter) Match(s Status) bool {
 	switch f {
 	case FilterAll:
 		return true
 	case FilterDownloading:
-		return s == StatusDownloading
+		return strings.EqualFold(string(s), string(StatusDownloading))
 	case FilterPaused:
-		return s == StatusPaused
+		return strings.EqualFold(string(s), string(StatusPaused))
 	case FilterCompleted:
-		return s == StatusCompleted
+		return strings.EqualFold(string(s), string(StatusCompleted))
 	case FilterFailed:
-		return s == StatusFailed
+		return strings.EqualFold(string(s), string(StatusFailed))
 	case FilterFileLost:
-		return s == StatusFileLost
+		return strings.EqualFold(string(s), string(StatusFileLost))
 	default:
 		return false
 	}
