@@ -57,25 +57,11 @@ func (tl *taskList) allTasks() []*store.Task {
 func (tl *taskList) filtered() []*store.Task {
 	fv, _ := tl.filter.Get()
 	sv, _ := tl.searchQ.Get()
+	filter := store.StatusFilter(fv)
 	var out []*store.Task
 	for _, t := range tl.allTasks() {
-		switch fv {
-		case "downloading":
-			if t.Status != store.StatusDownloading {
-				continue
-			}
-		case "paused":
-			if t.Status != store.StatusPaused {
-				continue
-			}
-		case "completed":
-			if t.Status != store.StatusCompleted {
-				continue
-			}
-		case "failed":
-			if t.Status != store.StatusFailed {
-				continue
-			}
+		if !filter.Match(t.Status) {
+			continue
 		}
 		if sv != "" {
 			needle := strings.ToLower(sv)

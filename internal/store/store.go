@@ -53,6 +53,67 @@ const (
 	StatusFileLost   Status = "FileLost"
 )
 
+// TaskStatus 导出所有状态常量，供外部包使用。
+var TaskStatus = struct {
+	Pending     Status
+	Downloading Status
+	Paused     Status
+	Completed  Status
+	Failed    Status
+	FileLost  Status
+}{
+	Pending:     StatusPending,
+	Downloading: StatusDownloading,
+	Paused:     StatusPaused,
+	Completed:  StatusCompleted,
+	Failed:    StatusFailed,
+	FileLost:  StatusFileLost,
+}
+
+// String 返回状态的字符串表示。
+func (s Status) String() string { return string(s) }
+
+// IsTerminal 表示该状态为终态（已完成/失败/文件丢失）。
+func (s Status) IsTerminal() bool { return s == StatusCompleted || s == StatusFailed || s == StatusFileLost }
+
+// IsActive 表示该状态为活跃状态（等待中/下载中）。
+func (s Status) IsActive() bool { return s == StatusPending || s == StatusDownloading }
+
+// StatusFilter 用于 UI 侧边栏筛选任务。
+type StatusFilter string
+
+const (
+	FilterAll        StatusFilter = "all"
+	FilterDownloading StatusFilter = "downloading"
+	FilterPaused    StatusFilter = "paused"
+	FilterCompleted StatusFilter = "completed"
+	FilterFailed   StatusFilter = "failed"
+	FilterFileLost  StatusFilter = "filelost"
+)
+
+// Match 判断任务状态是否匹配该筛选器。
+func (f StatusFilter) Match(s Status) bool {
+	switch f {
+	case FilterAll:
+		return true
+	case FilterDownloading:
+		return s == StatusDownloading
+	case FilterPaused:
+		return s == StatusPaused
+	case FilterCompleted:
+		return s == StatusCompleted
+	case FilterFailed:
+		return s == StatusFailed
+	case FilterFileLost:
+		return s == StatusFileLost
+	default:
+		return false
+	}
+}
+
+func (f StatusFilter) String() string { return string(f) }
+
+
 // Task 是数据库行的内存表示，便于 JSON 序列化。
 type Task struct {
 	ID            string    `json:"id"`

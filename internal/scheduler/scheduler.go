@@ -102,7 +102,7 @@ func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 		Protocol:      string(in.Protocol),
 		ChunkCount:    in.ChunkCount,
 		MinChunkSize:  in.MinChunkSize,
-		Status:        store.StatusPending,
+		Status:        store.TaskStatus.Pending,
 		ChunkProgress: make([]int64, in.ChunkCount),
 		AuthData:      string(authBlob),
 	}
@@ -129,8 +129,8 @@ func (s *Scheduler) Start(taskID string) error {
 	}
 
 	// 文件丢失状态：重置进度再继续
-	if tk.Status == store.StatusFileLost {
-		_ = s.st.UpdateTaskProgress(tk.ID, 0, nil, store.StatusPending, "")
+	if tk.Status == store.TaskStatus.FileLost {
+		_ = s.st.UpdateTaskProgress(tk.ID, 0, nil, store.TaskStatus.Pending, "")
 		tk, _ = s.st.GetTask(taskID)
 	}
 
@@ -221,14 +221,14 @@ func (s *Scheduler) Start(taskID string) error {
 		task:    tk,
 		cancel:  cancel,
 		job:     job,
-		status:  store.StatusDownloading,
+		status:  store.TaskStatus.Downloading,
 	}
 	s.mu.Lock()
 	s.jobs[tk.ID] = rj
 	s.mu.Unlock()
 
 
-	if err := s.st.UpdateTaskProgress(tk.ID, sumInts(tk.ChunkProgress), tk.ChunkProgress, store.StatusDownloading, ""); err != nil {
+	if err := s.st.UpdateTaskProgress(tk.ID, sumInts(tk.ChunkProgress), tk.ChunkProgress, store.TaskStatus.Downloading, ""); err != nil {
 		// 非致命错误——稍后的批量刷新会追赶上来。
 	}
 	s.publish(Event{Why: "started", Task: tk.Clone()})
@@ -253,7 +253,7 @@ func (s *Scheduler) Start(taskID string) error {
 			return
 		}
 		if ctx.Err() != nil {
-			s.markStatusFromJob(tk.ID, store.StatusPaused, rjRef)
+			s.markStatusFromJob(tk.ID, store.TaskStatus.Paused, rjRef)
 			return
 		}
 		s.completeFromEngine(tk.ID, rjRef)
@@ -289,7 +289,7 @@ func (s *Scheduler) Cancel(taskID string) error {
 	if tk.SavePath != "" {
 		_ = os.Remove(tk.SavePath)
 	}
-	if err := s.markStatus(tk.ID, store.StatusFailed); err != nil {
+	if err := s.markStatus(tk.ID, store.TaskStatus.Failed); err != nil {
 		return err
 	}
 	return nil
@@ -326,14 +326,14 @@ func (s *Scheduler) ValidateFileExistence() {
 		return
 	}
 	for _, tk := range tasks {
-		if tk.Status != store.StatusCompleted && tk.Status != store.StatusDownloading {
+		if tk.Status != store.TaskStatus.Completed && tk.Status != store.TaskStatus.Downloading {
 			continue
 		}
 		if tk.SavePath == "" {
 			continue
 		}
 		if _, err := os.Stat(tk.SavePath); os.IsNotExist(err) {
-			_ = s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.StatusFileLost, "文件已丢失")
+			_ = s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.FileLost, "文件已丢失")
 			s.publish(Event{Why: "updated", Task: tk})
 		}
 	}
@@ -345,7 +345,7 @@ func (s *Scheduler) ResetTask(taskID string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.st.UpdateTaskProgress(tk.ID, 0, nil, store.StatusPending, ""); err != nil {
+	if err := s.st.UpdateTaskProgress(tk.ID, 0, nil, store.TaskStatus.Pending, ""); err != nil {
 		return err
 	}
 	// 重新获取最新状态的任务用于发布事件
@@ -397,12 +397,12 @@ func (s *Scheduler) markProgress(taskID string, p engine.Progress) {
 	rj.dirtyMu.Lock()
 	rj.dirty = true
 	rj.lastSnapshot = p
-	rj.status = store.StatusDownloading
+	rj.status = store.TaskStatus.Downloading
 
 	// 将 engine 的字节计数同步到任务快照中,使 Event 能把最新的
 	// Downloaded、各 chunk 偏移以及 status 传递给 UI 和 store。
 	rj.task.Downloaded = p.DownloadedBytes
-	rj.task.Status = store.StatusDownloading
+	rj.task.Status = store.TaskStatus.Downloading
 	// 将 engine 的每个 chunk 偏移回写到 task,这样下次 flushAll
 	// 之前若发生快速 Pause,也能通过 rj.task 看到最新值。
 	cs := rj.job.Chunks()
@@ -507,7 +507,7 @@ func (s *Scheduler) completeFromEngine(taskID string, rj *runningJob) {
 		s.mu.Unlock()
 	}
 	if rj == nil {
-		s.markStatus(taskID, store.StatusCompleted)
+		s.markStatus(taskID, store.TaskStatus.Completed)
 		return
 	}
 	cs := rj.job.Chunks()
@@ -520,7 +520,7 @@ func (s *Scheduler) completeFromEngine(taskID string, rj *runningJob) {
 		}
 		total += progress[i]
 	}
-	if err := s.st.UpdateTaskProgress(taskID, total, progress, store.StatusCompleted, ""); err != nil {
+	if err := s.st.UpdateTaskProgress(taskID, total, progress, store.TaskStatus.Completed, ""); err != nil {
 		fmt.Fprintln(os.Stderr, "scheduler completeFromEngine:", err)
 	}
 	rj.task.ChunkProgress = progress
@@ -531,7 +531,7 @@ func (s *Scheduler) completeFromEngine(taskID string, rj *runningJob) {
 }
 
 func (s *Scheduler) fail(tk *store.Task, err error) {
-	if writeErr := s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.StatusFailed, err.Error()); writeErr != nil {
+	if writeErr := s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.Failed, err.Error()); writeErr != nil {
 		fmt.Fprintln(os.Stderr, "scheduler fail:", writeErr)
 	}
 	if tk2, err := s.st.GetTask(tk.ID); err == nil {
@@ -541,11 +541,11 @@ func (s *Scheduler) fail(tk *store.Task, err error) {
 
 func statusWhy(s store.Status) string {
 	switch s {
-	case store.StatusPaused:
+	case store.TaskStatus.Paused:
 		return "paused"
-	case store.StatusCompleted:
+	case store.TaskStatus.Completed:
 		return "completed"
-	case store.StatusFailed:
+	case store.TaskStatus.Failed:
 		return "failed"
 	default:
 		return "progress"

@@ -118,14 +118,14 @@ func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 	})
 	pauseAllBtn := widget.NewButtonWithIcon("暂停全部", theme.MediaPauseIcon(), func() {
 		for _, tk := range m.taskList.allTasks() {
-			if tk.Status == store.StatusDownloading {
+			if tk.Status == store.TaskStatus.Downloading {
 				_ = m.sc.Pause(tk.ID)
 			}
 		}
 	})
 	resumeAllBtn := widget.NewButtonWithIcon("恢复全部", theme.MediaPlayIcon(), func() {
 		for _, tk := range m.taskList.allTasks() {
-			if tk.Status == store.StatusPaused || tk.Status == store.StatusFailed {
+			if tk.Status == store.TaskStatus.Paused || tk.Status == store.TaskStatus.Failed {
 				_ = m.sc.Start(tk.ID)
 			}
 		}

@@ -176,7 +176,7 @@ func (r *taskRow) refresh() {
 	}
 
 	switch t.Status {
-	case store.StatusPending:
+	case store.TaskStatus.Pending:
 		r.statusLbl.SetText("等待中")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
@@ -186,7 +186,7 @@ func (r *taskRow) refresh() {
 		r.startBtn.Show()
 		r.openFolderBtn.Hide()
 		r.openFileBtn.Hide()
-	case store.StatusDownloading:
+	case store.TaskStatus.Downloading:
 		r.statusLbl.SetText("下载中")
 		r.speed.SetText(formatBPS(r.curSpeed))
 		r.remTime.SetText(etaText(t, r.curSpeed))
@@ -194,7 +194,7 @@ func (r *taskRow) refresh() {
 		r.pauseBtn.Show()
 		r.openFolderBtn.Hide()
 		r.openFileBtn.Hide()
-	case store.StatusPaused:
+	case store.TaskStatus.Paused:
 		r.statusLbl.SetText("已暂停")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
@@ -204,7 +204,7 @@ func (r *taskRow) refresh() {
 		r.pauseBtn.Hide()
 		r.openFolderBtn.Hide()
 		r.openFileBtn.Hide()
-	case store.StatusCompleted:
+	case store.TaskStatus.Completed:
 		r.statusLbl.SetText("已完成")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
@@ -212,7 +212,7 @@ func (r *taskRow) refresh() {
 		r.startBtn.Hide()
 		r.openFolderBtn.Show()
 		r.openFileBtn.Show()
-	case store.StatusFileLost:
+	case store.TaskStatus.FileLost:
 		r.statusLbl.SetText("文件丢失")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
@@ -222,7 +222,7 @@ func (r *taskRow) refresh() {
 		r.pauseBtn.Hide()
 		r.openFolderBtn.Hide()
 		r.openFileBtn.Hide()
-	case store.StatusFailed:
+	case store.TaskStatus.Failed:
 		r.statusLbl.SetText("失败")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
