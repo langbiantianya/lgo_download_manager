@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"image/color"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,24 +13,27 @@ import (
 	"testing"
 	"time"
 
+	"fyne.io/fyne/v2"
+	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/theme"
 
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
 
-// TestMosaicBarsFillOnDownload runs a real scheduler + engine through a
-// download against an httptest server (no Accept-Ranges → streaming
-// path). After completion, the engine has collapsed to a single chunk
-// covering the whole file, with progress = total bytes. We assert that
-// feeding this data into the mosaic's update() leaves every bar at 1.0.
+// TestMosaicTilesTurnGreenOnDownload runs the real scheduler + engine
+// through a download against an httptest server with no Accept-Ranges
+// (forcing the engine's streaming fallback path). After completion, the
+// engine has collapsed to a single chunk covering the whole file with
+// progress = total bytes. We assert that the mosaic's update() paints
+// every tile with the success color.
 //
-// We feed the data in two ways:
-//   (a) via the Subscribe goroutine, simulating the production path;
-//   (b) directly from the DB after completion, simulating the worst case
-//       where the goroutine never delivered.
-func TestMosaicBarsFillOnDownload(t *testing.T) {
+// Tile colors are set by rebuilding canvas.Rectangle children on every
+// update, sidestepping fyne-io/fyne#3216 (Refresh on individual GridWrap
+// children can be silently dropped).
+func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 	const size = 4 * 1024 * 1024
 	payload := make([]byte, size)
 	if _, err := rand.Read(payload); err != nil {
@@ -83,8 +87,6 @@ func TestMosaicBarsFillOnDownload(t *testing.T) {
 		t.Fatalf("scheduler.Start: %v", err)
 	}
 
-	// scheduler.Start mutates its own tk pointer; re-read from DB so we
-	// see the post-Probe TotalSize/ChunkRanges.
 	if cur, err := st.GetTask(tk.ID); err == nil {
 		tk = cur
 	}
@@ -105,7 +107,6 @@ func TestMosaicBarsFillOnDownload(t *testing.T) {
 
 	m.update(tk.ChunkProgress, tk.ChunkRanges, tk.TotalSize)
 
-	// Wait for completion.
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		cur, _ := st.GetTask(tk.ID)
@@ -115,12 +116,8 @@ func TestMosaicBarsFillOnDownload(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	// Give the Subscribe goroutine a chance to deliver the final event.
 	time.Sleep(1 * time.Second)
 
-	// Independently of whether the goroutine delivered, fetch the
-	// post-completion state from DB and update the mosaic directly. This
-	// is the same payload the goroutine would have delivered.
 	cur, _ := st.GetTask(tk.ID)
 	if cur == nil {
 		t.Fatalf("task vanished after completion")
@@ -132,9 +129,26 @@ func TestMosaicBarsFillOnDownload(t *testing.T) {
 	if m.blocks != 4 {
 		t.Fatalf("expected 4 blocks, got %d", m.blocks)
 	}
-	for i, bar := range m.bars {
-		if v := bar.Value; v < 0.999 {
-			t.Errorf("bar %d Value = %v, want 1.0 (full)", i, v)
+	if got := len(m.wrap.Objects); got != 4 {
+		t.Fatalf("expected 4 tiles, got %d", got)
+	}
+	for i, obj := range m.wrap.Objects {
+		rect, ok := obj.(*canvas.Rectangle)
+		if !ok {
+			t.Fatalf("tile %d is %T, want *canvas.Rectangle", i, obj)
+		}
+		// Fully-downloaded streaming download → every tile should be
+		// the success (green) color.
+		if rect.FillColor != successColor() {
+			t.Errorf("tile %d FillColor = %v, want Success (%v)",
+				i, rect.FillColor, successColor())
 		}
 	}
+}
+
+// successColor resolves the theme's success color so we can compare a
+// tile's FillColor (color.Color) against it.
+func successColor() color.Color {
+	th := fyne.CurrentApp().Settings().Theme()
+	return th.Color(theme.ColorNameSuccess, fyne.CurrentApp().Settings().ThemeVariant())
 }
