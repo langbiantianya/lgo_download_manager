@@ -170,9 +170,14 @@ func (m *MainWindow) buildSidebar() fyne.CanvasObject {
 		{"已暂停", "paused"},
 		{"已完成", "completed"},
 		{"失败", "failed"},
+		{"文件丢失", "filelost"},
+	}
+	labelToFilter := map[string]string{}
+	for _, f := range filters {
+		labelToFilter[f.label] = f.filterVal
 	}
 	radios := widget.NewRadioGroup([]string{}, func(s string) {
-		_ = m.filter.Set(s)
+		_ = m.filter.Set(labelToFilter[s])
 	})
 	labels := make([]string, len(filters))
 	for i, f := range filters {
@@ -181,6 +186,7 @@ func (m *MainWindow) buildSidebar() fyne.CanvasObject {
 	radios.Options = labels
 	radios.Required = true
 	radios.SetSelected("全部")
+	_ = m.filter.Set("all")
 	radios.Horizontal = false
 	header := widget.NewLabelWithStyle("任务筛选", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 
