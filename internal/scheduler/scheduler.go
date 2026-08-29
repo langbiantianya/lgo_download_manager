@@ -1,14 +1,13 @@
-// Package scheduler orchestrates download tasks end-to-end. It owns the
-// mapping taskID -> running job and provides Add/Start/Pause/Resume/Cancel
-// controls. The store layer is the persistence side; the engine does the
-// actual file/network work.
+// Package scheduler 端到端编排下载任务。它持有 taskID -> 运行中 job 的映射,
+// 并提供 Add/Start/Pause/Resume/Cancel 控制接口。store 层负责持久化;
+// engine 层负责实际的文件与网络 I/O。
 //
-// Flushing policy:
-//   - Each running job reports Progress ~250ms; scheduler batches these
-//     and calls store.UpdateTaskProgress every FlushInterval seconds
-//     (default 2s).
-//   - Lifecycle events (Start/Pause/Resume/Cancel/Complete/Fail) call
-//     flushImmediate which writes synchronously.
+// 刷新策略(flush policy):
+//   - 每个运行中的 job 大约每 250ms 上报一次 Progress;scheduler 会对这些
+//     上报进行批处理,并每 FlushInterval 秒(默认 2s)调用一次
+//     store.UpdateTaskProgress。
+//   - 生命周期事件(Start/Pause/Resume/Cancel/Complete/Fail)调用
+//     flushImmediate 以同步方式写入。
 package scheduler
 
 import (
@@ -29,14 +28,14 @@ import (
 )
 const FlushInterval = 2 * time.Second
 
-// Scheduler is the user-facing orchestrator.
+// Scheduler 是面向用户的下载编排器。
 type Scheduler struct {
 	st *store.Store
 
 	mu   sync.Mutex
 	jobs map[string]*runningJob
 
-	// Event subscribers (GUI). Filtering happens in the consumer.
+	// 事件订阅者(GUI)。筛选逻辑在消费侧完成。
 	Subs []chan Event
 }
 
@@ -44,17 +43,17 @@ type runningJob struct {
 	task    *store.Task
 	cancel  context.CancelFunc
 	job     *engine.Job
-	dirty   bool        // needs flush
-	dirtyMu sync.Mutex  // protects dirty + progressToFlush + statusToFlush
+	dirty   bool        // 需要刷新
+	dirtyMu sync.Mutex  // 保护 dirty、progressToFlush 和 statusToFlush
 	stopped bool
-	lastSnapshot engine.Progress // for catch-up flushes
+	lastSnapshot engine.Progress // 用于追赶式刷新
 
 	status        store.Status
 	progressToFlush engine.Progress
 	errMsg         string
 }
 
-// New constructs a Scheduler backed by the given Store.
+// New 构造一个由给定 Store 支撑的 Scheduler。
 func New(s *store.Store) *Scheduler {
 	return &Scheduler{
 		st:   s,
@@ -62,25 +61,25 @@ func New(s *store.Store) *Scheduler {
 	}
 }
 
-// Event is sent to subscribers. Why = why the event fired.
+// Event 会被发送给订阅者。Why 表示事件触发的原因。
 type Event struct {
-	Why      string      // "added", "started", "paused", "resumed", "completed", "failed", "progress"
+	Why      string      // "added"、"started"、"paused"、"resumed"、"completed"、"failed"、"progress" 之一
 	Task     *store.Task // snapshot at event time (cloned)
-	SpeedBPS float64     // latest measured speed; only meaningful for "progress"
+	SpeedBPS float64     // 最近测得的瞬时速度;仅对 "progress" 事件有意义
 }
 
-// AddTaskInput is what callers pass when they create a new task.
+// AddTaskInput 是调用方在创建新任务时传入的参数。
 type AddTaskInput struct {
 	URL          string
 	SavePath     string
 	Protocol     protocol.ProtocolKind
 	Auth         protocol.AuthOptions
 	ChunkCount   int
-	MinChunkSize int64 // bytes; <=0 falls back to engine default (1 MiB)
+	MinChunkSize int64 // 字节;<=0 时回退为 engine 默认值(1 MiB)
 }
 
-// Add records a new task in the store and returns its generated ID.
-// It does NOT start the download — call Start for that.
+// Add 在 store 中记录一个新任务并返回其自动生成的 ID。
+// 它并不会启动下载——如需启动请调用 Start。
 func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 	if in.URL == "" {
 		return nil, errors.New("scheduler: empty url")
@@ -92,7 +91,7 @@ func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 		in.ChunkCount = 4
 	}
 	if in.MinChunkSize <= 0 {
-		in.MinChunkSize = 1 << 20 // 1 MiB; matches engine default
+		in.MinChunkSize = 1 << 20 // 1 MiB;与 engine 的默认值保持一致
 	}
 	id := newID()
 	authBlob, _ := json.Marshal(in.Auth)
@@ -114,8 +113,8 @@ func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 	return tk, nil
 }
 
-// Start begins (or resumes) a task. If the task has chunk_progress already
-// from a prior run, the engine picks up at those offsets.
+// Start 启动(或恢复)一个任务。如果任务在之前的运行中已经存在 chunk_progress,
+// engine 将从这些偏移位置继续下载。
 func (s *Scheduler) Start(taskID string) error {
 	s.mu.Lock()
 	if _, ok := s.jobs[taskID]; ok {
@@ -129,7 +128,7 @@ func (s *Scheduler) Start(taskID string) error {
 		return fmt.Errorf("scheduler: %w", err)
 	}
 
-	// Probe the server to discover capabilities.
+	// 探测服务器以获取其能力(capabilities)。
 	auth := decodeAuth(tk.AuthData)
 	driver, err := protocol.New(tk.URL, protocol.ProtocolKind(tk.Protocol), protocol.Auth{AuthOptions: auth})
 	if err != nil {
@@ -151,7 +150,7 @@ func (s *Scheduler) Start(taskID string) error {
 		tk.SupportRange = caps.SupportRange
 	}
 
-	// Preallocate file if not already (Resume case: file is already sized).
+	// 若尚未预分配文件则进行预分配(恢复场景:文件已具有正确大小)。
 	needAlloc := !tk.IsAllocated && caps.TotalSize > 0
 	if needAlloc {
 		dest, err := prealloc.Preallocate(tk.SavePath, caps.TotalSize)
@@ -166,7 +165,7 @@ func (s *Scheduler) Start(taskID string) error {
 			return err
 		}
 		tk.IsAllocated = true
-		// Reopen for engine (file already at correct size).
+		// 重新打开供 engine 使用(文件已具有正确大小)。
 		dest.Close()
 	}
 	dest, err := os.OpenFile(tk.SavePath, os.O_RDWR, 0o644)
@@ -175,14 +174,13 @@ func (s *Scheduler) Start(taskID string) error {
 		s.fail(tk, err)
 		return err
 	}
-	// Resume offsets come from chunk_progress (each = bytes already
-	// written into that chunk).
+	// 恢复偏移取自 chunk_progress(每个值表示对应 chunk 已写入的字节数)。
 	resume := make([]int64, len(tk.ChunkProgress))
 	copy(resume, tk.ChunkProgress)
 
 	job := engine.NewJob(driver, caps.TotalSize, dest, engine.Options{
 		ChunkCount:    tk.ChunkCount,
-		MinChunkSize:  tk.MinChunkSize, // 0 means "use engine default"
+		MinChunkSize:  tk.MinChunkSize, // 0 表示使用 engine 的默认值
 		ResumeFrom:    resume,
 		ProgressEvery: 250 * time.Millisecond,
 		Progress: func(p engine.Progress) {
@@ -196,9 +194,9 @@ func (s *Scheduler) Start(taskID string) error {
 			}
 		},
 	})
-	// Snapshot the engine's actual chunk layout (depends on MinChunkSize +
-	// total size, not just ChunkCount) so the UI can render the chunk
-	// mosaic against the real byte ranges.
+	// 记录 engine 实际生效的 chunk 切分(取决于 MinChunkSize 和
+	// 文件总大小,而不仅仅是 ChunkCount),以便 UI 能基于真实字节
+	// 范围绘制 chunk 进度图。
 	cs := job.Chunks()
 	ranges := make([]int64, 0, len(cs)*2)
 	for _, c := range cs {
@@ -221,19 +219,19 @@ func (s *Scheduler) Start(taskID string) error {
 
 
 	if err := s.st.UpdateTaskProgress(tk.ID, sumInts(tk.ChunkProgress), tk.ChunkProgress, store.StatusDownloading, ""); err != nil {
-		// Non-fatal — biler flush will catch up.
+		// 非致命错误——稍后的批量刷新会追赶上来。
 	}
 	s.publish(Event{Why: "started", Task: tk.Clone()})
 
 
-	// Run the job synchronously inside a goroutine; the goroutine stays
-	// until completion or cancel.
+	// 在 goroutine 内同步运行 job;该 goroutine 会一直存活到
+	// 任务完成或被取消。
 	go func() {
-		// rjRef keeps a reference to the running job for the lifetime of
-		// the goroutine so status/finalise calls can read live ChunkProgress.
+		// rjRef 在整个 goroutine 生命周期内持有运行中 job 的引用,
+		// 以便状态/收尾调用能读取最新的 ChunkProgress。
 		rjRef := rj
 		defer func() {
-			// Reap on exit.
+			// 退出时进行清理(reap)。
 			s.mu.Lock()
 			delete(s.jobs, tk.ID)
 			s.mu.Unlock()
@@ -253,8 +251,7 @@ func (s *Scheduler) Start(taskID string) error {
 	return nil
 }
 
-// Pause cancels a running task. The task remains in the store with
-// progress and can be Resumed.
+// Pause 取消一个运行中的任务。该任务在 store 中保留进度,可被 Resume。
 func (s *Scheduler) Pause(taskID string) error {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
@@ -266,8 +263,8 @@ func (s *Scheduler) Pause(taskID string) error {
 	return nil
 }
 
-// Cancel pauses and removes the partial file. The store row is kept with
-// status=Failed for inspection.
+// Cancel 暂停任务并删除其部分文件。store 中的行会被保留,
+// status 置为 Failed,供事后查看。
 func (s *Scheduler) Cancel(taskID string) error {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
@@ -288,8 +285,8 @@ func (s *Scheduler) Cancel(taskID string) error {
 	return nil
 }
 
-// Delete cancels a running task (if any), removes its partial file, and
-// permanently removes the row from the store.
+// Delete 取消一个运行中的任务(若有),删除其部分文件,
+// 并从 store 中永久移除该行。
 func (s *Scheduler) Delete(taskID string) error {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
@@ -308,12 +305,10 @@ func (s *Scheduler) Delete(taskID string) error {
 	return nil
 }
 
-// List returns all known tasks from the store. The store is the source
-// of truth for the UI's sidebar.
+// List 返回 store 中所有已知任务。store 是 UI 侧边栏的唯一事实来源。
 func (s *Scheduler) List() ([]*store.Task, error) { return s.st.ListTasks() }
 
-// Subscribe returns a channel of events. The returned func, when called,
-// unsubscribes.
+// Subscribe 返回一个事件通道。返回的 func 被调用时取消订阅。
 func (s *Scheduler) Subscribe() (<-chan Event, func()) {
 	ch := make(chan Event, 64)
 	s.mu.Lock()
@@ -332,7 +327,7 @@ func (s *Scheduler) Subscribe() (<-chan Event, func()) {
 	}
 }
 
-// publish sends to all subscribers, drop on full.
+// publish 向所有订阅者发送事件;通道已满时丢弃。
 func (s *Scheduler) publish(ev Event) {
 	s.mu.Lock()
 	subs := append([]chan Event(nil), s.Subs...)
@@ -345,7 +340,7 @@ func (s *Scheduler) publish(ev Event) {
 	}
 }
 
-// markProgress is the throttle-safe path for engine progress callbacks.
+// markProgress 是 engine 进度回调的节流安全(throttle-safe)入口。
 func (s *Scheduler) markProgress(taskID string, p engine.Progress) {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
@@ -358,12 +353,12 @@ func (s *Scheduler) markProgress(taskID string, p engine.Progress) {
 	rj.lastSnapshot = p
 	rj.status = store.StatusDownloading
 
-	// Sync engine's byte counts into the task snapshot so the Event carries
-	// up-to-date Downloaded + chunk offsets + status to the UI and store.
+	// 将 engine 的字节计数同步到任务快照中,使 Event 能把最新的
+	// Downloaded、各 chunk 偏移以及 status 传递给 UI 和 store。
 	rj.task.Downloaded = p.DownloadedBytes
 	rj.task.Status = store.StatusDownloading
-	// Mirror engine's per-chunk offsets back into the task so a quick Pause
-	// (before the next flushAll tick) sees fresh values via rj.task.
+	// 将 engine 的每个 chunk 偏移回写到 task,这样下次 flushAll
+	// 之前若发生快速 Pause,也能通过 rj.task 看到最新值。
 	cs := rj.job.Chunks()
 	if len(cs) > 0 {
 		cp := make([]int64, len(cs))
@@ -379,9 +374,9 @@ func (s *Scheduler) markProgress(taskID string, p engine.Progress) {
 	s.publish(Event{Why: "progress", Task: rj.task.Clone(), SpeedBPS: p.SpeedBPS})
 }
 
-// markStatus (Paused/Completed/Failed) writes the latest in-memory task state
-// to the store and publishes a status event. rj is optional; when non-nil it
-// is the live runningJob used to read fresh ChunkProgress/Downloaded.
+// markStatus(Paused/Completed/Failed)把最新的内存任务状态写入
+// store,并发布一条状态事件。rj 为可选参数;非 nil 时表示一个
+// 仍然存活的 runningJob,用于读取最新的 ChunkProgress/Downloaded。
 func (s *Scheduler) markStatus(taskID string, st store.Status) error {
 	var downloaded int64
 	var chunkProg []int64
@@ -394,7 +389,7 @@ func (s *Scheduler) markStatus(taskID string, st store.Status) error {
 	if hasRJ && rj != nil {
 		rj.dirtyMu.Lock()
 		downloaded = rj.task.Downloaded
-		// Prefer fresh engine chunk offsets over stale task snapshot.
+		// 优先使用 engine 的最新 chunk 偏移,而不是过时的任务快照。
 		cs := rj.job.Chunks()
 		if len(cs) > 0 {
 			chunkProg = make([]int64, len(cs))
@@ -428,9 +423,9 @@ func (s *Scheduler) markStatus(taskID string, st store.Status) error {
 	return nil
 }
 
-// markStatusFromJob writes a status using a runningJob reference that's been
-// removed from s.jobs but is still alive in the goroutine. This avoids losing
-// the latest bytes on Pause/Fail.
+// markStatusFromJob 使用一个已被从 s.jobs 移除但在 goroutine 中
+// 仍然存活的 runningJob 引用来写入状态。这样可以避免在 Pause/Fail
+// 时丢失最新的字节进度。
 func (s *Scheduler) markStatusFromJob(taskID string, st store.Status, rj *runningJob) {
 	if rj == nil {
 		_ = s.markStatus(taskID, st)
@@ -457,8 +452,8 @@ func (s *Scheduler) markStatusFromJob(taskID string, st store.Status, rj *runnin
 	}
 }
 
-// completeFromEngine flushes the final per-chunk offsets and total bytes
-// from the engine's authoritative state, then marks the task Completed.
+// completeFromEngine 把 engine 权威状态中的每个 chunk 偏移和总字节数
+// 刷新出去,然后将任务标记为 Completed。
 func (s *Scheduler) completeFromEngine(taskID string, rj *runningJob) {
 	if rj == nil {
 		s.mu.Lock()
@@ -511,8 +506,8 @@ func statusWhy(s store.Status) string {
 	}
 }
 
-// Run starts the batched flusher goroutine. Call it once at startup; it
-// runs until ctx is canceled.
+// Run 启动批量刷新 goroutine。请在启动时调用一次;它会一直运行
+// 直到 ctx 被取消。
 func (s *Scheduler) Run(ctx context.Context) {
 	t := time.NewTicker(FlushInterval)
 	defer t.Stop()
@@ -545,7 +540,7 @@ func (s *Scheduler) flushAll() {
 		status := rj.status
 		rj.dirty = false
 		rj.dirtyMu.Unlock()
-		// Map chunk snapshot back to per-chunk offset-from-start.
+		// 将 chunk 快照映射回“相对于 chunk 起始的偏移”。
 		cs := rj.job.Chunks()
 		progress := make([]int64, len(cs))
 		for i, c := range cs {
@@ -556,7 +551,7 @@ func (s *Scheduler) flushAll() {
 		}
 		if err := s.st.UpdateTaskProgress(rj.task.ID, p.DownloadedBytes, progress, status, ""); err != nil {
 			fmt.Fprintln(os.Stderr, "flush:", err)
-			// Mark dirty so we retry next interval.
+			// 标记为 dirty,以便下一个周期重试。
 			rj.dirtyMu.Lock()
 			rj.dirty = true
 			rj.dirtyMu.Unlock()
@@ -567,7 +562,7 @@ func (s *Scheduler) flushAll() {
 	}
 }
 
-// decodeAuth reconstructs protocol.AuthOptions from a stored blob.
+// decodeAuth 从存储的 blob 中重建 protocol.AuthOptions。
 func decodeAuth(blob string) protocol.AuthOptions {
 	var a protocol.AuthOptions
 	if blob == "" {
@@ -585,13 +580,13 @@ func sumInts(xs []int64) int64 {
 	return s
 }
 
-// newID makes a millisecond timestamp-based id, plus a small random
-// suffix for uniqueness on rapid add.
+// newID 基于毫秒级时间戳生成 ID,并附加一个小的随机后缀以保证
+// 快速连续添加时的唯一性。
 func newID() string {
 	return fmt.Sprintf("ts-%d-%d", time.Now().UnixMilli(), os.Getpid())
 }
 
-// EnsureSaveDir makes sure the local path's parent dir exists. Used by UI.
+// EnsureSaveDir 确保本地路径的父目录存在。由 UI 调用。
 func EnsureSaveDir(p string) error {
 	return os.MkdirAll(filepath.Dir(p), 0o755)
 }

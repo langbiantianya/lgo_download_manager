@@ -1,5 +1,11 @@
-// Package engine turns a unified ProtocolDriver and a plan of byte ranges
-// into a concurrent, resumable write into a pre-allocated output file.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
+// Package engine 将统一的 ProtocolDriver 和字节区间规划
+// 转换为对一个预分配输出文件的并发、可恢复写入。
 package engine
 
 import (
@@ -15,6 +21,7 @@ import (
 	"lgo_download_manager/internal/protocol"
 )
 
+// Progress 描述一次下载任务的进度快照。
 type Progress struct {
 	TaskID           string
 	TotalSize        int64
@@ -33,10 +40,9 @@ type Options struct {
 	ProgressEvery time.Duration
 	TaskID        string
 	OnChunkCountDecreased func(newCount int)
-	// OnPlanChanged fires when the engine collapses or re-plans its
-	// chunks (e.g. when a server doesn't support byte ranges and the
-	// engine falls back to a single streaming chunk). The hook is
-	// invoked with the new [start0,end0,start1,end1,...] range pairs.
+	// OnPlanChanged 在引擎合并或重新规划其分片时触发
+	// (例如当服务器不支持字节区间时,引擎回退到单个流式分片)。
+	// 该回调以新的 [start0,end0,start1,end1,...] 区间对作为参数调用。
 	OnPlanChanged func(ranges []int64)
 	Logger        Logger
 }
@@ -118,9 +124,10 @@ func (j *Job) plan() {
 		j.chunks = append(j.chunks, chunk{idx: 0, start: 0, end: -1})
 		return
 	}
-	// ChunkCount is the MAXIMUM number of concurrent connections. The
-	// actual chunk count is sized by MinChunkSize — each chunk is at
-	// least MinChunkSize bytes unless the file itself is smaller.
+	// ChunkCount 是允许的最大并发连接数。实际的
+	// 分片数量由 MinChunkSize 决定——每个分片至少为
+	// MinChunkSize 字节,除非文件本身更小。
+
 	n := int(j.total / j.opts.MinChunkSize)
 	if j.total%j.opts.MinChunkSize != 0 {
 		n++
@@ -204,9 +211,9 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		lastTickVal atomic.Int64
 	)
 
-	// resumedBytes is the total already on disk before this session started.
-	// bytesDone is per-session; the Progress callback reports the cumulative
-	// total so the UI doesn't snap back to 0 on Resume.
+	// resumedBytes 是本次会话开始之前磁盘上已有的字节总数。
+	// bytesDone 是会话级别的累加;Progress 回调报告的是累计总量,
+	// 这样在断点续传时 UI 不会回退到 0。
 	var resumedBytes int64
 	for _, off := range j.opts.ResumeFrom {
 		if off > 0 {
@@ -257,12 +264,11 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 
 	if isStreaming {
 		j.mu.Lock()
-		// Collapse the plan to a single chunk covering the entire file so
-		// Chunks() reports progress on one chunk rather than N chunks
-		// where only chunks[0] was actually written to. Without this,
-		// the scheduler would read e.g. [N, 0, 0, 0] from a server that
-		// doesn't advertise Accept-Ranges — the UI would only ever
-		// light up the first tile's worth of mosaic.
+		// 将计划合并为覆盖整个文件的单个分片,这样
+		// Chunks() 只在一个分片上报告进度,而不是 N 个分片
+		// 中只有 chunks[0] 真正被写入。否则,调度器会从
+		// 不声明 Accept-Ranges 的服务器上读到类似 [N, 0, 0, 0]
+		// 的进度——UI 只会点亮第一块马赛克。
 		var progress int64
 		if len(j.chunks) > 0 {
 			progress = j.chunks[0].progress
@@ -292,12 +298,12 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		}
 		return stopErr
 	}
+	// 保守的并发增长策略:从 1 个分片开始。如果某个分片顺利完成,
+	// 就再增加一个。一旦出现错误,就停止增长并回退。
 
-	// Conservative growth: start with 1 chunk. If it completes without error,
-	// add another. On any error, stop growing and back off.
 	activeCount := 1
 
-	// downloadChunk runs one chunk's retry loop.
+	// downloadChunk 运行单个分片的重试循环。
 	downloadChunk := func(c *chunk, idx int, errCh chan<- error) {
 		defer func() {
 			chunksDone.Add(1)
@@ -370,7 +376,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 
 		j.log.Infof("round starting  active=%d chunks", toLaunch)
 
-		// Wait for chunks to finish or an error.
+		// 等待分片结束或出现错误。
 		var lastErr error
 		waitDone := make(chan struct{})
 		go func() {
@@ -382,7 +388,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		case err := <-errCh:
 			lastErr = err
 		case <-waitDone:
-			// All chunks finished with no error.
+			// 所有分片已完成且无错误。
 			j.mu.Lock()
 			allDone := true
 			for _, c := range j.chunks {
@@ -405,7 +411,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 				}
 				return nil
 			}
-			// Not done — try growing.
+			// 还未完成——尝试增加并发。
 			if activeCount < j.chunkCount && activeCount < len(j.chunks) {
 				activeCount++
 				j.log.Infof("chunk completed, growing active chunks to %d", activeCount)
@@ -416,7 +422,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			return ctx.Err()
 		}
 
-		// Error path.
+		// 错误路径。
 		if lastErr == nil {
 			continue
 		}
@@ -428,7 +434,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			return nil
 		}
 
-		// Reduce.
+		// 缩减。
 		oldActive := activeCount
 		activeCount = activeCount / 2
 		if activeCount < 1 {
@@ -445,7 +451,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			j.log.Warnf("reduced active chunks %d -> %d", oldActive, activeCount)
 		}
 
-		// Re-plan.
+		// 重新规划。
 		j.mu.Lock()
 		progress := make([]int64, len(j.chunks))
 		for i, c := range j.chunks {

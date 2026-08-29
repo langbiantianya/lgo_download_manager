@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package ui
 
 import (
@@ -13,19 +19,19 @@ import (
 	"lgo_download_manager/internal/store"
 )
 
-// taskList is the right-hand panel showing the download queue.
+// taskList 是右侧显示下载队列的面板。
 type taskList struct {
 	sc      *scheduler.Scheduler
 	filter  binding.String
 	searchQ binding.String
 
-	// fyne widgets
+	// fyne 控件
 	list       *widget.List
 	panel      *fyne.Container
 	headerRow  *fyne.Container
 	emptyLabel *widget.Label
 
-	// rowMap maps taskID -> live taskRow for O(1) event dispatch.
+	// rowMap 将 taskID 映射到活动的 taskRow，以便 O(1) 地派发事件。
 	rowMu  sync.Mutex
 	rowMap map[string]*taskRow
 }
@@ -83,7 +89,7 @@ func (tl *taskList) filtered() []*store.Task {
 	return out
 }
 
-// build assembles the task list panel: a header row + the scrolling list.
+// build 组装任务列表面板：表头行加可滚动列表。
 func (tl *taskList) build() *fyne.Container {
 	tl.list = widget.NewList(
 		func() int { return len(tl.filtered()) },
@@ -112,24 +118,23 @@ func (tl *taskList) build() *fyne.Container {
 	return content
 }
 
-// buildHeader renders the column labels above the list rows.
+// buildHeader 在列表行上方渲染列标题。
 func (tl *taskList) buildHeader() *fyne.Container {
 	mkHdr := func(text string, w float32) fyne.CanvasObject {
 		l := widget.NewLabelWithStyle(text, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 		return container.NewGridWrap(fyne.NewSize(w, 28), l)
 	}
-	row := container.NewHBox(
-		mkHdr("任务", 320),
-		widget.NewLabelWithStyle("大小", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true}),
-		widget.NewLabelWithStyle("状态", fyne.TextAlignCenter, fyne.TextStyle{Bold: true}),
-	)
+	name := mkHdr("任务", 320)
+	size := widget.NewLabelWithStyle("大小", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true})
+	status := widget.NewLabelWithStyle("状态", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	row := container.NewBorder(nil, nil, nil, container.NewHBox(size, status), name)
 	return container.NewVBox(
 		row,
 		widget.NewSeparator(),
 	)
 }
 
-// bindRow registers row in rowMap under taskID.
+// bindRow 在 rowMap 中以 taskID 注册 row。
 func (tl *taskList) bindRow(row *taskRow, taskID string) {
 	tl.rowMu.Lock()
 	tl.rowMap[taskID] = row
@@ -154,7 +159,7 @@ func (tl *taskList) refreshEmptyState() {
 	}
 }
 
-// onEvent refreshes the list and dispatches progress events to the matching row.
+// onEvent 刷新列表并将进度事件派发到对应的行。
 func (tl *taskList) onEvent(ev scheduler.Event) {
 	if ev.Task != nil {
 		tl.rowMu.Lock()

@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package prealloc
 
 import (
@@ -25,7 +31,7 @@ func TestPreallocate_10MB(t *testing.T) {
 		t.Fatalf("size mismatch: got %d, want %d", st.Size(), size)
 	}
 
-	// Writing at offset 0 should succeed and not extend the file.
+// 在偏移 0 处写入应该成功,且不应扩展文件。
 	if _, err := f.WriteAt([]byte("hello"), 0); err != nil {
 		t.Fatalf("WriteAt: %v", err)
 	}

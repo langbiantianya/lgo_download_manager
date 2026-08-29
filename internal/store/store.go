@@ -1,6 +1,12 @@
-// Package store is the SQLite persistence layer for download tasks.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
-// Schema (matches design doc section IV):
+// Copyright (c) 2026 langbiantianya
+
+// Package store 是下载任务的 SQLite 持久化层。
+//
+// 表结构（对应设计文档 IV 节）：
 //
 //	id              TEXT PK
 //	url             TEXT
@@ -11,16 +17,15 @@
 //	support_range   INTEGER (0/1)
 //	is_allocated    INTEGER (0/1)
 //	chunk_count     INTEGER
-//	chunk_progress  TEXT  JSON array
+//	chunk_progress  TEXT  JSON 数组
 //	status          TEXT  Pending/Downloading/Paused/Completed/Failed
-//	auth_data       TEXT  JSON (kept plaintext for now; see comment)
+//	auth_data       TEXT  JSON (目前以明文保存，详见代码内注释)
 //	error_message   TEXT
 //	created_at      DATETIME
 //	updated_at      DATETIME
 //
-// All writes go through (*Store).Flush: a Ticker in the engine calls
-// Flush every 2 seconds. Lifecycle events (pause/complete/fail) call
-// FlushImmediate to force a sync.
+// 所有写入都通过 (*Store).Flush 完成：engine 中的 Ticker 每 2 秒调用
+// Flush 一次。生命周期事件（暂停/完成/失败）通过 FlushImmediate 强制同步。
 package store
 
 import (
@@ -33,10 +38,10 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite" // pure-Go sqlite driver
+	_ "modernc.org/sqlite" // 纯 Go 实现的 sqlite 驱动
 )
 
-// Status reflects the lifecycle of a Task. The DB column is plain text.
+// Status 反映 Task 的生命周期状态。数据库中以纯文本存储。
 type Status string
 
 const (
@@ -47,7 +52,7 @@ const (
 	StatusFailed     Status = "Failed"
 )
 
-// Task is the in-memory representation of a row. JSON-friendly.
+// Task 是数据库行的内存表示，便于 JSON 序列化。
 type Task struct {
 	ID            string    `json:"id"`
 	URL           string    `json:"url"`
@@ -58,28 +63,27 @@ type Task struct {
 	SupportRange  bool      `json:"support_range"`
 	IsAllocated   bool      `json:"is_allocated"`
 	ChunkCount    int       `json:"chunk_count"`
-	MinChunkSize  int64     `json:"min_chunk_size"` // engine chunk lower-bound (bytes)
-	ChunkProgress []int64   `json:"chunk_progress"` // per-chunk offset-from-start
-	ChunkRanges   []int64   `json:"chunk_ranges"`   // [start0,end0,start1,end1,...] — actual engine chunk layout
+	MinChunkSize  int64     `json:"min_chunk_size"` // engine 分块下界（字节）
+	ChunkProgress []int64   `json:"chunk_progress"` // 每个分块从起点开始的偏移量
+	ChunkRanges   []int64   `json:"chunk_ranges"`   // [start0,end0,start1,end1,...] — 实际的 engine 分块布局
 	Status        Status    `json:"status"`
-	AuthData      string    `json:"auth_data"`  // JSON: {username,password,...}
+	AuthData      string    `json:"auth_data"`  // JSON：{username,password,...}
 	ErrorMessage  string    `json:"error_message"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 }
 
-// Store wraps an *sql.DB with prepared statements used by the engine.
-// It is safe for concurrent use; the underlying sqlite driver is locked
-// at the process level so writes are serialized through mu.
+// Store 用 engine 使用的 prepared 语句封装 *sql.DB。
+// 它是并发安全的；底层 sqlite 驱动在进程级别加锁，
+// 因此写入通过 mu 串行化。
 type Store struct {
 	mu sync.Mutex
 	db *sql.DB
 }
 
-// Open opens the database at path, creating the parent directory if
-// needed. The provided DSN enables WAL + a busy timeout for safety
-// against concurrent connections (the engine may have more than one
-// writer if the user starts/stops tasks rapidly).
+// Open 打开 path 指定的数据库，必要时创建父目录。
+// 所使用的 DSN 启用 WAL 与 busy_timeout，以应对并发连接
+//（当用户频繁启停任务时，engine 可能有多个 writer）。
 func Open(path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -91,8 +95,8 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("store open: %w", err)
 	}
-	// Pragmas for safety: foreign keys off (none here), synchronous=NORMAL,
-	// and a 5s busy timeout. modernc.org/sqlite sets these via DSN already.
+	// 出于安全考虑的 PRAGMA：关闭外键（此处未使用），synchronous=NORMAL，
+	// 以及 5 秒的 busy_timeout。modernc.org/sqlite 已经通过 DSN 设置这些。
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store ping: %w", err)
@@ -105,8 +109,7 @@ func Open(path string) (*Store, error) {
 	return s, nil
 }
 
-// migrate creates the tables on a fresh DB and applies idempotent column
-// migrations for older databases.
+// migrate 在全新数据库上创建表，并对旧数据库应用幂等的列迁移。
 func (s *Store) migrate() error {
 	const ddl = `CREATE TABLE IF NOT EXISTS tasks (
 		id              TEXT PRIMARY KEY,
@@ -138,16 +141,15 @@ func (s *Store) migrate() error {
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
 	}
-	// Idempotent column migrations: add new columns to existing tasks
-	// tables without dropping data.
+	// 幂等的列迁移：向已存在的 tasks 表新增列，且不丢数据。
 	if err := s.addColumnIfMissing("tasks", "chunk_ranges", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
 	return nil
 }
 
-// addColumnIfMissing adds a column to an existing table when it isn't
-// already present. modernc.org/sqlite exposes table_info via PRAGMA.
+// addColumnIfMissing 在列不存在时向现有表新增该列。
+// modernc.org/sqlite 通过 PRAGMA 暴露 table_info。
 func (s *Store) addColumnIfMissing(table, col, decl string) error {
 	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
@@ -171,11 +173,10 @@ func (s *Store) addColumnIfMissing(table, col, decl string) error {
 	return nil
 }
 
-// Close releases the DB handle. The engine should defer this on shutdown.
+// Close 释放数据库句柄。engine 在关闭时应通过 defer 调用。
 func (s *Store) Close() error { return s.db.Close() }
 
-// CreateTask inserts a new task row. It returns the inserted Task (with
-// CreatedAt/UpdatedAt populated) or an error.
+// CreateTask 插入一条新的任务记录。返回插入后的 Task（CreatedAt/UpdatedAt 已填充）或错误。
 func (s *Store) CreateTask(t *Task) error {
 	if t.ID == "" {
 		return errors.New("store: empty task id")
@@ -210,8 +211,8 @@ func (s *Store) CreateTask(t *Task) error {
 	return nil
 }
 
-// UpdateTaskProgress is the hot-path flush used by the engine. It only
-// touches the volatile columns (downloaded, chunk_progress, status).
+// UpdateTaskProgress 是 engine 使用的高频刷盘路径。仅更新易变列
+// （downloaded、chunk_progress、status）。
 func (s *Store) UpdateTaskProgress(id string, downloaded int64, chunkProgress []int64, status Status, errMsg string) error {
 	if chunkProgress == nil {
 		chunkProgress = []int64{}
@@ -226,7 +227,7 @@ func (s *Store) UpdateTaskProgress(id string, downloaded int64, chunkProgress []
 	return err
 }
 
-// UpdateTaskMeta updates non-volatile fields after Probe completes.
+// UpdateTaskMeta 在 Probe 完成后更新非易变字段。
 func (s *Store) UpdateTaskMeta(id string, totalSize int64, supportRange, isAllocated bool, chunkCount int) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -238,7 +239,7 @@ func (s *Store) UpdateTaskMeta(id string, totalSize int64, supportRange, isAlloc
 	return err
 }
 
-// GetTask fetches a task by ID. Returns sql.ErrNoRows if not present.
+// GetTask 按 ID 获取任务。若不存在则返回 sql.ErrNoRows。
 func (s *Store) GetTask(id string) (*Task, error) {
 	row := s.db.QueryRow(`SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
@@ -248,7 +249,7 @@ func (s *Store) GetTask(id string) (*Task, error) {
 	return scanTask(row)
 }
 
-// ListTasks returns all tasks ordered by updated_at desc.
+// ListTasks 返回全部任务，按 updated_at 降序排列。
 func (s *Store) ListTasks() ([]*Task, error) {
 	rows, err := s.db.Query(`SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
@@ -270,8 +271,8 @@ func (s *Store) ListTasks() ([]*Task, error) {
 	return out, rows.Err()
 }
 
-// Clone deep-copies the task. Used when handing a Task to a UI consumer
-// that might mutate it without affecting the running engine's view.
+// Clone 深拷贝任务。用于把 Task 交给可能就地修改它的 UI 消费者，
+// 避免影响 engine 当前持有的视图。
 func (t *Task) Clone() *Task {
 	if t == nil {
 		return nil
@@ -286,7 +287,7 @@ func (t *Task) Clone() *Task {
 	return &cp
 }
 
-// DeleteTask removes a task by ID.
+// DeleteTask 按 ID 删除任务。
 func (s *Store) DeleteTask(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -294,11 +295,10 @@ func (s *Store) DeleteTask(id string) error {
 	return err
 }
 
-// UpdateTaskChunkRanges records the engine's actual chunk layout for a
-// task. Called once per Start(), after the engine has planned its chunks
-// (see engine.Options.ChunkCount + MinChunkSize). Persisted so the UI
-// can render the chunk-details mosaic against the real byte ranges
-// instead of guessing per-thread layout.
+// UpdateTaskChunkRanges 记录 engine 为某个任务实际规划的分块布局。
+// 每次 Start() 调用一次，位于 engine 完成分块规划之后
+// （参见 engine.Options.ChunkCount + MinChunkSize）。持久化该布局后，
+// UI 即可按真实的字节区间渲染分块详情，而不是按线程布局去猜测。
 func (s *Store) UpdateTaskChunkRanges(id string, ranges []int64) error {
 	if ranges == nil {
 		ranges = []int64{}
@@ -344,9 +344,8 @@ func scanTask(s scanner) (*Task, error) {
 	return &t, nil
 }
 
-// Settings is the persisted user-tunable defaults. Stored as a single row
-// in the settings table (id = 1). Zero values are valid (the table DEFAULTs
-// cover them on first load).
+// Settings 是持久化的用户可调默认配置。以单行形式保存在 settings 表中
+// （id = 1）。零值是合法的（首次加载时由表的 DEFAULT 覆盖）。
 type Settings struct {
 	DefaultSaveDir string
 	DefaultThreads int
@@ -357,9 +356,9 @@ type Settings struct {
 	Prealloc       bool
 }
 
-// LoadSettings returns the persisted settings row. If no row exists yet,
-// it inserts one with all-zero values (the caller is responsible for
-// applying defaults) and returns the zero-valued Settings.
+// LoadSettings 返回已持久化的 settings 行。若尚不存在，
+// 则插入一条全零的记录（由调用方负责套用默认值），
+// 并返回零值的 Settings。
 func (s *Store) LoadSettings() (Settings, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -377,7 +376,7 @@ func (s *Store) LoadSettings() (Settings, error) {
 		user_agent, cookies, ftp_passive, prealloc FROM settings WHERE id=1`,
 	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc)
 	if errors.Is(err, sql.ErrNoRows) {
-		// First run: insert a zero row so subsequent LoadSettings returns it.
+		// 首次运行：插入一条全零行，以便后续 LoadSettings 能读到。
 		_, ierr := s.db.Exec(`INSERT OR IGNORE INTO settings (id) VALUES (1)`)
 		if ierr != nil {
 			return Settings{}, fmt.Errorf("settings init: %w", ierr)
@@ -398,7 +397,7 @@ func (s *Store) LoadSettings() (Settings, error) {
 	}, nil
 }
 
-// SaveSettings upserts the persisted settings row.
+// SaveSettings upsert 已持久化的 settings 行。
 func (s *Store) SaveSettings(s2 Settings) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

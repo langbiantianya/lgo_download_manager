@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 //go:build windows
 
 package prealloc
@@ -16,9 +22,8 @@ var (
 )
 
 func platformPrealloc(f *os.File, size int64) error {
-	h := f.Fd()
+	// 将指针移动到 size,然后 SetEndOfFile 使用当前位置作为新的 EOF。
 	var newPos int64
-	// Move pointer to size, then SetEndOfFile uses the current position as new EOF.
 	r, _, e := procSetFilePointerEx.Call(
 		h,
 		uintptr(size),
@@ -32,7 +37,7 @@ func platformPrealloc(f *os.File, size int64) error {
 	if r == 0 {
 		return fmt.Errorf("SetEndOfFile: %v", e)
 	}
-	// Reset pointer to beginning for the caller.
+	// 为调用者将指针重置到开头。
 	if _, err := f.Seek(0, 0); err != nil {
 		return fmt.Errorf("seek: %w", err)
 	}

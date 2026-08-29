@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package protocol
 
 import (
@@ -6,7 +12,7 @@ import (
 	"strings"
 )
 
-// ProtocolKind is an enum-friendly string for the supported transports.
+// ProtocolKind 是便于枚举的字符串类型，用于表示所支持的传输协议。
 type ProtocolKind string
 
 const (
@@ -16,15 +22,14 @@ const (
 	ProtoWebDAV ProtocolKind = "WEBDAV"
 )
 
-// DetectKind resolves the protocol to use for a URL. Mapping rules follow
-// the design doc:
+// DetectKind 解析给定 URL 应使用的协议。映射规则遵循设计文档：
 //
-//   - http://, https://   -> HTTP / HTTPS  (webdav:// is rewritten to https
-//     for compatibility with some NAS firmwares; we keep a separate code path)
-//   - ftp://               -> FTP
-//   - webdav://, dav://    -> WEBDAV (mapped onto HTTP underneath)
+//   - http://、https://   -> HTTP / HTTPS（webdav:// 被改写为 https 以兼容
+//     部分 NAS 固件；我们仍保留独立的代码路径）
+//   - ftp://              -> FTP
+//   - webdav://、dav://   -> WEBDAV（底层由 HTTP 实现）
 //
-// An explicit hint from the caller (e.g. a UI selection) wins.
+// 调用方显式传入的 hint（例如 UI 中的选择）优先生效。
 func DetectKind(raw string, hint ProtocolKind) (ProtocolKind, error) {
 	if hint != "" {
 		return hint, nil
@@ -47,8 +52,9 @@ func DetectKind(raw string, hint ProtocolKind) (ProtocolKind, error) {
 	}
 }
 
-// ResolveURL returns a usable transport URL. For WEBDAV the caller passes
-// the original webdav:// scheme; the webdav driver rewrites it to http(s).
+// ResolveURL 返回一个真正可用的传输 URL。对于 WEBDAV，
+// 调用方传入的是原始的 webdav:// 协议；webdav 驱动会
+// 将其改写为 http(s)。
 func ResolveURL(raw string, kind ProtocolKind) string {
 	if kind == ProtoWebDAV {
 		if strings.HasPrefix(raw, "webdav://") {
@@ -61,14 +67,14 @@ func ResolveURL(raw string, kind ProtocolKind) string {
 	return raw
 }
 
-// Auth holds the credentials carried alongside a task. Drivers read what
-// they need; irrelevant fields are ignored.
+// Auth 承载随任务一起传递的凭据。驱动按需读取其关心的字段；
+// 不相关的字段将被忽略。
 type Auth struct {
 	AuthOptions
 }
 
-// New returns the right driver for `kind`. All drivers validate the URL.
-// The returned driver owns its own resources; Close() must be called.
+// New 为 `kind` 返回对应的驱动。所有驱动都会校验 URL。
+// 返回的驱动拥有其自身的资源；调用方必须调用 Close()。
 func New(raw string, kind ProtocolKind, auth Auth) (ProtocolDriver, error) {
 	url := ResolveURL(raw, kind)
 	switch kind {

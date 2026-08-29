@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package ui
 
 import (
@@ -19,16 +25,15 @@ import (
 
 const mib = int64(1 << 20)
 
-// GlobalSettings is the live settings used by "新建任务" when prefilling fields
-// and by the URL launcher in main.go. It mirrors the persisted row in the
-// settings table of the SQLite store and is loaded by LoadSettings on startup.
+// GlobalSettings 是“新建任务”预填字段时以及 main.go 中的 URL 启动器
+// 使用的实时设置。它与 SQLite 存储 settings 表中的持久化行一一对应，
+// 并在启动时由 LoadSettings 加载。
 var GlobalSettings store.Settings
 
-// LoadSettings reads the persisted settings from the store and overlays
-// them onto GlobalSettings. Defaults are applied for fields whose zero
-// value is ambiguous (empty string / 0) — the row-level "no value
-// stored" sentinel is empty DefaultSaveDir on the very first run. After
-// the first save, every field persists verbatim.
+// LoadSettings 从存储中读取持久化的设置，并将其覆盖到 GlobalSettings 上。
+// 对于零值具有歧义（空字符串 / 0）的字段，会应用默认值——首次运行时，
+// 行级“未存储值”标记就是空的 DefaultSaveDir。首次保存后，
+// 所有字段将按原值持久化。
 func LoadSettings(st *store.Store) error {
 	persisted, err := st.LoadSettings()
 	if err != nil {
@@ -46,18 +51,15 @@ func LoadSettings(st *store.Store) error {
 	}
 	GlobalSettings = persisted
 	if firstRun {
-		// Persist the defaults so subsequent loads find a real row.
-		_ = st.SaveSettings(persisted)
+		// 持久化默认值，以便后续加载时能找到真实数据行。
 	}
 	return nil
 }
 
-// SaveSettings writes GlobalSettings to the store. Safe to call after
-// every UI mutation.
+// SaveSettings 将 GlobalSettings 写入存储。每次 UI 修改后均可安全调用。
 func SaveSettings(st *store.Store) error {
 	return st.SaveSettings(GlobalSettings)
 }
-
 func buildSettingsContent(sc *scheduler.Scheduler) fyne.CanvasObject {
 	persist := func() {
 		if globalStore == nil {
@@ -85,9 +87,8 @@ func buildSettingsContent(sc *scheduler.Scheduler) fyne.CanvasObject {
 		}
 	}
 
-	// Chunk size is exposed as MiB (decimal integer, e.g. "4"). The static
-	// "MB" label on the right is purely cosmetic — the value is always
-	// multiplied by 1<<20 before reaching the engine.
+	// 分块大小以 MiB 形式显示（十进制整数，例如“4”）。右侧静态的
+	// “MB”标签仅为装饰——在传给引擎前，该值始终乘以 1<<20。
 	chunkSizeEntry := widget.NewEntry()
 	chunkSizeEntry.SetText(fmt.Sprintf("%d", GlobalSettings.MinChunkSize/mib))
 	chunkSizeEntry.SetPlaceHolder("整数 MiB")
@@ -151,7 +152,7 @@ func buildSettingsContent(sc *scheduler.Scheduler) fyne.CanvasObject {
 	return scroll
 }
 
-// diskSpaceAt reports the free bytes on the filesystem holding path.
+// diskSpaceAt 返回 path 所在文件系统的剩余可用字节数。
 func diskSpaceAt(path string) string {
 	if path == "" {
 		return "未设置"
@@ -167,7 +168,7 @@ func diskSpaceAt(path string) string {
 	return fmt.Sprintf("可用 %s / 总计 %s", humanBytes(free), humanBytes(total))
 }
 
-// humanBytes formats n as a short human-readable string.
+// humanBytes 将 n 格式化为简短的人类可读字符串。
 func humanBytes(n int64) string {
 	const (
 		KB = 1 << 10
@@ -189,7 +190,7 @@ func humanBytes(n int64) string {
 	}
 }
 
-// formatRemainingTime renders remaining seconds as a short Chinese string.
+// formatRemainingTime 将剩余秒数渲染为简短的中文字符串。
 func formatRemainingTime(secs int) string {
 	if secs <= 0 {
 		return "--"

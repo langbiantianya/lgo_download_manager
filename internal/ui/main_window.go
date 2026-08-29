@@ -1,13 +1,16 @@
-// Package ui provides the Fyne-based GUI for the download manager.
-// Thread-safety: the scheduler lives on background goroutines; all GUI
-// mutations happen on the Fyne event thread via fyne.Do().
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
+// Package ui 为下载管理器提供基于 Fyne 的图形界面。
+// 线程安全：scheduler 运行在后台 goroutine 中；所有 GUI
+// 修改都通过 fyne.Do() 在 Fyne 事件线程上进行。
 package ui
 
 import (
 	"fmt"
-	"image/color"
-	"log"
-	"path/filepath"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
@@ -15,17 +18,20 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+	"image/color"
+	"log"
+	"path/filepath"
 
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
 
-// MainWindow holds all GUI state and the top-level Fyne window.
+// MainWindow 保存所有 GUI 状态以及顶层 Fyne 窗口。
 type MainWindow struct {
-	app      fyne.App
-	sc       *scheduler.Scheduler
-	win      fyne.Window
-	content  *fyne.Container
+	app     fyne.App
+	sc      *scheduler.Scheduler
+	win     fyne.Window
+	content *fyne.Container
 
 	filter    binding.String
 	taskList  *taskList
@@ -34,11 +40,11 @@ type MainWindow struct {
 	unsub func()
 }
 
-// NewMainWindow builds the main window attached to app.
+// NewMainWindow 构建附加到 app 的主窗口。
 //
-// This MUST be called on the Fyne event thread (typically the main goroutine
-// after app.New…() and before a.Run()), because widget constructors rely on
-// fyne.CurrentApp() resolving to the just-created app.
+// 必须在 Fyne 事件线程上调用（通常在 app.New…() 之后、
+// a.Run() 之前的主 goroutine 中），因为 widget 构造器依赖
+// fyne.CurrentApp() 解析为刚创建的 app。
 func NewMainWindow(a fyne.App, st *store.Store, sc *scheduler.Scheduler) *MainWindow {
 	setGlobalStore(st)
 	if err := LoadSettings(st); err != nil {
@@ -59,8 +65,8 @@ func NewMainWindow(a fyne.App, st *store.Store, sc *scheduler.Scheduler) *MainWi
 	setGlobalWindow(m.win)
 	return m
 }
-// buildMainUI assembles the main window and stores the content container
-// for page-switching (e.g., to settings page).
+
+// buildMainUI 组装主窗口并保存内容容器，以便在页面之间切换（例如切换到设置页面）。
 func (m *MainWindow) buildMainUI() {
 	m.win = m.app.NewWindow("下载管理器")
 	m.content = container.NewBorder(
@@ -75,7 +81,7 @@ func (m *MainWindow) buildMainUI() {
 	m.win.SetOnClosed(func() { m.Close() })
 }
 
-// showSettingsPage switches the main content to the settings page.
+// showSettingsPage 将主内容切换到设置页面。
 func (m *MainWindow) showSettingsPage() {
 	m.win.SetContent(container.NewBorder(
 		m.buildSettingsHeader(),
@@ -84,12 +90,12 @@ func (m *MainWindow) showSettingsPage() {
 	))
 }
 
-// showMainPage switches the main content back to the main view.
+// showMainPage 将主内容切换回主视图。
 func (m *MainWindow) showMainPage() {
 	m.win.SetContent(m.content)
 }
 
-// buildSettingsHeader returns a header bar with a back button and title.
+// buildSettingsHeader 返回带有返回按钮和标题的标题栏。
 func (m *MainWindow) buildSettingsHeader() fyne.CanvasObject {
 	backBtn := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
 		m.showMainPage()
@@ -99,11 +105,12 @@ func (m *MainWindow) buildSettingsHeader() fyne.CanvasObject {
 	return container.NewBorder(nil, nil, backBtn, nil, container.NewHBox(title, layout.NewSpacer()))
 }
 
-// buildSettingsContent returns the settings form content.
+// buildSettingsContent 返回设置表单内容。
 func (m *MainWindow) buildSettingsContent() fyne.CanvasObject {
 	return buildSettingsContent(m.sc)
 }
-// buildToolbar packs the action buttons, search and the settings shortcut.
+
+// buildToolbar 排列操作按钮、搜索框以及设置快捷按钮。
 func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 	newBtn := widget.NewButtonWithIcon("新建任务", theme.ContentAddIcon(), func() {
 		showAddTaskDialog(m.win, m.sc)
@@ -140,7 +147,7 @@ func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 	)
 }
 
-// buildMainSplit creates the horizontal split between sidebar and task list.
+// buildMainSplit 创建侧边栏和任务列表之间的水平分割。
 func (m *MainWindow) buildMainSplit() *container.Split {
 	split := container.NewHSplit(
 		m.buildSidebar(),
@@ -150,7 +157,7 @@ func (m *MainWindow) buildMainSplit() *container.Split {
 	return split
 }
 
-// buildSidebar renders the filter radio group.
+// buildSidebar 渲染筛选单选按钮组。
 func (m *MainWindow) buildSidebar() fyne.CanvasObject {
 	type filterDef struct {
 		label     string
@@ -184,19 +191,20 @@ func (m *MainWindow) buildSidebar() fyne.CanvasObject {
 	)
 }
 
-// Show displays the main window.
-// Called from main goroutine before a.Run(), so no fyne.Do() needed.
+// Show 显示主窗口。
+// 在主 goroutine 中、a.Run() 之前调用，因此不需要 fyne.Do()。
 func (m *MainWindow) Show() {
 	m.win.Show()
 }
 
-// Close tears down subscriptions.
+// Close 清理订阅。
 func (m *MainWindow) Close() {
 	if m.unsub != nil {
 		m.unsub()
 	}
 }
-// setupTray adds a system tray icon with Show menu item.
+
+// setupTray 添加带有 Show 菜单项的系统托盘图标。
 func (m *MainWindow) setupTray() {
 	openItem := fyne.NewMenuItem("Open", func() {
 		m.win.Show()
@@ -204,7 +212,7 @@ func (m *MainWindow) setupTray() {
 	})
 	trayMenu := fyne.NewMenu("", openItem)
 
-	// SetSystemTrayMenu/SetSystemTrayWindow are desktop-only methods on *fyneApp.
+	// SetSystemTrayMenu/SetSystemTrayWindow 是 *fyneApp 上仅限桌面端的方法。
 	if desk, ok := m.app.(interface {
 		SetSystemTrayMenu(*fyne.Menu)
 		SetSystemTrayWindow(fyne.Window)
@@ -214,7 +222,7 @@ func (m *MainWindow) setupTray() {
 	}
 }
 
-// subscribe wires the scheduler event bus to fyne.Do GUI updates.
+// subscribe 将 scheduler 事件总线接入 fyne.Do 的 GUI 更新。
 func (m *MainWindow) subscribe() {
 	ch, unsub := m.sc.Subscribe()
 	m.unsub = unsub
@@ -228,10 +236,10 @@ func (m *MainWindow) subscribe() {
 	}()
 }
 
-// diskBar is a thin colored bar showing disk usage (green→red).
+// diskBar 是一个细长彩色条，用于显示磁盘使用情况（绿→红）。
 type diskBar struct {
 	widget.BaseWidget
-	progress float64 // 0.0 to 1.0
+	progress float64 // 0.0 到 1.0
 
 	bg   *canvas.Rectangle
 	fill *canvas.Rectangle
@@ -284,12 +292,12 @@ func (r *diskBarRenderer) Layout(size fyne.Size) {
 	r.fill.Resize(fyne.NewSize(barW, size.Height))
 }
 
-func (r *diskBarRenderer) MinSize() fyne.Size  { return r.b.MinSize() }
+func (r *diskBarRenderer) MinSize() fyne.Size           { return r.b.MinSize() }
 func (r *diskBarRenderer) Objects() []fyne.CanvasObject { return []fyne.CanvasObject{r.bg, r.fill} }
-func (r *diskBarRenderer) Destroy()              {}
-func (r *diskBarRenderer) Refresh()              {}
+func (r *diskBarRenderer) Destroy()                     {}
+func (r *diskBarRenderer) Refresh()                     {}
 func colorForProgress(frac float64) color.Color {
-	// green: #4CAF50, yellow: #FFEB3B, red: #F44336
+	// 绿色：#4CAF50，黄色：#FFEB3B，红色：#F44336
 	var r, g, b_ float64
 	if frac < 0.5 {
 		t := frac * 2
@@ -305,7 +313,7 @@ func colorForProgress(frac float64) color.Color {
 	return color.RGBA{R: uint8(r), G: uint8(g), B: uint8(b_), A: 255}
 }
 
-// statusBar shows disk usage.
+// statusBar 显示磁盘使用情况。
 type statusBar struct {
 	diskBar   *diskBar
 	diskLabel *widget.Label
@@ -339,7 +347,8 @@ func (sb *statusBar) setDiskSpace(free, total int64) {
 	sb.diskLabel.SetText(fmt.Sprintf("磁盘空间: 可用 %s / 总计 %s",
 		humanBytes(free), humanBytes(total)))
 }
-// refreshDiskSpace updates the disk space display from GlobalSettings.DefaultSaveDir.
+
+// refreshDiskSpace 根据 GlobalSettings.DefaultSaveDir 更新磁盘空间显示。
 func (sb *statusBar) refreshDiskSpace() {
 	dir := GlobalSettings.DefaultSaveDir
 	if dir == "" {

@@ -18,9 +18,8 @@ import (
 	"lgo_download_manager/internal/store"
 )
 
-// TestSchedulerEndToEnd exercises the full path: add task, start, chunked
-// download, complete. Verifies the 2s batched flush persisted final state
-// and the destination file equals the source payload byte-for-byte.
+// TestSchedulerEndToEnd 走完完整路径:add task、start、分块下载、complete。
+// 验证 2s 的批量刷新持久化了最终状态,且目标文件与源 payload 字节级一致。
 func TestSchedulerEndToEnd(t *testing.T) {
 	const size = 1 * 1024 * 1024 // 1 MiB
 	payload := make([]byte, size)
@@ -67,7 +66,7 @@ func TestSchedulerEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait for completion via event channel.
+	// 通过事件通道等待完成。
 	ch, unsub := sc.Subscribe()
 	defer unsub()
 	deadline := time.Now().Add(15 * time.Second)
@@ -83,7 +82,7 @@ func TestSchedulerEndToEnd(t *testing.T) {
 	t.Fatal("did not reach completed in time")
 done:
 
-	// Flush must have happened (FlushInterval = 2s; we waited >2s).
+	// 必须已经发生过 flush(FlushInterval = 2s;我们已等待超过 2s)。
 	persisted, err := st.GetTask(tk.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -104,8 +103,8 @@ done:
 	}
 }
 
-// TestSchedulerResume verifies a task resumed with partial chunk_progress
-// offsets successfully finishes from where it left off.
+// TestSchedulerResume 验证一个带有部分 chunk_progress 偏移的任务
+// 在恢复后可以从中断处继续完成。
 func TestSchedulerResume(t *testing.T) {
 	const size = 512 * 1024
 	payload := make([]byte, size)
@@ -148,8 +147,8 @@ func TestSchedulerResume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Pre-fill chunk_progress to simulate a partial download (chunk 0
-	// fully done; chunk 1 partially done).
+	// 预填 chunk_progress 以模拟一次部分下载(chunk 0 已全部完成;
+	// chunk 1 部分完成)。
 	if err := st.UpdateTaskProgress(tk.ID, int64(size)/2, []int64{size / 4, size / 8, 0, 0}, store.StatusPaused, ""); err != nil {
 		t.Fatal(err)
 	}

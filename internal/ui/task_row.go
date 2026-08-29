@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package ui
 
 import (
@@ -19,23 +25,23 @@ type taskRow struct {
 	task *store.Task
 	sc   *scheduler.Scheduler
 
-	// Row 1: name + size + status
+	// 第一行：名称 + 大小 + 状态
 	name      *widget.Label
 	size      *widget.Label
 	statusLbl *widget.Label
 
-	// Row 2: progress + speed + eta
+	// 第二行：进度条 + 速度 + 剩余时间
 	progress *widget.ProgressBar
 	speed    *widget.Label
 	remTime  *widget.Label
 
-	// Row 3: action buttons
+	// 第三行：操作按钮
 	startBtn   *widget.Button
 	pauseBtn   *widget.Button
 	cancelBtn  *widget.Button
 	detailsBtn *widget.Button
 
-	// Cached speed between events
+	// 在事件之间缓存的速度
 	curSpeed float64
 
 	inner *fyne.Container
@@ -78,16 +84,16 @@ func (r *taskRow) build() {
 		b.Importance = widget.LowImportance
 	}
 
-	// Row 1: name (expand) [size][status]
+	// 第一行：名称（可扩展）[大小][状态]
 	row1 := container.NewBorder(
 		nil, nil, nil,
 		container.NewHBox(r.size, r.statusLbl),
 		r.name,
 	)
-	// Row 2: progress (expand) full width
+	// 第二行：进度条（可扩展）占满整行
 	row2 := container.NewStack(r.progress)
 
-	// Row 3: speed + ETA on the left, buttons aligned right
+	// 第三行：左侧为速度 + 剩余时间，右侧对齐按钮
 	row3 := container.NewBorder(
 		nil, nil,
 		container.NewHBox(r.startBtn, r.pauseBtn, r.cancelBtn, r.detailsBtn),
@@ -107,7 +113,7 @@ func (r *taskRow) onProgress(ev scheduler.Event) {
 }
 
 func (r *taskRow) bind(t *store.Task, sc *scheduler.Scheduler) {
-	//   - curSpeed: not in Task struct, only updated by progress events.
+	//   - curSpeed：不在 Task 结构体中，仅由进度事件更新。
 	r.task = t
 	r.sc = sc
 	r.refresh()
@@ -188,7 +194,7 @@ func (r *taskRow) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(r.inner)
 }
 
-// displayName returns the human-readable filename for a task.
+// displayName 返回任务的人类可读文件名。
 func displayName(t *store.Task) string {
 	if t.SavePath != "" {
 		return filepath.Base(t.SavePath)
@@ -196,7 +202,7 @@ func displayName(t *store.Task) string {
 	return t.URL
 }
 
-// formatBytes formats n with a binary unit suffix.
+// formatBytes 使用二进制单位后缀格式化 n。
 func formatBytes(n int64) string {
 	if n <= 0 {
 		return "未知大小"
@@ -221,7 +227,7 @@ func formatBytes(n int64) string {
 	}
 }
 
-// formatBPS formats a speed in bytes/second.
+// formatBPS 以字节/秒为单位格式化速度。
 func formatBPS(bps float64) string {
 	if bps <= 0 {
 		return "--"
@@ -229,7 +235,7 @@ func formatBPS(bps float64) string {
 	return formatBytes(int64(bps)) + "/s"
 }
 
-// etaText estimates remaining time for a running task.
+// etaText 估算正在运行任务的剩余时间。
 func etaText(t *store.Task, bps float64) string {
 	if bps <= 0 || t.TotalSize <= 0 {
 		return "ETA --"
@@ -245,15 +251,17 @@ func etaText(t *store.Task, bps float64) string {
 	return "ETA " + formatRemainingTime(secs)
 }
 
-// setGlobalScheduler is called from NewMainWindow to make the scheduler
-// accessible to task row button callbacks without threading sc through
-// every widget constructor.
+// setGlobalScheduler 由 NewMainWindow 调用，以便在不需要
+// 在每个 widget 构造器中传递 sc 的情况下，使 scheduler
+// 可被任务行按钮回调访问。
 var globalSc *scheduler.Scheduler
 
 func setGlobalScheduler(sc *scheduler.Scheduler) { globalSc = sc }
+
 var globalWin fyne.Window
 
 func setGlobalWindow(win fyne.Window) { globalWin = win }
+
 var globalStore *store.Store
 
 func setGlobalStore(st *store.Store) { globalStore = st }

@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package protocol
 
 import (
@@ -12,19 +18,17 @@ import (
 	"time"
 )
 
-// webdavDriver implements ProtocolDriver over HTTP semantics: PROPFIND for
-// size + capability discovery, byte ranges (RFC 7233) for partial fetches.
-// Basic Auth is sent when username/password are supplied. Digest can be
-// added later if needed.
+// webdavDriver 基于 HTTP 语义实现 ProtocolDriver：使用 PROPFIND
+// 探测大小与能力，使用字节区间（RFC 7233）进行分片获取。
+// 当提供用户名/密码时发送 Basic Auth；如有需要后续可再加入 Digest。
 type webdavDriver struct {
 	url  string
 	auth AuthOptions
 	cli  *http.Client
 }
 
-// propfindResponse mirrors the bits we care about from a WebDAV
-// multistatus body. Intentionally minimal — full RFC 4918 surface area is
-// premature for what the engine needs.
+// propfindResponse 镜像 WebDAV multistatus 响应体中我们关心的字段。
+// 故意保持最小——引擎当前尚不需要完整的 RFC 4918 字段集。
 type propfindResponse struct {
 	XMLName   xml.Name           `xml:"multistatus"`
 	Responses []propfindRespItem `xml:"response"`
@@ -44,9 +48,9 @@ type propfindRespItem struct {
 	} `xml:"propstat"`
 }
 
-// newWebDAVDriver is the factory entry point. raw is already the resolved
-// http(s) URL (the factory rewrote webdav://), so the only difference vs
-// the httpDriver is the Probe implementation.
+// newWebDAVDriver 是工厂入口。raw 已经是解析后的 http(s) URL
+// （由工厂改写过 webdav://），因此与 httpDriver 唯一的差别
+// 在于 Probe 实现。
 func newWebDAVDriver(raw string, auth AuthOptions) (ProtocolDriver, error) {
 	if raw == "" {
 		return nil, fmt.Errorf("webdav: empty url")
@@ -81,7 +85,7 @@ func (d *webdavDriver) decorate(req *http.Request) {
 	}
 }
 
-// Probe issues a PROPFIND Depth:0 request and reads getcontentlength.
+// Probe 发起 PROPFIND Depth:0 请求并读取 getcontentlength。
 func (d *webdavDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	body := strings.NewReader(`<?xml version="1.0" encoding="utf-8"?>` +
 		`<propfind xmlns="DAV:"><prop><getcontentlength xmlns="DAV:"/>` +
@@ -127,7 +131,7 @@ func (d *webdavDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	return caps, nil
 }
 
-// fallbackProbe tries HEAD when PROPFIND fails.
+// fallbackProbe 在 PROPFIND 失败时改用 HEAD 进行探测。
 func (d *webdavDriver) fallbackProbe(ctx context.Context) (*DriverCapabilities, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead, d.url, nil)
 	if err != nil {
@@ -150,9 +154,9 @@ func (d *webdavDriver) fallbackProbe(ctx context.Context) (*DriverCapabilities, 
 	return caps, nil
 }
 
-// DownloadChunk is conceptually identical to httpDriver.DownloadChunk. We
-// keep a parallel implementation (not an embedding) so future WebDAV
-// quirks (locking, conditional GET) can be added without touching HTTP.
+// DownloadChunk 在概念上与 httpDriver.DownloadChunk 一致。我们
+// 保留一份并行实现（而非组合）以便未来在不改动 HTTP 的前提下
+// 增加 WebDAV 特有的行为（锁、条件 GET 等）。
 func (d *webdavDriver) DownloadChunk(ctx context.Context, start, end int64, file *os.File, onData func(n int)) error {
 	if start < 0 || end < start {
 		return fmt.Errorf("webdav chunk: invalid range [%d,%d]", start, end)
@@ -199,7 +203,7 @@ func (d *webdavDriver) DownloadChunk(ctx context.Context, start, end int64, file
 	return nil
 }
 
-// DownloadFallback streams from offset.
+// DownloadFallback 从 offset 处开始流式读取。
 func (d *webdavDriver) DownloadFallback(ctx context.Context, offset int64, file *os.File, onData func(n int)) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.url, nil)
 	if err != nil {
@@ -238,7 +242,7 @@ func (d *webdavDriver) DownloadFallback(ctx context.Context, offset int64, file 
 	return nil
 }
 
-// Close shuts down the underlying http.Client's idle connections.
+// Close 关闭底层 http.Client 的空闲连接。
 func (d *webdavDriver) Close() error {
 	if tr, ok := d.cli.Transport.(*http.Transport); ok {
 		tr.CloseIdleConnections()

@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package ui
 
 import (
@@ -23,16 +29,15 @@ import (
 	"lgo_download_manager/internal/store"
 )
 
-// TestMosaicTilesTurnGreenOnDownload runs the real scheduler + engine
-// through a download against an httptest server with no Accept-Ranges
-// (forcing the engine's streaming fallback path). After completion, the
-// engine has collapsed to a single chunk covering the whole file with
-// progress = total bytes. We assert that the mosaic's update() paints
-// every tile with the success color.
+// TestMosaicTilesTurnGreenOnDownload 在一个不支持 Accept-Ranges 的 httptest
+// 服务器上，通过真实的 scheduler + engine 跑一次下载（强制走 engine 的
+// 流式回退路径）。完成后，engine 会折叠为覆盖整个文件的单一分块，且
+// 进度等于总字节数。我们断言 mosaic 的 update() 会将每块瓦片都绘制
+// 为 success 颜色。
 //
-// Tile colors are set by rebuilding canvas.Rectangle children on every
-// update, sidestepping fyne-io/fyne#3216 (Refresh on individual GridWrap
-// children can be silently dropped).
+// 瓦片颜色通过在每次更新时重建 canvas.Rectangle 子节点来设置，
+// 从而规避 fyne-io/fyne#3216（在 GridWrap 单个子节点上调用 Refresh
+// 可能会被静默丢弃）。
 func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 	const size = 4 * 1024 * 1024
 	payload := make([]byte, size)
@@ -137,8 +142,7 @@ func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 		if !ok {
 			t.Fatalf("tile %d is %T, want *canvas.Rectangle", i, obj)
 		}
-		// Fully-downloaded streaming download → every tile should be
-		// the success (green) color.
+		// 流式下载完全完成后 → 每块瓦片都应是 success（绿色）。
 		if rect.FillColor != successColor() {
 			t.Errorf("tile %d FillColor = %v, want Success (%v)",
 				i, rect.FillColor, successColor())
@@ -146,9 +150,9 @@ func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 	}
 }
 
-// successColor resolves the theme's success color so we can compare a
-// tile's FillColor (color.Color) against it.
+// successColor 解析主题的 success 颜色，以便我们比较瓦片
 func successColor() color.Color {
 	th := fyne.CurrentApp().Settings().Theme()
+	// 的 FillColor（color.Color）与其是否相等。
 	return th.Color(theme.ColorNameSuccess, fyne.CurrentApp().Settings().ThemeVariant())
 }

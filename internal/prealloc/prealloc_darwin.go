@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 //go:build darwin
 
 package prealloc
@@ -13,9 +19,9 @@ func platformPrealloc(f *os.File, size int64) error {
 	const _F_PREALLOCATE = 42
 	const _F_ALLOCATECONTIG = 2
 
-	// struct fstore from <sys/fcntl.h>
-	// Mirrors xnu: uint32_t flags, uint32_t posmode, off_t offset, off_t length,
-	//             off_t bytesdone, uint32_t mode
+// 来自 <sys/fcntl.h> 的 struct fstore
+// 对应 xnu: uint32_t flags, uint32_t posmode, off_t offset, off_t length,
+//             off_t bytesdone, uint32_t mode
 	type fstoreT struct {
 		Flags     uint32
 		Posmode   uint32

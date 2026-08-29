@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package store
 
 import (
@@ -52,7 +58,7 @@ func TestStoreRoundtrip(t *testing.T) {
 		t.Fatal("updated_at should be >= created_at")
 	}
 
-	// ListTasks should return our one row.
+	// ListTasks 应该返回我们插入的那一行。
 	list, err := s.ListTasks()
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +67,7 @@ func TestStoreRoundtrip(t *testing.T) {
 		t.Fatalf("ListTasks len=%d", len(list))
 	}
 
-	// Delete + verify.
+	// 删除并验证。
 	if err := s.DeleteTask("task-1"); err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +91,7 @@ func TestStoreReopen(t *testing.T) {
 	}
 	s.Close()
 
-	// Reopen and read.
+	// 重新打开并读取。
 	s2, err := Open(dbPath)
 	if err != nil {
 		t.Fatal(err)

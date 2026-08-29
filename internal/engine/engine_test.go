@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package engine
 
 import (
@@ -18,8 +24,8 @@ import (
 	"lgo_download_manager/internal/protocol"
 )
 
-// TestChunkedDownload spins up an HTTP server serving a randomized file
-// and verifies the engine reconstructs it byte-for-byte using 8 chunks.
+// TestChunkedDownload 启动一个 HTTP 服务器来提供一个随机生成的文件,
+// 并验证引擎能用 8 个分片逐字节地还原该文件。
 func TestChunkedDownload(t *testing.T) {
 	const size = 4 * 1024 * 1024
 	payload := make([]byte, size)
@@ -97,7 +103,7 @@ func TestChunkedDownload(t *testing.T) {
 	}
 }
 
-// TestFallback streams a small file via the fallback path (no range).
+// TestFallback 通过 fallback 路径(无 range)下载一个较小的文件。
 func TestFallback(t *testing.T) {
 	const size = 256 * 1024
 	payload := make([]byte, size)
@@ -142,19 +148,18 @@ func TestFallback(t *testing.T) {
 	}
 }
 
-// TestRealDownload exercises the engine against a live HTTP server with
-// Content-Length and Range support. Skipped in short mode or when the
-// server is unreachable.
+// TestRealDownload 真实地驱动引擎对一个支持 Content-Length 和 Range 的
+// HTTP 服务器进行下载。在 short 模式或服务器不可达时跳过。
 func TestRealDownload(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping real download in short mode")
 	}
 
-	// Use the Go tarball from a CDN — small, fast, and reliably serves
-	// byte-range requests.
+	// 使用 CDN 上的 Go 源码压缩包——体积小、速度快,而且能稳定地
+	// 提供 byte-range 请求支持。
+
 	const url = "https://dl.google.com/go/go1.22.3.src.tar.gz"
 
-	// Probe server for Content-Length and Range support.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	headResp, err := http.Head(url)
 	cancel()
@@ -171,7 +176,7 @@ func TestRealDownload(t *testing.T) {
 		t.Skip("skipping: server did not advertise Content-Length")
 	}
 
-	// Limit to first 256 KiB to keep test time reasonable.
+	// 限制为前 256 KiB,以使测试时间保持合理。
 	const maxSize = 256 * 1024
 	if totalSize > maxSize {
 		totalSize = maxSize
@@ -190,9 +195,8 @@ func TestRealDownload(t *testing.T) {
 		t.Fatalf("prealloc: %v", err)
 	}
 	defer dest.Close()
-
-	// Give the download up to 2 minutes — mirrors can be slow to connect.
 	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Minute)
+	// 给下载最多 2 分钟——某些镜像源连接较慢。
 	defer cancel()
 
 	var progressCalls atomic.Int32
@@ -228,7 +232,7 @@ func TestRealDownload(t *testing.T) {
 	}
 }
 
-// parseRange handles "bytes=START-END" with sizes clipped to total-1.
+// parseRange 解析 "bytes=START-END",并把端点裁剪到 total-1。
 func parseRange(s string, total int64) (int64, int64, error) {
 	if !strings.HasPrefix(s, "bytes=") {
 		return 0, 0, errBadRange

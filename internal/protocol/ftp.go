@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package protocol
 
 import (
@@ -15,22 +21,21 @@ import (
 	ftp "github.com/jlaffaye/ftp"
 )
 
-// ftpDriver implements ProtocolDriver for FTP. Each chunk goroutine owns
-// its own ServerConn because FTP data connections are exclusive to a
-// single transfer; sharing one connection would serialize chunks.
-// All ServerConns log into the same credentials; Probe discovers which.
+// ftpDriver 为 FTP 实现 ProtocolDriver。每个分块 goroutine 持有
+// 自己的 ServerConn，因为 FTP 数据连接在单次传输中是独占的；
+// 共享同一条连接会把分块串行化。所有 ServerConn 使用同一组
+// 凭据登录；由 Probe 探测可用性。
 //
-// We intentionally keep the conn pool concurrency = chunk count upper
-// bound to avoid resource leaks.
+// 我们有意将连接池并发数限制为分块数上限，以避免资源泄漏。
 type ftpDriver struct {
 	host     string // host:port
-	path     string // remote path
+	path     string // 远程路径
 	auth     AuthOptions
 	mu       sync.Mutex
-	reserved bool // whether the server responded 350 to REST 0
+	reserved bool // 服务器是否对 REST 0 响应了 350
 }
 
-// newFTPDriver is the factory entry point.
+// newFTPDriver 是工厂入口。
 func newFTPDriver(raw string, auth AuthOptions) (ProtocolDriver, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -57,15 +62,15 @@ func hasPort(s string) bool {
 	return strings.Contains(s, ":")
 }
 
-// dial logs in with the configured credentials. PASV is controlled by the
-// AuthOptions.FTPPassive flag via DialWithDisabledEPSV (active mode is the
-// negation of "PASV" for our purposes; we keep EPSV/PASV on when
-// FTPPassive is true, the default).
+// dial 使用配置的凭据登录。PASV 由 AuthOptions.FTPPassive 通过
+// DialWithDisabledEPSV 控制（在我们这里，主动模式是 "PASV" 的反面；
+// FTPPassive 为 true（默认值）时保持 EPSV/PASV 开启）。
 func (d *ftpDriver) dial(_ context.Context) (*ftp.ServerConn, error) {
 	opts := []ftp.DialOption{ftp.DialWithTimeout(10 * time.Second)}
 	if !d.auth.FTPPassive {
-		// active mode: ask the client to disable all server-side passive
-		// variants so RETR causes the server to connect back to us.
+		// 主动模式：要求客户端禁用所有服务器端的被动模式变体，
+		// 从而让 RETR 触发服务器回连到我们。
+
 		opts = append(opts, ftp.DialWithDisabledEPSV(true))
 	}
 	conn, err := ftp.Dial(d.host, opts...)
@@ -87,8 +92,8 @@ func (d *ftpDriver) dial(_ context.Context) (*ftp.ServerConn, error) {
 	return conn, nil
 }
 
-// Probe uses SIZE for the total size and REST 0 to discover whether the
-// server supports resume (RFC 959). 350 means supported; 502 means not.
+// Probe 使用 SIZE 获取总大小，并通过 REST 0 探测服务器是否
+// 支持断点续传（RFC 959）。350 表示支持；502 表示不支持。
 func (d *ftpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	conn, err := d.dial(ctx)
 	if err != nil {
@@ -96,7 +101,7 @@ func (d *ftpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	}
 	defer func() { _ = conn.Quit() }()
 
-	// Switch to binary mode for size/retr.
+	// 切换为二进制模式以进行 size/retr。
 	if err := conn.Type("I"); err != nil {
 		return nil, fmt.Errorf("ftp TYPE I: %w", err)
 	}
@@ -106,11 +111,10 @@ func (d *ftpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	if size, err := conn.FileSize(d.path); err == nil {
 		caps.TotalSize = size
 	} else {
-		// No SIZE support is rare; treat as unknown.
+		// 不支持 SIZE 的情况较为罕见；视为未知。
 		caps.TotalSize = -1
 	}
-
-	// Test RESUME: send REST 0 on a probe connection.
+	// 探测 RESUME：在探测连接上发送 REST 0。
 	d.mu.Lock()
 	probe, err := dialRaw(d.host)
 	if err == nil {
@@ -126,8 +130,8 @@ func (d *ftpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	return caps, nil
 }
 
-// dialRaw opens a passive text-mode conn used solely to issue a single
-// REST command. Used by Probe to test resume support cleanly.
+// dialRaw 打开一个被动的文本模式连接，仅用于发送一条 REST 命令。
+// 由 Probe 使用，以便干净地测试断点续传支持。
 func dialRaw(addr string) (*rawConn, error) {
 	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
 	if err != nil {
@@ -143,14 +147,14 @@ type rawConn struct {
 	rd io.Reader
 }
 
-// welcome reads the 220 banner. Future read/writes work in line-protocol.
+// welcome 读取 220 banner。后续的读/写都按行协议进行。
 func (r *rawConn) welcome() {
 	buf := make([]byte, 1024)
 	_, _ = r.rd.Read(buf)
 }
 
-// readReply returns the next status line and any continuation lines until
-// the final "NNN " (space) terminator.
+// readReply 返回下一行状态及其延续行，直到遇到形如 "NNN "（空格）的
+// 终结符为止。
 func (r *rawConn) readReply() (string, error) {
 	var sb strings.Builder
 	tmp := make([]byte, 1024)
@@ -170,8 +174,7 @@ func (r *rawConn) readReply() (string, error) {
 	}
 }
 
-// cmd sends a single command and returns the reply text. expected is -1
-// (any) for probing.
+// cmd 发送单条命令并返回响应文本。探测场景下 expected 取 -1（任意）。
 func (r *rawConn) cmd(_ int, format string, args ...interface{}) (int, string, error) {
 	line := fmt.Sprintf(format, args...) + "\r\n"
 	if _, err := r.c.Write([]byte(line)); err != nil {
@@ -192,13 +195,13 @@ func (r *rawConn) cmd(_ int, format string, args ...interface{}) (int, string, e
 
 func (r *rawConn) Close() error { return r.c.Close() }
 
-// connFor opens a fresh login for one chunk's transfer.
+// connFor 为单个分块传输打开一次全新的登录。
 func (d *ftpDriver) connFor(ctx context.Context) (*ftp.ServerConn, error) {
 	return d.dial(ctx)
 }
 
-// DownloadChunk opens a dedicated control conn, sends REST start, then
-// RETR and streams the body into file at the given offset.
+// DownloadChunk 打开一条专用的控制连接，发送 REST start，再发 RETR，
+// 然后将响应体从给定偏移开始写入 file。
 func (d *ftpDriver) DownloadChunk(ctx context.Context, start, end int64, file *os.File, onData func(n int)) error {
 	conn, err := d.connFor(ctx)
 	if err != nil {
@@ -212,11 +215,11 @@ func (d *ftpDriver) DownloadChunk(ctx context.Context, start, end int64, file *o
 		return fmt.Errorf("ftp TYPE I: %w", err)
 	}
 
-	// Many FTP clients clamp RETR to bytes-below-total by sending REST.
-	// Set the offset; some servers also expect the high byte here.
+	// 许多 FTP 客户端通过发送 REST 把 RETR 限制为「总大小以下的部分」。
+	// 设置起始偏移；部分服务器在此处还期望收到高位字节。
 	r, err := conn.RetrFrom(d.path, uint64(start))
 	if err != nil {
-		// REST unsupported: fail so engine can fall back.
+		// 不支持 REST：直接失败，由引擎选择回退。
 		return fmt.Errorf("ftp RETR/REST: %w", err)
 	}
 	defer r.Close()
@@ -250,8 +253,7 @@ func (d *ftpDriver) DownloadChunk(ctx context.Context, start, end int64, file *o
 	return nil
 }
 
-// DownloadFallback is a plain RETR with no resume. Used when the server
-// does not support REST.
+// DownloadFallback 是一条不带续传的纯 RETR。当服务器不支持 REST 时使用。
 func (d *ftpDriver) DownloadFallback(ctx context.Context, offset int64, file *os.File, onData func(n int)) error {
 	conn, err := d.connFor(ctx)
 	if err != nil {
@@ -297,8 +299,8 @@ func (d *ftpDriver) DownloadFallback(ctx context.Context, offset int64, file *os
 	return nil
 }
 
-// Close releases the reserved-flag mutex. Connection resources are owned
-// per-call (logged in/out as needed).
+// Close 释放 reserved 标志所使用的互斥锁。连接资源按调用粒度持有
+// （按需登录/登出）。
 func (d *ftpDriver) Close() error {
 	return nil
 }

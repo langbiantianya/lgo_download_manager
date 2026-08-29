@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package ui
 
 import (
@@ -16,28 +22,27 @@ import (
 	"lgo_download_manager/internal/store"
 )
 
-// blockSize is the fixed visual chunk size used by the mosaic (1 MiB).
+// blockSize 是马赛克中使用的固定可视分块大小（1 MiB）。
 const blockSize int64 = 1 << 20
 
-// maxTiles caps the number of tiles in the mosaic so we don't render
-// thousands of widgets for very large files. 1024 ≈ 1 GiB visible at
-// the natural scale; larger files collapse multiple MiB per tile.
+// maxTiles 限制马赛克中的瓦片数量，避免为超大文件渲染成千上万个 widget。
+// 1024 ≈ 在默认比例下显示 1 GiB；更大的文件会将多个 MiB 合并到一块瓦片中。
 const maxTiles = 1024
 
-// tileSize is the side length of each mosaic tile in points. Small
-// squares wrap into a tiled wall.
+// tileSize 是每个马赛克瓦片的边长（以 point 为单位）。
+// 小方块会排列成一面瓦片墙。
 const tileSize = 12
 
-// chunkMosaic renders the file as a wall of small square tiles. Each
-// tile represents blockSize bytes (or more for very large files so we
-// stay within maxTiles widgets). Completed ranges turn the tile green;
-// partial ranges use the theme's primary color; empty ranges use the
-// input background.
+// chunkMosaic 将文件渲染为一面由小方块组成的瓦片墙。
+// 每个瓦片代表 blockSize 字节（对于超大文件可能更多，
+// 以保证 widget 数量不超过 maxTiles）。已完成的范围将
+// 瓦片染为绿色；部分完成的范围使用主题的主色；空白范围
+// 使用输入框背景色。
 //
-// Tiles are real canvas.Rectangle widgets inside a GridWrap. We rebuild
-// the wrap on every update so each tile is freshly created — this
-// sidesteps fyne-io/fyne#3216 where Refresh() on individual children of
-// a GridWrap can be silently dropped.
+// 瓦片是 GridWrap 内的真实 canvas.Rectangle widget。
+// 我们在每次更新时重建 wrap，使每个瓦片都是新创建的——
+// 这规避了 fyne-io/fyne#3216：在 GridWrap 子节点上单独
+// 调用 Refresh() 可能会被静默丢弃。
 type chunkMosaic struct {
 	widget.BaseWidget
 	wrap    *fyne.Container
@@ -47,8 +52,8 @@ type chunkMosaic struct {
 	blocks  int
 }
 
-// showChunkDetails opens a window showing per-block progress for a task.
-// Each block is rendered as a tile in a wall — see chunkMosaic.
+// showChunkDetails 打开一个窗口，展示任务按分块的下载进度。
+// 每个分块被渲染为瓦片墙中的一块——参见 chunkMosaic。
 func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window) {
 	titleStr := fmt.Sprintf("任务详情: %s", taskName(t))
 
@@ -97,8 +102,8 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 	w.SetOnClosed(func() { unsub() })
 }
 
-// newChunkMosaic creates an empty mosaic; resizeForTotal allocates the
-// tile grid once we know the file size.
+// newChunkMosaic 创建一个空马赛克；resizeForTotal 会在知道文件大小后
+// 分配瓦片网格。
 func newChunkMosaic(taskID string) *chunkMosaic {
 	m := &chunkMosaic{
 		taskID: taskID,
@@ -108,10 +113,10 @@ func newChunkMosaic(taskID string) *chunkMosaic {
 	return m
 }
 
-// resizeForTotal rebuilds the wrap with the right number of tiles for
-// the file size. Each tile is blockSize bytes (or more for very large
-// files so we stay within maxTiles).
+// resizeForTotal 根据文件大小重建 wrap，并使用正确数量的瓦片。
 func (m *chunkMosaic) resizeForTotal(total int64) {
+	// 每个瓦片代表 blockSize 字节（对于超大文件可能更多，
+	// 以保证瓦片总数不超过 maxTiles）。
 	if total <= 0 {
 		m.total = 0
 		m.blocks = 0
@@ -141,13 +146,13 @@ func (m *chunkMosaic) resizeForTotal(total int64) {
 	m.Refresh()
 }
 
-// update rebuilds the wrap with freshly-painted tiles for the given
-// chunk layout and progress. Same algorithm as before: walk each chunk's
-// range, decide which fraction of each tile's byte range is covered.
-//
-// chunkProgress is per-chunk offset-from-start; chunkRanges is paired
-// [start0,end0,start1,end1,...] with inclusive end.
+// update 根据给定的分块布局和进度，使用新绘制的瓦片重建 wrap。
 func (m *chunkMosaic) update(chunkProgress, chunkRanges []int64, totalSize int64) {
+	// 算法与之前相同：遍历每个分块的范围，确定每个瓦片字节范围内
+	// 被覆盖的比例。
+	//
+	// chunkProgress 是每个分块自起始位置的偏移；chunkRanges 是成对的
+	// [start0,end0,start1,end1,...]，end 为闭区间。
 	if totalSize != m.total {
 		m.total = totalSize
 		m.resizeForTotal(totalSize)
@@ -159,7 +164,7 @@ func (m *chunkMosaic) update(chunkProgress, chunkRanges []int64, totalSize int64
 	ranges := chunkRanges
 	progress := chunkProgress
 	if len(ranges) == 0 || len(ranges) != 2*len(progress) {
-		// Fallback: assume N even chunks based on progress-array length.
+		// 回退方案：基于 progress 数组长度假定 N 个均匀分块。
 		threads := len(progress)
 		if threads == 0 {
 			m.wrap.Objects = m.makeTiles(make([]float64, m.blocks))
@@ -226,10 +231,10 @@ func (m *chunkMosaic) update(chunkProgress, chunkRanges []int64, totalSize int64
 	m.Refresh()
 }
 
-// makeTiles creates a fresh slice of canvas.Rectangle children — one
-// per tile — using the per-tile covered fraction to choose colour.
-// Rebuilding rather than mutating sidesteps fyne-io/fyne#3216.
+// makeTiles 新建一组 canvas.Rectangle 子节点——每个瓦片一个——
 func (m *chunkMosaic) makeTiles(covered []float64) []fyne.CanvasObject {
+	// 根据每块瓦片的覆盖比例选择颜色。重建而非就地修改可规避
+	// fyne-io/fyne#3216。
 	objs := make([]fyne.CanvasObject, len(covered))
 	th := fyne.CurrentApp().Settings().Theme()
 	for i, frac := range covered {
@@ -241,9 +246,9 @@ func (m *chunkMosaic) makeTiles(covered []float64) []fyne.CanvasObject {
 	return objs
 }
 
-// tileColor picks a color based on the tile's covered fraction. Fully
-// done tiles use the success (green) color; partial tiles use the
-// theme primary; empty tiles use the input background.
+// tileColor 根据瓦片的覆盖比例选择颜色。完全下载完成的瓦片
+// 使用 success（绿色）；部分完成的瓦片使用主题的主色；
+// 空瓦片使用输入框背景色。
 func tileColor(th fyne.Theme, frac float64) color.Color {
 	switch {
 	case frac >= 1:
@@ -255,9 +260,7 @@ func tileColor(th fyne.Theme, frac float64) color.Color {
 	}
 }
 
-// CreateRenderer returns a minimal renderer. The tiles live in m.wrap
-// and render themselves; this widget just needs a renderer to satisfy
-// fyne.Widget.
+// CreateRenderer 返回一个最小化的 renderer。瓦片由 m.wrap
 func (m *chunkMosaic) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(container.NewWithoutLayout())
 }
@@ -276,7 +279,7 @@ func max64(a, b int64) int64 {
 	return b
 }
 
-// uaForTask returns the User-Agent string applied to the task's downloads.
+// uaForTask 返回应用于该任务下载的 User-Agent 字符串。
 func uaForTask(t *store.Task) string {
 	if t.AuthData == "" {
 		return "UA: Wget/1.21.3 (default)"
@@ -290,7 +293,7 @@ func uaForTask(t *store.Task) string {
 	return "UA: Wget/1.21.3 (default)"
 }
 
-// taskName returns the file name portion of a task's save path.
+// taskName 返回任务保存路径中的文件名部分。
 func taskName(t *store.Task) string {
 	return filepath.Base(t.SavePath)
 }

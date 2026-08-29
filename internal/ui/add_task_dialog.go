@@ -1,3 +1,9 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package ui
 
 import (
@@ -12,11 +18,10 @@ import (
 	"lgo_download_manager/internal/scheduler"
 )
 
-// showAddTaskDialog opens the "新建下载任务" dialog with global settings
-// pre-populated. Only essential fields appear here; advanced options live
-// in the Settings dialog.
+// showAddTaskDialog 打开“新建下载任务”对话框，并预填全局设置中的内容。
+// 这里只显示必要的字段；高级选项位于“设置”对话框中。
 func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
-	// Build a vertically laid-out form with left-aligned labels.
+	// 构建一个纵向布局、标签左对齐的表单。
 	makeRow := func(label string, w fyne.CanvasObject) *fyne.Container {
 		lbl := widget.NewLabel(label)
 		lbl.Alignment = fyne.TextAlignLeading
@@ -95,4 +100,3 @@ var errEmpty = errEmptyField{}
 type errEmptyField struct{}
 
 func (errEmptyField) Error() string { return "required" }
-

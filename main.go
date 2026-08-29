@@ -1,7 +1,13 @@
-// ldm (Local Download Manager) is the single binary that runs the full
-// download manager: SQLite store, scheduler, and Fyne GUI.
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
 //
-// URL scheme: lgom://download?url=<encoded>[&name=<encoded>[&ua=<encoded>[&headers=<encoded>[&cookies=<encoded>]]]]
+// Copyright (c) 2026 langbiantianya
+
+// ldm（Local Download Manager）是运行整套下载管理器的单一可执行文件：
+// SQLite store、scheduler 以及 Fyne GUI。
+//
+// URL scheme：lgom://download?url=<encoded>[&name=<encoded>[&ua=<encoded>[&headers=<encoded>[&cookies=<encoded>]]]]
 package main
 
 import (
@@ -33,8 +39,8 @@ func main() {
 	openURL := flag.String("open-url", "", "download URL (lgom://... format)")
 	flag.Parse()
 
-	// Collect URLs from --open-url flag and positional arguments.
-	// Some desktop environments pass the URL as a positional arg.
+	// 从 --open-url flag 与位置参数中收集 URL。
+	// 部分桌面环境会以位置参数的形式传入 URL。
 	var urls []string
 	if *openURL != "" {
 		urls = append(urls, *openURL)
@@ -45,13 +51,13 @@ func main() {
 		}
 	}
 
-	// Single-instance lock
+	// 单实例锁
 	isPrimary, release, err := urllauncher.AcquireLock()
 	if err != nil {
 		log.Fatalf("urllauncher: %v", err)
 	}
 	if !isPrimary {
-		// Another instance is running; forward all URLs and exit
+			// 已有其他实例运行；转发所有 URL 后退出
 		if len(urls) > 0 {
 			for _, u := range urls {
 				if err := urllauncher.SendURL(u); err != nil {
@@ -70,18 +76,18 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Store
+	// 存储层
 	st, err := store.Open(*dbPath)
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
 	defer st.Close()
 
-	// Scheduler
+	// 调度器
 	sc := scheduler.New(st)
-	go sc.Run(ctx) // background flusher; cancelled via ctx
+	go sc.Run(ctx) // 后台刷盘协程；通过 ctx 取消
 
-	// URL handler: add download task from URL request
+	// URL handler：从 URL 请求添加下载任务
 	handleDownloadURL := func(rawURL string) {
 		req, err := urllauncher.HandleURL(rawURL)
 		if err != nil {
@@ -90,24 +96,24 @@ func main() {
 		}
 		log.Printf("adding download: %s", req.URL)
 
-		// Detect protocol
+		// 探测 protocol
 		proto, err := protocol.DetectKind(req.URL, "")
 		if err != nil {
 			log.Printf("invalid URL: %v", err)
 			return
 		}
 
-		// Use default save dir, or configured one
+		// 优先使用已配置的保存目录，否则回退到默认
 		saveDir := defaultSaveDir()
 		if ui.GlobalSettings.DefaultSaveDir != "" {
 			saveDir = ui.GlobalSettings.DefaultSaveDir
 		}
 
-		// Filename from URL if not provided
+		// 若未提供文件名则从 URL 中推导
 		filename := req.Name
 		if filename == "" {
 			filename = filepath.Base(req.URL)
-			// Remove query string from filename
+			// 从文件名中移除 query string
 			if idx := strings.IndexByte(filename, '?'); idx != -1 {
 				filename = filename[:idx]
 			}
@@ -132,29 +138,29 @@ func main() {
 			return
 		}
 
-		// Start the download
+		// 启动下载
 		if err := sc.Start(tk.ID); err != nil {
 			log.Printf("failed to start task: %v", err)
 		}
 	}
 
-	// Start Unix socket server for URL forwarding (non-blocking)
+	// 启动 Unix socket server 用于 URL 转发（非阻塞）
 	go func() {
 		if err := urllauncher.ListenAndServe(handleDownloadURL); err != nil {
 			log.Printf("urllauncher server error: %v", err)
 		}
 	}()
 
-	// Handle URLs passed as arguments (via --open-url or positional args)
+	// 处理通过 --open-url 或位置参数传入的 URL
 	for _, u := range urls {
 		handleDownloadURL(u)
 	}
 
-	// GUI — must run on the main goroutine where Fyne's Run() executes.
+	// GUI —— 必须在 Fyne Run() 所在的 main goroutine 中执行。
 	if !*noGUI {
 		a := app.NewWithID("com.ldm")
-		// Construct the window AFTER the app is created so widget constructors
-		// can resolve fyne.CurrentApp() (list.go calls it during setup).
+		// 在 app 创建之后再构造窗口，这样 widget 构造时可以解析
+		// fyne.CurrentApp()（list.go 在初始化阶段会调用它）。
 		win := ui.NewMainWindow(a, st, sc)
 		win.Show()
 		a.Run()
@@ -162,7 +168,7 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Wait for shutdown signal
+	// 等待关闭信号
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -170,7 +176,7 @@ func main() {
 	cancel()
 }
 
-// defaultSaveDir returns a platform-appropriate download directory.
+// defaultSaveDir 返回当前平台合适的下载目录。
 func defaultSaveDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, "Downloads")
