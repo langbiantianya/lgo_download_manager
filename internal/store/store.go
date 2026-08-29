@@ -50,6 +50,7 @@ const (
 	StatusPaused     Status = "Paused"
 	StatusCompleted  Status = "Completed"
 	StatusFailed     Status = "Failed"
+	StatusFileLost   Status = "FileLost"
 )
 
 // Task 是数据库行的内存表示，便于 JSON 序列化。

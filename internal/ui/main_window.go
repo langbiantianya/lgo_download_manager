@@ -21,7 +21,7 @@ import (
 	"image/color"
 	"log"
 	"path/filepath"
-
+	"time"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
@@ -37,7 +37,8 @@ type MainWindow struct {
 	taskList  *taskList
 	statusBar *statusBar
 
-	unsub func()
+	unsub     func()
+	focusTicker *time.Ticker
 }
 
 // NewMainWindow 构建附加到 app 的主窗口。
@@ -191,14 +192,26 @@ func (m *MainWindow) buildSidebar() fyne.CanvasObject {
 	)
 }
 
-// Show 显示主窗口。
+// Show 显示主窗口并在周期性地检查文件是否存在。
 // 在主 goroutine 中、a.Run() 之前调用，因此不需要 fyne.Do()。
 func (m *MainWindow) Show() {
 	m.win.Show()
+	if m.focusTicker == nil {
+		m.focusTicker = time.NewTicker(10 * time.Second)
+		go func() {
+			for range m.focusTicker.C {
+				m.sc.ValidateFileExistence()
+			}
+		}()
+	}
 }
 
-// Close 清理订阅。
+// Close 清理订阅和定时器。
 func (m *MainWindow) Close() {
+	if m.focusTicker != nil {
+		m.focusTicker.Stop()
+		m.focusTicker = nil
+	}
 	if m.unsub != nil {
 		m.unsub()
 	}

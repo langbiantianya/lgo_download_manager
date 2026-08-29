@@ -125,7 +125,13 @@ func (r *taskRow) bindButtons(t *store.Task, sc *scheduler.Scheduler) {
 		return
 	}
 	taskID := t.ID
-	r.startBtn.OnTapped = func() { _ = sc.Start(taskID) }
+	r.startBtn.OnTapped = func() {
+		// 文件丢失状态：先重置进度再启动
+		if t.Status == store.StatusFileLost {
+			_ = sc.ResetTask(taskID)
+		}
+		_ = sc.Start(taskID)
+	}
 	r.pauseBtn.OnTapped = func() { _ = sc.Pause(taskID) }
 	r.cancelBtn.OnTapped = func() { sc.Delete(taskID) }
 	r.detailsBtn.OnTapped = func() { showChunkDetails(t, sc, globalWin) }
@@ -180,6 +186,12 @@ func (r *taskRow) refresh() {
 		r.remTime.SetText("--")
 		r.pauseBtn.Hide()
 		r.startBtn.Hide()
+	case store.StatusFileLost:
+		r.statusLbl.SetText("文件丢失")
+		r.speed.SetText("--")
+		r.remTime.SetText("--")
+		r.startBtn.Show()
+		r.pauseBtn.Hide()
 	case store.StatusFailed:
 		r.statusLbl.SetText("失败")
 		r.speed.SetText("--")
