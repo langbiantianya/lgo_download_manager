@@ -83,6 +83,9 @@ type Job struct {
 	log        Logger
 }
 
+
+const oneMiB = 1 << 20
+
 type chunk struct {
 	idx      int
 	start    int64
@@ -124,10 +127,46 @@ func (j *Job) plan() {
 		j.chunks = append(j.chunks, chunk{idx: 0, start: 0, end: -1})
 		return
 	}
-	// ChunkCount 是允许的最大并发连接数。实际的
-	// 分片数量由 MinChunkSize 决定——每个分片至少为
-	// MinChunkSize 字节,除非文件本身更小。
+	// 文件小于 1 MiB：不分块，单个流式 chunk。
+	if j.total < oneMiB {
+		j.chunks = append(j.chunks, chunk{idx: 0, start: 0, end: j.total - 1, progress: 0})
+		return
+	}
 
+	// 文件大于等于 1 MiB 但小于 MinChunkSize：
+	// 按 ChunkCount 等分，忽略 MinChunkSize。
+	if j.total < j.opts.MinChunkSize {
+		n := j.chunkCount
+		if n <= 0 {
+			n = 1
+		}
+		step := j.total / int64(n)
+		rem := j.total % int64(n)
+		start := int64(0)
+		for i := 0; i < n; i++ {
+			size := step
+			if i == n-1 {
+				size += rem
+			}
+			end := start + size - 1
+			c := chunk{idx: i, start: start, end: end, progress: start}
+			if i < len(j.opts.ResumeFrom) {
+				c.progress = c.start + j.opts.ResumeFrom[i]
+				if c.progress < c.start {
+					c.progress = c.start
+				}
+				if c.progress > c.end {
+					c.progress = c.end + 1
+				}
+			}
+			j.chunks = append(j.chunks, c)
+			start = end + 1
+		}
+		return
+	}
+
+	// 文件大于等于 MinChunkSize：每个 chunk 至少 MinChunkSize，
+	// 由 ChunkCount 限制最大并发数。
 	n := int(j.total / j.opts.MinChunkSize)
 	if j.total%j.opts.MinChunkSize != 0 {
 		n++
@@ -141,7 +180,7 @@ func (j *Job) plan() {
 	step := j.total / int64(n)
 	rem := j.total % int64(n)
 	start := int64(0)
-	for i := range n {
+	for i := 0; i < n; i++ {
 		size := step
 		if i == n-1 {
 			size += rem

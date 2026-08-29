@@ -87,9 +87,11 @@ internal/urllauncher/          # lgom:// URL 解析、Unix socket 转发
 internal/ui/                   # Fyne 窗口、任务列表、设置对话框、分片视图
 ```
 
-引擎按 `min(MinChunkSize, ceil(total / MinChunkSize))` 规划分片，
-并以 `ChunkCount` 作为上限。若服务器未声明 `Accept-Ranges`，
-则回退到单流下载，只产生一个分片。
+分片规划规则（若服务器不支持 `Accept-Ranges` 则回退为单流）：
+
+- 文件 < 1 MiB：不分块，1 个 chunk。
+- 1 MiB ≤ 文件 < MinChunkSize：按配置的线程数（ChunkCount）等分。
+- 文件 ≥ MinChunkSize：每个 chunk 至少 MinChunkSize，由 ChunkCount 限制上限。
 
 ## 测试
 
