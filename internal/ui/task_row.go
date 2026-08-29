@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -244,6 +245,14 @@ func displayName(t *store.Task) string {
 		return filepath.Base(t.SavePath)
 	}
 	return t.URL
+}
+// formatTime 把 time.Time 渲染为本地时区的 YYYY-MM-DD HH:MM:SS 字符串。
+// 零值返回 "-" 表示尚未发生。
+func formatTime(t time.Time) string {
+	if t.IsZero() {
+		return "-"
+	}
+	return t.Local().Format("2006-01-02 15:04:05")
 }
 
 // formatBytes 使用二进制单位后缀格式化 n。

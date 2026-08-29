@@ -154,3 +154,52 @@ func TestListTasksFilter(t *testing.T) {
 		t.Fatalf("FilterCompleted=%v want only task c", done)
 	}
 }
+func TestCompletedAt(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// 新建任务，CompletedAt 应为零值。
+	if err := s.CreateTask(&Task{
+		ID: "x", URL: "u", SavePath: "/tmp/x", Protocol: "HTTP",
+		ChunkProgress: []int64{}, Status: TaskStatus.Pending,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetTask("x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.CompletedAt.IsZero() {
+		t.Fatalf("CompletedAt should be zero initially, got %v", got.CompletedAt)
+	}
+
+	// 状态变为 Completed 时，CompletedAt 应被自动写入。
+	if err := s.UpdateTaskProgress("x", 0, nil, TaskStatus.Completed, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetTask("x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.CompletedAt.IsZero() {
+		t.Fatal("CompletedAt should be set after Completed transition")
+	}
+	if !got.CompletedAt.After(time.Now().Add(-time.Hour)) {
+		t.Fatalf("CompletedAt should be recent, got %v", got.CompletedAt)
+	}
+
+	// 多次 UpdateTaskProgress 不应覆盖原 CompletedAt（用 COALESCE 保留）。
+	first := got.CompletedAt
+	time.Sleep(10 * time.Millisecond)
+	if err := s.UpdateTaskProgress("x", 0, nil, TaskStatus.Completed, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = s.GetTask("x")
+	if !got.CompletedAt.Equal(first) {
+		t.Fatalf("CompletedAt should not be overwritten; was %v, now %v", first, got.CompletedAt)
+	}
+}

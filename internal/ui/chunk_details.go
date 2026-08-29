@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"image/color"
 	"path/filepath"
-
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
@@ -63,6 +62,8 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 	pathLabel := widget.NewLabel("路径: " + t.SavePath)
 	sizeLabel := widget.NewLabel(fmt.Sprintf("总计: %s", formatBytes(t.TotalSize)))
 	uaLabel := widget.NewLabel(uaForTask(t))
+	createdAtLabel := widget.NewLabel("添加时间: " + formatTime(t.CreatedAt))
+	completedAtLabel := widget.NewLabel("下载完成时间: " + formatTime(t.CompletedAt))
 
 	mosaic := newChunkMosaic(t.ID)
 	mosaic.resizeForTotal(t.TotalSize)
@@ -76,6 +77,8 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 		pathLabel,
 		sizeLabel,
 		uaLabel,
+		createdAtLabel,
+		completedAtLabel,
 		widget.NewSeparator(),
 		widget.NewLabel("文件分块详情"),
 	)

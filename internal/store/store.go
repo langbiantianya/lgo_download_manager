@@ -133,6 +133,7 @@ type Task struct {
 	ErrorMessage  string    `json:"error_message"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
+	CompletedAt   time.Time `json:"completed_at"` // 零值表示尚未完成
 }
 
 // Store 用 engine 使用的 prepared 语句封装 *sql.DB。
@@ -207,6 +208,9 @@ func (s *Store) migrate() error {
 	if err := s.addColumnIfMissing("tasks", "chunk_ranges", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
+	if err := s.addColumnIfMissing("tasks", "completed_at", "DATETIME"); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -260,12 +264,12 @@ func (s *Store) CreateTask(t *Task) error {
 	_, err := s.db.Exec(`INSERT INTO tasks (
 		id,url,save_path,protocol,total_size,downloaded,support_range,
 		is_allocated,chunk_count,chunk_progress,chunk_ranges,status,
-		auth_data,error_message,created_at,updated_at
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		auth_data,error_message,created_at,updated_at,completed_at
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		t.ID, t.URL, t.SavePath, t.Protocol, t.TotalSize, t.Downloaded,
 		boolToInt(t.SupportRange), boolToInt(t.IsAllocated), t.ChunkCount,
 		string(cpJSON), string(rgJSON), string(t.Status), t.AuthData,
-		t.ErrorMessage, t.CreatedAt, t.UpdatedAt,
+		t.ErrorMessage, t.CreatedAt, t.UpdatedAt, nil,
 	)
 	if err != nil {
 		return fmt.Errorf("store insert: %w", err)
@@ -274,7 +278,8 @@ func (s *Store) CreateTask(t *Task) error {
 }
 
 // UpdateTaskProgress 是 engine 使用的高频刷盘路径。仅更新易变列
-// （downloaded、chunk_progress、status）。
+// （downloaded、chunk_progress、status）。当状态变为 Completed 时，
+// 自动写入 completed_at；其余情况保持原值。
 func (s *Store) UpdateTaskProgress(id string, downloaded int64, chunkProgress []int64, status Status, errMsg string) error {
 	if chunkProgress == nil {
 		chunkProgress = []int64{}
@@ -282,13 +287,21 @@ func (s *Store) UpdateTaskProgress(id string, downloaded int64, chunkProgress []
 	cpJSON, _ := json.Marshal(chunkProgress)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	now := time.Now().UTC()
+	if status == _completed {
+		_, err := s.db.Exec(`UPDATE tasks SET
+			downloaded=?, chunk_progress=?, status=?, error_message=?, updated_at=?,
+			completed_at=COALESCE(completed_at, ?)
+		WHERE id=?`,
+			downloaded, string(cpJSON), string(status), errMsg, now, now, id)
+		return err
+	}
 	_, err := s.db.Exec(`UPDATE tasks SET
 		downloaded=?, chunk_progress=?, status=?, error_message=?, updated_at=?
 		WHERE id=?`,
-		downloaded, string(cpJSON), string(status), errMsg, time.Now().UTC(), id)
+		downloaded, string(cpJSON), string(status), errMsg, now, id)
 	return err
 }
-
 // UpdateTaskMeta 在 Probe 完成后更新非易变字段。
 func (s *Store) UpdateTaskMeta(id string, totalSize int64, supportRange, isAllocated bool, chunkCount int) error {
 	s.mu.Lock()
@@ -306,7 +319,7 @@ func (s *Store) GetTask(id string) (*Task, error) {
 	row := s.db.QueryRow(`SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
 		is_allocated,chunk_count,chunk_progress,chunk_ranges,status,
-		auth_data,error_message,created_at,updated_at
+		auth_data,error_message,created_at,updated_at,completed_at
 		FROM tasks WHERE id=?`, id)
 	return scanTask(row)
 }
@@ -319,7 +332,7 @@ func (s *Store) ListTasks(filter StatusFilter) ([]*Task, error) {
 	query := `SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
 		is_allocated,chunk_count,chunk_progress,chunk_ranges,status,
-		auth_data,error_message,created_at,updated_at
+		auth_data,error_message,created_at,updated_at,completed_at
 		FROM tasks`
 	if useWhere {
 		query += ` WHERE status = ?`
@@ -396,17 +409,21 @@ type scanner interface {
 
 func scanTask(s scanner) (*Task, error) {
 	var (
-		t          Task
-		cp, rg     string
-		support    int
-		alloc      int
-		total, dwn int64
+		t             Task
+		cp, rg        string
+		support       int
+		alloc         int
+		total, dwn    int64
+		completedAtNS sql.NullTime
 	)
 	err := s.Scan(&t.ID, &t.URL, &t.SavePath, &t.Protocol, &total, &dwn,
 		&support, &alloc, &t.ChunkCount, &cp, &rg, &t.Status, &t.AuthData,
-		&t.ErrorMessage, &t.CreatedAt, &t.UpdatedAt)
+		&t.ErrorMessage, &t.CreatedAt, &t.UpdatedAt, &completedAtNS)
 	if err != nil {
 		return nil, err
+	}
+	if completedAtNS.Valid {
+		t.CompletedAt = completedAtNS.Time
 	}
 	t.TotalSize = total
 	t.Downloaded = dwn
