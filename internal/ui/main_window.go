@@ -106,9 +106,10 @@ func (m *MainWindow) buildSettingsHeader() fyne.CanvasObject {
 	return container.NewBorder(nil, nil, backBtn, nil, container.NewHBox(title, layout.NewSpacer()))
 }
 
-// buildSettingsContent 返回设置表单内容。
+// buildSettingsContent 返回设置表单内容。onChange 在任意设置项变更后触发，
+// 用于刷新任务列表（例如排序方式改变后）。
 func (m *MainWindow) buildSettingsContent() fyne.CanvasObject {
-	return buildSettingsContent(m.sc)
+	return buildSettingsContent(m.sc, func() { m.taskList.refresh() })
 }
 
 // buildToolbar 排列操作按钮、搜索框以及设置快捷按钮。

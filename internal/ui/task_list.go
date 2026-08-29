@@ -51,7 +51,7 @@ func (tl *taskList) container() *fyne.Container { return tl.panel }
 
 func (tl *taskList) allTasks() []*store.Task {
 	fv, _ := tl.filter.Get()
-	tks, _ := tl.sc.List(store.StatusFilter(fv))
+	tks, _ := tl.sc.List(store.StatusFilter(fv), GlobalSettings.TaskSort)
 	return tks
 }
 

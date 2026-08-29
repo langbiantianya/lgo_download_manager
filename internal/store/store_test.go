@@ -59,7 +59,7 @@ func TestStoreRoundtrip(t *testing.T) {
 	}
 
 	// ListTasks 应该返回我们插入的那一行。
-	list, err := s.ListTasks(FilterAll)
+	list, err := s.ListTasks(FilterAll, SortCreatedDesc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestListTasksFilter(t *testing.T) {
 	mkTask("c", TaskStatus.Completed)
 
 	// FilterAll 返回全部 3 行。
-	all, err := s.ListTasks(FilterAll)
+	all, err := s.ListTasks(FilterAll, SortCreatedDesc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +137,7 @@ func TestListTasksFilter(t *testing.T) {
 	}
 
 	// FilterDownloading 只返回 Downloading 状态的 1 行。
-	dl, err := s.ListTasks(FilterDownloading)
+	dl, err := s.ListTasks(FilterDownloading, SortCreatedDesc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +146,7 @@ func TestListTasksFilter(t *testing.T) {
 	}
 
 	// FilterCompleted 只返回 1 行。
-	done, err := s.ListTasks(FilterCompleted)
+	done, err := s.ListTasks(FilterCompleted, SortCreatedDesc)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -202,4 +202,74 @@ func TestCompletedAt(t *testing.T) {
 	if !got.CompletedAt.Equal(first) {
 		t.Fatalf("CompletedAt should not be overwritten; was %v, now %v", first, got.CompletedAt)
 	}
+}
+func TestListTasksSort(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// 插入 3 个任务，通过 SetCreatedAt 控制时间先后。
+	mk := func(id, path string, created time.Time) {
+		if err := s.CreateTask(&Task{
+			ID: id, URL: "u", SavePath: path, Protocol: "HTTP",
+			ChunkProgress: []int64{}, Status: TaskStatus.Pending,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		// 直接更新 created_at 绕过 CreateTask 默认值。
+		if _, err := s.db.Exec(`UPDATE tasks SET created_at=? WHERE id=?`, created.UTC(), id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	base := time.Now().UTC()
+	mk("a", "/tmp/banana.bin", base.Add(-2*time.Hour))
+	mk("b", "/tmp/apple.bin", base.Add(-1*time.Hour))
+	mk("c", "/tmp/cherry.bin", base)
+
+	// SortCreatedDesc: c, b, a（最新的在前）
+	got, err := s.ListTasks(FilterAll, SortCreatedDesc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0].ID != "c" || got[1].ID != "b" || got[2].ID != "a" {
+		t.Fatalf("SortCreatedDesc order: %v", gotIDs(got))
+	}
+
+	// SortCreatedAsc: a, b, c
+	got, err = s.ListTasks(FilterAll, SortCreatedAsc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].ID != "a" || got[1].ID != "b" || got[2].ID != "c" {
+		t.Fatalf("SortCreatedAsc order: %v", gotIDs(got))
+	}
+
+	// SortNameAsc: apple, banana, cherry
+	got, err = s.ListTasks(FilterAll, SortNameAsc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].ID != "b" || got[1].ID != "a" || got[2].ID != "c" {
+		t.Fatalf("SortNameAsc order: %v", gotIDs(got))
+	}
+
+	// SortNameDesc: cherry, banana, apple
+	got, err = s.ListTasks(FilterAll, SortNameDesc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].ID != "c" || got[1].ID != "a" || got[2].ID != "b" {
+		t.Fatalf("SortNameDesc order: %v", gotIDs(got))
+	}
+}
+
+func gotIDs(ts []*Task) []string {
+	out := make([]string, len(ts))
+	for i, t := range ts {
+		out[i] = t.ID
+	}
+	return out
 }

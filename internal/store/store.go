@@ -113,6 +113,36 @@ func (f StatusFilter) filterStatus() (Status, bool) {
 
 func (f StatusFilter) String() string { return string(f) }
 
+// TaskSort 是任务列表的排序方式枚举类。
+type TaskSort string
+
+const (
+	SortCreatedDesc TaskSort = "created_desc" // 按添加时间倒序（默认，最新的在前）
+	SortCreatedAsc  TaskSort = "created_asc"  // 按添加时间正序（最老的在前）
+	SortNameAsc     TaskSort = "name_asc"     // 按文件名正序（A-Z）
+	SortNameDesc    TaskSort = "name_desc"    // 按文件名倒序（Z-A）
+)
+
+// AllTaskSorts 列出所有可选排序选项，用于 UI 渲染。
+func AllTaskSorts() []TaskSort {
+	return []TaskSort{SortCreatedDesc, SortCreatedAsc, SortNameAsc, SortNameDesc}
+}
+
+// orderByClause 把 TaskSort 翻译成 SQL ORDER BY 子句。
+func (s TaskSort) orderByClause() string {
+	switch s {
+	case SortCreatedAsc:
+		return "ORDER BY created_at ASC, id ASC"
+	case SortNameAsc:
+		return "ORDER BY save_path ASC, id ASC"
+	case SortNameDesc:
+		return "ORDER BY save_path DESC, id ASC"
+	default:
+		return "ORDER BY updated_at DESC, id ASC"
+	}
+}
+
+func (s TaskSort) String() string { return string(s) }
 
 // Task 是数据库行的内存表示，便于 JSON 序列化。
 type Task struct {
@@ -211,10 +241,11 @@ func (s *Store) migrate() error {
 	if err := s.addColumnIfMissing("tasks", "completed_at", "DATETIME"); err != nil {
 		return err
 	}
+	if err := s.addColumnIfMissing("settings", "task_sort", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
 	return nil
 }
-
-// addColumnIfMissing 在列不存在时向现有表新增该列。
 // modernc.org/sqlite 通过 PRAGMA 暴露 table_info。
 func (s *Store) addColumnIfMissing(table, col, decl string) error {
 	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
@@ -324,10 +355,10 @@ func (s *Store) GetTask(id string) (*Task, error) {
 	return scanTask(row)
 }
 
-// ListTasks 返回任务列表，按 updated_at 降序排列。
+// ListTasks 返回任务列表，按 sort 指定的排序方式在 SQL 层 ORDER BY。
 // filter 控制 SQL 过滤：FilterAll 返回所有任务，其它值通过
 // WHERE status = ? 在 DB 层过滤，避免把不匹配的行拉回内存。
-func (s *Store) ListTasks(filter StatusFilter) ([]*Task, error) {
+func (s *Store) ListTasks(filter StatusFilter, sort TaskSort) ([]*Task, error) {
 	statusVal, useWhere := filter.filterStatus()
 	query := `SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
@@ -337,7 +368,7 @@ func (s *Store) ListTasks(filter StatusFilter) ([]*Task, error) {
 	if useWhere {
 		query += ` WHERE status = ?`
 	}
-	query += ` ORDER BY updated_at DESC`
+	query += ` ` + sort.orderByClause()
 
 	var (
 		rows *sql.Rows
@@ -450,6 +481,7 @@ type Settings struct {
 	Cookies        string
 	FTPPassive     bool
 	Prealloc       bool
+	TaskSort       TaskSort // 任务列表排序方式
 }
 
 // LoadSettings 返回已持久化的 settings 行。若尚不存在，
@@ -467,10 +499,11 @@ func (s *Store) LoadSettings() (Settings, error) {
 		cookies  string
 		passive  int
 		prealloc int
+		taskSort string
 	)
 	err := s.db.QueryRow(`SELECT default_save_dir, default_threads, min_chunk_size,
-		user_agent, cookies, ftp_passive, prealloc FROM settings WHERE id=1`,
-	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc)
+		user_agent, cookies, ftp_passive, prealloc, task_sort FROM settings WHERE id=1`,
+	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc, &taskSort)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 首次运行：插入一条全零行，以便后续 LoadSettings 能读到。
 		_, ierr := s.db.Exec(`INSERT OR IGNORE INTO settings (id) VALUES (1)`)
@@ -490,6 +523,7 @@ func (s *Store) LoadSettings() (Settings, error) {
 		Cookies:        cookies,
 		FTPPassive:     passive != 0,
 		Prealloc:       prealloc != 0,
+		TaskSort:       TaskSort(taskSort),
 	}, nil
 }
 
@@ -498,18 +532,20 @@ func (s *Store) SaveSettings(s2 Settings) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO settings (id, default_save_dir, default_threads,
-		min_chunk_size, user_agent, cookies, ftp_passive, prealloc)
-		VALUES (1, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
+		min_chunk_size, user_agent, cookies, ftp_passive, prealloc, task_sort)
+	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(id) DO UPDATE SET
 			default_save_dir=excluded.default_save_dir,
 			default_threads=excluded.default_threads,
 			min_chunk_size=excluded.min_chunk_size,
 			user_agent=excluded.user_agent,
 			cookies=excluded.cookies,
 			ftp_passive=excluded.ftp_passive,
-			prealloc=excluded.prealloc`,
+			prealloc=excluded.prealloc,
+			task_sort=excluded.task_sort`,
 		s2.DefaultSaveDir, s2.DefaultThreads, s2.MinChunkSize,
 		s2.UserAgent, s2.Cookies, boolToInt(s2.FTPPassive), boolToInt(s2.Prealloc),
+		string(s2.TaskSort),
 	)
 	if err != nil {
 		return fmt.Errorf("settings save: %w", err)

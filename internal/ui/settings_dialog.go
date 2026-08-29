@@ -48,8 +48,8 @@ func LoadSettings(st *store.Store) error {
 		persisted.UserAgent = "Wget/1.21.3"
 		persisted.FTPPassive = true
 		persisted.Prealloc = true
+		persisted.TaskSort = store.SortCreatedDesc
 	}
-	GlobalSettings = persisted
 	if firstRun {
 		// 持久化默认值，以便后续加载时能找到真实数据行。
 	}
@@ -60,7 +60,7 @@ func LoadSettings(st *store.Store) error {
 func SaveSettings(st *store.Store) error {
 	return st.SaveSettings(GlobalSettings)
 }
-func buildSettingsContent(sc *scheduler.Scheduler) fyne.CanvasObject {
+func buildSettingsContent(sc *scheduler.Scheduler, onChange func()) fyne.CanvasObject {
 	persist := func() {
 		if globalStore == nil {
 			return
@@ -68,11 +68,12 @@ func buildSettingsContent(sc *scheduler.Scheduler) fyne.CanvasObject {
 		if err := SaveSettings(globalStore); err != nil {
 			log.Printf("ui: save settings: %v", err)
 		}
+		if onChange != nil {
+			onChange()
+		}
 	}
-
 	dirEntry := widget.NewEntry()
 	dirEntry.SetText(GlobalSettings.DefaultSaveDir)
-	dirEntry.SetPlaceHolder("/path/to/Downloads")
 	dirEntry.OnChanged = func(s string) {
 		GlobalSettings.DefaultSaveDir = s
 		persist()
@@ -137,6 +138,30 @@ func buildSettingsContent(sc *scheduler.Scheduler) fyne.CanvasObject {
 		}, globalWin)
 	})
 
+	// 任务列表排序方式
+	sortLabels := map[store.TaskSort]string{
+		store.SortCreatedDesc: "添加时间倒序（最新在前）",
+		store.SortCreatedAsc:  "添加时间正序（最老在前）",
+		store.SortNameAsc:     "文件名正序（A-Z）",
+		store.SortNameDesc:    "文件名倒序（Z-A）",
+	}
+	sortOpts := make([]string, 0, len(sortLabels))
+	labelToSort := map[string]store.TaskSort{}
+	for _, s := range store.AllTaskSorts() {
+		sortOpts = append(sortOpts, sortLabels[s])
+		labelToSort[sortLabels[s]] = s
+	}
+	currentSortLabel := sortLabels[GlobalSettings.TaskSort]
+	sortRadios := widget.NewRadioGroup(sortOpts, func(s string) {
+		if sort, ok := labelToSort[s]; ok {
+			GlobalSettings.TaskSort = sort
+			persist()
+		}
+	})
+	sortRadios.Required = true
+	sortRadios.Horizontal = false
+	sortRadios.SetSelected(currentSortLabel)
+
 	form := widget.NewForm(
 		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
 		widget.NewFormItem("默认并发线程数", threadsEntry),
@@ -145,6 +170,7 @@ func buildSettingsContent(sc *scheduler.Scheduler) fyne.CanvasObject {
 		widget.NewFormItem("默认 Cookie", cookiesEntry),
 		widget.NewFormItem("FTP 模式", ftpPassive),
 		widget.NewFormItem("磁盘预分配", prealloc),
+		widget.NewFormItem("任务列表排序", sortRadios),
 	)
 
 	scroll := container.NewScroll(form)
