@@ -151,6 +151,10 @@ func (s *Scheduler) Start(taskID string) error {
 	}
 
 	// 若尚未预分配文件则进行预分配(恢复场景:文件已具有正确大小)。
+	// 若文件不存在（被删除）则强制重新预分配，即使 IsAllocated 为 true
+	if _, statErr := os.Stat(tk.SavePath); statErr != nil {
+		tk.IsAllocated = false
+	}
 	needAlloc := !tk.IsAllocated && caps.TotalSize > 0
 	if needAlloc {
 		dest, err := prealloc.Preallocate(tk.SavePath, caps.TotalSize)
