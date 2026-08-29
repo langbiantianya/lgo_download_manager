@@ -126,10 +126,6 @@ func (r *taskRow) bindButtons(t *store.Task, sc *scheduler.Scheduler) {
 	}
 	taskID := t.ID
 	r.startBtn.OnTapped = func() {
-		// 文件丢失状态：先重置进度再启动
-		if t.Status == store.StatusFileLost {
-			_ = sc.ResetTask(taskID)
-		}
 		_ = sc.Start(taskID)
 	}
 	r.pauseBtn.OnTapped = func() { _ = sc.Pause(taskID) }
@@ -166,6 +162,8 @@ func (r *taskRow) refresh() {
 		r.statusLbl.SetText("等待中")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
+		r.startBtn.SetIcon(theme.MediaPlayIcon())
+		r.startBtn.Importance = widget.LowImportance
 		r.pauseBtn.Hide()
 		r.startBtn.Show()
 	case store.StatusDownloading:
@@ -178,6 +176,8 @@ func (r *taskRow) refresh() {
 		r.statusLbl.SetText("已暂停")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
+		r.startBtn.SetIcon(theme.MediaPlayIcon())
+		r.startBtn.Importance = widget.LowImportance
 		r.startBtn.Show()
 		r.pauseBtn.Hide()
 	case store.StatusCompleted:
@@ -190,12 +190,16 @@ func (r *taskRow) refresh() {
 		r.statusLbl.SetText("文件丢失")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
+		r.startBtn.SetIcon(theme.DownloadIcon())
+		r.startBtn.Importance = widget.HighImportance
 		r.startBtn.Show()
 		r.pauseBtn.Hide()
 	case store.StatusFailed:
 		r.statusLbl.SetText("失败")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
+		r.startBtn.SetIcon(theme.MediaReplayIcon())
+		r.startBtn.Importance = widget.LowImportance
 		r.startBtn.Show()
 		r.pauseBtn.Hide()
 	}

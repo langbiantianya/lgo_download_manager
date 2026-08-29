@@ -128,6 +128,12 @@ func (s *Scheduler) Start(taskID string) error {
 		return fmt.Errorf("scheduler: %w", err)
 	}
 
+	// 文件丢失状态：重置进度再继续
+	if tk.Status == store.StatusFileLost {
+		_ = s.st.UpdateTaskProgress(tk.ID, 0, nil, store.StatusPending, "")
+		tk, _ = s.st.GetTask(taskID)
+	}
+
 	// 探测服务器以获取其能力(capabilities)。
 	auth := decodeAuth(tk.AuthData)
 	driver, err := protocol.New(tk.URL, protocol.ProtocolKind(tk.Protocol), protocol.Auth{AuthOptions: auth})
@@ -339,7 +345,13 @@ func (s *Scheduler) ResetTask(taskID string) error {
 	if err != nil {
 		return err
 	}
-	return s.st.UpdateTaskProgress(tk.ID, 0, nil, store.StatusPending, "")
+	if err := s.st.UpdateTaskProgress(tk.ID, 0, nil, store.StatusPending, ""); err != nil {
+		return err
+	}
+	// 重新获取最新状态的任务用于发布事件
+	tk, _ = s.st.GetTask(taskID)
+	s.publish(Event{Why: "updated", Task: tk})
+	return nil
 }
 
 // Subscribe 返回一个事件通道。返回的 func 被调用时取消订阅。
