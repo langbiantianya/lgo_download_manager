@@ -178,6 +178,8 @@ func (m *MainWindow) buildSidebar() fyne.CanvasObject {
 	}
 	radios := widget.NewRadioGroup([]string{}, func(s string) {
 		_ = m.filter.Set(labelToFilter[s])
+		// 状态过滤改变后必须刷新列表，否则 List 的 Length 不会重新求值。
+		m.taskList.refresh()
 	})
 	labels := make([]string, len(filters))
 	for i, f := range filters {
