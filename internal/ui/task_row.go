@@ -8,6 +8,7 @@ package ui
 
 import (
 	"fmt"
+	"os/exec"
 	"path/filepath"
 
 	"fyne.io/fyne/v2"
@@ -36,10 +37,12 @@ type taskRow struct {
 	remTime  *widget.Label
 
 	// 第三行：操作按钮
-	startBtn   *widget.Button
-	pauseBtn   *widget.Button
-	cancelBtn  *widget.Button
-	detailsBtn *widget.Button
+	startBtn     *widget.Button
+	pauseBtn     *widget.Button
+	cancelBtn    *widget.Button
+	detailsBtn   *widget.Button
+	openFolderBtn *widget.Button
+	openFileBtn   *widget.Button
 
 	// 在事件之间缓存的速度
 	curSpeed float64
@@ -79,8 +82,10 @@ func (r *taskRow) build() {
 	r.pauseBtn = widget.NewButtonWithIcon("", theme.MediaPauseIcon(), func() {})
 	r.cancelBtn = widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {})
 	r.detailsBtn = widget.NewButtonWithIcon("", theme.InfoIcon(), func() {})
+	r.openFolderBtn = widget.NewButtonWithIcon("", theme.FolderIcon(), func() {})
+	r.openFileBtn = widget.NewButtonWithIcon("", theme.FileIcon(), func() {})
 
-	for _, b := range []*widget.Button{r.startBtn, r.pauseBtn, r.cancelBtn, r.detailsBtn} {
+	for _, b := range []*widget.Button{r.startBtn, r.pauseBtn, r.cancelBtn, r.detailsBtn, r.openFolderBtn, r.openFileBtn} {
 		b.Importance = widget.LowImportance
 	}
 
@@ -96,7 +101,7 @@ func (r *taskRow) build() {
 	// 第三行：左侧为速度 + 剩余时间，右侧对齐按钮
 	row3 := container.NewBorder(
 		nil, nil,
-		container.NewHBox(r.startBtn, r.pauseBtn, r.cancelBtn, r.detailsBtn),
+		container.NewHBox(r.startBtn, r.pauseBtn, r.cancelBtn, r.detailsBtn, r.openFolderBtn, r.openFileBtn),
 		container.NewHBox(r.speed, r.remTime),
 		layout.NewSpacer(),
 	)
@@ -131,6 +136,19 @@ func (r *taskRow) bindButtons(t *store.Task, sc *scheduler.Scheduler) {
 	r.pauseBtn.OnTapped = func() { _ = sc.Pause(taskID) }
 	r.cancelBtn.OnTapped = func() { sc.Delete(taskID) }
 	r.detailsBtn.OnTapped = func() { showChunkDetails(t, sc, globalWin) }
+	r.openFolderBtn.OnTapped = func() {
+		if t.SavePath == "" {
+			return
+		}
+		dir := filepath.Dir(t.SavePath)
+		exec.Command("xdg-open", dir).Run()
+	}
+	r.openFileBtn.OnTapped = func() {
+		if t.SavePath == "" {
+			return
+		}
+		exec.Command("xdg-open", t.SavePath).Run()
+	}
 }
 
 func (r *taskRow) refresh() {
@@ -166,12 +184,16 @@ func (r *taskRow) refresh() {
 		r.startBtn.Importance = widget.LowImportance
 		r.pauseBtn.Hide()
 		r.startBtn.Show()
+		r.openFolderBtn.Hide()
+		r.openFileBtn.Hide()
 	case store.StatusDownloading:
 		r.statusLbl.SetText("下载中")
 		r.speed.SetText(formatBPS(r.curSpeed))
 		r.remTime.SetText(etaText(t, r.curSpeed))
 		r.startBtn.Hide()
 		r.pauseBtn.Show()
+		r.openFolderBtn.Hide()
+		r.openFileBtn.Hide()
 	case store.StatusPaused:
 		r.statusLbl.SetText("已暂停")
 		r.speed.SetText("--")
@@ -180,12 +202,16 @@ func (r *taskRow) refresh() {
 		r.startBtn.Importance = widget.LowImportance
 		r.startBtn.Show()
 		r.pauseBtn.Hide()
+		r.openFolderBtn.Hide()
+		r.openFileBtn.Hide()
 	case store.StatusCompleted:
 		r.statusLbl.SetText("已完成")
 		r.speed.SetText("--")
 		r.remTime.SetText("--")
 		r.pauseBtn.Hide()
 		r.startBtn.Hide()
+		r.openFolderBtn.Show()
+		r.openFileBtn.Show()
 	case store.StatusFileLost:
 		r.statusLbl.SetText("文件丢失")
 		r.speed.SetText("--")
@@ -194,6 +220,8 @@ func (r *taskRow) refresh() {
 		r.startBtn.Importance = widget.HighImportance
 		r.startBtn.Show()
 		r.pauseBtn.Hide()
+		r.openFolderBtn.Hide()
+		r.openFileBtn.Hide()
 	case store.StatusFailed:
 		r.statusLbl.SetText("失败")
 		r.speed.SetText("--")
