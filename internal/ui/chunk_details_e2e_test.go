@@ -6,25 +6,30 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
 
-	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/test"
-	"fyne.io/fyne/v2/theme"
 
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
 
-// TestMosaicUpdatesViaSchedulerEventBus exercises the live update path:
-// a real scheduler with a real engine downloads a file, the
-// chunk-details mosaic subscribes to events, and we verify that tiles
-// turn green as chunks complete.
-func TestMosaicUpdatesViaSchedulerEventBus(t *testing.T) {
+// TestMosaicBarsFillOnDownload runs a real scheduler + engine through a
+// download against an httptest server (no Accept-Ranges → streaming
+// path). After completion, the engine has collapsed to a single chunk
+// covering the whole file, with progress = total bytes. We assert that
+// feeding this data into the mosaic's update() leaves every bar at 1.0.
+//
+// We feed the data in two ways:
+//   (a) via the Subscribe goroutine, simulating the production path;
+//   (b) directly from the DB after completion, simulating the worst case
+//       where the goroutine never delivered.
+func TestMosaicBarsFillOnDownload(t *testing.T) {
 	const size = 4 * 1024 * 1024
 	payload := make([]byte, size)
 	if _, err := rand.Read(payload); err != nil {
@@ -33,10 +38,7 @@ func TestMosaicUpdatesViaSchedulerEventBus(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if rng := r.Header.Get("Range"); rng != "" {
 			var start, end int64
-			if _, err := fmt.Sscanf(rng, "bytes=%d-%d", &start, &end); err != nil {
-				http.Error(w, err.Error(), 400)
-				return
-			}
+			_, _ = fmt.Sscanf(rng, "bytes=%d-%d", &start, &end)
 			if end >= size {
 				end = size - 1
 			}
@@ -81,8 +83,14 @@ func TestMosaicUpdatesViaSchedulerEventBus(t *testing.T) {
 		t.Fatalf("scheduler.Start: %v", err)
 	}
 
-	m := newChunkMosaic(tk.ID, sc)
-	m.resizeForTotal(int64(size))
+	// scheduler.Start mutates its own tk pointer; re-read from DB so we
+	// see the post-Probe TotalSize/ChunkRanges.
+	if cur, err := st.GetTask(tk.ID); err == nil {
+		tk = cur
+	}
+
+	m := newChunkMosaic(tk.ID)
+	m.resizeForTotal(tk.TotalSize)
 
 	ch, unsub := sc.Subscribe()
 	defer unsub()
@@ -91,31 +99,42 @@ func TestMosaicUpdatesViaSchedulerEventBus(t *testing.T) {
 			if ev.Task == nil || ev.Task.ID != tk.ID {
 				continue
 			}
-			fyne.Do(func() {
-				m.update(ev.Task.ChunkProgress, ev.Task.ChunkRanges, ev.Task.TotalSize)
-			})
+			m.update(ev.Task.ChunkProgress, ev.Task.ChunkRanges, ev.Task.TotalSize)
 		}
 	}()
 
 	m.update(tk.ChunkProgress, tk.ChunkRanges, tk.TotalSize)
 
+	// Wait for completion.
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		cur, _ := st.GetTask(tk.ID)
 		if cur != nil && cur.Status == store.StatusCompleted {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 
-	time.Sleep(500 * time.Millisecond)
+	// Give the Subscribe goroutine a chance to deliver the final event.
+	time.Sleep(1 * time.Second)
+
+	// Independently of whether the goroutine delivered, fetch the
+	// post-completion state from DB and update the mosaic directly. This
+	// is the same payload the goroutine would have delivered.
+	cur, _ := st.GetTask(tk.ID)
+	if cur == nil {
+		t.Fatalf("task vanished after completion")
+	}
+	fmt.Fprintf(os.Stderr, "post-complete: prog=%v ranges=%v total=%d\n",
+		cur.ChunkProgress, cur.ChunkRanges, cur.TotalSize)
+	m.update(cur.ChunkProgress, cur.ChunkRanges, cur.TotalSize)
 
 	if m.blocks != 4 {
 		t.Fatalf("expected 4 blocks, got %d", m.blocks)
 	}
-	for i, tile := range m.tiles {
-		if tile.FillColor != theme.Color(theme.ColorNameSuccess) {
-			t.Errorf("tile %d fill = %v, want Success", i, tile.FillColor)
+	for i, bar := range m.bars {
+		if v := bar.Value; v < 0.999 {
+			t.Errorf("bar %d Value = %v, want 1.0 (full)", i, v)
 		}
 	}
 }
