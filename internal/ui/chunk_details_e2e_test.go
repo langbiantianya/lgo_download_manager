@@ -115,7 +115,7 @@ func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		cur, _ := st.GetTask(tk.ID)
-		if cur != nil && cur.Status == store.StatusCompleted {
+		if cur != nil && cur.Status == store.TaskStatus.Completed {
 			break
 		}
 		time.Sleep(50 * time.Millisecond)

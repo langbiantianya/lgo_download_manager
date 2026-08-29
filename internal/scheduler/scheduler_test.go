@@ -87,7 +87,7 @@ done:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Status != store.StatusCompleted {
+	if persisted.Status != store.TaskStatus.Completed {
 		t.Fatalf("status=%s want Completed", persisted.Status)
 	}
 	if persisted.Downloaded != size {
@@ -149,7 +149,7 @@ func TestSchedulerResume(t *testing.T) {
 
 	// 预填 chunk_progress 以模拟一次部分下载(chunk 0 已全部完成;
 	// chunk 1 部分完成)。
-	if err := st.UpdateTaskProgress(tk.ID, int64(size)/2, []int64{size / 4, size / 8, 0, 0}, store.StatusPaused, ""); err != nil {
+	if err := st.UpdateTaskProgress(tk.ID, int64(size)/2, []int64{size / 4, size / 8, 0, 0}, store.TaskStatus.Paused, ""); err != nil {
 		t.Fatal(err)
 	}
 	dest, err := prealloc.Preallocate(tk.SavePath, size)
@@ -186,7 +186,7 @@ doneResume:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.Status != store.StatusCompleted {
+	if persisted.Status != store.TaskStatus.Completed {
 		t.Fatalf("status=%s want Completed", persisted.Status)
 	}
 	got, err := os.ReadFile(tk.SavePath)

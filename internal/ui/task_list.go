@@ -50,27 +50,26 @@ func newTaskList(sc *scheduler.Scheduler, filter binding.String) *taskList {
 func (tl *taskList) container() *fyne.Container { return tl.panel }
 
 func (tl *taskList) allTasks() []*store.Task {
-	tks, _ := tl.sc.List()
+	fv, _ := tl.filter.Get()
+	tks, _ := tl.sc.List(store.StatusFilter(fv))
 	return tks
 }
 
+// filtered 用 SQL 过滤（按 store 层）+ 内存内的搜索文本过滤。
+// 状态过滤在 store 层完成；搜索框匹配 URL 或保存路径，在内存里完成。
 func (tl *taskList) filtered() []*store.Task {
-	fv, _ := tl.filter.Get()
 	sv, _ := tl.searchQ.Get()
-	filter := store.StatusFilter(fv)
+	tasks := tl.allTasks()
+	if sv == "" {
+		return tasks
+	}
+	needle := strings.ToLower(sv)
 	var out []*store.Task
-	for _, t := range tl.allTasks() {
-		if !filter.Match(t.Status) {
-			continue
+	for _, t := range tasks {
+		if strings.Contains(strings.ToLower(t.URL), needle) ||
+			strings.Contains(strings.ToLower(t.SavePath), needle) {
+			out = append(out, t)
 		}
-		if sv != "" {
-			needle := strings.ToLower(sv)
-			if !strings.Contains(strings.ToLower(t.URL), needle) &&
-				!strings.Contains(strings.ToLower(t.SavePath), needle) {
-				continue
-			}
-		}
-		out = append(out, t)
 	}
 	return out
 }

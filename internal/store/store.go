@@ -35,7 +35,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -45,40 +44,42 @@ import (
 // Status 反映 Task 的生命周期状态。数据库中以纯文本存储。
 type Status string
 
+// 内部常量：禁止外部包直接引用，只能通过 TaskStatus 枚举类访问。
 const (
-	StatusPending    Status = "Pending"
-	StatusDownloading Status = "Downloading"
-	StatusPaused     Status = "Paused"
-	StatusCompleted  Status = "Completed"
-	StatusFailed     Status = "Failed"
-	StatusFileLost   Status = "FileLost"
+	_pending      Status = "Pending"
+	_downloading Status = "Downloading"
+	_paused       Status = "Paused"
+	_completed    Status = "Completed"
+	_failed       Status = "Failed"
+	_fileLost     Status = "FileLost"
 )
 
-// TaskStatus 导出所有状态常量，供外部包使用。
+// TaskStatus 是状态枚举类，提供所有合法的 Status 值。
+// 外部包必须通过 TaskStatus 访问，禁止引用内部 _pending 等常量。
 var TaskStatus = struct {
 	Pending     Status
 	Downloading Status
-	Paused     Status
-	Completed  Status
-	Failed    Status
-	FileLost  Status
+	Paused      Status
+	Completed   Status
+	Failed      Status
+	FileLost    Status
 }{
-	Pending:     StatusPending,
-	Downloading: StatusDownloading,
-	Paused:     StatusPaused,
-	Completed:  StatusCompleted,
-	Failed:    StatusFailed,
-	FileLost:  StatusFileLost,
+	Pending:     _pending,
+	Downloading: _downloading,
+	Paused:      _paused,
+	Completed:   _completed,
+	Failed:      _failed,
+	FileLost:    _fileLost,
 }
 
 // String 返回状态的字符串表示。
 func (s Status) String() string { return string(s) }
 
 // IsTerminal 表示该状态为终态（已完成/失败/文件丢失）。
-func (s Status) IsTerminal() bool { return s == StatusCompleted || s == StatusFailed || s == StatusFileLost }
+func (s Status) IsTerminal() bool { return s == _completed || s == _failed || s == _fileLost }
 
 // IsActive 表示该状态为活跃状态（等待中/下载中）。
-func (s Status) IsActive() bool { return s == StatusPending || s == StatusDownloading }
+func (s Status) IsActive() bool { return s == _pending || s == _downloading }
 
 // StatusFilter 用于 UI 侧边栏筛选任务。
 type StatusFilter string
@@ -91,24 +92,22 @@ const (
 	FilterFailed   StatusFilter = "failed"
 	FilterFileLost  StatusFilter = "filelost"
 )
-
-// Match 判断任务状态是否匹配该筛选器。比较时大小写不敏感。
-func (f StatusFilter) Match(s Status) bool {
+// filterStatus 把 StatusFilter 映射到对应的 DB Status 值。
+// 返回的 bool 表示该筛选器是否需要在 SQL WHERE 中加 status 条件。
+func (f StatusFilter) filterStatus() (Status, bool) {
 	switch f {
-	case FilterAll:
-		return true
 	case FilterDownloading:
-		return strings.EqualFold(string(s), string(StatusDownloading))
+		return _downloading, true
 	case FilterPaused:
-		return strings.EqualFold(string(s), string(StatusPaused))
+		return _paused, true
 	case FilterCompleted:
-		return strings.EqualFold(string(s), string(StatusCompleted))
+		return _completed, true
 	case FilterFailed:
-		return strings.EqualFold(string(s), string(StatusFailed))
+		return _failed, true
 	case FilterFileLost:
-		return strings.EqualFold(string(s), string(StatusFileLost))
+		return _fileLost, true
 	default:
-		return false
+		return "", false
 	}
 }
 
@@ -312,13 +311,30 @@ func (s *Store) GetTask(id string) (*Task, error) {
 	return scanTask(row)
 }
 
-// ListTasks 返回全部任务，按 updated_at 降序排列。
-func (s *Store) ListTasks() ([]*Task, error) {
-	rows, err := s.db.Query(`SELECT
+// ListTasks 返回任务列表，按 updated_at 降序排列。
+// filter 控制 SQL 过滤：FilterAll 返回所有任务，其它值通过
+// WHERE status = ? 在 DB 层过滤，避免把不匹配的行拉回内存。
+func (s *Store) ListTasks(filter StatusFilter) ([]*Task, error) {
+	statusVal, useWhere := filter.filterStatus()
+	query := `SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
 		is_allocated,chunk_count,chunk_progress,chunk_ranges,status,
 		auth_data,error_message,created_at,updated_at
-		FROM tasks ORDER BY updated_at DESC`)
+		FROM tasks`
+	if useWhere {
+		query += ` WHERE status = ?`
+	}
+	query += ` ORDER BY updated_at DESC`
+
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if useWhere {
+		rows, err = s.db.Query(query, string(statusVal))
+	} else {
+		rows, err = s.db.Query(query)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("store list: %w", err)
 	}

@@ -315,13 +315,16 @@ func (s *Scheduler) Delete(taskID string) error {
 	return nil
 }
 
-// List 返回 store 中所有已知任务。store 是 UI 侧边栏的唯一事实来源。
-func (s *Scheduler) List() ([]*store.Task, error) { return s.st.ListTasks() }
+// List 返回 store 中按 filter 过滤后的任务列表。
+// UI 侧边栏应当传 StoreFilterAll 或其它 StatusFilter 来获取子集。
+func (s *Scheduler) List(filter store.StatusFilter) ([]*store.Task, error) {
+	return s.st.ListTasks(filter)
+}
 
 // ValidateFileExistence 检查所有已完成和下载中任务的文件是否存在，
 // 不存在则将状态更新为 FileLost。用于窗口重新聚焦时的文件完整性检查。
 func (s *Scheduler) ValidateFileExistence() {
-	tasks, err := s.st.ListTasks()
+	tasks, err := s.st.ListTasks(store.FilterAll)
 	if err != nil {
 		return
 	}

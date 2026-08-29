@@ -30,14 +30,14 @@ func TestStoreRoundtrip(t *testing.T) {
 		ChunkCount:   4,
 		SupportRange: true,
 		IsAllocated:  true,
-		Status:       StatusPending,
+		Status:       TaskStatus.Pending,
 		AuthData:     `{"username":""}`,
 	}
 	if err := s.CreateTask(tk); err != nil {
 		t.Fatalf("CreateTask: %v", err)
 	}
 
-	if err := s.UpdateTaskProgress("task-1", 512, []int64{128, 128, 128, 128}, StatusDownloading, ""); err != nil {
+	if err := s.UpdateTaskProgress("task-1", 512, []int64{128, 128, 128, 128}, TaskStatus.Downloading, ""); err != nil {
 		t.Fatalf("UpdateTaskProgress: %v", err)
 	}
 
@@ -45,7 +45,7 @@ func TestStoreRoundtrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTask: %v", err)
 	}
-	if got.URL != tk.URL || got.Status != StatusDownloading || got.Downloaded != 512 {
+	if got.URL != tk.URL || got.Status != TaskStatus.Downloading || got.Downloaded != 512 {
 		t.Fatalf("unexpected row: %+v", got)
 	}
 	if len(got.ChunkProgress) != 4 || got.ChunkProgress[0] != 128 {
@@ -59,7 +59,7 @@ func TestStoreRoundtrip(t *testing.T) {
 	}
 
 	// ListTasks 应该返回我们插入的那一行。
-	list, err := s.ListTasks()
+	list, err := s.ListTasks(FilterAll)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -85,7 +85,7 @@ func TestStoreReopen(t *testing.T) {
 	}
 	if err := s.CreateTask(&Task{
 		ID: "x", URL: "u", SavePath: "/tmp/x", Protocol: "HTTP",
-		ChunkProgress: []int64{}, Status: StatusPending,
+		ChunkProgress: []int64{}, Status: TaskStatus.Pending,
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -103,5 +103,54 @@ func TestStoreReopen(t *testing.T) {
 	}
 	if got.ID != "x" {
 		t.Fatalf("ID mismatch: %s", got.ID)
+	}
+}
+func TestListTasksFilter(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "state.db")
+	s, err := Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// 插入 3 个不同状态的任务。
+	mkTask := func(id string, status Status) {
+		if err := s.CreateTask(&Task{
+			ID: id, URL: "u", SavePath: "/tmp/" + id, Protocol: "HTTP",
+			ChunkProgress: []int64{}, Status: status,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mkTask("a", TaskStatus.Pending)
+	mkTask("b", TaskStatus.Downloading)
+	mkTask("c", TaskStatus.Completed)
+
+	// FilterAll 返回全部 3 行。
+	all, err := s.ListTasks(FilterAll)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("FilterAll len=%d want 3", len(all))
+	}
+
+	// FilterDownloading 只返回 Downloading 状态的 1 行。
+	dl, err := s.ListTasks(FilterDownloading)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dl) != 1 || dl[0].ID != "b" {
+		t.Fatalf("FilterDownloading=%v want only task b", dl)
+	}
+
+	// FilterCompleted 只返回 1 行。
+	done, err := s.ListTasks(FilterCompleted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(done) != 1 || done[0].ID != "c" {
+		t.Fatalf("FilterCompleted=%v want only task c", done)
 	}
 }
