@@ -138,7 +138,7 @@ func buildSettingsContent(sc *scheduler.Scheduler, onChange func()) fyne.CanvasO
 		}, globalWin)
 	})
 
-	// 任务列表排序方式
+	// 任务列表排序方式（单选下拉框）
 	sortLabels := map[store.TaskSort]string{
 		store.SortCreatedDesc: "添加时间倒序（最新在前）",
 		store.SortCreatedAsc:  "添加时间正序（最老在前）",
@@ -151,17 +151,13 @@ func buildSettingsContent(sc *scheduler.Scheduler, onChange func()) fyne.CanvasO
 		sortOpts = append(sortOpts, sortLabels[s])
 		labelToSort[sortLabels[s]] = s
 	}
-	currentSortLabel := sortLabels[GlobalSettings.TaskSort]
-	sortRadios := widget.NewRadioGroup(sortOpts, func(s string) {
+	sortSelect := widget.NewSelect(sortOpts, func(s string) {
 		if sort, ok := labelToSort[s]; ok {
 			GlobalSettings.TaskSort = sort
 			persist()
 		}
 	})
-	sortRadios.Required = true
-	sortRadios.Horizontal = false
-	sortRadios.SetSelected(currentSortLabel)
-
+	sortSelect.SetSelected(sortLabels[GlobalSettings.TaskSort])
 	form := widget.NewForm(
 		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
 		widget.NewFormItem("默认并发线程数", threadsEntry),
@@ -170,7 +166,7 @@ func buildSettingsContent(sc *scheduler.Scheduler, onChange func()) fyne.CanvasO
 		widget.NewFormItem("默认 Cookie", cookiesEntry),
 		widget.NewFormItem("FTP 模式", ftpPassive),
 		widget.NewFormItem("磁盘预分配", prealloc),
-		widget.NewFormItem("任务列表排序", sortRadios),
+		widget.NewFormItem("任务列表排序", sortSelect),
 	)
 
 	scroll := container.NewScroll(form)
