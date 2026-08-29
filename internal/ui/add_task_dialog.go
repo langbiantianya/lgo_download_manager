@@ -7,7 +7,11 @@
 package ui
 
 import (
+	"context"
+	"net/url"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
@@ -18,8 +22,10 @@ import (
 	"lgo_download_manager/internal/scheduler"
 )
 
-// showAddTaskDialog 打开“新建下载任务”对话框，并预填全局设置中的内容。
-// 这里只显示必要的字段；高级选项位于“设置”对话框中。
+// showAddTaskDialog 打开"新建下载任务"对话框，并预填全局设置中的内容。
+// 这里只显示必要的字段；高级选项位于"设置"对话框中。
+//
+// URL 变更时自动从路径末尾提取文件名填入保存路径，并探测文件大小进行预览。
 func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 	// 构建一个纵向布局、标签左对齐的表单。
 	makeRow := func(label string, w fyne.CanvasObject) *fyne.Container {
@@ -40,12 +46,78 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 			if err != nil || uri == nil {
 				return
 			}
-			savePathEntry.SetText(filepath.Join(uri.Path(), "download.bin"))
+			savePathEntry.SetText(filepath.Join(uri.Path(), filepath.Base(savePathEntry.Text)))
 		}, win)
 	})
 
+	// 文件大小预览标签
+	sizeLabel := widget.NewLabel("")
+	sizeLabel.Alignment = fyne.TextAlignTrailing
+	sizeLabel.TextStyle.Italic = true
+
+	// 从 URL 提取文件名并更新保存路径，同时探测文件大小
+	updateFromURL := func(rawURL string) {
+		u, err := url.Parse(rawURL)
+		if err != nil || u.Path == "" {
+			sizeLabel.SetText("")
+			return
+		}
+		filename := filepath.Base(u.Path)
+		if filename == "" || filename == "." || filename == "/" {
+			filename = "download.bin"
+		}
+		if savePathEntry.Text == "" || savePathEntry.Text == filepath.Join(GlobalSettings.DefaultSaveDir, "download.bin") {
+			savePathEntry.SetText(filepath.Join(GlobalSettings.DefaultSaveDir, filename))
+		}
+
+		// 异步探测文件大小
+		go func() {
+			proto, err := protocol.DetectKind(rawURL, "")
+			if err != nil {
+				fyne.Do(func() { sizeLabel.SetText("") })
+				return
+			}
+			driver, err := protocol.New(rawURL, proto, protocol.Auth{AuthOptions: protocol.AuthOptions{
+				UserAgent:  GlobalSettings.UserAgent,
+				Cookies:    GlobalSettings.Cookies,
+				FTPPassive: GlobalSettings.FTPPassive,
+			}})
+			if err != nil {
+				fyne.Do(func() { sizeLabel.SetText("") })
+				return
+			}
+			defer driver.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+
+			caps, err := driver.Probe(ctx)
+			if err != nil {
+				fyne.Do(func() { sizeLabel.SetText("") })
+				return
+			}
+			if caps.TotalSize <= 0 {
+				fyne.Do(func() { sizeLabel.SetText("") })
+				return
+			}
+			fyne.Do(func() {
+				sizeLabel.SetText(formatSize(caps.TotalSize))
+			})
+		}()
+	}
+
+	// URL 变化时触发
+	urlEntry.OnChanged = func(s string) {
+		if s == "" {
+			sizeLabel.SetText("")
+			return
+		}
+		updateFromURL(s)
+	}
+
 	formContent := container.NewVBox(
 		makeRow("下载链接 (URL)", urlEntry),
+		makeRow("文件大小", sizeLabel),
 		makeRow("保存路径", container.NewBorder(nil, nil, nil, browseBtn, savePathEntry)),
 	)
 
@@ -100,3 +172,20 @@ var errEmpty = errEmptyField{}
 type errEmptyField struct{}
 
 func (errEmptyField) Error() string { return "required" }
+
+// formatSize 将字节数格式化为人类可读字符串。
+func formatSize(n int64) string {
+	const KB = 1 << 10
+	const MB = 1 << 20
+	const GB = 1 << 30
+	switch {
+	case n >= GB:
+		return strconv.FormatFloat(float64(n)/GB, 'f', 2, 64) + " GB"
+	case n >= MB:
+		return strconv.FormatFloat(float64(n)/MB, 'f', 2, 64) + " MB"
+	case n >= KB:
+		return strconv.FormatFloat(float64(n)/KB, 'f', 2, 64) + " KB"
+	default:
+		return strconv.FormatInt(n, 10) + " B"
+	}
+}
