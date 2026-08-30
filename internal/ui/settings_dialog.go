@@ -50,12 +50,13 @@ func LoadSettings(st *store.Store) error {
 		persisted.Prealloc = true
 		persisted.TaskSort = store.SortCreatedDesc
 	}
+	GlobalSettings = persisted
 	if firstRun {
 		// 持久化默认值，以便后续加载时能找到真实数据行。
+		_ = SaveSettings(st)
 	}
 	return nil
 }
-
 // SaveSettings 将 GlobalSettings 写入存储。每次 UI 修改后均可安全调用。
 func SaveSettings(st *store.Store) error {
 	return st.SaveSettings(GlobalSettings)
@@ -157,7 +158,11 @@ func buildSettingsContent(sc *scheduler.Scheduler, onChange func()) fyne.CanvasO
 			persist()
 		}
 	})
-	sortSelect.SetSelected(sortLabels[GlobalSettings.TaskSort])
+	currentLabel := sortLabels[GlobalSettings.TaskSort]
+	if currentLabel == "" {
+		currentLabel = sortLabels[store.SortCreatedDesc]
+	}
+	sortSelect.SetSelected(currentLabel)
 	form := widget.NewForm(
 		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
 		widget.NewFormItem("默认并发线程数", threadsEntry),

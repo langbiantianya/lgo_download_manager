@@ -273,3 +273,57 @@ func gotIDs(ts []*Task) []string {
 	}
 	return out
 }
+func TestSettingsRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// 首次加载返回零值。
+	got, err := s.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TaskSort != "" {
+		t.Fatalf("initial TaskSort should be empty, got %q", got.TaskSort)
+	}
+
+	// 保存完整 settings 后重新打开 DB。
+	want := Settings{
+		DefaultSaveDir: "/tmp/dl",
+		DefaultThreads: 8,
+		MinChunkSize:   4 * (1 << 20),
+		UserAgent:      "curl/8.0",
+		Cookies:        "k=v",
+		FTPPassive:     false,
+		Prealloc:       true,
+		TaskSort:       SortNameAsc,
+	}
+	if err := s.SaveSettings(want); err != nil {
+		t.Fatal(err)
+	}
+
+	s2, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	got, err = s2.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.TaskSort != want.TaskSort {
+		t.Fatalf("TaskSort: got %q want %q", got.TaskSort, want.TaskSort)
+	}
+	if got.DefaultSaveDir != want.DefaultSaveDir {
+		t.Fatalf("DefaultSaveDir: got %q want %q", got.DefaultSaveDir, want.DefaultSaveDir)
+	}
+	if got.DefaultThreads != want.DefaultThreads {
+		t.Fatalf("DefaultThreads: got %d want %d", got.DefaultThreads, want.DefaultThreads)
+	}
+	if got.FTPPassive != want.FTPPassive {
+		t.Fatalf("FTPPassive: got %v want %v", got.FTPPassive, want.FTPPassive)
+	}
+}
