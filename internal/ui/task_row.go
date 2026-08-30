@@ -117,6 +117,7 @@ func (r *taskRow) build() {
 func (r *taskRow) onProgress(ev scheduler.Event) {
 	r.task = ev.Task
 	if ev.SpeedBPS > 0 {
+		r.curSpeed = ev.SpeedBPS
 	}
 	r.refresh()
 }
