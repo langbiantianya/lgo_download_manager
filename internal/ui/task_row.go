@@ -169,7 +169,7 @@ func (r *taskRow) refresh() {
 		return
 	}
 	r.name.SetText(displayName(t))
-	r.createdAtLbl.SetText("添加: " + formatTime(t.CreatedAt))
+	r.createdAtLbl.SetText("添加于: " + formatTime(t.CreatedAt))
 	r.size.SetText(formatBytes(t.TotalSize))
 	pct := 0.0
 	if t.TotalSize > 0 {
