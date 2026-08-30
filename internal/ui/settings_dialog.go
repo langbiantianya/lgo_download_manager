@@ -43,8 +43,8 @@ func LoadSettings(st *store.Store) error {
 	if firstRun {
 		home, _ := os.UserHomeDir()
 		persisted.DefaultSaveDir = filepath.Join(home, "Downloads")
-		persisted.DefaultThreads = 16
-		persisted.MinChunkSize = 1 * mib
+		persisted.DefaultThreads = 4
+		persisted.MinChunkSize = 10 * mib
 		persisted.UserAgent = "Wget/1.21.3"
 		persisted.FTPPassive = true
 		persisted.Prealloc = true
