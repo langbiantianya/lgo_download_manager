@@ -79,11 +79,7 @@ func (r *taskRow) build() {
 
 	r.speed = widget.NewLabel("")
 	r.speed.Alignment = fyne.TextAlignTrailing
-	r.speed.TextStyle.Monospace = true
-
-	r.remTime = widget.NewLabel("")
 	r.remTime.Alignment = fyne.TextAlignTrailing
-
 	r.startBtn = widget.NewButtonWithIcon("", theme.MediaPlayIcon(), func() {})
 	r.pauseBtn = widget.NewButtonWithIcon("", theme.MediaPauseIcon(), func() {})
 	r.cancelBtn = widget.NewButtonWithIcon("", theme.DeleteIcon(), func() {})
