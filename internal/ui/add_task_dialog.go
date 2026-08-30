@@ -25,24 +25,42 @@ import (
 	"lgo_download_manager/internal/scheduler"
 )
 
-// knownCompoundExts 是按 '.tar.xx' 风格出现的复合扩展名列表（最长匹配优先）。
-// 通过此列表来拆分 stem/ext，避免 filepath.Ext 把 'archive.tar.gz' 误切成
-// stem='archive.tar' + ext='.gz'，再插入 (1) 后变成 'archive.tar(1).gz'。
-var knownCompoundExts = []string{
-	".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lz",
-	".tar.lzma", ".tar.sz", ".tar.br",
+// archiveCompressionExts 列出常见的归档/压缩单段扩展名。任何"<x>.<archive>"
+// 形式都会被 splitExt 当作复合扩展名处理——例如 .tar.gz、.cpio.gz、.img.zst。
+// 这样新出现的压缩格式（.sz、.br、.zst 等）无需改动代码即可正确拆分。
+//
+// 注意：第二段必须以 'archive'/'compression' 角色出现；常见的次级扩展名覆盖了
+// 当前主流（gzip / bzip2 / xz / zstd / lz 系列），未来若有新压缩格式被广泛
+// 使用，只需在此追加一行。
+var archiveCompressionExts = []string{
+	".gz", ".bz2", ".xz", ".zst", ".lz", ".lzma", ".lzo", ".br", ".sz", ".Z",
 }
 
 // uniqueSuffixRegex 匹配 'name(N)' 形式的后缀——用于在文件名已存在时递增编号。
 var uniqueSuffixRegex = regexp.MustCompile(`^(.*?)(\((\d+)\))$`)
-
-// splitExt 优先按 knownCompoundExts 拆分；否则退化为 filepath.Ext 行为。
-// 返回 (stem, ext)，保证 ext 不为空字符串且不含路径分隔符。
+// splitExt 拆分文件名后缀为 (stem, ext)。优先识别复合扩展名：
+// 当 base 形如 "<something>.<archiveCompressionExt>" 且 <archiveCompressionExt>
+// 是已知的压缩归档格式时，把整段当作 ext。否则退化为 filepath.Ext。
+// 大小写不敏感匹配，但返回的 ext 保留原始大小写。
+//
+// 这种启发式无需枚举所有可能的复合扩展名——只要新增了压缩格式（往
+// archiveCompressionExts 追加），新的复合形式就会自动工作。
 func splitExt(base string) (string, string) {
 	lower := strings.ToLower(base)
-	for _, ce := range knownCompoundExts {
-		if strings.HasSuffix(lower, ce) {
-			return base[:len(base)-len(ce)], base[len(base)-len(ce):]
+	// 找到最后一个 '.'，尝试把它当作复合扩展名的分界点。
+	idx := strings.LastIndex(lower, ".")
+	if idx <= 0 || idx == len(lower)-1 {
+		// 没有 '.' 或以 '.' 结尾——退回 filepath.Ext。
+		return base[:len(base)-len(filepath.Ext(base))], filepath.Ext(base)
+	}
+	candidate := lower[idx:] // 例如 ".gz"
+	for _, comp := range archiveCompressionExts {
+		if candidate == comp {
+			// 第二段是已知的压缩格式。再往左看是否有"更外层"的 .xxx。
+			before := lower[:idx] // 例如 "archive.tar"
+			if j := strings.LastIndex(before, "."); j > 0 {
+				return base[:j], base[j:]
+			}
 		}
 	}
 	return base[:len(base)-len(filepath.Ext(base))], filepath.Ext(base)

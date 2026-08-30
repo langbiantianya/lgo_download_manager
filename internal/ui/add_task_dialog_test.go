@@ -113,3 +113,30 @@ func TestSplitExt(t *testing.T) {
 		}
 	}
 }
+
+// TestSplitExtForwardCompat 验证新增的压缩格式只需往 archiveCompressionExts 追加
+// 一行就能立即支持新的复合扩展名——例如 .whl.gz、.crate.zst、.pkg.br。
+func TestSplitExtForwardCompat(t *testing.T) {
+	cases := []struct {
+		base     string
+		wantStem string
+		wantExt  string
+	}{
+		// 任何"<anything>.<knownCompression>"形式都能被识别为复合扩展名。
+		{"python-3.12.tar.gz", "python-3.12", ".tar.gz"},
+		{"snapshot.img.zst", "snapshot", ".img.zst"},
+		{"libfoo.crate.br", "libfoo", ".crate.br"},
+		{"backup.cpio.xz", "backup", ".cpio.xz"},
+		// 已知压缩格式单独出现时不应误判。
+		{"archive.gz", "archive", ".gz"},
+		// 非压缩扩展名（如 .txt）应保持普通单段扩展名行为。
+		{"notes.tar.txt", "notes.tar", ".txt"},
+	}
+	for _, c := range cases {
+		stem, ext := splitExt(c.base)
+		if stem != c.wantStem || ext != c.wantExt {
+			t.Errorf("splitExt(%q) = (%q, %q), want (%q, %q)",
+				c.base, stem, ext, c.wantStem, c.wantExt)
+		}
+	}
+}
