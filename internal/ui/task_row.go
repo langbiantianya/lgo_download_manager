@@ -28,20 +28,23 @@ type taskRow struct {
 	sc   *scheduler.Scheduler
 
 	// 第一行：名称 + 大小 + 状态
-	name       *widget.Label
-	createdAtLbl *widget.Label // 名称下方的添加时间小字
-	size       *widget.Label
-	statusLbl  *widget.Label
-	// 第二行：进度条 + 速度 + 剩余时间
+	name        *widget.Label
+	size        *widget.Label
+	statusLbl   *widget.Label
+
+	// 第二行：进度条
 	progress *widget.ProgressBar
-	speed    *widget.Label
-	remTime  *widget.Label
+
+	// 第三行：左侧按钮，右侧速度+剩余时间+添加时间
+	speed        *widget.Label
+	remTime      *widget.Label
+	createdAtLbl *widget.Label
 
 	// 第三行：操作按钮
-	startBtn     *widget.Button
-	pauseBtn     *widget.Button
-	cancelBtn    *widget.Button
-	detailsBtn   *widget.Button
+	startBtn      *widget.Button
+	pauseBtn      *widget.Button
+	cancelBtn     *widget.Button
+	detailsBtn    *widget.Button
 	openFolderBtn *widget.Button
 	openFileBtn   *widget.Button
 
@@ -64,10 +67,9 @@ func (r *taskRow) build() {
 	r.name.Truncation = fyne.TextTruncateEllipsis
 
 	r.createdAtLbl = widget.NewLabel("")
-	r.createdAtLbl.Importance = widget.LowImportance
+	r.createdAtLbl.Alignment = fyne.TextAlignTrailing
 
 	r.size = widget.NewLabel("")
-	r.size.Alignment = fyne.TextAlignTrailing
 
 	r.statusLbl = widget.NewLabel("")
 	r.statusLbl.Alignment = fyne.TextAlignCenter
@@ -93,20 +95,19 @@ func (r *taskRow) build() {
 		b.Importance = widget.LowImportance
 	}
 
-	// 第一行：名称（可扩展）+ 下方添加时间 [大小][状态]
-	nameStack := container.NewVBox(r.name, r.createdAtLbl)
+	// 第一行：名称（可扩展）[大小][状态]
 	row1 := container.NewBorder(
 		nil, nil, nil,
 		container.NewHBox(r.size, r.statusLbl),
-		nameStack,
+		r.name,
 	)
 	// 第二行：进度条占满整行
 	row2 := container.NewStack(r.progress)
-	// 第三行：左侧速度+剩余时间，右侧按钮
+	// 第三行：左侧按钮，右侧速度+剩余时间+添加时间
 	row3 := container.NewBorder(
 		nil, nil,
 		container.NewHBox(r.startBtn, r.pauseBtn, r.openFolderBtn, r.openFileBtn, r.detailsBtn, r.cancelBtn),
-		container.NewHBox(r.speed, r.remTime),
+		container.NewHBox(r.speed, r.remTime, r.createdAtLbl),
 		layout.NewSpacer(),
 	)
 
@@ -116,7 +117,6 @@ func (r *taskRow) build() {
 func (r *taskRow) onProgress(ev scheduler.Event) {
 	r.task = ev.Task
 	if ev.SpeedBPS > 0 {
-		r.curSpeed = ev.SpeedBPS
 	}
 	r.refresh()
 }
@@ -162,8 +162,8 @@ func (r *taskRow) refresh() {
 		r.createdAtLbl.SetText("")
 		r.statusLbl.SetText("")
 		r.progress.SetValue(0)
-		r.speed.SetText("--")
-		r.remTime.SetText("--")
+		r.speed.Hide()
+		r.remTime.Hide()
 		r.startBtn.Hide()
 		r.pauseBtn.Hide()
 		return
@@ -179,11 +179,21 @@ func (r *taskRow) refresh() {
 		pct = 1
 	}
 
+	// 下载速度和剩余时间仅在 Downloading 状态下显示，其它状态都隐藏。
+	isDownloading := t.Status == store.TaskStatus.Downloading
+	if isDownloading {
+		r.speed.SetText(formatBPS(r.curSpeed))
+		r.remTime.SetText(etaText(t, r.curSpeed))
+		r.speed.Show()
+		r.remTime.Show()
+	} else {
+		r.speed.Hide()
+		r.remTime.Hide()
+	}
+
 	switch t.Status {
 	case store.TaskStatus.Pending:
 		r.statusLbl.SetText("等待中")
-		r.speed.SetText("--")
-		r.remTime.SetText("--")
 		r.startBtn.SetIcon(theme.MediaPlayIcon())
 		r.startBtn.Importance = widget.LowImportance
 		r.pauseBtn.Hide()
@@ -192,16 +202,12 @@ func (r *taskRow) refresh() {
 		r.openFileBtn.Hide()
 	case store.TaskStatus.Downloading:
 		r.statusLbl.SetText("下载中")
-		r.speed.SetText(formatBPS(r.curSpeed))
-		r.remTime.SetText(etaText(t, r.curSpeed))
 		r.startBtn.Hide()
 		r.pauseBtn.Show()
 		r.openFolderBtn.Hide()
 		r.openFileBtn.Hide()
 	case store.TaskStatus.Paused:
 		r.statusLbl.SetText("已暂停")
-		r.speed.SetText("--")
-		r.remTime.SetText("--")
 		r.startBtn.SetIcon(theme.MediaPlayIcon())
 		r.startBtn.Importance = widget.LowImportance
 		r.startBtn.Show()
@@ -210,16 +216,12 @@ func (r *taskRow) refresh() {
 		r.openFileBtn.Hide()
 	case store.TaskStatus.Completed:
 		r.statusLbl.SetText("已完成")
-		r.speed.SetText("--")
-		r.remTime.SetText("--")
 		r.pauseBtn.Hide()
 		r.startBtn.Hide()
 		r.openFolderBtn.Show()
 		r.openFileBtn.Show()
 	case store.TaskStatus.FileLost:
 		r.statusLbl.SetText("文件丢失")
-		r.speed.SetText("--")
-		r.remTime.SetText("--")
 		r.startBtn.SetIcon(theme.DownloadIcon())
 		r.startBtn.Importance = widget.HighImportance
 		r.startBtn.Show()
@@ -228,8 +230,6 @@ func (r *taskRow) refresh() {
 		r.openFileBtn.Hide()
 	case store.TaskStatus.Failed:
 		r.statusLbl.SetText("失败")
-		r.speed.SetText("--")
-		r.remTime.SetText("--")
 		r.startBtn.SetIcon(theme.MediaReplayIcon())
 		r.startBtn.Importance = widget.LowImportance
 		r.startBtn.Show()
@@ -237,7 +237,6 @@ func (r *taskRow) refresh() {
 	}
 	r.progress.SetValue(pct)
 }
-
 func (r *taskRow) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(r.inner)
 }
