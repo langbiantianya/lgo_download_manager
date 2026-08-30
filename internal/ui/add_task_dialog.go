@@ -9,7 +9,9 @@ package ui
 import (
 	"context"
 	"net/url"
+	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -21,6 +23,38 @@ import (
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 )
+
+// uniqueSuffixRegex 匹配 'name(N)' 形式的后缀——用于在文件名已存在时递增编号。
+var uniqueSuffixRegex = regexp.MustCompile(`^(.*?)(\((\d+)\))$`)
+
+// uniqueSavePath 若 path 指向的文件已存在，则在扩展名前插入 (N) 直到
+// 找到不存在的名字（N 从 1 开始）。目录不存在或 IO 错误时返回原 path。
+func uniqueSavePath(path string) string {
+	if _, err := os.Stat(path); err != nil {
+		// 不存在或无法访问——直接返回原 path，由调用方按需处理错误。
+		return path
+	}
+	dir := filepath.Dir(path)
+	base := filepath.Base(path)
+	ext := filepath.Ext(base)
+	stem := base[:len(base)-len(ext)]
+
+	// 如果已经是 name(N) 形式，则从 N+1 开始递增；否则从 (1) 开始。
+	start := 1
+	if m := uniqueSuffixRegex.FindStringSubmatch(stem); m != nil {
+		if n, err := strconv.Atoi(m[3]); err == nil {
+			start = n + 1
+			stem = m[1]
+		}
+	}
+	for n := start; n < 10000; n++ {
+		candidate := filepath.Join(dir, stem+"("+strconv.Itoa(n)+")"+ext)
+		if _, err := os.Stat(candidate); err != nil {
+			return candidate
+		}
+	}
+	return path
+}
 
 // showAddTaskDialog 打开"新建下载任务"对话框，并预填全局设置中的内容。
 // 这里只显示必要的字段；高级选项位于"设置"对话框中。
@@ -34,19 +68,18 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 		lbl.TextStyle.Bold = true
 		return container.NewBorder(nil, nil, lbl, nil, w)
 	}
-
 	urlEntry := widget.NewEntry()
 	urlEntry.SetPlaceHolder("https://...")
 	urlEntry.Validator = notEmptyValidator()
 
 	savePathEntry := widget.NewEntry()
-	savePathEntry.SetText(filepath.Join(GlobalSettings.DefaultSaveDir, "download.bin"))
+	savePathEntry.SetText(uniqueSavePath(filepath.Join(GlobalSettings.DefaultSaveDir, "download.bin")))
 	browseBtn := widget.NewButton("浏览...", func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
 			if err != nil || uri == nil {
 				return
 			}
-			savePathEntry.SetText(filepath.Join(uri.Path(), filepath.Base(savePathEntry.Text)))
+			savePathEntry.SetText(uniqueSavePath(filepath.Join(uri.Path(), filepath.Base(savePathEntry.Text))))
 		}, win)
 	})
 
@@ -63,13 +96,9 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 			return
 		}
 		filename := filepath.Base(u.Path)
-		if filename == "" || filename == "." || filename == "/" {
-			filename = "download.bin"
-		}
 		if savePathEntry.Text == "" || savePathEntry.Text == filepath.Join(GlobalSettings.DefaultSaveDir, "download.bin") {
-			savePathEntry.SetText(filepath.Join(GlobalSettings.DefaultSaveDir, filename))
+			savePathEntry.SetText(uniqueSavePath(filepath.Join(GlobalSettings.DefaultSaveDir, filename)))
 		}
-
 		// 异步探测文件大小
 		go func() {
 			proto, err := protocol.DetectKind(rawURL, "")
@@ -126,7 +155,7 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 			return
 		}
 		url := urlEntry.Text
-		savePath := savePathEntry.Text
+		savePath := uniqueSavePath(savePathEntry.Text)
 		if url == "" || savePath == "" {
 			return
 		}
