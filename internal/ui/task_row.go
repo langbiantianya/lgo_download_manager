@@ -28,10 +28,10 @@ type taskRow struct {
 	sc   *scheduler.Scheduler
 
 	// 第一行：名称 + 大小 + 状态
-	name      *widget.Label
-	size      *widget.Label
-	statusLbl *widget.Label
-
+	name       *widget.Label
+	createdAtLbl *widget.Label // 名称下方的添加时间小字
+	size       *widget.Label
+	statusLbl  *widget.Label
 	// 第二行：进度条 + 速度 + 剩余时间
 	progress *widget.ProgressBar
 	speed    *widget.Label
@@ -63,11 +63,10 @@ func (r *taskRow) build() {
 	r.name.TextStyle.Bold = true
 	r.name.Truncation = fyne.TextTruncateEllipsis
 
-	r.size = widget.NewLabel("")
-	r.size.Alignment = fyne.TextAlignTrailing
+	r.createdAtLbl = widget.NewLabel("")
+	r.createdAtLbl.Importance = widget.LowImportance
 
-	r.statusLbl = widget.NewLabel("")
-	r.statusLbl.Alignment = fyne.TextAlignCenter
+	r.size = widget.NewLabel("")
 
 	r.progress = widget.NewProgressBar()
 	r.progress.TextFormatter = func() string { return "" }
@@ -90,16 +89,16 @@ func (r *taskRow) build() {
 		b.Importance = widget.LowImportance
 	}
 
-	// 第一行：名称（可扩展）[大小][状态]
+	// 第一行：名称（可扩展）+ 下方添加时间 [大小][状态]
+	nameStack := container.NewVBox(r.name, r.createdAtLbl)
 	row1 := container.NewBorder(
 		nil, nil, nil,
 		container.NewHBox(r.size, r.statusLbl),
-		r.name,
+		nameStack,
 	)
-	// 第二行：进度条（可扩展）占满整行
+	// 第二行：进度条占满整行
 	row2 := container.NewStack(r.progress)
-
-	// 第三行：左侧为速度 + 剩余时间，右侧对齐按钮
+	// 第三行：左侧速度+剩余时间，右侧按钮
 	row3 := container.NewBorder(
 		nil, nil,
 		container.NewHBox(r.startBtn, r.pauseBtn, r.openFolderBtn, r.openFileBtn, r.detailsBtn, r.cancelBtn),
@@ -156,7 +155,7 @@ func (r *taskRow) refresh() {
 	t := r.task
 	if t == nil {
 		r.name.SetText("")
-		r.size.SetText("")
+		r.createdAtLbl.SetText("")
 		r.statusLbl.SetText("")
 		r.progress.SetValue(0)
 		r.speed.SetText("--")
@@ -166,8 +165,8 @@ func (r *taskRow) refresh() {
 		return
 	}
 	r.name.SetText(displayName(t))
+	r.createdAtLbl.SetText("添加: " + formatTime(t.CreatedAt))
 	r.size.SetText(formatBytes(t.TotalSize))
-
 	pct := 0.0
 	if t.TotalSize > 0 {
 		pct = float64(t.Downloaded) / float64(t.TotalSize)
