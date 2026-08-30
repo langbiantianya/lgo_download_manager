@@ -67,6 +67,10 @@ func (r *taskRow) build() {
 	r.createdAtLbl.Importance = widget.LowImportance
 
 	r.size = widget.NewLabel("")
+	r.size.Alignment = fyne.TextAlignTrailing
+
+	r.statusLbl = widget.NewLabel("")
+	r.statusLbl.Alignment = fyne.TextAlignCenter
 
 	r.progress = widget.NewProgressBar()
 	r.progress.TextFormatter = func() string { return "" }
