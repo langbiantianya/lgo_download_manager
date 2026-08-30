@@ -58,3 +58,58 @@ func TestUniqueSavePath(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+func TestUniqueSavePathCompoundExt(t *testing.T) {
+	dir := t.TempDir()
+
+	// archive.tar.gz 已存在 → archive(1).tar.gz（不要把 (1) 插在 .tar 后面）。
+	if err := os.WriteFile(filepath.Join(dir, "archive.tar.gz"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := uniqueSavePath(filepath.Join(dir, "archive.tar.gz"))
+	want := filepath.Join(dir, "archive(1).tar.gz")
+	if got != want {
+		t.Fatalf("tar.gz: got %q want %q", got, want)
+	}
+
+	// data.tar.bz2 已存在 → data(1).tar.bz2。
+	if err := os.WriteFile(filepath.Join(dir, "data.tar.bz2"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got = uniqueSavePath(filepath.Join(dir, "data.tar.bz2"))
+	want = filepath.Join(dir, "data(1).tar.bz2")
+	if got != want {
+		t.Fatalf("tar.bz2: got %q want %q", got, want)
+	}
+
+	// 同时存在 archive.tar.gz 与 archive(1).tar.gz，应继续递增到 (2)。
+	if err := os.WriteFile(filepath.Join(dir, "archive(1).tar.gz"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got = uniqueSavePath(filepath.Join(dir, "archive.tar.gz"))
+	want = filepath.Join(dir, "archive(2).tar.gz")
+	if got != want {
+		t.Fatalf("tar.gz chained: got %q want %q", got, want)
+	}
+}
+
+func TestSplitExt(t *testing.T) {
+	cases := []struct {
+		base     string
+		wantStem string
+		wantExt  string
+	}{
+		{"archive.tar.gz", "archive", ".tar.gz"},
+		{"archive.tar.xz", "archive", ".tar.xz"},
+		{"file.bin", "file", ".bin"},
+		{"noext", "noext", ""},
+		{"multi.dotted.name.txt", "multi.dotted.name", ".txt"},
+		{"UPPER.TAR.GZ", "UPPER", ".TAR.GZ"}, // splitExt 大小写不敏感匹配，但保留原大小写
+	}
+	for _, c := range cases {
+		stem, ext := splitExt(c.base)
+		if stem != c.wantStem || ext != c.wantExt {
+			t.Errorf("splitExt(%q) = (%q, %q), want (%q, %q)",
+				c.base, stem, ext, c.wantStem, c.wantExt)
+		}
+	}
+}

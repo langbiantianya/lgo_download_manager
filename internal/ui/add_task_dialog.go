@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -24,8 +25,28 @@ import (
 	"lgo_download_manager/internal/scheduler"
 )
 
+// knownCompoundExts 是按 '.tar.xx' 风格出现的复合扩展名列表（最长匹配优先）。
+// 通过此列表来拆分 stem/ext，避免 filepath.Ext 把 'archive.tar.gz' 误切成
+// stem='archive.tar' + ext='.gz'，再插入 (1) 后变成 'archive.tar(1).gz'。
+var knownCompoundExts = []string{
+	".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar.lz",
+	".tar.lzma", ".tar.sz", ".tar.br",
+}
+
 // uniqueSuffixRegex 匹配 'name(N)' 形式的后缀——用于在文件名已存在时递增编号。
 var uniqueSuffixRegex = regexp.MustCompile(`^(.*?)(\((\d+)\))$`)
+
+// splitExt 优先按 knownCompoundExts 拆分；否则退化为 filepath.Ext 行为。
+// 返回 (stem, ext)，保证 ext 不为空字符串且不含路径分隔符。
+func splitExt(base string) (string, string) {
+	lower := strings.ToLower(base)
+	for _, ce := range knownCompoundExts {
+		if strings.HasSuffix(lower, ce) {
+			return base[:len(base)-len(ce)], base[len(base)-len(ce):]
+		}
+	}
+	return base[:len(base)-len(filepath.Ext(base))], filepath.Ext(base)
+}
 
 // uniqueSavePath 若 path 指向的文件已存在，则在扩展名前插入 (N) 直到
 // 找到不存在的名字（N 从 1 开始）。目录不存在或 IO 错误时返回原 path。
@@ -36,8 +57,7 @@ func uniqueSavePath(path string) string {
 	}
 	dir := filepath.Dir(path)
 	base := filepath.Base(path)
-	ext := filepath.Ext(base)
-	stem := base[:len(base)-len(ext)]
+	stem, ext := splitExt(base)
 
 	// 如果已经是 name(N) 形式，则从 N+1 开始递增；否则从 (1) 开始。
 	start := 1
