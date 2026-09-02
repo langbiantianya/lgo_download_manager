@@ -10,35 +10,22 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"image/color"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
 	"time"
-
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
-	"fyne.io/fyne/v2/test"
-	"fyne.io/fyne/v2/theme"
 
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
 
-// TestMosaicTilesTurnGreenOnDownload 在一个不支持 Accept-Ranges 的 httptest
-// 服务器上，通过真实的 scheduler + engine 跑一次下载（强制走 engine 的
-// 流式回退路径）。完成后，engine 会折叠为覆盖整个文件的单一分块，且
-// 进度等于总字节数。我们断言 mosaic 的 update() 会将每块瓦片都绘制
-// 为 success 颜色。
-//
-// 瓦片颜色通过在每次更新时重建 canvas.Rectangle 子节点来设置，
-// 从而规避 fyne-io/fyne#3216（在 GridWrap 单个子节点上调用 Refresh
-// 可能会被静默丢弃）。
-func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
+// TestMosaicTilesGoGreenOnDownload 在不支持 Range 的 httptest 服务器上跑一次
+// 真实下载；engine 流式回退到单分块，进度 = TotalSize。我们断言
+// chunkMosaic.update 后每块 tile 的 covered == 1.0。
+func TestMosaicTilesGoGreenOnDownload(t *testing.T) {
 	const size = 4 * 1024 * 1024
 	payload := make([]byte, size)
 	if _, err := rand.Read(payload); err != nil {
@@ -62,9 +49,6 @@ func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	test.NewApp()
-	defer test.NewApp()
-
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "ldm.db")
 	st, err := store.Open(dbPath)
@@ -87,31 +71,18 @@ func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scheduler.Add: %v", err)
 	}
-
 	if err := sc.Start(tk.ID); err != nil {
 		t.Fatalf("scheduler.Start: %v", err)
 	}
-
 	if cur, err := st.GetTask(tk.ID); err == nil {
 		tk = cur
 	}
 
-	m := newChunkMosaic(tk.ID)
+	m := &chunkMosaic{}
 	m.resizeForTotal(tk.TotalSize)
-
-	ch, unsub := sc.Subscribe()
-	defer unsub()
-	go func() {
-		for ev := range ch {
-			if ev.Task == nil || ev.Task.ID != tk.ID {
-				continue
-			}
-			m.update(ev.Task.ChunkProgress, ev.Task.ChunkRanges, ev.Task.TotalSize)
-		}
-	}()
-
 	m.update(tk.ChunkProgress, tk.ChunkRanges, tk.TotalSize)
 
+	// 等到完成。
 	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		cur, _ := st.GetTask(tk.ID)
@@ -120,39 +91,23 @@ func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-
 	time.Sleep(1 * time.Second)
 
 	cur, _ := st.GetTask(tk.ID)
 	if cur == nil {
 		t.Fatalf("task vanished after completion")
 	}
-	fmt.Fprintf(os.Stderr, "post-complete: prog=%v ranges=%v total=%d\n",
-		cur.ChunkProgress, cur.ChunkRanges, cur.TotalSize)
 	m.update(cur.ChunkProgress, cur.ChunkRanges, cur.TotalSize)
 
 	if m.blocks != 4 {
 		t.Fatalf("expected 4 blocks, got %d", m.blocks)
 	}
-	if got := len(m.wrap.Objects); got != 4 {
+	if got := len(m.tiles); got != 4 {
 		t.Fatalf("expected 4 tiles, got %d", got)
 	}
-	for i, obj := range m.wrap.Objects {
-		rect, ok := obj.(*canvas.Rectangle)
-		if !ok {
-			t.Fatalf("tile %d is %T, want *canvas.Rectangle", i, obj)
-		}
-		// 流式下载完全完成后 → 每块瓦片都应是 success（绿色）。
-		if rect.FillColor != successColor() {
-			t.Errorf("tile %d FillColor = %v, want Success (%v)",
-				i, rect.FillColor, successColor())
+	for i, tile := range m.tiles {
+		if tile.covered < 1 {
+			t.Errorf("tile %d covered = %f, want 1.0", i, tile.covered)
 		}
 	}
-}
-
-// successColor 解析主题的 success 颜色，以便我们比较瓦片
-func successColor() color.Color {
-	th := fyne.CurrentApp().Settings().Theme()
-	// 的 FillColor（color.Color）与其是否相等。
-	return th.Color(theme.ColorNameSuccess, fyne.CurrentApp().Settings().ThemeVariant())
 }

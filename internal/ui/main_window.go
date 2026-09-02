@@ -4,387 +4,429 @@
 //
 // Copyright (c) 2026 langbiantianya
 
-// Package ui 为下载管理器提供基于 Fyne 的图形界面。
-// 线程安全：scheduler 运行在后台 goroutine 中；所有 GUI
-// 修改都通过 fyne.Do() 在 Fyne 事件线程上进行。
 package ui
 
 import (
-	"fmt"
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
-	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/data/binding"
-	"fyne.io/fyne/v2/layout"
-	"fyne.io/fyne/v2/theme"
-	"fyne.io/fyne/v2/widget"
-	"image/color"
-	"log"
 	"path/filepath"
-	"time"
-	"lgo_download_manager/internal/scheduler"
+	"strings"
+
+	"gioui.org/app"
+	"gioui.org/font"
+	"gioui.org/layout"
+	"gioui.org/unit"
+	"gioui.org/widget"
+	"gioui.org/widget/material"
+
 	"lgo_download_manager/internal/store"
 )
 
-// MainWindow 保存所有 GUI 状态以及顶层 Fyne 窗口。
+// OpenNewTaskFunc 是打开"新建任务"窗口的回调。
+type OpenNewTaskFunc func()
+
+// MainWindow 主窗口的状态——所有字段为本窗口私有。
 type MainWindow struct {
-	app     fyne.App
-	sc      *scheduler.Scheduler
-	win     fyne.Window
-	content *fyne.Container
+	a  *App
+	th *material.Theme
+	w  *app.Window
 
-	filter    binding.String
-	taskList  *taskList
-	statusBar *statusBar
+	newBtn       widget.Clickable
+	pauseAllBtn  widget.Clickable
+	resumeAllBtn widget.Clickable
+	settingsBtn  widget.Clickable
+	searchEditor widget.Editor
 
-	unsub     func()
-	focusTicker *time.Ticker
+	filterEnum widget.Enum
+
+	taskList widget.List
+
+	rowStates map[int]*rowState
+
+	schedUnsub func()
+
+	disks []diskInfo
+
+	openNewTask OpenNewTaskFunc
 }
 
-// NewMainWindow 构建附加到 app 的主窗口。
-//
-// 必须在 Fyne 事件线程上调用（通常在 app.New…() 之后、
-// a.Run() 之前的主 goroutine 中），因为 widget 构造器依赖
-// fyne.CurrentApp() 解析为刚创建的 app。
-func NewMainWindow(a fyne.App, st *store.Store, sc *scheduler.Scheduler) *MainWindow {
-	setGlobalStore(st)
-	if err := LoadSettings(st); err != nil {
-		log.Printf("ui: load settings: %v", err)
+// rowState 一行内所有可点击 widget 的状态。
+type rowState struct {
+	startBtn, pauseBtn, openDirBtn, openFileBtn, detailsBtn, cancelBtn widget.Clickable
+}
+
+// RunMainWindow 创建主窗口并启动 event loop。
+func RunMainWindow(a *App) *MainWindow {
+	w := new(app.Window)
+	w.Option(app.Title("LDM - Download Manager"))
+	w.Option(app.Size(unit.Dp(1100), unit.Dp(720)))
+
+	th := newTheme()
+	mw := &MainWindow{
+		a:         a,
+		th:        th,
+		w:         w,
+		rowStates: map[int]*rowState{},
 	}
-	setGlobalScheduler(sc)
-	m := &MainWindow{
-		app:    a,
-		sc:     sc,
-		filter: binding.NewString(),
-	}
-	m.taskList = newTaskList(sc, m.filter)
-	m.statusBar = newStatusBar()
-	m.buildMainUI()
-	m.statusBar.refreshDiskSpace()
-	m.subscribe()
-	m.setupTray()
-	setGlobalWindow(m.win)
-	return m
-}
+	mw.filterEnum.Value = a.Filter()
+	mw.taskList.Axis = layout.Vertical
 
-// buildMainUI 组装主窗口并保存内容容器，以便在页面之间切换（例如切换到设置页面）。
-func (m *MainWindow) buildMainUI() {
-	m.win = m.app.NewWindow("下载管理器")
-	m.content = container.NewBorder(
-		m.buildToolbar(),
-		m.statusBar.container(),
-		nil, nil,
-		m.buildMainSplit(),
-	)
-	m.win.SetContent(m.content)
-	m.win.Resize(fyne.NewSize(1000, 640))
-	m.win.CenterOnScreen()
-	m.win.SetOnClosed(func() { m.Close() })
-}
+	a.SetMainWindow(w)
 
-// showSettingsPage 将主内容切换到设置页面。
-func (m *MainWindow) showSettingsPage() {
-	m.win.SetContent(container.NewBorder(
-		m.buildSettingsHeader(),
-		nil, nil, nil,
-		m.buildSettingsContent(),
-	))
-}
-
-// showMainPage 将主内容切换回主视图。
-func (m *MainWindow) showMainPage() {
-	m.win.SetContent(m.content)
-}
-
-// buildSettingsHeader 返回带有返回按钮和标题的标题栏。
-func (m *MainWindow) buildSettingsHeader() fyne.CanvasObject {
-	backBtn := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
-		m.showMainPage()
-	})
-	title := widget.NewLabel("设置")
-	title.TextStyle.Bold = true
-	return container.NewBorder(nil, nil, backBtn, nil, container.NewHBox(title, layout.NewSpacer()))
-}
-
-// buildSettingsContent 返回设置表单内容。onChange 在任意设置项变更后触发，
-// 用于刷新任务列表（例如排序方式改变后）。
-func (m *MainWindow) buildSettingsContent() fyne.CanvasObject {
-	return buildSettingsContent(m.sc, func() { m.taskList.refresh() })
-}
-
-// buildToolbar 排列操作按钮、搜索框以及设置快捷按钮。
-func (m *MainWindow) buildToolbar() fyne.CanvasObject {
-	newBtn := widget.NewButtonWithIcon("新建任务", theme.ContentAddIcon(), func() {
-		showAddTaskDialog(m.win, m.sc)
-	})
-	pauseAllBtn := widget.NewButtonWithIcon("暂停全部", theme.MediaPauseIcon(), func() {
-		for _, tk := range m.taskList.allTasks() {
-			if tk.Status == store.TaskStatus.Downloading {
-				_ = m.sc.Pause(tk.ID)
-			}
-		}
-	})
-	resumeAllBtn := widget.NewButtonWithIcon("恢复全部", theme.MediaPlayIcon(), func() {
-		for _, tk := range m.taskList.allTasks() {
-			if tk.Status == store.TaskStatus.Paused || tk.Status == store.TaskStatus.Failed {
-				_ = m.sc.Start(tk.ID)
-			}
-		}
-	})
-	settingsBtn := widget.NewButtonWithIcon("设置", theme.SettingsIcon(), func() {
-		m.showSettingsPage()
-	})
-
-	searchEntry := widget.NewEntry()
-	searchEntry.SetPlaceHolder("搜索 URL 或保存路径…")
-	searchEntry.OnChanged = func(s string) { m.taskList.setSearch(s) }
-
-	left := container.NewHBox(newBtn, pauseAllBtn, resumeAllBtn)
-	return container.NewBorder(
-		nil,         // top
-		nil,         // bottom
-		left,        // left：按钮组
-		settingsBtn, // right：设置按钮
-		searchEntry, // center：搜索框自动撑满剩余空间
-	)
-}
-
-// buildMainSplit 创建侧边栏和任务列表之间的水平分割。
-func (m *MainWindow) buildMainSplit() *container.Split {
-	split := container.NewHSplit(
-		m.buildSidebar(),
-		m.taskList.container(),
-	)
-	split.SetOffset(0.18)
-	return split
-}
-
-// buildSidebar 渲染筛选单选按钮组。
-func (m *MainWindow) buildSidebar() fyne.CanvasObject {
-	type filterDef struct {
-		label     string
-		filterVal string
-	}
-	filters := []filterDef{
-		{"全部", "all"},
-		{"下载中", "downloading"},
-		{"已暂停", "paused"},
-		{"已完成", "completed"},
-		{"失败", "failed"},
-		{"文件丢失", "filelost"},
-	}
-	labelToFilter := map[string]string{}
-	for _, f := range filters {
-		labelToFilter[f.label] = f.filterVal
-	}
-	radios := widget.NewRadioGroup([]string{}, func(s string) {
-		_ = m.filter.Set(labelToFilter[s])
-		// 状态过滤改变后必须刷新列表，否则 List 的 Length 不会重新求值。
-		m.taskList.refresh()
-	})
-	labels := make([]string, len(filters))
-	for i, f := range filters {
-		labels[i] = f.label
-	}
-	radios.Options = labels
-	radios.Required = true
-	radios.SetSelected("全部")
-	_ = m.filter.Set("all")
-	radios.Horizontal = false
-	header := widget.NewLabelWithStyle("任务筛选", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-
-	return container.NewBorder(
-		container.NewVBox(header, widget.NewSeparator()),
-		nil,
-		nil, nil,
-		radios,
-	)
-}
-
-// Show 显示主窗口并在周期性地检查文件是否存在。
-// 在主 goroutine 中、a.Run() 之前调用，因此不需要 fyne.Do()。
-func (m *MainWindow) Show() {
-	m.win.Show()
-	if m.focusTicker == nil {
-		m.focusTicker = time.NewTicker(10 * time.Second)
-		go func() {
-			for range m.focusTicker.C {
-				m.sc.ValidateFileExistence()
-			}
-		}()
-	}
-}
-
-// Close 清理订阅和定时器。
-func (m *MainWindow) Close() {
-	if m.focusTicker != nil {
-		m.focusTicker.Stop()
-		m.focusTicker = nil
-	}
-	if m.unsub != nil {
-		m.unsub()
-	}
-}
-
-// setupTray 添加带有 Show 菜单项的系统托盘图标。
-func (m *MainWindow) setupTray() {
-	openItem := fyne.NewMenuItem("Open", func() {
-		m.win.Show()
-		m.win.RequestFocus()
-	})
-	trayMenu := fyne.NewMenu("", openItem)
-
-	// SetSystemTrayMenu/SetSystemTrayWindow 是 *fyneApp 上仅限桌面端的方法。
-	if desk, ok := m.app.(interface {
-		SetSystemTrayMenu(*fyne.Menu)
-		SetSystemTrayWindow(fyne.Window)
-	}); ok {
-		desk.SetSystemTrayMenu(trayMenu)
-		desk.SetSystemTrayWindow(m.win)
-	}
-}
-
-// subscribe 将 scheduler 事件总线接入 fyne.Do 的 GUI 更新。
-func (m *MainWindow) subscribe() {
-	ch, unsub := m.sc.Subscribe()
-	m.unsub = unsub
+	ch, unsub := a.Sched.Subscribe()
+	mw.schedUnsub = unsub
 	go func() {
-		for ev := range ch {
-			ev := ev
-			fyne.Do(func() {
-				m.taskList.onEvent(ev)
-			})
+		for range ch {
+			w.Invalidate()
 		}
 	}()
+
+	a.Subscribe(func() { w.Invalidate() })
+
+	runWindow(w, mw.Layout)
+	return mw
 }
 
-// diskBar 是一个细长彩色条，用于显示磁盘使用情况（绿→红）。
-type diskBar struct {
-	widget.BaseWidget
-	progress float64 // 0.0 到 1.0
-
-	bg   *canvas.Rectangle
-	fill *canvas.Rectangle
+// SetOpenNewTask 注册打开新建任务窗口的回调。
+func (mw *MainWindow) SetOpenNewTask(fn OpenNewTaskFunc) {
+	mw.openNewTask = fn
 }
 
-func newDiskBar() *diskBar {
-	db := &diskBar{}
-	db.ExtendBaseWidget(db)
-	return db
-}
-
-func (db *diskBar) setProgress(frac float64) {
-	if frac < 0 {
-		frac = 0
-	}
-	if frac > 1 {
-		frac = 1
-	}
-	db.progress = frac
-	db.Refresh()
-}
-
-func (db *diskBar) CreateRenderer() fyne.WidgetRenderer {
-	db.bg = canvas.NewRectangle(theme.Color(theme.ColorNameInputBackground))
-	db.fill = canvas.NewRectangle(colorForProgress(db.progress))
-	return &diskBarRenderer{db, db.bg, db.fill}
-}
-
-func (db *diskBar) MinSize() fyne.Size {
-	return fyne.NewSize(200, 4)
-}
-
-func (db *diskBar) Refresh() {
-	db.fill.FillColor = colorForProgress(db.progress)
-	db.fill.Refresh()
-}
-
-type diskBarRenderer struct {
-	b    *diskBar
-	bg   *canvas.Rectangle
-	fill *canvas.Rectangle
-}
-
-func (r *diskBarRenderer) Layout(size fyne.Size) {
-	r.bg.Resize(size)
-	barW := float32(r.b.progress) * size.Width
-	if barW < 0 {
-		barW = 0
-	}
-	r.fill.Resize(fyne.NewSize(barW, size.Height))
-}
-
-func (r *diskBarRenderer) MinSize() fyne.Size           { return r.b.MinSize() }
-func (r *diskBarRenderer) Objects() []fyne.CanvasObject { return []fyne.CanvasObject{r.bg, r.fill} }
-func (r *diskBarRenderer) Destroy()                     {}
-func (r *diskBarRenderer) Refresh()                     {}
-func colorForProgress(frac float64) color.Color {
-	// 绿色：#4CAF50，黄色：#FFEB3B，红色：#F44336
-	var r, g, b_ float64
-	if frac < 0.5 {
-		t := frac * 2
-		r = t*255 + (1-t)*76
-		g = t*235 + (1-t)*175
-		b_ = t*59 + (1-t)*80
-	} else {
-		t := (frac - 0.5) * 2
-		r = t*244 + (1-t)*255
-		g = t*67 + (1-t)*235
-		b_ = t*54 + (1-t)*59
-	}
-	return color.RGBA{R: uint8(r), G: uint8(g), B: uint8(b_), A: 255}
-}
-
-// statusBar 显示磁盘使用情况。
-type statusBar struct {
-	diskBar   *diskBar
-	diskLabel *widget.Label
-}
-
-func newStatusBar() *statusBar {
-	diskLabel := widget.NewLabel("磁盘空间: 检测中...")
-	diskLabel.SizeName = theme.SizeNameCaptionText
-
-	return &statusBar{
-		diskBar:   newDiskBar(),
-		diskLabel: diskLabel,
+// Close 释放订阅。
+func (mw *MainWindow) Close() {
+	if mw.schedUnsub != nil {
+		mw.schedUnsub()
 	}
 }
 
-func (sb *statusBar) container() fyne.CanvasObject {
-	return container.New(layout.NewCustomPaddedVBoxLayout(0),
-		widget.NewSeparator(),
-		sb.diskLabel,
-		sb.diskBar,
+// Layout 是每帧渲染入口。
+//
+// 布局：
+//
+//	┌───────────────────────────────────────┐
+//	│  Toolbar (按钮组 + 搜索框)            │
+//	├──────────┬────────────────────────────┤
+//	│ Sidebar  │  Task List                  │
+//	│ (filter) │                            │
+//	├──────────┴────────────────────────────┤
+//	│  Status Bar (磁盘占用)                │
+//	└───────────────────────────────────────┘
+func (mw *MainWindow) Layout(gtx layout.Context) layout.Dimensions {
+	// 处理 search editor 事件。
+	for {
+		ev, ok := mw.searchEditor.Update(gtx)
+		if !ok {
+			break
+		}
+		switch ev.(type) {
+		case widget.ChangeEvent:
+			mw.a.SetSearch(mw.searchEditor.Text())
+		case widget.SubmitEvent:
+			if mw.openNewTask != nil {
+				mw.openNewTask()
+			}
+		}
+	}
+	if mw.filterEnum.Update(gtx) {
+		mw.a.SetFilter(mw.filterEnum.Value)
+	}
+
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		// Toolbar：垂直 8dp 上下内边距、水平 16dp
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{
+				Top:    SpaceSM,
+				Bottom: SpaceSM,
+				Left:   SpaceMD,
+				Right:  SpaceMD,
+			}.Layout(gtx, mw.layoutToolbar)
+		}),
+		// 主区域 + 状态条
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			return mw.layoutBody(gtx)
+		}),
 	)
 }
-func (sb *statusBar) setDiskSpace(free, total int64) {
-	if total == 0 {
-		sb.diskLabel.SetText("磁盘空间: 不可用")
-		sb.diskBar.setProgress(0)
-		return
-	}
-	frac := 1.0 - float64(free)/float64(total)
-	sb.diskBar.setProgress(frac)
-	sb.diskLabel.SetText(fmt.Sprintf("磁盘空间: 可用 %s / 总计 %s",
-		humanBytes(free), humanBytes(total)))
+
+func (mw *MainWindow) layoutToolbar(gtx layout.Context) layout.Dimensions {
+	return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+		toolbarButton(mw.th, &mw.newBtn, "新建任务", func() {
+			if mw.openNewTask != nil {
+				mw.openNewTask()
+			}
+		}),
+		toolbarSpacer(),
+		toolbarButton(mw.th, &mw.pauseAllBtn, "暂停全部", mw.pauseAll),
+		toolbarSpacer(),
+		toolbarButton(mw.th, &mw.resumeAllBtn, "恢复全部", mw.resumeAll),
+		hspace(SpaceMD),
+		// 搜索框：填满剩余空间，垂直对齐
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			ed := material.Editor(mw.th, &mw.searchEditor, "搜索 URL 或保存路径…")
+			ed.TextSize = unit.Sp(14)
+			return ed.Layout(gtx)
+		}),
+		hspace(SpaceMD),
+		toolbarButton(mw.th, &mw.settingsBtn, "设置", func() {
+			OpenSettingsWindow(mw.a)
+		}),
+	)
 }
 
-// refreshDiskSpace 根据 GlobalSettings.DefaultSaveDir 更新磁盘空间显示。
-func (sb *statusBar) refreshDiskSpace() {
-	dir := GlobalSettings.DefaultSaveDir
-	if dir == "" {
-		sb.setDiskSpace(0, 0)
-		return
+// layoutBody 主区域：左侧 sidebar + 右侧 task list + 底部 status bar。
+func (mw *MainWindow) layoutBody(gtx layout.Context) layout.Dimensions {
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Horizontal}.Layout(gtx,
+				// Sidebar：固定宽度，贴左边
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					gtx.Constraints.Min.X = gtx.Dp(SidebarWidth)
+					gtx.Constraints.Max.X = gtx.Dp(SidebarWidth)
+					return mw.layoutSidebar(gtx)
+				}),
+				hspace(SpaceMD),
+				// Task List：填满剩余
+				layout.Flexed(1, mw.layoutTaskList),
+			)
+		}),
+		vspace(SpaceSM),
+		// Status Bar
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			return layout.Inset{
+				Top:    SpaceSM,
+				Bottom: SpaceSM,
+				Left:   SpaceMD,
+				Right:  SpaceMD,
+			}.Layout(gtx, mw.layoutStatus)
+		}),
+	)
+}
+
+// layoutSidebar 侧栏：标题 + 6 个 RadioButton。
+func (mw *MainWindow) layoutSidebar(gtx layout.Context) layout.Dimensions {
+	filters := []struct{ key, label string }{
+		{string(store.FilterAll), "全部"},
+		{string(store.FilterDownloading), "下载中"},
+		{string(store.FilterPaused), "已暂停"},
+		{string(store.FilterCompleted), "已完成"},
+		{string(store.FilterFailed), "失败"},
+		{string(store.FilterFileLost), "文件丢失"},
 	}
-	d := filepath.Dir(dir)
-	if d == "" {
-		d = "."
+	// 标题与列表各占一行。
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			l := material.Body1(mw.th, "任务筛选")
+			l.Font.Weight = font.Bold
+			l.TextSize = unit.Sp(14)
+			return l.Layout(gtx)
+		}),
+		vspace(SpaceMD),
+		layout.Rigid(separator(mw.th)),
+		vspace(SpaceSM),
+		// 每个 RadioButton 一行，垂直间距 SM
+		func() layout.FlexChild {
+			children := make([]layout.FlexChild, 0, len(filters)*2)
+			for _, f := range filters {
+				k, lbl := f.key, f.label
+				children = append(children,
+					layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+						return material.RadioButton(mw.th, &mw.filterEnum, k, lbl).Layout(gtx)
+					}),
+					vspace(SpaceSM),
+				)
+			}
+			return layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+			})
+		}(),
+	)
+}
+
+// layoutTaskList 任务列表区域。
+func (mw *MainWindow) layoutTaskList(gtx layout.Context) layout.Dimensions {
+	filter := store.StatusFilter(mw.a.Filter())
+	tasks, _ := mw.a.Sched.List(filter, GlobalSettings.TaskSort)
+	search := strings.ToLower(mw.a.Search())
+	filtered := tasks
+	if search != "" {
+		filtered = make([]*store.Task, 0, len(tasks))
+		for _, t := range tasks {
+			if strings.Contains(strings.ToLower(t.URL), search) ||
+				strings.Contains(strings.ToLower(t.SavePath), search) {
+				filtered = append(filtered, t)
+			}
+		}
 	}
-	free, total, err := diskUsage(d)
-	if err != nil {
-		sb.setDiskSpace(0, 0)
-		return
+	if len(filtered) == 0 {
+		return layout.Center.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			l := material.Body2(mw.th, "暂无任务，点击「新建任务」开始")
+			l.TextSize = unit.Sp(14)
+			return l.Layout(gtx)
+		})
 	}
-	sb.setDiskSpace(free, total)
+	return mw.taskList.Layout(gtx, len(filtered),
+		func(gtx layout.Context, i int) layout.Dimensions {
+			t := filtered[i]
+			r := mw.rowStateFor(i)
+			return taskRowWidget(mw.th, r, t, mw.a)(gtx)
+		},
+	)
+}
+
+func (mw *MainWindow) rowStateFor(i int) *rowState {
+	if r, ok := mw.rowStates[i]; ok {
+		return r
+	}
+	r := &rowState{}
+	mw.rowStates[i] = r
+	return r
+}
+
+// layoutStatus 底部状态条：磁盘占用。
+func (mw *MainWindow) layoutStatus(gtx layout.Context) layout.Dimensions {
+	mw.disks = listMounts()
+	return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+		layout.Rigid(separator(mw.th)),
+		vspace(SpaceSM),
+		layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+			l := material.Body2(mw.th, "磁盘占用")
+			l.Font.Weight = font.Bold
+			l.TextSize = unit.Sp(13)
+			return l.Layout(gtx)
+		}),
+		vspace(SpaceSM),
+		func() layout.FlexChild {
+			children := make([]layout.FlexChild, 0, len(mw.disks)+1)
+			if len(mw.disks) == 0 {
+				children = append(children, layout.Rigid(
+					material.Caption(mw.th, "(无挂载信息)").Layout))
+			} else {
+				for _, d := range mw.disks {
+					d := d
+					children = append(children,
+						vspace(SpaceXS),
+						layout.Rigid(diskRow(mw.th, d)),
+					)
+				}
+			}
+			return layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+				return layout.Flex{Axis: layout.Vertical}.Layout(gtx, children...)
+			})
+		}(),
+	)
+}
+
+func (mw *MainWindow) pauseAll() {
+	tasks, _ := mw.a.Sched.List(store.StatusFilter(mw.a.Filter()), GlobalSettings.TaskSort)
+	for _, tk := range tasks {
+		if tk.Status == store.TaskStatus.Downloading {
+			_ = mw.a.Sched.Pause(tk.ID)
+		}
+	}
+}
+
+func (mw *MainWindow) resumeAll() {
+	tasks, _ := mw.a.Sched.List(store.StatusFilter(mw.a.Filter()), GlobalSettings.TaskSort)
+	for _, tk := range tasks {
+		if tk.Status == store.TaskStatus.Paused || tk.Status == store.TaskStatus.Failed {
+			_ = mw.a.Sched.Start(tk.ID)
+		}
+	}
+}
+
+// taskRowWidget 返回一行的 Layout 函数。
+func taskRowWidget(th *material.Theme, rs *rowState, t *store.Task, a *App) layout.Widget {
+	return func(gtx layout.Context) layout.Dimensions {
+		// 行整体：左右 16dp 边距、上下 12dp
+		return layout.Inset{
+			Top: SpaceSM, Bottom: SpaceSM, Left: SpaceMD, Right: SpaceMD,
+		}.Layout(gtx, func(gtx layout.Context) layout.Dimensions {
+			return layout.Flex{Axis: layout.Vertical}.Layout(gtx,
+				// 第一行：文件名 + size + status
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+						layout.Flexed(1, func(gtx layout.Context) layout.Dimensions {
+							name := material.Body1(th, displayName(t))
+							name.Font.Weight = font.Bold
+							name.TextSize = unit.Sp(14)
+							name.MaxLines = 1
+							return name.Layout(gtx)
+						}),
+						hspace(SpaceSM),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							return material.Body2(th, formatBytes(t.TotalSize)).Layout(gtx)
+						}),
+						hspace(SpaceSM),
+						layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+							l := material.Body2(th, statusText(t.Status))
+							l.TextSize = unit.Sp(12)
+							return l.Layout(gtx)
+						}),
+					)
+				}),
+				vspace(SpaceXS),
+				// 第二行：进度条
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					pct := 0.0
+					if t.TotalSize > 0 {
+						pct = float64(t.Downloaded) / float64(t.TotalSize)
+						if pct > 1 {
+							pct = 1
+						}
+					}
+					return material.ProgressBar(th, float32(pct)).Layout(gtx)
+				}),
+				vspace(SpaceSM),
+				// 第三行：操作按钮
+				layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+					return layout.Flex{Axis: layout.Horizontal, Alignment: layout.Middle}.Layout(gtx,
+						rowActionBtn(th, &rs.startBtn, "开始", func() { _ = a.Sched.Start(t.ID) }),
+						hspace(SpaceXS),
+						rowActionBtn(th, &rs.pauseBtn, "暂停", func() { _ = a.Sched.Pause(t.ID) }),
+						hspace(SpaceXS),
+						rowActionBtn(th, &rs.openDirBtn, "目录", func() { openPath(filepath.Dir(t.SavePath)) }),
+						hspace(SpaceXS),
+						rowActionBtn(th, &rs.openFileBtn, "文件", func() { openPath(t.SavePath) }),
+						hspace(SpaceXS),
+						rowActionBtn(th, &rs.detailsBtn, "详情", func() { OpenChunkDetails(a, t) }),
+						hspace(SpaceXS),
+						rowActionBtn(th, &rs.cancelBtn, "删除", func() { _ = a.Sched.Delete(t.ID) }),
+					)
+				}),
+			)
+		})
+	}
+}
+
+func rowActionBtn(th *material.Theme, c *widget.Clickable, label string, onClick func()) layout.FlexChild {
+	return layout.Rigid(func(gtx layout.Context) layout.Dimensions {
+		for c.Clicked(gtx) {
+			if onClick != nil {
+				onClick()
+			}
+		}
+		b := material.Button(th, c, label)
+		b.CornerRadius = ButtonRadius
+		b.Inset = layout.UniformInset(unit.Dp(8))
+		b.TextSize = unit.Sp(13)
+		return b.Layout(gtx)
+	})
+}
+
+// statusText 中文状态映射。
+func statusText(s store.Status) string {
+	switch s {
+	case store.TaskStatus.Pending:
+		return "等待中"
+	case store.TaskStatus.Downloading:
+		return "下载中"
+	case store.TaskStatus.Paused:
+		return "已暂停"
+	case store.TaskStatus.Completed:
+		return "已完成"
+	case store.TaskStatus.Failed:
+		return "失败"
+	case store.TaskStatus.FileLost:
+		return "文件丢失"
+	default:
+		return string(s)
+	}
 }
