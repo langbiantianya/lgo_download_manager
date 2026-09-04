@@ -11,13 +11,13 @@ import (
 	"fmt"
 	"image/color"
 	"path/filepath"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
-	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
 
@@ -53,7 +53,7 @@ type chunkMosaic struct {
 
 // showChunkDetails 打开一个窗口，展示任务按分块的下载进度。
 // 每个分块被渲染为瓦片墙中的一块——参见 chunkMosaic。
-func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window) {
+func showChunkDetails(t *store.Task, svc Service, parent fyne.Window) {
 	titleStr := fmt.Sprintf("任务详情: %s", taskName(t))
 
 	urlLabel := widget.NewLabel("URL: " + t.URL)
@@ -91,11 +91,9 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 	w.Resize(fyne.NewSize(640, 460))
 	w.Show()
 
-	// 先订阅 scheduler 事件拿到 unsub，再注册 SetOnClosed。
-	// Subscribe 内部仅加锁把 channel 写入 scheduler.Subs，几乎不耗时，
-	// 与 w.Show() 之间的窗口期可忽略；即便用户在那一瞬关闭窗口，
-	// Fyne 仍会等 SetOnClosed 注册完成后再触发 close 事件。
-	ch, unsub := sc.Subscribe()
+	// 先订阅业务事件流拿到 unsub，再注册 SetOnClosed，
+	// 保证窗口关闭时取消订阅。
+	ch, unsub := svc.Subscribe()
 	w.SetOnClosed(func() { unsub() })
 	go func() {
 		for ev := range ch {
@@ -108,6 +106,7 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 		}
 	}()
 }
+
 // newChunkMosaic 创建一个空马赛克；resizeForTotal 会在知道文件大小后
 // 分配瓦片网格。
 func newChunkMosaic(taskID string) *chunkMosaic {

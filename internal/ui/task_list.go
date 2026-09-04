@@ -21,7 +21,7 @@ import (
 
 // taskList 是右侧显示下载队列的面板。
 type taskList struct {
-	sc      *scheduler.Scheduler
+	svc     Service
 	filter  binding.String
 	searchQ binding.String
 
@@ -36,9 +36,9 @@ type taskList struct {
 	rowMap map[string]*taskRow
 }
 
-func newTaskList(sc *scheduler.Scheduler, filter binding.String) *taskList {
+func newTaskList(svc Service, filter binding.String) *taskList {
 	tl := &taskList{
-		sc:      sc,
+		svc:     svc,
 		filter:  filter,
 		searchQ: binding.NewString(),
 		rowMap:  map[string]*taskRow{},
@@ -51,12 +51,12 @@ func (tl *taskList) container() *fyne.Container { return tl.panel }
 
 func (tl *taskList) allTasks() []*store.Task {
 	fv, _ := tl.filter.Get()
-	tks, _ := tl.sc.List(store.StatusFilter(fv), GlobalSettings.TaskSort)
+	tks, _ := tl.svc.List(store.StatusFilter(fv), GlobalSettings.TaskSort)
 	return tks
 }
 
-// filtered 用 SQL 过滤（按 store 层）+ 内存内的搜索文本过滤。
-// 状态过滤在 store 层完成；搜索框匹配 URL 或保存路径，在内存里完成。
+// filtered 用后端过滤（status）+ 内存内的搜索文本过滤。
+// 状态过滤由业务侧完成；搜索框匹配 URL 或保存路径，在内存里完成。
 func (tl *taskList) filtered() []*store.Task {
 	sv, _ := tl.searchQ.Get()
 	tasks := tl.allTasks()
@@ -85,7 +85,7 @@ func (tl *taskList) build() *fyne.Container {
 				return
 			}
 			row := obj.(*taskRow)
-			row.bind(tasks[int(id)], tl.sc)
+			row.bind(tasks[int(id)], tl.svc)
 			tl.bindRow(row, tasks[int(id)].ID)
 		},
 	)

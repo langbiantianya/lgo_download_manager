@@ -9,7 +9,6 @@ package ui
 import (
 	"fmt"
 	"log"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -20,74 +19,23 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"lgo_download_manager/internal/protocol"
-	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
 
 const mib = int64(1 << 20)
 
-// GlobalSettings 是“新建任务”预填字段时以及 main.go 中的 URL 启动器
-// 使用的实时设置。它与 SQLite 存储 settings 表中的持久化行一一对应，
-// 并在启动时由 LoadSettings 加载。
+// GlobalSettings 是 UI 侧持有的设置镜像，供“新建任务”预填、状态栏
+// 磁盘空间、任务排序等即时读取。权威设置在业务进程（store）；UI 通过
+// svc.SaveSettings 持久化，业务进程负责应用代理配置。每次修改镜像后
+// 都同步保存，因此两者保持一致。
 var GlobalSettings store.Settings
-// forceLightMode 当从 CLI 传入 --light 标志时设为 true，强制开启轻量模式。
-var forceLightMode bool
 
-// SetForceLightMode 由 main.go 的 --light flag 调用，使后续 LoadSettings
-// 调用强制 LightMode 为 true。
-func SetForceLightMode() { forceLightMode = true }
-
-// LoadSettings 从存储中读取持久化的设置，并将其覆盖到 GlobalSettings 上。
-// 对于零值具有歧义（空字符串 / 0）的字段，会应用默认值——首次运行时，
-// 行级“未存储值”标记就是空的 DefaultSaveDir。首次保存后，
-// 所有字段将按原值持久化。
-func LoadSettings(st *store.Store) error {
-	persisted, err := st.LoadSettings()
-	if err != nil {
-		return err
-	}
-	firstRun := persisted.DefaultSaveDir == ""
-	if firstRun {
-		home, _ := os.UserHomeDir()
-		persisted.DefaultSaveDir = filepath.Join(home, "Downloads")
-		persisted.DefaultThreads = 4
-		persisted.MinChunkSize = 10 * mib
-		persisted.UserAgent = "Wget/1.21.3"
-		persisted.FTPPassive = true
-		persisted.Prealloc = true
-		persisted.TaskSort = store.SortCreatedDesc
-		persisted.LightMode = true // 新用户默认开启轻量模式
-	}
-	GlobalSettings = persisted
-	if forceLightMode {
-		GlobalSettings.LightMode = true
-	}
-	protocol.SetProxyConfig(protocol.ProxyConfig{
-		Mode:        persisted.ProxyMode,
-		ProxyURL:    persisted.ProxyURL,
-		ProxyBypass: persisted.ProxyBypass,
-	})
-	if firstRun {
-		_ = SaveSettings(st)
-	}
-	return nil
-}
-// SaveSettings 将 GlobalSettings 写入存储。每次 UI 修改后均可安全调用。
-func SaveSettings(st *store.Store) error {
-	// 同步更新 protocol 包的全局代理，使新创建/恢复的任务立即生效。
-	protocol.SetProxyConfig(protocol.ProxyConfig{
-		Mode:        GlobalSettings.ProxyMode,
-		ProxyURL:    GlobalSettings.ProxyURL,
-		ProxyBypass: GlobalSettings.ProxyBypass,
-	})
-	return st.SaveSettings(GlobalSettings)
-}
-func buildSettingsContent(sc *scheduler.Scheduler, onChange func()) fyne.CanvasObject {
+func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 	persist := func() {
-		if globalStore == nil {
+		if svc == nil {
 			return
 		}
-		if err := SaveSettings(globalStore); err != nil {
+		if err := svc.SaveSettings(GlobalSettings); err != nil {
 			log.Printf("ui: save settings: %v", err)
 		}
 		if onChange != nil {
@@ -139,72 +87,67 @@ func buildSettingsContent(sc *scheduler.Scheduler, onChange func()) fyne.CanvasO
 		persist()
 	}
 
-// 代理相关控件
-proxyURLEntry := widget.NewEntry()
-proxyURLEntry.SetText(GlobalSettings.ProxyURL)
-proxyURLEntry.SetPlaceHolder("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
-proxyURLEntry.OnChanged = func(s string) {
-	GlobalSettings.ProxyURL = strings.TrimSpace(s)
-	persist()
-}
-
-proxyBypassEntry := widget.NewEntry()
-proxyBypassEntry.SetText(GlobalSettings.ProxyBypass)
-proxyBypassEntry.SetPlaceHolder("逗号分隔，例如 example.com,*.lan")
-proxyBypassEntry.OnChanged = func(s string) {
-	GlobalSettings.ProxyBypass = strings.TrimSpace(s)
-	persist()
-}
-
-proxyModeLabels := map[protocol.ProxyMode]string{
-	protocol.ProxyModeSystem:   "使用系统代理（默认）",
-	protocol.ProxyModeDisabled: "不使用代理（始终直连）",
-	protocol.ProxyModeManual:   "手动设置代理",
-}
-labelToProxyMode := map[string]protocol.ProxyMode{}
-proxyModeOpts := make([]string, 0, len(proxyModeLabels))
-for _, m := range []protocol.ProxyMode{protocol.ProxyModeSystem, protocol.ProxyModeDisabled, protocol.ProxyModeManual} {
-	proxyModeOpts = append(proxyModeOpts, proxyModeLabels[m])
-	labelToProxyMode[proxyModeLabels[m]] = m
-}
-
-// 切换模式时仅控制代理地址/绕过列表的可见性。地址本身始终保留，
-// 这样用户在 Manual↔System 之间来回切换不会丢失已填写的 URL。
-proxyModeSelect := widget.NewSelect(proxyModeOpts, func(s string) {
-	mode, ok := labelToProxyMode[s]
-	if !ok {
-		return
+	// 代理相关控件
+	proxyURLEntry := widget.NewEntry()
+	proxyURLEntry.SetText(GlobalSettings.ProxyURL)
+	proxyURLEntry.SetPlaceHolder("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
+	proxyURLEntry.OnChanged = func(s string) {
+		GlobalSettings.ProxyURL = strings.TrimSpace(s)
+		persist()
 	}
-	GlobalSettings.ProxyMode = mode
-	// 切到 System 模式时清掉缓存，使下一次请求重新探测桌面代理设置。
-	if mode == protocol.ProxyModeSystem {
-		protocol.InvalidateSystemProxyCache()
+
+	proxyBypassEntry := widget.NewEntry()
+	proxyBypassEntry.SetText(GlobalSettings.ProxyBypass)
+	proxyBypassEntry.SetPlaceHolder("逗号分隔，例如 example.com,*.lan")
+	proxyBypassEntry.OnChanged = func(s string) {
+		GlobalSettings.ProxyBypass = strings.TrimSpace(s)
+		persist()
 	}
-	manual := mode == protocol.ProxyModeManual
-	if manual {
-		proxyURLEntry.Show()
-		proxyBypassEntry.Show()
-	} else {
+
+	proxyModeLabels := map[protocol.ProxyMode]string{
+		protocol.ProxyModeSystem:   "使用系统代理（默认）",
+		protocol.ProxyModeDisabled: "不使用代理（始终直连）",
+		protocol.ProxyModeManual:   "手动设置代理",
+	}
+	labelToProxyMode := map[string]protocol.ProxyMode{}
+	proxyModeOpts := make([]string, 0, len(proxyModeLabels))
+	for _, m := range []protocol.ProxyMode{protocol.ProxyModeSystem, protocol.ProxyModeDisabled, protocol.ProxyModeManual} {
+		proxyModeOpts = append(proxyModeOpts, proxyModeLabels[m])
+		labelToProxyMode[proxyModeLabels[m]] = m
+	}
+
+	// 切换模式时仅控制代理地址/绕过列表的可见性。地址本身始终保留，
+	// 这样用户在 Manual↔System 之间来回切换不会丢失已填写的 URL。
+	// 代理缓存失效在业务进程保存设置时处理（settings.Save）。
+	proxyModeSelect := widget.NewSelect(proxyModeOpts, func(s string) {
+		mode, ok := labelToProxyMode[s]
+		if !ok {
+			return
+		}
+		GlobalSettings.ProxyMode = mode
+		manual := mode == protocol.ProxyModeManual
+		if manual {
+			proxyURLEntry.Show()
+			proxyBypassEntry.Show()
+		} else {
+			proxyURLEntry.Hide()
+			proxyBypassEntry.Hide()
+		}
+		persist()
+	})
+	initialMode := GlobalSettings.ProxyMode
+	if initialMode == 0 {
+		initialMode = protocol.ProxyModeSystem
+	}
+	initialLabel := proxyModeLabels[initialMode]
+	if initialLabel == "" {
+		initialLabel = proxyModeLabels[protocol.ProxyModeSystem]
+	}
+	proxyModeSelect.SetSelected(initialLabel)
+	if initialMode != protocol.ProxyModeManual {
 		proxyURLEntry.Hide()
 		proxyBypassEntry.Hide()
 	}
-	persist()
-})
-initialMode := GlobalSettings.ProxyMode
-if initialMode == 0 {
-	initialMode = protocol.ProxyModeSystem
-}
-initialLabel := proxyModeLabels[initialMode]
-if initialLabel == "" {
-	initialLabel = proxyModeLabels[protocol.ProxyModeSystem]
-}
-proxyModeSelect.SetSelected(initialLabel)
-if initialMode != protocol.ProxyModeManual {
-	proxyURLEntry.Hide()
-	proxyBypassEntry.Hide()
-}
-
-
 
 	ftpPassive := widget.NewCheck("启用 FTP PASV 被动模式", func(checked bool) {
 		GlobalSettings.FTPPassive = checked
@@ -250,14 +193,14 @@ if initialMode != protocol.ProxyModeManual {
 	if currentLabel == "" {
 		currentLabel = sortLabels[store.SortCreatedDesc]
 	}
-	lightModeCheck := widget.NewCheck("轻量模式（关闭主窗口时释放界面内存）", func(checked bool) {
+	lightModeCheck := widget.NewCheck("轻量模式（关闭主窗口时退出 UI 进程并释放内存）", func(checked bool) {
 		GlobalSettings.LightMode = checked
 		persist()
 	})
 	lightModeCheck.SetChecked(GlobalSettings.LightMode)
 
- 	sortSelect.SetSelected(currentLabel)
- 	form := widget.NewForm(
+	sortSelect.SetSelected(currentLabel)
+	form := widget.NewForm(
 		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
 		widget.NewFormItem("默认并发线程数", threadsEntry),
 		widget.NewFormItem("最小分块大小", chunkSizeRow),

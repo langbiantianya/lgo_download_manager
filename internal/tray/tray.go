@@ -4,7 +4,10 @@
 //
 // Copyright (c) 2026 langbiantianya
 
-package ui
+// Package tray 提供独立于 Fyne 的系统托盘（fyne.io/systray）。
+// 托盘运行在业务主进程中：UI 子进程关闭/崩溃不影响托盘，
+// 菜单可随时重新拉起 UI。
+package tray
 
 import (
 	_ "embed"
@@ -28,38 +31,31 @@ var trayIcon32 []byte
 //go:embed assets/tray.png
 var trayIcon64 []byte
 
-// TrayCallbacks 描述托盘菜单触发的回调。
+// Callbacks 描述托盘菜单触发的回调。
 //
-// 全部回调必须由调用方保证线程安全：systray 自身运行在自己的事件循环中，
-// 回调通常在非主 goroutine 上触发；Fyne 端的窗口操作通过 fyne.Do 投递
-// 即可保证 GUI 线程安全。
-type TrayCallbacks struct {
+// 全部回调由调用方保证线程安全：systray 自身运行在自己的事件循环中，
+// 回调通常在非主 goroutine 上触发。Open/Quit 均回到业务主进程：
+// Open 拉起/显示 UI 子进程；Quit 结束整个程序（含 UI 子进程）。
+type Callbacks struct {
 	// Open 在用户点击 “Open” 菜单项时调用。
-	// 应当确保主窗口可见、获得焦点；轻量模式下还需重建内容。
 	Open func()
 
 	// Quit 在用户点击 “退出” 菜单项时调用。
-	// 调用方负责结束主事件循环并清理资源（通常调用 fyne.App.Quit()）。
+	// 调用方负责结束业务进程（并顺带回收 UI 子进程）。
 	Quit func()
 }
 
-// StartTray 在当前 goroutine 上启动 systray 事件循环。
+// Start 在当前 goroutine 上启动 systray 事件循环。
 //
-// 它会一直阻塞直到 systray.Quit() 被调用——因此必须在 Fyne 主事件
-// 循环运行之前启动，或者放在独立的 goroutine 里。
+// 它会一直阻塞直到 systray.Quit() 被调用——因此必须在主流程中
+// 以独立 goroutine 启动。
 //
 // 启动后，托盘自带一个 “Open” 与 “退出” 菜单项；点击会触发对应的回调。
-func StartTray(cb TrayCallbacks) {
+func Start(cb Callbacks) {
 	onReady := func() {
 		systray.SetTitle("下载管理器")
 		systray.SetTooltip("下载管理器")
 
-		// systray 在不同平台使用不同尺寸：
-		//   - Linux：优先 22×22；AppIndicator 对尺寸敏感。
-		//   - macOS：使用模板图标随系统主题反转（这里用普通图标亦可）。
-		//   - Windows：32×32 最稳。
-		// SetTemplateIcon（仅 macOS 真正生效）使用单色 alpha 通道图；
-		// 我们使用 SetIcon 并按平台自动挑最合适的尺寸。
 		systray.SetIcon(trayIconForPlatform())
 		systray.SetTemplateIcon(trayIcon32, trayIcon32)
 
@@ -91,14 +87,13 @@ func StartTray(cb TrayCallbacks) {
 	systray.Run(onReady, onExit)
 }
 
+// Stop 通知 systray 退出事件循环。可以在主程序结束时调用以释放托盘。
+func Stop() {
+	systray.Quit()
+}
+
 // trayIconForPlatform 返回最适合当前平台的托盘图标字节。
-//
-// 平台检测在运行时（fyne.io/systray 的 build tag 在 import 时已
-// 决定了底层 driver，但不会自动挑选合适尺寸），因此用一个简单的
-// 选择策略：默认 32×32；macOS 走 64×64 以适配 Retina。
 func trayIconForPlatform() []byte {
-	// fyne.io/systray 在 build 时已决定 driver；
-	// runtime.GOOS 可用于按 OS 选择尺寸。
 	switch runtime.GOOS {
 	case "darwin":
 		return trayIcon64
@@ -107,9 +102,4 @@ func trayIconForPlatform() []byte {
 	default:
 		return trayIcon32
 	}
-}
-
-// StopTray 通知 systray 退出事件循环。可以在主程序结束时调用以释放托盘。
-func StopTray() {
-	systray.Quit()
 }

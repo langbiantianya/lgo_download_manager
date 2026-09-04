@@ -1,0 +1,75 @@
+# Flatpak manifest for lgo_download_manager (LDM).
+#
+# Build with:
+#   flatpak-builder --user --install --force-clean build-dir org.langbiantianya.LDM.yml
+# Or via the helper target:
+#   make flatpak
+#
+# Runtime choice: GNOME 50. Works on both X11 (via XWayland when needed)
+# and native Wayland sessions; LDM uses Fyne, which renders through
+# EGL/GLFW and works in either case.
+#
+# URL scheme: lgom://download?url=<encoded>[&name=<encoded>[&ua=<encoded>
+#             [&headers=<encoded>[&cookies=<encoded>]]]]
+# Registered via the .desktop entry's MimeType=x-scheme-handler/lgom.
+# The running primary instance receives forwarded URLs over a Unix
+# socket in $XDG_RUNTIME_DIR; that's why --filesystem=xdg-run is needed.
+#
+# Build strategy:
+#   - `make build` produces ./bin/lgo_download_manager using the host's
+#     Go toolchain (so we don't need to download the Go module graph
+#     inside the Flatpak sandbox, which often can't reach the network).
+#   - The `ldm` module only copies that pre-built binary into /app/bin.
+#   - The `ldm-desktop` module installs the desktop/metainfo/icon assets.
+
+id: org.langbiantianya.LDM
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: lgo_download_manager
+finish-args: |
+  # --- 网络访问（HTTP/HTTPS/FTP/WebDAV 下载） ---
+  - --share=network
+  - --share=ipc
+  # --- 显示：Wayland 优先，X11 回退 ---
+  - --socket=wayland
+  - --socket=fallback-x11
+  # --- D-Bus 会话总线 ---
+  - --socket=session-bus
+  # --- 用户文件系统 ---
+  - --filesystem=xdg-download
+  - --filesystem=home
+  - --filesystem=host
+  # --- 运行期运行时目录（urllauncher 在此放 Unix socket） ---
+  - --filesystem=xdg-run
+
+modules:
+  # ---------------------------------------------------------------
+  # 应用二进制：先在 host 上 `make build` 产出 ./bin/lgo_download_manager，
+  # 这里只把它拷进 /app/bin。这样构建期不需要在沙箱内访问 Go module proxy。
+  # ---------------------------------------------------------------
+  - name: ldm
+    buildsystem: simple
+    build-commands:
+      - install -Dm755 /run/build-ldm/ldm/bin/lgo_download_manager \
+          /app/bin/lgo_download_manager
+    sources:
+      - type: dir
+        path: .
+
+  # ---------------------------------------------------------------
+  # 桌面集成：拷贝 .desktop / metainfo / 图标。
+  # .desktop 中的 MimeType=x-scheme-handler/lgom 注册 lgom:// 协议。
+  # ---------------------------------------------------------------
+  - name: ldm-desktop
+    buildsystem: simple
+    build-commands:
+      - install -Dm644 /run/build-ldm/ldm-desktop/conf/lgo_download_manager.desktop \
+          /app/share/applications/org.langbiantianya.LDM.desktop
+      - install -Dm644 /run/build-ldm/ldm-desktop/flatpak/org.langbiantianya.LDM.metainfo.xml \
+          /app/share/metainfo/org.langbiantianya.LDM.metainfo.xml
+      - install -Dm644 /run/build-ldm/ldm-desktop/flatpak/org.langbiantianya.LDM.png \
+          /app/share/icons/hicolor/256x256/apps/org.langbiantianya.LDM.png
+    sources:
+      - type: dir
+        path: .

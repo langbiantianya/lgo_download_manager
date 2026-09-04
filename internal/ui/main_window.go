@@ -5,12 +5,15 @@
 // Copyright (c) 2026 langbiantianya
 
 // Package ui 为下载管理器提供基于 Fyne 的图形界面。
-// 线程安全：scheduler 运行在后台 goroutine 中；所有 GUI
+// 线程安全：业务服务（scheduler 等）运行在业务进程中；所有 GUI
 // 修改都通过 fyne.Do() 在 Fyne 事件线程上进行。
 package ui
 
 import (
 	"fmt"
+	"image/color"
+	"path/filepath"
+
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/container"
@@ -18,18 +21,14 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
-	"image/color"
-	"log"
-	"path/filepath"
-	"time"
-	"lgo_download_manager/internal/scheduler"
+
 	"lgo_download_manager/internal/store"
 )
 
 // MainWindow 保存所有 GUI 状态以及顶层 Fyne 窗口。
 type MainWindow struct {
 	app     fyne.App
-	sc      *scheduler.Scheduler
+	svc     Service
 	win     fyne.Window
 	content *fyne.Container
 
@@ -37,12 +36,7 @@ type MainWindow struct {
 	taskList  *taskList
 	statusBar *statusBar
 
-	unsub       func()
-	focusTicker *time.Ticker
-
-	// contentDestroyed 记录主内容是否已被释放（轻量模式下用户关闭主窗口时）。
-	// 下次 Show 需重新构建 widget 树。
-	contentDestroyed bool
+	unsub func()
 }
 
 // NewMainWindow 构建附加到 app 的主窗口。
@@ -50,27 +44,22 @@ type MainWindow struct {
 // 必须在 Fyne 事件线程上调用（通常在 app.New…() 之后、
 // a.Run() 之前的主 goroutine 中），因为 widget 构造器依赖
 // fyne.CurrentApp() 解析为刚创建的 app。
-func NewMainWindow(a fyne.App, st *store.Store, sc *scheduler.Scheduler) *MainWindow {
-	setGlobalStore(st)
-	if err := LoadSettings(st); err != nil {
-		log.Printf("ui: load settings: %v", err)
-	}
-	setGlobalScheduler(sc)
+func NewMainWindow(a fyne.App, svc Service) *MainWindow {
+	GlobalSettings = svc.Settings()
+	setGlobalSvc(svc)
 	m := &MainWindow{
 		app:    a,
-		sc:     sc,
+		svc:    svc,
 		filter: binding.NewString(),
 	}
-	m.taskList = newTaskList(sc, m.filter)
+	m.taskList = newTaskList(svc, m.filter)
 	m.statusBar = newStatusBar()
 	m.buildMainUI()
 	m.subscribe()
 	m.statusBar.refreshDiskSpace()
-	m.startFocusTicker()
 	return m
 }
-// buildMainUI 组装主窗口并保存内容容器，以便在页面之间切换（例如切换到设置页面）。
-func (m *MainWindow) buildMainUI() {
+
 	m.win = m.app.NewWindow("下载管理器")
 	m.content = container.NewBorder(
 		m.buildToolbar(),
@@ -81,7 +70,15 @@ func (m *MainWindow) buildMainUI() {
 	m.win.SetContent(m.content)
 	m.win.Resize(fyne.NewSize(1000, 640))
 	m.win.CenterOnScreen()
-	// 关闭拦截：默认隐藏到托盘；轻量模式下额外释放 widget 树以节省内存。
+	setGlobalWindow(m.win)
+	m.win.SetCloseIntercept(m.onCloseRequested)
+}
+
+// showSettingsPage 将主内容切换到设置页面。
+func (m *MainWindow) showSettingsPage() {
+	setGlobalWindow(m.win)
+	m.win.SetCloseIntercept(m.onCloseRequested)
+}
 	m.win.SetCloseIntercept(m.onCloseRequested)
 }
 
@@ -112,25 +109,25 @@ func (m *MainWindow) buildSettingsHeader() fyne.CanvasObject {
 // buildSettingsContent 返回设置表单内容。onChange 在任意设置项变更后触发，
 // 用于刷新任务列表（例如排序方式改变后）。
 func (m *MainWindow) buildSettingsContent() fyne.CanvasObject {
-	return buildSettingsContent(m.sc, func() { m.taskList.refresh() })
+	return buildSettingsContent(m.svc, func() { m.taskList.refresh() })
 }
 
 // buildToolbar 排列操作按钮、搜索框以及设置快捷按钮。
 func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 	newBtn := widget.NewButtonWithIcon("新建任务", theme.ContentAddIcon(), func() {
-		showAddTaskDialog(m.win, m.sc)
+		showAddTaskDialog(m.win, m.svc)
 	})
 	pauseAllBtn := widget.NewButtonWithIcon("暂停全部", theme.MediaPauseIcon(), func() {
 		for _, tk := range m.taskList.allTasks() {
 			if tk.Status == store.TaskStatus.Downloading {
-				_ = m.sc.Pause(tk.ID)
+				_ = m.svc.Pause(tk.ID)
 			}
 		}
 	})
 	resumeAllBtn := widget.NewButtonWithIcon("恢复全部", theme.MediaPlayIcon(), func() {
 		for _, tk := range m.taskList.allTasks() {
 			if tk.Status == store.TaskStatus.Paused || tk.Status == store.TaskStatus.Failed {
-				_ = m.sc.Start(tk.ID)
+				_ = m.svc.Start(tk.ID)
 			}
 		}
 	})
@@ -204,115 +201,43 @@ func (m *MainWindow) buildSidebar() fyne.CanvasObject {
 	)
 }
 
+// Show 显示主窗口。
 func (m *MainWindow) Show() {
 	m.win.Show()
-	if m.unsub == nil {
-		m.subscribe()
-	}
-	m.startFocusTicker()
 }
 
-// startFocusTicker 启动定期校验文件存在的 goroutine。
-// 幂等；重建主内容后会被重新调用。
-func (m *MainWindow) startFocusTicker() {
-	if m.focusTicker != nil {
+// ShowFromTray 在业务进程托盘「显示窗口」时调用（MsgShow）。
+// 调用方必须保证在 Fyne 事件线程上（fyne.Do）。
+func (m *MainWindow) ShowFromTray() {
+	m.win.Show()
+	m.win.RequestFocus()
+}
+
+// onCloseRequested 在用户点击窗口关闭按钮时被调用。
+//
+// LightMode 开启时整个 UI 子进程退出，内存由操作系统彻底回收；
+// 业务进程不受影响，托盘可随时重新拉起 UI。非轻量模式仅隐藏窗口，
+// 由业务进程 MsgShow 再次显示（快速恢复、保留内存）。
+func (m *MainWindow) onCloseRequested() {
+	if GlobalSettings.LightMode {
+		m.Close()
+		m.app.Quit()
 		return
 	}
-	m.focusTicker = time.NewTicker(10 * time.Second)
-	go func() {
-		for range m.focusTicker.C {
-			m.sc.ValidateFileExistence()
-		}
-	}()
+	m.win.Hide()
 }
 
-// cleanupResources 停止 ticker 并取消事件订阅。
-// 幂等，可被 Close 与 destroyContent 共用。
-func (m *MainWindow) cleanupResources() {
-	if m.focusTicker != nil {
-		m.focusTicker.Stop()
-		m.focusTicker = nil
-	}
+// Close 清理事件订阅（进程退出路径）。
+func (m *MainWindow) Close() {
 	if m.unsub != nil {
 		m.unsub()
 		m.unsub = nil
 	}
 }
-// Close 清理订阅和定时器。
-func (m *MainWindow) Close() {
-	m.cleanupResources()
-}
 
-// ShowFromTray 在系统托盘菜单触发时调用：恢复并重建主窗口。
-//
-// 它不是线程安全的；调用方必须通过 fyne.Do() 把它投递到 Fyne 事件线程。
-func (m *MainWindow) ShowFromTray() {
-	if m.contentDestroyed {
-		m.rebuildContent()
-	}
-	m.win.Show()
-	m.win.RequestFocus()
-}
-// onCloseRequested 在用户点击窗口关闭按钮时被调用。
-// 隐藏窗口前先停掉 ticker 与 scheduler 事件订阅，避免后台持续派发；
-// 重新打开时由 Show 重新启动。
-//
-// 轻量模式下：额外释放 widget 树（destroyContent 内部已含 cleanupResources，
-// 这里跳过以免重复）。
-func (m *MainWindow) onCloseRequested() {
-	if GlobalSettings.LightMode {
-		m.win.Hide()
-		m.destroyContent()
-		return
-	}
-	m.cleanupResources()
-	m.win.Hide()
-}
-
-// destroyContent 释放主 widget 树，使窗口关闭后内存可被 GC 回收。
-// 必须在主 goroutine 中调用。
-//
-// Fyne 的 glfw 驱动不允许向 SetContent 传入 nil CanvasObject（直接
-// 解引用导致段错误）。这里把窗口内容替换为隐藏的占位 widget，
-// 而非传 nil。
-func (m *MainWindow) destroyContent() {
-	if m.content == nil && m.contentDestroyed {
-		return
-	}
-	// 必须在置 nil 字段之前清理后台 goroutine / 订阅，
-	// 否则 ticker 闭包持有 m，订阅也会继续向 nil taskList push 事件。
-	m.cleanupResources()
-	m.content = nil
-	m.taskList = nil
-	m.statusBar = nil
-	m.contentDestroyed = true
-	if m.win != nil {
-		placeholder := widget.NewLabel("")
-		placeholder.Hide()
-		m.win.SetContent(placeholder)
-	}
-}
-
-// rebuildContent 在轻量模式下重新构建已被销毁的主 UI。
-// 必须在主 goroutine 中调用。
-func (m *MainWindow) rebuildContent() {
-	m.taskList = newTaskList(m.sc, m.filter)
-	m.statusBar = newStatusBar()
-	m.content = container.NewBorder(
-		m.buildToolbar(),
-		m.statusBar.container(),
-		nil, nil,
-		m.buildMainSplit(),
-	)
-	m.win.SetContent(m.content)
-	m.subscribe()
-	m.statusBar.refreshDiskSpace()
-	m.startFocusTicker()
-	m.contentDestroyed = false
-}
-// subscribe 将 scheduler 事件总线接入 fyne.Do 的 GUI 更新。
+// subscribe 将业务事件流接入 fyne.Do 的 GUI 更新。
 func (m *MainWindow) subscribe() {
-	ch, unsub := m.sc.Subscribe()
+	ch, unsub := m.svc.Subscribe()
 	m.unsub = unsub
 	go func() {
 		for ev := range ch {

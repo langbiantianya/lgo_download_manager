@@ -25,7 +25,7 @@ import (
 type taskRow struct {
 	widget.BaseWidget
 	task *store.Task
-	sc   *scheduler.Scheduler
+	svc  Service
 
 	// 第一行：名称 + 大小 + 状态
 	name        *widget.Label
@@ -119,25 +119,25 @@ func (r *taskRow) onProgress(ev scheduler.Event) {
 	r.refresh()
 }
 
-func (r *taskRow) bind(t *store.Task, sc *scheduler.Scheduler) {
+func (r *taskRow) bind(t *store.Task, svc Service) {
 	//   - curSpeed：不在 Task 结构体中，仅由进度事件更新。
 	r.task = t
-	r.sc = sc
+	r.svc = svc
 	r.refresh()
-	r.bindButtons(t, sc)
+	r.bindButtons(t, svc)
 }
 
-func (r *taskRow) bindButtons(t *store.Task, sc *scheduler.Scheduler) {
+func (r *taskRow) bindButtons(t *store.Task, svc Service) {
 	if t == nil {
 		return
 	}
 	taskID := t.ID
 	r.startBtn.OnTapped = func() {
-		_ = sc.Start(taskID)
+		_ = svc.Start(taskID)
 	}
-	r.pauseBtn.OnTapped = func() { _ = sc.Pause(taskID) }
-	r.cancelBtn.OnTapped = func() { sc.Delete(taskID) }
-	r.detailsBtn.OnTapped = func() { showChunkDetails(t, sc, globalWin) }
+	r.pauseBtn.OnTapped = func() { _ = svc.Pause(taskID) }
+	r.cancelBtn.OnTapped = func() { svc.Delete(taskID) }
+	r.detailsBtn.OnTapped = func() { showChunkDetails(t, svc, globalWin) }
 	r.openFolderBtn.OnTapped = func() {
 		if t.SavePath == "" {
 			return
@@ -304,17 +304,13 @@ func etaText(t *store.Task, bps float64) string {
 	return "ETA " + formatRemainingTime(secs)
 }
 
-// setGlobalScheduler 由 NewMainWindow 调用，以便在不需要
-// 在每个 widget 构造器中传递 sc 的情况下，使 scheduler
+// setGlobalSvc 由 NewMainWindow 调用，以便在不需要
+// 在每个 widget 构造器中传递 svc 的情况下，使业务服务
 // 可被任务行按钮回调访问。
-var globalSc *scheduler.Scheduler
+var globalSvc Service
 
-func setGlobalScheduler(sc *scheduler.Scheduler) { globalSc = sc }
+func setGlobalSvc(svc Service) { globalSvc = svc }
 
 var globalWin fyne.Window
 
 func setGlobalWindow(win fyne.Window) { globalWin = win }
-
-var globalStore *store.Store
-
-func setGlobalStore(st *store.Store) { globalStore = st }

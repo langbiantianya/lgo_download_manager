@@ -7,7 +7,6 @@
 package ui
 
 import (
-	"context"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -20,9 +19,6 @@ import (
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
-
-	"lgo_download_manager/internal/protocol"
-	"lgo_download_manager/internal/scheduler"
 )
 
 // archiveCompressionExts 列出常见的归档/压缩单段扩展名。任何"<x>.<archive>"
@@ -97,8 +93,9 @@ func uniqueSavePath(path string) string {
 // showAddTaskDialog 打开"新建下载任务"对话框，并预填全局设置中的内容。
 // 这里只显示必要的字段；高级选项位于"设置"对话框中。
 //
-// URL 变更时自动从路径末尾提取文件名填入保存路径，并探测文件大小进行预览。
-func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
+// URL 变更时自动从路径末尾提取文件名填入保存路径，并异步请求业务进程
+// 探测文件大小进行预览（探针复用业务侧代理配置）。
+func showAddTaskDialog(win fyne.Window, svc Service) {
 	// 构建一个纵向布局、标签左对齐的表单。
 	makeRow := func(label string, w fyne.CanvasObject) *fyne.Container {
 		lbl := widget.NewLabel(label)
@@ -126,7 +123,7 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 	sizeLabel.Alignment = fyne.TextAlignTrailing
 	sizeLabel.TextStyle.Italic = true
 
-	// 从 URL 提取文件名并更新保存路径，同时探测文件大小
+	// 从 URL 提取文件名并更新保存路径，同时异步探测文件大小
 	updateFromURL := func(rawURL string) {
 		u, err := url.Parse(rawURL)
 		if err != nil || u.Path == "" {
@@ -137,41 +134,19 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 		if savePathEntry.Text == "" || savePathEntry.Text == filepath.Join(GlobalSettings.DefaultSaveDir, "download.bin") {
 			savePathEntry.SetText(uniqueSavePath(filepath.Join(GlobalSettings.DefaultSaveDir, filename)))
 		}
-		// 异步探测文件大小
+		// 异步探测（经业务进程，代理配置一致）。失败时静默清空预览。
 		go func() {
-			proto, err := protocol.DetectKind(rawURL, "")
-			if err != nil {
+			size, perr := svc.Probe(rawURL)
+			if perr != nil {
 				fyne.Do(func() { sizeLabel.SetText("") })
 				return
 			}
-			driver, err := protocol.New(rawURL, proto, protocol.Auth{AuthOptions: protocol.AuthOptions{
-				UserAgent:    GlobalSettings.UserAgent,
-				Cookies:      GlobalSettings.Cookies,
-				FTPPassive:   GlobalSettings.FTPPassive,
-				ProxyMode:    GlobalSettings.ProxyMode,
-				ProxyURL:     GlobalSettings.ProxyURL,
-				ProxyBypass:  GlobalSettings.ProxyBypass,
-			}})
-			if err != nil {
-				fyne.Do(func() { sizeLabel.SetText("") })
-				return
-			}
-			defer driver.Close()
-
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-
-			caps, err := driver.Probe(ctx)
-			if err != nil {
-				fyne.Do(func() { sizeLabel.SetText("") })
-				return
-			}
-			if caps.TotalSize <= 0 {
+			if size <= 0 {
 				fyne.Do(func() { sizeLabel.SetText("") })
 				return
 			}
 			fyne.Do(func() {
-				sizeLabel.SetText(formatSize(caps.TotalSize))
+				sizeLabel.SetText(formatSize(size))
 			})
 		}()
 	}
@@ -200,21 +175,10 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 		if url == "" || savePath == "" {
 			return
 		}
-		proto, err := protocol.DetectKind(url, "")
-		if err != nil {
-			dialog.ShowError(err, win)
-			return
-		}
 
-		tk, err := sc.Add(scheduler.AddTaskInput{
-			URL:      url,
-			SavePath: savePath,
-			Protocol: proto,
-			Auth: protocol.AuthOptions{
-				UserAgent:  GlobalSettings.UserAgent,
-				Cookies:    GlobalSettings.Cookies,
-				FTPPassive: GlobalSettings.FTPPassive,
-			},
+		tk, err := svc.AddTask(AddTaskInput{
+			URL:          url,
+			SavePath:     savePath,
 			ChunkCount:   GlobalSettings.DefaultThreads,
 			MinChunkSize: GlobalSettings.MinChunkSize,
 		})
@@ -222,7 +186,7 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 			dialog.ShowError(err, win)
 			return
 		}
-		_ = sc.Start(tk.ID)
+		_ = svc.Start(tk.ID)
 	}, win)
 	d.Resize(fyne.NewSize(600, d.MinSize().Height))
 	d.Show()
@@ -259,3 +223,5 @@ func formatSize(n int64) string {
 		return strconv.FormatInt(n, 10) + " B"
 	}
 }
+
+var _ = time.Now // 保留 time 引用以防未来日志扩展
