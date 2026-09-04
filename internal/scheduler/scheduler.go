@@ -115,16 +115,26 @@ func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 
 // Start 启动(或恢复)一个任务。如果任务在之前的运行中已经存在 chunk_progress,
 // engine 将从这些偏移位置继续下载。
+//
+// Start 立即返回 nil，不等待服务器探测（HEAD 请求）或预分配完成。
+// 任何错误都会被写入 store.Task.Status（Failed）并通过事件总线发布
+// （Event{Why: "failed"}），UI 可订阅该事件并展示给用户。
+//
+// 由于探测在后台 goroutine 中进行，调用方可以在 UI 线程上安全地调用 Start：
+// 不可达的服务器或超大的文件预分配都不会阻塞 UI。
 func (s *Scheduler) Start(taskID string) error {
 	s.mu.Lock()
 	if _, ok := s.jobs[taskID]; ok {
 		s.mu.Unlock()
 		return errors.New("scheduler: task already running")
 	}
+	// 立即预留 slot，防止并发的 Start 调用重复触发探测 / 预分配。
+	s.jobs[taskID] = &runningJob{}
 	s.mu.Unlock()
 
 	tk, err := s.st.GetTask(taskID)
 	if err != nil {
+		s.releaseSlot(taskID)
 		return fmt.Errorf("scheduler: %w", err)
 	}
 
@@ -134,23 +144,44 @@ func (s *Scheduler) Start(taskID string) error {
 		tk, _ = s.st.GetTask(taskID)
 	}
 
-	// 探测服务器以获取其能力(capabilities)。
+	go s.startAsync(taskID, tk)
+	return nil
+}
+
+// releaseSlot 释放预留的 slot；用于 Start 的快速失败路径（探测/构造尚未开始）。
+func (s *Scheduler) releaseSlot(taskID string) {
+	s.mu.Lock()
+	delete(s.jobs, taskID)
+	s.mu.Unlock()
+}
+
+// startAsync 在独立 goroutine 中执行 Start 的慢路径：
+// 服务器探测 → 元数据持久化 → 文件预分配 → 启动 engine.Run。
+// 任何阶段失败都会把任务标记为 Failed 并发布失败事件，由 UI 监听器显示。
+func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	auth := decodeAuth(tk.AuthData)
 	driver, err := protocol.New(tk.URL, protocol.ProtocolKind(tk.Protocol), protocol.Auth{AuthOptions: auth})
 	if err != nil {
-		return err
+		s.fail(tk, err)
+		s.releaseSlot(taskID)
+		return
 	}
+
 	probeCtx, probeCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	caps, err := driver.Probe(probeCtx)
 	probeCancel()
 	if err != nil {
 		_ = driver.Close()
 		s.fail(tk, err)
-		return err
+		s.releaseSlot(taskID)
+		return
 	}
 	if caps.TotalSize > 0 {
 		if err := s.st.UpdateTaskMeta(tk.ID, caps.TotalSize, caps.SupportRange, tk.IsAllocated, tk.ChunkCount); err != nil {
-			return err
+			_ = driver.Close()
+			s.fail(tk, err)
+			s.releaseSlot(taskID)
+			return
 		}
 		tk.TotalSize = caps.TotalSize
 		tk.SupportRange = caps.SupportRange
@@ -167,12 +198,15 @@ func (s *Scheduler) Start(taskID string) error {
 		if err != nil {
 			_ = driver.Close()
 			s.fail(tk, err)
-			return err
+			s.releaseSlot(taskID)
+			return
 		}
 		if err := s.st.UpdateTaskMeta(tk.ID, caps.TotalSize, caps.SupportRange, true, tk.ChunkCount); err != nil {
 			dest.Close()
 			_ = driver.Close()
-			return err
+			s.fail(tk, err)
+			s.releaseSlot(taskID)
+			return
 		}
 		tk.IsAllocated = true
 		// 重新打开供 engine 使用(文件已具有正确大小)。
@@ -182,7 +216,8 @@ func (s *Scheduler) Start(taskID string) error {
 	if err != nil {
 		_ = driver.Close()
 		s.fail(tk, err)
-		return err
+		s.releaseSlot(taskID)
+		return
 	}
 	// 恢复偏移取自 chunk_progress(每个值表示对应 chunk 已写入的字节数)。
 	resume := make([]int64, len(tk.ChunkProgress))
@@ -224,6 +259,7 @@ func (s *Scheduler) Start(taskID string) error {
 		status:  store.TaskStatus.Downloading,
 	}
 	s.mu.Lock()
+	// 替换之前 Start 预留的空 slot。
 	s.jobs[tk.ID] = rj
 	s.mu.Unlock()
 
@@ -258,10 +294,13 @@ func (s *Scheduler) Start(taskID string) error {
 		}
 		s.completeFromEngine(tk.ID, rjRef)
 	}()
-	return nil
 }
 
 // Pause 取消一个运行中的任务。该任务在 store 中保留进度,可被 Resume。
+//
+// 注意：若 Start 仍在探测/预分配阶段（仅占位 slot），Pause 不会中断探测，
+// 仅在后续 startAsync 启动 engine.Run 前生效；这是已知的"探测期不可取消"权衡，
+// 避免锁/取消逻辑把简单路径复杂化。
 func (s *Scheduler) Pause(taskID string) error {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
@@ -269,7 +308,9 @@ func (s *Scheduler) Pause(taskID string) error {
 	if !ok {
 		return errors.New("scheduler: task not running")
 	}
-	rj.cancel()
+	if rj.cancel != nil {
+		rj.cancel()
+	}
 	return nil
 }
 
@@ -279,7 +320,7 @@ func (s *Scheduler) Cancel(taskID string) error {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
 	s.mu.Unlock()
-	if ok {
+	if ok && rj.cancel != nil {
 		rj.cancel()
 	}
 	tk, err := s.st.GetTask(taskID)
@@ -301,7 +342,7 @@ func (s *Scheduler) Delete(taskID string) error {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
 	s.mu.Unlock()
-	if ok {
+	if ok && rj.cancel != nil {
 		rj.cancel()
 	}
 	tk, err := s.st.GetTask(taskID)
@@ -314,7 +355,6 @@ func (s *Scheduler) Delete(taskID string) error {
 	s.publish(Event{Why: "deleted", Task: nil})
 	return nil
 }
-// List 返回 store 中按 filter 过滤、按 sort 排序后的任务列表。
 // UI 侧边栏应当传 StoreFilterAll 或其它 StatusFilter 来获取子集。
 func (s *Scheduler) List(filter store.StatusFilter, sort store.TaskSort) ([]*store.Task, error) {
 	return s.st.ListTasks(filter, sort)

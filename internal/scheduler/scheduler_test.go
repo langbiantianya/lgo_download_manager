@@ -198,6 +198,86 @@ doneResume:
 	}
 }
 
+// TestStartIsAsync 验证 Start 在探测/预分配期间不会阻塞调用方。
+// 用一个立即关闭的 HTTP 服务模拟探测失败（连接被拒），Start 必须
+// 立即返回 nil；随后任务被标记为 Failed，并通过事件通道发布。
+//
+// 这是 UI 不卡死的核心保证：探测超时（最长 30s）发生在后台 goroutine。
+func TestStartIsAsync(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	sc := New(st)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sc.Run(ctx)
+
+	// Add 一个指向不存在端口的任务；探测会失败（连接被拒）。
+	tk, err := sc.Add(AddTaskInput{
+		URL:        "http://127.0.0.1:1/never.bin", // 端口 1 通常无监听
+		SavePath:   filepath.Join(dir, "out.bin"),
+		Protocol:   protocol.ProtoHTTP,
+		ChunkCount: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Start 必须立即返回 nil —— 不能因探测阻塞。
+	startReturned := make(chan time.Duration, 1)
+	startStart := time.Now()
+	if err := sc.Start(tk.ID); err != nil {
+		t.Fatalf("Start returned error: %v", err)
+	}
+	startReturned <- time.Since(startStart)
+
+	const startBudget = 500 * time.Millisecond
+	select {
+	case d := <-startReturned:
+		if d > startBudget {
+			t.Fatalf("Start blocked for %v, want < %v (probe must be async)", d, startBudget)
+		}
+	case <-time.After(startBudget):
+		t.Fatalf("Start did not return within %v", startBudget)
+	}
+
+	// 等待任务变为 Failed。
+	ch, unsub := sc.Subscribe()
+	defer unsub()
+	deadline := time.Now().Add(10 * time.Second)
+	failed := false
+	for time.Now().Before(deadline) && !failed {
+		select {
+		case ev := <-ch:
+			if ev.Task != nil && ev.Task.ID == tk.ID && ev.Task.Status == store.TaskStatus.Failed {
+				failed = true
+			}
+		case <-time.After(100 * time.Millisecond):
+			cur, _ := st.GetTask(tk.ID)
+			if cur != nil && cur.Status == store.TaskStatus.Failed {
+				failed = true
+			}
+		}
+	}
+	if !failed {
+		cur, _ := st.GetTask(tk.ID)
+		t.Fatalf("task did not reach Failed status; current=%v", cur)
+	}
+
+	// 失败时 ErrorMessage 必须非空，UI 才能展示原因。
+	persisted, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ErrorMessage == "" {
+		t.Error("Failed task has empty ErrorMessage; UI cannot show reason")
+	}
+}
+
 func parseBytesRange(t *testing.T, rng string, size int64) (int64, int64) {
 	t.Helper()
 	if !strings.HasPrefix(rng, "bytes=") {
