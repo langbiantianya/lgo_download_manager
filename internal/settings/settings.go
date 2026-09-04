@@ -38,7 +38,9 @@ func Load(st *store.Store, forceLight bool) (store.Settings, error) {
 		persisted.FTPPassive = true
 		persisted.Prealloc = true
 		persisted.TaskSort = store.SortCreatedDesc
-		persisted.LightMode = true // 新用户默认开启轻量模式
+		// LightMode 默认关闭：关闭主窗口只隐藏窗口，便于随时通过托盘恢复。
+		// 用户可在「设置」里手动开启，开启后关闭主窗口会同时退出 UI 进程。
+		persisted.LightMode = false
 	}
 	if forceLight {
 		persisted.LightMode = true

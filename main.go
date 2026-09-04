@@ -154,25 +154,32 @@ func main() {
 	uim := uimgr.New(st, sc)
 	uim.SetSettings(cur)
 
-	// 托盘：与 UI 子进程解耦，常驻业务进程；Open 拉起/显示 UI，
-	// Quit 结束整个程序。
+	// 退出信号：业务进程同时监听 SIGINT/SIGTERM 和托盘「退出」菜单。
+	// 任何一方触发都会走同一条优雅退出路径(cancel → uim.Close → tray.Stop)。
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	// 托盘:与 UI 子进程解耦,常驻业务进程;Open 拉起/显示 UI,
+	// Quit 触发 quit 通道与 SIGINT/SIGTERM 等价的退出。
 	go tray.Start(tray.Callbacks{
 		Open: uim.Open,
 		Quit: func() {
-			cancel()
+			// 复用与信号相同的 quit 通道,避免自信号/self-kill 的可移植性麻烦。
+			// 非阻塞:首次点击后 tray goroutine 已退出,后续重复触发直接丢弃。
+			select {
+			case quit <- syscall.SIGTERM:
+			default:
+			}
 		},
 	})
 
-	// 默认拉起 UI（除非 -no-gui）。
+	// 默认拉起 UI(除非 -no-gui)。
 	if !*noGUI {
 		if err := uim.Start(); err != nil {
 			log.Printf("uimgr: cannot start UI child: %v", err)
 		}
 	}
 
-	// 等待退出信号：SIGINT/SIGTERM。
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Println("shutting down...")
 	cancel()
