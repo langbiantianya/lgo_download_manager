@@ -36,7 +36,7 @@ func newHTTPDriver(raw string, auth AuthOptions) (ProtocolDriver, error) {
 		return nil, fmt.Errorf("http: empty url")
 	}
 	tr := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 proxyFunc(effectiveAuth(auth)),
 		MaxIdleConns:          16,
 		MaxIdleConnsPerHost:   16,
 		IdleConnTimeout:       90 * time.Second,

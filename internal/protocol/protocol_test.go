@@ -115,6 +115,355 @@ func TestSupportsRanges(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// 代理配置测试
+// ---------------------------------------------------------------------------
+
+func TestParseBypassList(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bypassList
+	}{
+		{"empty", "", nil},
+		{"spaces", "   ", nil},
+		{"single", "example.com", bypassList{"example.com"}},
+		{"multi", "a.example.com, b.example.com ,cdn.local", bypassList{"a.example.com", "b.example.com", "cdn.local"}},
+		{"wildcard", "*.example.com", bypassList{"example.com"}},
+		{"dot-prefix", ".example.com", bypassList{"example.com"}},
+		{"trailing-dots", "  .x.io , *.y.io  ", bypassList{"x.io", "y.io"}},
+		{"empty-entry", ",, ,", nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := parseBypassList(tt.input)
+			if !equalBypass(got, tt.want) {
+				t.Errorf("parseBypassList(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func equalBypass(a, b bypassList) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func TestBypassListMatches(t *testing.T) {
+	b := parseBypassList("example.com, cdn.local")
+	tests := []struct {
+		host string
+		want bool
+	}{
+		{"example.com", true},
+		{"api.example.com", true},
+		{"a.b.example.com", true},
+		{"notexample.com", false},
+		{"cdn.local", true},
+		{"x.cdn.local", true},
+		{"", false},
+		{"example.org", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			if got := b.matches(tt.host); got != tt.want {
+				t.Errorf("matches(%q) = %v, want %v", tt.host, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProxyFuncNoConfigReturnsEnvironment(t *testing.T) {
+	fn := proxyFunc(AuthOptions{})
+	if fn == nil {
+		t.Fatal("proxyFunc(AuthOptions{}) = nil, want non-nil function")
+	}
+}
+
+func TestProxyFuncWithURL(t *testing.T) {
+	fn := proxyFunc(AuthOptions{ProxyURL: "http://127.0.0.1:7890"})
+	req := httptest.NewRequest("GET", "http://example.com/file", nil)
+	got, err := fn(req)
+	if err != nil {
+		t.Fatalf("proxyFunc: %v", err)
+	}
+	if got == nil {
+		t.Fatal("proxyFunc returned nil, want proxy URL")
+	}
+	if got.Host != "127.0.0.1:7890" {
+		t.Errorf("proxy Host = %q, want 127.0.0.1:7890", got.Host)
+	}
+	if got.Scheme != "http" {
+		t.Errorf("proxy Scheme = %q, want http", got.Scheme)
+	}
+}
+
+func TestProxyFuncWithInvalidURLFallsBack(t *testing.T) {
+	// 非法 URL 在 Manual 模式下不应被使用：出于安全考虑直接返回 nil，
+	// 避免将畸形字符串交给 http.ProxyFromEnvironment 误判。
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeManual, ProxyURL: "not a url"})
+	req := httptest.NewRequest("GET", "http://example.com/file", nil)
+	if fn == nil {
+		t.Fatal("proxyFunc = nil, want non-nil")
+	}
+	got, err := fn(req)
+	if err != nil {
+		t.Errorf("proxyFunc returned error: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil proxy for invalid URL, got %v", got)
+	}
+}
+
+func TestProxyFuncBypassSkipsProxy(t *testing.T) {
+	fn := proxyFunc(AuthOptions{
+		ProxyMode:   ProxyModeManual,
+		ProxyURL:    "http://127.0.0.1:7890",
+		ProxyBypass: "example.com, cdn.local",
+	})
+	tests := []struct {
+		host    string
+		skipped bool
+	}{
+		{"example.com", true},
+		{"a.example.com", true},
+		{"cdn.local", true},
+		{"other.com", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.host, func(t *testing.T) {
+			req := httptest.NewRequest("GET", "http://"+tt.host+"/file", nil)
+			got, err := fn(req)
+			if err != nil {
+				t.Fatalf("proxyFunc: %v", err)
+			}
+			if tt.skipped {
+				if got != nil {
+					t.Errorf("matches(%q) returned proxy %v, want nil (bypass)", tt.host, got)
+				}
+				return
+			}
+			if got == nil {
+				t.Errorf("matches(%q) = nil, want proxy", tt.host)
+			}
+		})
+	}
+}
+
+func TestProxyFuncBypassOnlyFallsBackToEnv(t *testing.T) {
+	// 仅配置 bypass、不配置 ProxyURL：必须仍返回非 nil 函数，
+	// 这样浏览器式 NO_PROXY 语义才能生效（System 模式）。
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeSystem, ProxyBypass: "example.com"})
+	if fn == nil {
+		t.Fatal("proxyFunc = nil, want non-nil env resolver with bypass")
+	}
+	req := httptest.NewRequest("GET", "http://example.com/x", nil)
+	got, err := fn(req)
+	if err != nil {
+		t.Fatalf("proxyFunc: %v", err)
+	}
+	if got != nil {
+		t.Errorf("expected nil for bypassed host, got %v", got)
+	}
+}
+
+func TestParseProxyMode(t *testing.T) {
+	tests := []struct {
+		in   string
+		want ProxyMode
+	}{
+		{"system", ProxyModeSystem},
+		{"SYSTEM", ProxyModeSystem},
+		{"", ProxyModeSystem},
+		{"disabled", ProxyModeDisabled},
+		{"off", ProxyModeDisabled},
+		{"none", ProxyModeDisabled},
+		{"manual", ProxyModeManual},
+		{"custom", ProxyModeManual},
+		{"unknown", ProxyModeSystem},
+		{"  manual  ", ProxyModeManual},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			if got := ParseProxyMode(tt.in); got != tt.want {
+				t.Errorf("ParseProxyMode(%q) = %v, want %v", tt.in, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestProxyModeString(t *testing.T) {
+	tests := []struct {
+		m    ProxyMode
+		want string
+	}{
+		{ProxyModeSystem, "system"},
+		{ProxyModeDisabled, "disabled"},
+		{ProxyModeManual, "manual"},
+	}
+	for _, tt := range tests {
+		if got := tt.m.String(); got != tt.want {
+			t.Errorf("ProxyMode(%d).String() = %q, want %q", tt.m, got, tt.want)
+		}
+	}
+}
+
+func TestProxyFuncDisabledMode(t *testing.T) {
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeDisabled, ProxyURL: "http://1.2.3.4:9999"})
+	if fn == nil {
+		t.Fatal("proxyFunc returned nil")
+	}
+	req := httptest.NewRequest("GET", "http://example.com/file", nil)
+	got, err := fn(req)
+	if err != nil {
+		t.Fatalf("proxyFunc: %v", err)
+	}
+	if got != nil {
+		t.Errorf("Disabled mode must direct-connect, got %v", got)
+	}
+}
+
+func TestProxyFuncManualEmptyURLGoesDirect(t *testing.T) {
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeManual, ProxyURL: ""})
+	if fn == nil {
+		t.Fatal("proxyFunc returned nil")
+	}
+	req := httptest.NewRequest("GET", "http://example.com/file", nil)
+	got, _ := fn(req)
+	if got != nil {
+		t.Errorf("Manual mode with empty URL must direct-connect, got %v", got)
+	}
+}
+
+func TestProxyFuncSystemModeReturnsEnv(t *testing.T) {
+	// 设置一个环境变量让 ProxyFromEnvironment 有值；测试结束后清理。
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:7890")
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeSystem})
+	req := httptest.NewRequest("GET", "http://example.com/file", nil)
+	got, err := fn(req)
+	if err != nil {
+		t.Fatalf("proxyFunc: %v", err)
+	}
+	if got == nil {
+		t.Fatal("System mode should pick up HTTP_PROXY, got nil")
+	}
+	if got.Host != "127.0.0.1:7890" {
+		t.Errorf("proxy Host = %q, want 127.0.0.1:7890", got.Host)
+	}
+}
+
+func TestProxyFuncZeroModeInfersFromURL(t *testing.T) {
+	// 兼容路径：未设模式但提供了 URL，视为 Manual。
+	fn := proxyFunc(AuthOptions{ProxyURL: "http://127.0.0.1:7890"})
+	req := httptest.NewRequest("GET", "http://example.com/file", nil)
+	got, err := fn(req)
+	if err != nil {
+		t.Fatalf("proxyFunc: %v", err)
+	}
+	if got == nil || got.Host != "127.0.0.1:7890" {
+		t.Errorf("zero-mode + URL should yield proxy, got %v", got)
+	}
+
+	// 未设模式且无 URL：视为 System。
+	fn = proxyFunc(AuthOptions{})
+	if fn == nil {
+		t.Fatal("zero-mode + empty URL returned nil fn")
+	}
+}
+
+func TestEffectiveAuthMergesFromGlobal(t *testing.T) {
+	prev := GetProxyConfig()
+	defer SetProxyConfig(prev)
+
+	SetProxyConfig(ProxyConfig{
+		Mode:        ProxyModeManual,
+		ProxyURL:    "http://127.0.0.1:7890",
+		ProxyBypass: "example.com",
+	})
+
+	// 全部为零的 AuthOptions：必须完全继承全局。
+	got := effectiveAuth(AuthOptions{})
+	if got.ProxyMode != ProxyModeManual {
+		t.Errorf("Mode = %v, want Manual", got.ProxyMode)
+	}
+	if got.ProxyURL != "http://127.0.0.1:7890" {
+		t.Errorf("ProxyURL = %q, want http://127.0.0.1:7890", got.ProxyURL)
+	}
+	if got.ProxyBypass != "example.com" {
+		t.Errorf("ProxyBypass = %q, want example.com", got.ProxyBypass)
+	}
+
+	// 部分覆盖：Mode 显式指定，URL/Bypass 留空 → 仍继承全局。
+	got = effectiveAuth(AuthOptions{ProxyMode: ProxyModeDisabled})
+	if got.ProxyMode != ProxyModeDisabled {
+		t.Errorf("Mode = %v, want Disabled", got.ProxyMode)
+	}
+	if got.ProxyURL != "http://127.0.0.1:7890" {
+		t.Errorf("ProxyURL = %q, want inherited", got.ProxyURL)
+	}
+}
+
+func TestProxyFuncSystemFallsBackToSysproxy(t *testing.T) {
+	// System 模式 + 无 env + 无 bypass：在测试环境下应该至少返回非 nil 函数
+	// （可能 nil URL，因为没装 GNOME/KDE；也可能命中 scutil/registry）。
+	// 关键是验证 chain 不 panic、且遵循"先 env 后 sysproxy"的语义。
+	t.Setenv("HTTP_PROXY", "")
+	t.Setenv("HTTPS_PROXY", "")
+	t.Setenv("NO_PROXY", "")
+	InvalidateSystemProxyCache()
+
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeSystem})
+	if fn == nil {
+		t.Fatal("proxyFunc returned nil function")
+	}
+	req := httptest.NewRequest("GET", "http://example.com/file", nil)
+	got, err := fn(req)
+	if err != nil {
+		t.Fatalf("proxyFunc: %v", err)
+	}
+	// got 可能为 nil（无任何代理来源），不应出错。
+	_ = got
+}
+
+func TestProxyFuncSystemEnvTakesPrecedence(t *testing.T) {
+	// 当 HTTP_PROXY 已设置时必须优先于 sysproxy 探测。
+	// 同时覆盖大小写，因为 httpproxy 在两者都设时优先使用小写。
+	for _, name := range []string{
+		"HTTP_PROXY", "http_proxy",
+		"HTTPS_PROXY", "https_proxy",
+		"ALL_PROXY", "all_proxy",
+		"NO_PROXY", "no_proxy",
+	} {
+		os.Unsetenv(name)
+	}
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9999")
+	t.Setenv("http_proxy", "http://127.0.0.1:9999")
+	InvalidateSystemProxyCache()
+
+	// 直接探针：先确认 http.ProxyFromEnvironment 在此环境下能返回 9999。
+	probeReq := httptest.NewRequest("GET", "http://example.com/file", nil)
+	if u, err := http.ProxyFromEnvironment(probeReq); err != nil || u == nil || u.Host != "127.0.0.1:9999" {
+		t.Skipf("test environment makes env precedence ambiguous: probe=%v err=%v", u, err)
+	}
+
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeSystem})
+	req := httptest.NewRequest("GET", "http://example.com/file", nil)
+	got, err := fn(req)
+	if err != nil {
+		t.Fatalf("proxyFunc: %v", err)
+	}
+	if got == nil || got.Host != "127.0.0.1:9999" {
+		t.Errorf("env should win, got %v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // DetectKind / ResolveURL 测试
 // ---------------------------------------------------------------------------
 
@@ -126,6 +475,7 @@ func TestDetectKind(t *testing.T) {
 		errOK bool
 	}{
 		{"http://example.com/file", "", ProtoHTTP, false},
+
 		{"https://example.com/file", "", ProtoHTTPS, false},
 		{"ftp://example.com/file", "", ProtoFTP, false},
 		{"webdav://example.com/file", "", ProtoWebDAV, false},

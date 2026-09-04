@@ -56,7 +56,7 @@ func newWebDAVDriver(raw string, auth AuthOptions) (ProtocolDriver, error) {
 		return nil, fmt.Errorf("webdav: empty url")
 	}
 	tr := &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
+		Proxy:                 proxyFunc(effectiveAuth(auth)),
 		MaxIdleConns:          16,
 		MaxIdleConnsPerHost:   16,
 		IdleConnTimeout:       90 * time.Second,
@@ -66,7 +66,7 @@ func newWebDAVDriver(raw string, auth AuthOptions) (ProtocolDriver, error) {
 	return &webdavDriver{
 		url:  raw,
 		auth: auth,
-		cli:  &http.Client{Transport: tr},
+		cli:  &http.Client{Transport: tr, Timeout: 0},
 	}, nil
 }
 

@@ -25,7 +25,6 @@ type DriverCapabilities struct {
 	SupportRange bool   // 服务器是否支持 Range / FTP REST
 	ServerInfo   string // 自由形式的 banner / 服务器响应头
 }
-
 // AuthOptions 封装凭据以及驱动能够遵循的请求修饰开关。
 // 字段与具体协议无关；驱动会忽略其不理解的字段。
 type AuthOptions struct {
@@ -35,6 +34,20 @@ type AuthOptions struct {
 	Cookies    string
 	Referer    string
 	FTPPassive bool // 仅对 FTP 生效
+
+	// ProxyMode 控制代理解析方式：System（默认）/ Disabled / Manual。
+	// 零值表示未指定，由 effectiveAuth 在驱动创建时合并全局默认。
+	// 仅对 HTTP/HTTPS/WebDAV 驱动生效。
+	ProxyMode ProxyMode
+
+	// ProxyURL 是 Manual 模式下的代理地址，格式为
+	// "http://[user:pass@]host:port" 或 "socks5://[user:pass@]host:port"。
+	// 仅对 HTTP/HTTPS/WebDAV 驱动生效；空值在 Manual 模式下视同直连。
+	ProxyURL string
+
+	// ProxyBypass 是逗号分隔的主机/域名后缀列表，这些目标直连而不
+	// 经过代理。空字符串表示不绕过任何目标。
+	ProxyBypass string
 }
 
 // ProtocolDriver 是每个传输实现必须满足的接口。所有方法都必须

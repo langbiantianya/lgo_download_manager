@@ -38,6 +38,8 @@ import (
 	"sync"
 	"time"
 
+	"lgo_download_manager/internal/protocol"
+
 	_ "modernc.org/sqlite" // 纯 Go 实现的 sqlite 驱动
 )
 
@@ -242,6 +244,15 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.addColumnIfMissing("settings", "task_sort", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "proxy_url", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "proxy_bypass", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "proxy_mode", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	return nil
@@ -470,9 +481,6 @@ func scanTask(s scanner) (*Task, error) {
 	}
 	return &t, nil
 }
-
-// Settings 是持久化的用户可调默认配置。以单行形式保存在 settings 表中
-// （id = 1）。零值是合法的（首次加载时由表的 DEFAULT 覆盖）。
 type Settings struct {
 	DefaultSaveDir string
 	DefaultThreads int
@@ -482,6 +490,14 @@ type Settings struct {
 	FTPPassive     bool
 	Prealloc       bool
 	TaskSort       TaskSort // 任务列表排序方式
+	ProxyMode protocol.ProxyMode
+
+
+	// ProxyURL 是 Manual 模式下使用的代理地址；其他模式忽略。
+	ProxyURL string
+
+	// ProxyBypass 是逗号分隔的主机/域名列表，这些目标直连而不经过代理。
+	ProxyBypass string
 }
 
 // LoadSettings 返回已持久化的 settings 行。若尚不存在，
@@ -492,18 +508,24 @@ func (s *Store) LoadSettings() (Settings, error) {
 	defer s.mu.Unlock()
 
 	var (
-		saveDir  string
-		threads  int
-		minChunk int64
-		ua       string
-		cookies  string
-		passive  int
-		prealloc int
-		taskSort string
+		saveDir     string
+		threads     int
+		minChunk    int64
+		ua          string
+		cookies     string
+		passive     int
+		prealloc    int
+		taskSort    string
+		proxyMode   string
+		proxyURL    string
+		proxyBypass string
 	)
 	err := s.db.QueryRow(`SELECT default_save_dir, default_threads, min_chunk_size,
-		user_agent, cookies, ftp_passive, prealloc, task_sort FROM settings WHERE id=1`,
-	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc, &taskSort)
+		user_agent, cookies, ftp_passive, prealloc, task_sort,
+		COALESCE(proxy_mode, ''), COALESCE(proxy_url, ''), COALESCE(proxy_bypass, '')
+		FROM settings WHERE id=1`,
+	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc, &taskSort,
+		&proxyMode, &proxyURL, &proxyBypass)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 首次运行：插入一条全零行，以便后续 LoadSettings 能读到。
 		_, ierr := s.db.Exec(`INSERT OR IGNORE INTO settings (id) VALUES (1)`)
@@ -515,6 +537,17 @@ func (s *Store) LoadSettings() (Settings, error) {
 	if err != nil {
 		return Settings{}, fmt.Errorf("settings load: %w", err)
 	}
+	// 兼容升级：未持久化 proxy_mode 时根据 proxy_url 是否非空推断。
+	// - 空 URL ⇒ System（默认，与"未启用"语义一致）
+	// - 非空 URL ⇒ Manual（旧版的"启用 HTTP 代理"）
+	mode := protocol.ParseProxyMode(proxyMode)
+	if proxyMode == "" {
+		if proxyURL != "" {
+			mode = protocol.ProxyModeManual
+		} else {
+			mode = protocol.ProxyModeSystem
+		}
+	}
 	return Settings{
 		DefaultSaveDir: saveDir,
 		DefaultThreads: threads,
@@ -524,16 +557,19 @@ func (s *Store) LoadSettings() (Settings, error) {
 		FTPPassive:     passive != 0,
 		Prealloc:       prealloc != 0,
 		TaskSort:       TaskSort(taskSort),
+		ProxyMode:      mode,
+		ProxyURL:       proxyURL,
+		ProxyBypass:    proxyBypass,
 	}, nil
 }
-
 // SaveSettings upsert 已持久化的 settings 行。
 func (s *Store) SaveSettings(s2 Settings) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO settings (id, default_save_dir, default_threads,
-		min_chunk_size, user_agent, cookies, ftp_passive, prealloc, task_sort)
-	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+		min_chunk_size, user_agent, cookies, ftp_passive, prealloc, task_sort,
+		proxy_mode, proxy_url, proxy_bypass)
+	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 			default_save_dir=excluded.default_save_dir,
 			default_threads=excluded.default_threads,
@@ -542,10 +578,14 @@ func (s *Store) SaveSettings(s2 Settings) error {
 			cookies=excluded.cookies,
 			ftp_passive=excluded.ftp_passive,
 			prealloc=excluded.prealloc,
-			task_sort=excluded.task_sort`,
+			task_sort=excluded.task_sort,
+			proxy_mode=excluded.proxy_mode,
+			proxy_url=excluded.proxy_url,
+			proxy_bypass=excluded.proxy_bypass`,
 		s2.DefaultSaveDir, s2.DefaultThreads, s2.MinChunkSize,
 		s2.UserAgent, s2.Cookies, boolToInt(s2.FTPPassive), boolToInt(s2.Prealloc),
 		string(s2.TaskSort),
+		string(protocol.ProxyMode(s2.ProxyMode).String()), s2.ProxyURL, s2.ProxyBypass,
 	)
 	if err != nil {
 		return fmt.Errorf("settings save: %w", err)

@@ -19,6 +19,7 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
@@ -51,6 +52,15 @@ func LoadSettings(st *store.Store) error {
 		persisted.TaskSort = store.SortCreatedDesc
 	}
 	GlobalSettings = persisted
+	// 将代理配置写入 protocol 包，使后续由 scheduler 创建的驱动
+	// 在其任务级 AuthOptions 未指定代理时自动应用。
+	// 将代理配置写入 protocol 包，使后续由 scheduler 创建的驱动
+	// 在其任务级 AuthOptions 未指定代理时自动应用。
+	protocol.SetProxyConfig(protocol.ProxyConfig{
+		Mode:        persisted.ProxyMode,
+		ProxyURL:    persisted.ProxyURL,
+		ProxyBypass: persisted.ProxyBypass,
+	})
 	if firstRun {
 		// 持久化默认值，以便后续加载时能找到真实数据行。
 		_ = SaveSettings(st)
@@ -59,6 +69,12 @@ func LoadSettings(st *store.Store) error {
 }
 // SaveSettings 将 GlobalSettings 写入存储。每次 UI 修改后均可安全调用。
 func SaveSettings(st *store.Store) error {
+	// 同步更新 protocol 包的全局代理，使新创建/恢复的任务立即生效。
+	protocol.SetProxyConfig(protocol.ProxyConfig{
+		Mode:        GlobalSettings.ProxyMode,
+		ProxyURL:    GlobalSettings.ProxyURL,
+		ProxyBypass: GlobalSettings.ProxyBypass,
+	})
 	return st.SaveSettings(GlobalSettings)
 }
 func buildSettingsContent(sc *scheduler.Scheduler, onChange func()) fyne.CanvasObject {
@@ -118,6 +134,73 @@ func buildSettingsContent(sc *scheduler.Scheduler, onChange func()) fyne.CanvasO
 		persist()
 	}
 
+// 代理相关控件
+proxyURLEntry := widget.NewEntry()
+proxyURLEntry.SetText(GlobalSettings.ProxyURL)
+proxyURLEntry.SetPlaceHolder("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
+proxyURLEntry.OnChanged = func(s string) {
+	GlobalSettings.ProxyURL = strings.TrimSpace(s)
+	persist()
+}
+
+proxyBypassEntry := widget.NewEntry()
+proxyBypassEntry.SetText(GlobalSettings.ProxyBypass)
+proxyBypassEntry.SetPlaceHolder("逗号分隔，例如 example.com,*.lan")
+proxyBypassEntry.OnChanged = func(s string) {
+	GlobalSettings.ProxyBypass = strings.TrimSpace(s)
+	persist()
+}
+
+proxyModeLabels := map[protocol.ProxyMode]string{
+	protocol.ProxyModeSystem:   "使用系统代理（默认）",
+	protocol.ProxyModeDisabled: "不使用代理（始终直连）",
+	protocol.ProxyModeManual:   "手动设置代理",
+}
+labelToProxyMode := map[string]protocol.ProxyMode{}
+proxyModeOpts := make([]string, 0, len(proxyModeLabels))
+for _, m := range []protocol.ProxyMode{protocol.ProxyModeSystem, protocol.ProxyModeDisabled, protocol.ProxyModeManual} {
+	proxyModeOpts = append(proxyModeOpts, proxyModeLabels[m])
+	labelToProxyMode[proxyModeLabels[m]] = m
+}
+
+// 切换模式时仅控制代理地址/绕过列表的可见性。地址本身始终保留，
+// 这样用户在 Manual↔System 之间来回切换不会丢失已填写的 URL。
+proxyModeSelect := widget.NewSelect(proxyModeOpts, func(s string) {
+	mode, ok := labelToProxyMode[s]
+	if !ok {
+		return
+	}
+	GlobalSettings.ProxyMode = mode
+	// 切到 System 模式时清掉缓存，使下一次请求重新探测桌面代理设置。
+	if mode == protocol.ProxyModeSystem {
+		protocol.InvalidateSystemProxyCache()
+	}
+	manual := mode == protocol.ProxyModeManual
+	if manual {
+		proxyURLEntry.Show()
+		proxyBypassEntry.Show()
+	} else {
+		proxyURLEntry.Hide()
+		proxyBypassEntry.Hide()
+	}
+	persist()
+})
+initialMode := GlobalSettings.ProxyMode
+if initialMode == 0 {
+	initialMode = protocol.ProxyModeSystem
+}
+initialLabel := proxyModeLabels[initialMode]
+if initialLabel == "" {
+	initialLabel = proxyModeLabels[protocol.ProxyModeSystem]
+}
+proxyModeSelect.SetSelected(initialLabel)
+if initialMode != protocol.ProxyModeManual {
+	proxyURLEntry.Hide()
+	proxyBypassEntry.Hide()
+}
+
+
+
 	ftpPassive := widget.NewCheck("启用 FTP PASV 被动模式", func(checked bool) {
 		GlobalSettings.FTPPassive = checked
 		persist()
@@ -169,6 +252,9 @@ func buildSettingsContent(sc *scheduler.Scheduler, onChange func()) fyne.CanvasO
 		widget.NewFormItem("最小分块大小", chunkSizeRow),
 		widget.NewFormItem("默认 User-Agent", uaEntry),
 		widget.NewFormItem("默认 Cookie", cookiesEntry),
+		widget.NewFormItem("HTTP/HTTPS 代理模式", proxyModeSelect),
+		widget.NewFormItem("代理地址", proxyURLEntry),
+		widget.NewFormItem("代理绕过列表", proxyBypassEntry),
 		widget.NewFormItem("FTP 模式", ftpPassive),
 		widget.NewFormItem("磁盘预分配", prealloc),
 		widget.NewFormItem("任务列表排序", sortSelect),

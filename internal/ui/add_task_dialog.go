@@ -145,9 +145,12 @@ func showAddTaskDialog(win fyne.Window, sc *scheduler.Scheduler) {
 				return
 			}
 			driver, err := protocol.New(rawURL, proto, protocol.Auth{AuthOptions: protocol.AuthOptions{
-				UserAgent:  GlobalSettings.UserAgent,
-				Cookies:    GlobalSettings.Cookies,
-				FTPPassive: GlobalSettings.FTPPassive,
+				UserAgent:    GlobalSettings.UserAgent,
+				Cookies:      GlobalSettings.Cookies,
+				FTPPassive:   GlobalSettings.FTPPassive,
+				ProxyMode:    GlobalSettings.ProxyMode,
+				ProxyURL:     GlobalSettings.ProxyURL,
+				ProxyBypass:  GlobalSettings.ProxyBypass,
 			}})
 			if err != nil {
 				fyne.Do(func() { sizeLabel.SetText("") })
