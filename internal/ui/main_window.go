@@ -59,7 +59,7 @@ func NewMainWindow(a fyne.App, svc Service) *MainWindow {
 	m.statusBar.refreshDiskSpace()
 	return m
 }
-
+func (m *MainWindow) buildMainUI() {
 	m.win = m.app.NewWindow("下载管理器")
 	m.content = container.NewBorder(
 		m.buildToolbar(),
@@ -71,14 +71,6 @@ func NewMainWindow(a fyne.App, svc Service) *MainWindow {
 	m.win.Resize(fyne.NewSize(1000, 640))
 	m.win.CenterOnScreen()
 	setGlobalWindow(m.win)
-	m.win.SetCloseIntercept(m.onCloseRequested)
-}
-
-// showSettingsPage 将主内容切换到设置页面。
-func (m *MainWindow) showSettingsPage() {
-	setGlobalWindow(m.win)
-	m.win.SetCloseIntercept(m.onCloseRequested)
-}
 	m.win.SetCloseIntercept(m.onCloseRequested)
 }
 
