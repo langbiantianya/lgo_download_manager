@@ -13,11 +13,12 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/dialog"
+	"fyne.io/fyne/v2/layout"
+	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 )
 
@@ -34,6 +35,7 @@ var archiveCompressionExts = []string{
 
 // uniqueSuffixRegex 匹配 'name(N)' 形式的后缀——用于在文件名已存在时递增编号。
 var uniqueSuffixRegex = regexp.MustCompile(`^(.*?)(\((\d+)\))$`)
+
 // splitExt 拆分文件名后缀为 (stem, ext)。优先识别复合扩展名：
 // 当 base 形如 "<something>.<archiveCompressionExt>" 且 <archiveCompressionExt>
 // 是已知的压缩归档格式时，把整段当作 ext。否则退化为 filepath.Ext。
@@ -90,12 +92,13 @@ func uniqueSavePath(path string) string {
 	return path
 }
 
-// showAddTaskDialog 打开"新建下载任务"对话框，并预填全局设置中的内容。
-// 这里只显示必要的字段；高级选项位于"设置"对话框中。
+// showAddTaskDialog 打开"新建下载任务"窗口，并预填全局设置中的内容。
+// 这里只显示必要的字段；高级选项位于"设置"窗口中。
 //
+// 弹出方式为独立窗口（与任务详情一致），用户可以同时与主窗口交互。
 // URL 变更时自动从路径末尾提取文件名填入保存路径，并异步请求业务进程
 // 探测文件大小进行预览（探针复用业务侧代理配置）。
-func showAddTaskDialog(win fyne.Window, svc Service) {
+func showAddTaskDialog(parent fyne.Window, svc Service) {
 	// 构建一个纵向布局、标签左对齐的表单。
 	makeRow := func(label string, w fyne.CanvasObject) *fyne.Container {
 		lbl := widget.NewLabel(label)
@@ -115,13 +118,17 @@ func showAddTaskDialog(win fyne.Window, svc Service) {
 				return
 			}
 			savePathEntry.SetText(uniqueSavePath(filepath.Join(uri.Path(), filepath.Base(savePathEntry.Text))))
-		}, win)
+		}, parent)
 	})
 
 	// 文件大小预览标签
 	sizeLabel := widget.NewLabel("")
 	sizeLabel.Alignment = fyne.TextAlignTrailing
 	sizeLabel.TextStyle.Italic = true
+
+	// 关闭窗口的工具函数——确认和取消两条路径共用，避免重复 SetOnClosed 链。
+	var closeWin func()
+	var startDownload func()
 
 	// 从 URL 提取文件名并更新保存路径，同时异步探测文件大小
 	updateFromURL := func(rawURL string) {
@@ -166,10 +173,12 @@ func showAddTaskDialog(win fyne.Window, svc Service) {
 		makeRow("保存路径", container.NewBorder(nil, nil, nil, browseBtn, savePathEntry)),
 	)
 
-	d := dialog.NewCustomConfirm("新建下载任务", "开始下载", "取消", formContent, func(c bool) {
-		if !c {
-			return
-		}
+	w := fyne.CurrentApp().NewWindow("新建下载任务")
+	w.Resize(fyne.NewSize(640, 260))
+	w.CenterOnScreen()
+
+	// 「开始下载」回调——校验 + 创建任务 + 关闭窗口。
+	startDownload = func() {
 		url := urlEntry.Text
 		savePath := uniqueSavePath(savePathEntry.Text)
 		if url == "" || savePath == "" {
@@ -183,13 +192,41 @@ func showAddTaskDialog(win fyne.Window, svc Service) {
 			MinChunkSize: GlobalSettings.MinChunkSize,
 		})
 		if err != nil {
-			dialog.ShowError(err, win)
+			dialog.ShowError(err, parent)
 			return
 		}
-		_ = svc.Start(tk.ID)
-	}, win)
-	d.Resize(fyne.NewSize(600, d.MinSize().Height))
-	d.Show()
+		if err := svc.Start(tk.ID); err != nil {
+			dialog.ShowError(err, parent)
+			return
+		}
+		if closeWin != nil {
+			closeWin()
+		}
+	}
+
+	confirmBtn := widget.NewButtonWithIcon("开始下载", theme.ConfirmIcon(), startDownload)
+	confirmBtn.Importance = widget.HighImportance
+	cancelBtn := widget.NewButtonWithIcon("取消", theme.CancelIcon(), func() {
+		if closeWin != nil {
+			closeWin()
+		}
+	})
+	footer := container.NewBorder(nil, nil, nil, nil, container.NewHBox(layout.NewSpacer(), cancelBtn, confirmBtn))
+
+	w.SetOnClosed(func() {
+		closeWin = nil
+	})
+
+	w.SetContent(container.NewBorder(nil, footer, nil, nil, container.NewPadded(formContent)))
+
+	// URL Entry 上按 Enter 也触发「开始下载」，避免用户每次都得切到按钮。
+	urlEntry.OnSubmitted = func(string) { startDownload() }
+	savePathEntry.OnSubmitted = func(string) { startDownload() }
+
+	// 让 closeWin 在所有控件构造完成后指向真实关闭逻辑。
+	closeWin = w.Close
+
+	w.Show()
 }
 
 func notEmptyValidator() fyne.StringValidator {
@@ -223,5 +260,3 @@ func formatSize(n int64) string {
 		return strconv.FormatInt(n, 10) + " B"
 	}
 }
-
-var _ = time.Now // 保留 time 引用以防未来日志扩展
