@@ -91,7 +91,12 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 	w.Resize(fyne.NewSize(640, 460))
 	w.Show()
 
+	// 先订阅 scheduler 事件拿到 unsub，再注册 SetOnClosed。
+	// Subscribe 内部仅加锁把 channel 写入 scheduler.Subs，几乎不耗时，
+	// 与 w.Show() 之间的窗口期可忽略；即便用户在那一瞬关闭窗口，
+	// Fyne 仍会等 SetOnClosed 注册完成后再触发 close 事件。
 	ch, unsub := sc.Subscribe()
+	w.SetOnClosed(func() { unsub() })
 	go func() {
 		for ev := range ch {
 			if ev.Task == nil || ev.Task.ID != t.ID {
@@ -102,9 +107,7 @@ func showChunkDetails(t *store.Task, sc *scheduler.Scheduler, parent fyne.Window
 			})
 		}
 	}()
-	w.SetOnClosed(func() { unsub() })
 }
-
 // newChunkMosaic 创建一个空马赛克；resizeForTotal 会在知道文件大小后
 // 分配瓦片网格。
 func newChunkMosaic(taskID string) *chunkMosaic {

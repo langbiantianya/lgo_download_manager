@@ -64,8 +64,9 @@ func NewMainWindow(a fyne.App, st *store.Store, sc *scheduler.Scheduler) *MainWi
 	m.taskList = newTaskList(sc, m.filter)
 	m.statusBar = newStatusBar()
 	m.buildMainUI()
-	m.setupTray()
+	m.subscribe()
 	m.statusBar.refreshDiskSpace()
+	m.startFocusTicker()
 	return m
 }
 // buildMainUI 组装主窗口并保存内容容器，以便在页面之间切换（例如切换到设置页面）。
@@ -203,50 +204,92 @@ func (m *MainWindow) buildSidebar() fyne.CanvasObject {
 	)
 }
 
-// Show 显示主窗口并在周期性地检查文件是否存在。
-// 在主 goroutine 中、a.Run() 之前调用，因此不需要 fyne.Do()。
 func (m *MainWindow) Show() {
 	m.win.Show()
-	if m.focusTicker == nil {
-		m.focusTicker = time.NewTicker(10 * time.Second)
-		go func() {
-			for range m.focusTicker.C {
-				m.sc.ValidateFileExistence()
-			}
-		}()
+	if m.unsub == nil {
+		m.subscribe()
 	}
+	m.startFocusTicker()
 }
 
-// Close 清理订阅和定时器。
-func (m *MainWindow) Close() {
+// startFocusTicker 启动定期校验文件存在的 goroutine。
+// 幂等；重建主内容后会被重新调用。
+func (m *MainWindow) startFocusTicker() {
+	if m.focusTicker != nil {
+		return
+	}
+	m.focusTicker = time.NewTicker(10 * time.Second)
+	go func() {
+		for range m.focusTicker.C {
+			m.sc.ValidateFileExistence()
+		}
+	}()
+}
+
+// cleanupResources 停止 ticker 并取消事件订阅。
+// 幂等，可被 Close 与 destroyContent 共用。
+func (m *MainWindow) cleanupResources() {
 	if m.focusTicker != nil {
 		m.focusTicker.Stop()
 		m.focusTicker = nil
 	}
 	if m.unsub != nil {
 		m.unsub()
+		m.unsub = nil
 	}
 }
+// Close 清理订阅和定时器。
+func (m *MainWindow) Close() {
+	m.cleanupResources()
+}
+
+// ShowFromTray 在系统托盘菜单触发时调用：恢复并重建主窗口。
+//
+// 它不是线程安全的；调用方必须通过 fyne.Do() 把它投递到 Fyne 事件线程。
+func (m *MainWindow) ShowFromTray() {
+	if m.contentDestroyed {
+		m.rebuildContent()
+	}
+	m.win.Show()
+	m.win.RequestFocus()
+}
 // onCloseRequested 在用户点击窗口关闭按钮时被调用。
-// 轻量模式下：隐藏窗口并释放 widget 树；否则仅隐藏窗口。
+// 隐藏窗口前先停掉 ticker 与 scheduler 事件订阅，避免后台持续派发；
+// 重新打开时由 Show 重新启动。
+//
+// 轻量模式下：额外释放 widget 树（destroyContent 内部已含 cleanupResources，
+// 这里跳过以免重复）。
 func (m *MainWindow) onCloseRequested() {
 	if GlobalSettings.LightMode {
 		m.win.Hide()
 		m.destroyContent()
 		return
 	}
+	m.cleanupResources()
 	m.win.Hide()
 }
 
 // destroyContent 释放主 widget 树，使窗口关闭后内存可被 GC 回收。
 // 必须在主 goroutine 中调用。
+//
+// Fyne 的 glfw 驱动不允许向 SetContent 传入 nil CanvasObject（直接
+// 解引用导致段错误）。这里把窗口内容替换为隐藏的占位 widget，
+// 而非传 nil。
 func (m *MainWindow) destroyContent() {
+	if m.content == nil && m.contentDestroyed {
+		return
+	}
+	// 必须在置 nil 字段之前清理后台 goroutine / 订阅，
+	// 否则 ticker 闭包持有 m，订阅也会继续向 nil taskList push 事件。
+	m.cleanupResources()
 	m.content = nil
 	m.taskList = nil
 	m.statusBar = nil
 	m.contentDestroyed = true
 	if m.win != nil {
-		m.win.SetContent(nil)
+		placeholder := widget.NewLabel("")
+		placeholder.Hide()
+		m.win.SetContent(placeholder)
 	}
 }
 
@@ -255,7 +298,6 @@ func (m *MainWindow) destroyContent() {
 func (m *MainWindow) rebuildContent() {
 	m.taskList = newTaskList(m.sc, m.filter)
 	m.statusBar = newStatusBar()
-	m.statusBar.refreshDiskSpace()
 	m.content = container.NewBorder(
 		m.buildToolbar(),
 		m.statusBar.container(),
@@ -263,32 +305,11 @@ func (m *MainWindow) rebuildContent() {
 		m.buildMainSplit(),
 	)
 	m.win.SetContent(m.content)
+	m.subscribe()
+	m.statusBar.refreshDiskSpace()
+	m.startFocusTicker()
 	m.contentDestroyed = false
 }
-// setupTray 添加带有 Show 菜单项的系统托盘图标。
-func (m *MainWindow) setupTray() {
-	openItem := fyne.NewMenuItem("Open", func() {
-		if m.contentDestroyed {
-			m.rebuildContent()
-		}
-		m.win.Show()
-		m.win.RequestFocus()
-	})
-	quitItem := fyne.NewMenuItem("退出", func() {
-		m.app.Quit()
-	})
-	trayMenu := fyne.NewMenu("", openItem, quitItem)
-
-	// SetSystemTrayMenu/SetSystemTrayWindow 是 *fyneApp 上仅限桌面端的方法。
-	if desk, ok := m.app.(interface {
-		SetSystemTrayMenu(*fyne.Menu)
-		SetSystemTrayWindow(fyne.Window)
-	}); ok {
-		desk.SetSystemTrayMenu(trayMenu)
-		desk.SetSystemTrayWindow(m.win)
-	}
-}
-
 // subscribe 将 scheduler 事件总线接入 fyne.Do 的 GUI 更新。
 func (m *MainWindow) subscribe() {
 	ch, unsub := m.sc.Subscribe()
@@ -340,6 +361,10 @@ func (db *diskBar) MinSize() fyne.Size {
 }
 
 func (db *diskBar) Refresh() {
+	if db.fill == nil {
+		// 还未接入 widget 树；CreateRenderer() 会调用 fill。
+		return
+	}
 	db.fill.FillColor = colorForProgress(db.progress)
 	db.fill.Refresh()
 }

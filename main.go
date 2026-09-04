@@ -20,6 +20,7 @@ import (
 	"strings"
 	"syscall"
 
+	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 
 	"lgo_download_manager/internal/protocol"
@@ -157,21 +158,30 @@ func main() {
 		handleDownloadURL(u)
 	}
 
-	// GUI —— 必须在 Fyne Run() 所在的 main goroutine 中执行。
-	// GUI —— 必须在 Fyne Run() 所在的 main goroutine 中执行。
-	if !*noGUI {
-		if *light {
-			ui.SetForceLightMode()
-		}
-		a := app.NewWithID("com.langbiantianya.LGDM")
-		// 在 app 创建之后再构造窗口，这样 widget 构造时可以解析
-		// fyne.CurrentApp()（list.go 在初始化阶段会调用它）。
-		win := ui.NewMainWindow(a, st, sc)
-		win.Show()
-		a.Run()
-		cancel()
-		os.Exit(0)
+// GUI —— 必须在 Fyne Run() 所在的 main goroutine 中执行。
+if !*noGUI {
+	if *light {
+		ui.SetForceLightMode()
 	}
+	a := app.NewWithID("com.langbiantianya.LGDM")
+	// 在 app 创建之后再构造窗口，这样 widget 构造时可以解析
+	// fyne.CurrentApp()（list.go 在初始化阶段会调用它）。
+	win := ui.NewMainWindow(a, st, sc)
+	win.Show()
+	// 启动独立于 Fyne 主循环的系统托盘。
+	go ui.StartTray(ui.TrayCallbacks{
+		Open: func() {
+			fyne.Do(func() { win.ShowFromTray() })
+		},
+		Quit: func() {
+			fyne.Do(func() { a.Quit() })
+		},
+	})
+	a.Run()
+	ui.StopTray()
+	cancel()
+	os.Exit(0)
+}
 
 	// 等待关闭信号
 	quit := make(chan os.Signal, 1)
