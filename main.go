@@ -37,6 +37,7 @@ func main() {
 	dbPath := flag.String("db", defaultDBPath, "path to SQLite database")
 	noGUI := flag.Bool("no-gui", false, "start without the Fyne GUI")
 	openURL := flag.String("open-url", "", "download URL (lgom://... format)")
+	light := flag.Bool("light", false, "force lightweight mode (destroy UI on close)")
 	flag.Parse()
 
 	// 从 --open-url flag 与位置参数中收集 URL。
@@ -57,7 +58,7 @@ func main() {
 		log.Fatalf("urllauncher: %v", err)
 	}
 	if !isPrimary {
-			// 已有其他实例运行；转发所有 URL 后退出
+		// 已有其他实例运行；转发所有 URL 后退出
 		if len(urls) > 0 {
 			for _, u := range urls {
 				if err := urllauncher.SendURL(u); err != nil {
@@ -126,11 +127,11 @@ func main() {
 		}
 
 		tk, err := sc.Add(scheduler.AddTaskInput{
-			URL:         req.URL,
-			SavePath:    savePath,
-			Protocol:    proto,
-			Auth:        auth,
-			ChunkCount:  4,
+			URL:          req.URL,
+			SavePath:     savePath,
+			Protocol:     proto,
+			Auth:         auth,
+			ChunkCount:   4,
 			MinChunkSize: ui.GlobalSettings.MinChunkSize,
 		})
 		if err != nil {
@@ -157,8 +158,12 @@ func main() {
 	}
 
 	// GUI —— 必须在 Fyne Run() 所在的 main goroutine 中执行。
+	// GUI —— 必须在 Fyne Run() 所在的 main goroutine 中执行。
 	if !*noGUI {
-		a := app.NewWithID("com.ldm")
+		if *light {
+			ui.SetForceLightMode()
+		}
+		a := app.NewWithID("com.langbiantianya.LGDM")
 		// 在 app 创建之后再构造窗口，这样 widget 构造时可以解析
 		// fyne.CurrentApp()（list.go 在初始化阶段会调用它）。
 		win := ui.NewMainWindow(a, st, sc)

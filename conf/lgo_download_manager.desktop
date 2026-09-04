@@ -1,10 +1,14 @@
 [Desktop Entry]
 Name=下载管理器
-Comment=本地下载管理器
+Name[en]=Download Manager
+GenericName=LGo Download Manager
+Comment=下载管理器
+Comment[en]=Download manager with multi-protocol support
 Exec=lgo_download_manager --open-url %u
-Icon=lgo_download_manager
+Icon=org.langbiantianya.LGDM
 Terminal=false
 Type=Application
 Categories=Network;Download;
-MimeType=x-scheme-handler/lgom://;
+MimeType=x-scheme-handler/lgom;
 StartupWMClass=lgo_download_manager
+Keywords=download;http;ftp;webdav;

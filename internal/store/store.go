@@ -255,6 +255,9 @@ func (s *Store) migrate() error {
 	if err := s.addColumnIfMissing("settings", "proxy_mode", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
+	if err := s.addColumnIfMissing("settings", "light_mode", `INTEGER NOT NULL DEFAULT 1`); err != nil {
+		return err
+	}
 	return nil
 }
 // modernc.org/sqlite 通过 PRAGMA 暴露 table_info。
@@ -495,12 +498,13 @@ type Settings struct {
 
 	// ProxyURL 是 Manual 模式下使用的代理地址；其他模式忽略。
 	ProxyURL string
-
-	// ProxyBypass 是逗号分隔的主机/域名列表，这些目标直连而不经过代理。
 	ProxyBypass string
-}
 
-// LoadSettings 返回已持久化的 settings 行。若尚不存在，
+	// LightMode 为 true 时，关闭主窗口会同时销毁窗口内的 widget 树，
+	// 释放任务行、磁盘条等占用的内存，仅保留调度器和系统托盘。
+	// 重新打开主窗口时按需重建。
+	LightMode bool
+}
 // 则插入一条全零的记录（由调用方负责套用默认值），
 // 并返回零值的 Settings。
 func (s *Store) LoadSettings() (Settings, error) {
@@ -519,13 +523,15 @@ func (s *Store) LoadSettings() (Settings, error) {
 		proxyMode   string
 		proxyURL    string
 		proxyBypass string
+		lightMode   int
 	)
 	err := s.db.QueryRow(`SELECT default_save_dir, default_threads, min_chunk_size,
 		user_agent, cookies, ftp_passive, prealloc, task_sort,
-		COALESCE(proxy_mode, ''), COALESCE(proxy_url, ''), COALESCE(proxy_bypass, '')
+		COALESCE(proxy_mode, ''), COALESCE(proxy_url, ''), COALESCE(proxy_bypass, ''),
+		COALESCE(light_mode, 1)
 		FROM settings WHERE id=1`,
 	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc, &taskSort,
-		&proxyMode, &proxyURL, &proxyBypass)
+		&proxyMode, &proxyURL, &proxyBypass, &lightMode)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 首次运行：插入一条全零行，以便后续 LoadSettings 能读到。
 		_, ierr := s.db.Exec(`INSERT OR IGNORE INTO settings (id) VALUES (1)`)
@@ -560,6 +566,9 @@ func (s *Store) LoadSettings() (Settings, error) {
 		ProxyMode:      mode,
 		ProxyURL:       proxyURL,
 		ProxyBypass:    proxyBypass,
+		// light_mode 列缺省值为 1（轻量模式为新用户的默认）；
+		// 老数据库在迁移后会得到这个缺省，无需特别处理。
+		LightMode: lightMode != 0,
 	}, nil
 }
 // SaveSettings upsert 已持久化的 settings 行。
@@ -568,8 +577,8 @@ func (s *Store) SaveSettings(s2 Settings) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO settings (id, default_save_dir, default_threads,
 		min_chunk_size, user_agent, cookies, ftp_passive, prealloc, task_sort,
-		proxy_mode, proxy_url, proxy_bypass)
-	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		proxy_mode, proxy_url, proxy_bypass, light_mode)
+	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 			default_save_dir=excluded.default_save_dir,
 			default_threads=excluded.default_threads,
@@ -581,11 +590,13 @@ func (s *Store) SaveSettings(s2 Settings) error {
 			task_sort=excluded.task_sort,
 			proxy_mode=excluded.proxy_mode,
 			proxy_url=excluded.proxy_url,
-			proxy_bypass=excluded.proxy_bypass`,
+			proxy_bypass=excluded.proxy_bypass,
+			light_mode=excluded.light_mode`,
 		s2.DefaultSaveDir, s2.DefaultThreads, s2.MinChunkSize,
 		s2.UserAgent, s2.Cookies, boolToInt(s2.FTPPassive), boolToInt(s2.Prealloc),
 		string(s2.TaskSort),
 		string(protocol.ProxyMode(s2.ProxyMode).String()), s2.ProxyURL, s2.ProxyBypass,
+		boolToInt(s2.LightMode),
 	)
 	if err != nil {
 		return fmt.Errorf("settings save: %w", err)

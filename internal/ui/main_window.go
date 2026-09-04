@@ -37,8 +37,12 @@ type MainWindow struct {
 	taskList  *taskList
 	statusBar *statusBar
 
-	unsub     func()
+	unsub       func()
 	focusTicker *time.Ticker
+
+	// contentDestroyed 记录主内容是否已被释放（轻量模式下用户关闭主窗口时）。
+	// 下次 Show 需重新构建 widget 树。
+	contentDestroyed bool
 }
 
 // NewMainWindow 构建附加到 app 的主窗口。
@@ -60,13 +64,10 @@ func NewMainWindow(a fyne.App, st *store.Store, sc *scheduler.Scheduler) *MainWi
 	m.taskList = newTaskList(sc, m.filter)
 	m.statusBar = newStatusBar()
 	m.buildMainUI()
-	m.statusBar.refreshDiskSpace()
-	m.subscribe()
 	m.setupTray()
-	setGlobalWindow(m.win)
+	m.statusBar.refreshDiskSpace()
 	return m
 }
-
 // buildMainUI 组装主窗口并保存内容容器，以便在页面之间切换（例如切换到设置页面）。
 func (m *MainWindow) buildMainUI() {
 	m.win = m.app.NewWindow("下载管理器")
@@ -79,7 +80,8 @@ func (m *MainWindow) buildMainUI() {
 	m.win.SetContent(m.content)
 	m.win.Resize(fyne.NewSize(1000, 640))
 	m.win.CenterOnScreen()
-	m.win.SetOnClosed(func() { m.Close() })
+	// 关闭拦截：默认隐藏到托盘；轻量模式下额外释放 widget 树以节省内存。
+	m.win.SetCloseIntercept(m.onCloseRequested)
 }
 
 // showSettingsPage 将主内容切换到设置页面。
@@ -225,14 +227,57 @@ func (m *MainWindow) Close() {
 		m.unsub()
 	}
 }
+// onCloseRequested 在用户点击窗口关闭按钮时被调用。
+// 轻量模式下：隐藏窗口并释放 widget 树；否则仅隐藏窗口。
+func (m *MainWindow) onCloseRequested() {
+	if GlobalSettings.LightMode {
+		m.win.Hide()
+		m.destroyContent()
+		return
+	}
+	m.win.Hide()
+}
 
+// destroyContent 释放主 widget 树，使窗口关闭后内存可被 GC 回收。
+// 必须在主 goroutine 中调用。
+func (m *MainWindow) destroyContent() {
+	m.content = nil
+	m.taskList = nil
+	m.statusBar = nil
+	m.contentDestroyed = true
+	if m.win != nil {
+		m.win.SetContent(nil)
+	}
+}
+
+// rebuildContent 在轻量模式下重新构建已被销毁的主 UI。
+// 必须在主 goroutine 中调用。
+func (m *MainWindow) rebuildContent() {
+	m.taskList = newTaskList(m.sc, m.filter)
+	m.statusBar = newStatusBar()
+	m.statusBar.refreshDiskSpace()
+	m.content = container.NewBorder(
+		m.buildToolbar(),
+		m.statusBar.container(),
+		nil, nil,
+		m.buildMainSplit(),
+	)
+	m.win.SetContent(m.content)
+	m.contentDestroyed = false
+}
 // setupTray 添加带有 Show 菜单项的系统托盘图标。
 func (m *MainWindow) setupTray() {
 	openItem := fyne.NewMenuItem("Open", func() {
+		if m.contentDestroyed {
+			m.rebuildContent()
+		}
 		m.win.Show()
 		m.win.RequestFocus()
 	})
-	trayMenu := fyne.NewMenu("", openItem)
+	quitItem := fyne.NewMenuItem("退出", func() {
+		m.app.Quit()
+	})
+	trayMenu := fyne.NewMenu("", openItem, quitItem)
 
 	// SetSystemTrayMenu/SetSystemTrayWindow 是 *fyneApp 上仅限桌面端的方法。
 	if desk, ok := m.app.(interface {

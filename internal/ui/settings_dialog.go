@@ -30,6 +30,12 @@ const mib = int64(1 << 20)
 // 使用的实时设置。它与 SQLite 存储 settings 表中的持久化行一一对应，
 // 并在启动时由 LoadSettings 加载。
 var GlobalSettings store.Settings
+// forceLightMode 当从 CLI 传入 --light 标志时设为 true，强制开启轻量模式。
+var forceLightMode bool
+
+// SetForceLightMode 由 main.go 的 --light flag 调用，使后续 LoadSettings
+// 调用强制 LightMode 为 true。
+func SetForceLightMode() { forceLightMode = true }
 
 // LoadSettings 从存储中读取持久化的设置，并将其覆盖到 GlobalSettings 上。
 // 对于零值具有歧义（空字符串 / 0）的字段，会应用默认值——首次运行时，
@@ -50,19 +56,18 @@ func LoadSettings(st *store.Store) error {
 		persisted.FTPPassive = true
 		persisted.Prealloc = true
 		persisted.TaskSort = store.SortCreatedDesc
+		persisted.LightMode = true // 新用户默认开启轻量模式
 	}
 	GlobalSettings = persisted
-	// 将代理配置写入 protocol 包，使后续由 scheduler 创建的驱动
-	// 在其任务级 AuthOptions 未指定代理时自动应用。
-	// 将代理配置写入 protocol 包，使后续由 scheduler 创建的驱动
-	// 在其任务级 AuthOptions 未指定代理时自动应用。
+	if forceLightMode {
+		GlobalSettings.LightMode = true
+	}
 	protocol.SetProxyConfig(protocol.ProxyConfig{
 		Mode:        persisted.ProxyMode,
 		ProxyURL:    persisted.ProxyURL,
 		ProxyBypass: persisted.ProxyBypass,
 	})
 	if firstRun {
-		// 持久化默认值，以便后续加载时能找到真实数据行。
 		_ = SaveSettings(st)
 	}
 	return nil
@@ -245,8 +250,14 @@ if initialMode != protocol.ProxyModeManual {
 	if currentLabel == "" {
 		currentLabel = sortLabels[store.SortCreatedDesc]
 	}
-	sortSelect.SetSelected(currentLabel)
-	form := widget.NewForm(
+	lightModeCheck := widget.NewCheck("轻量模式（关闭主窗口时释放界面内存）", func(checked bool) {
+		GlobalSettings.LightMode = checked
+		persist()
+	})
+	lightModeCheck.SetChecked(GlobalSettings.LightMode)
+
+ 	sortSelect.SetSelected(currentLabel)
+ 	form := widget.NewForm(
 		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
 		widget.NewFormItem("默认并发线程数", threadsEntry),
 		widget.NewFormItem("最小分块大小", chunkSizeRow),
@@ -257,6 +268,7 @@ if initialMode != protocol.ProxyModeManual {
 		widget.NewFormItem("代理绕过列表", proxyBypassEntry),
 		widget.NewFormItem("FTP 模式", ftpPassive),
 		widget.NewFormItem("磁盘预分配", prealloc),
+		widget.NewFormItem("轻量模式", lightModeCheck),
 		widget.NewFormItem("任务列表排序", sortSelect),
 	)
 
