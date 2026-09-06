@@ -207,9 +207,9 @@ func (m *MainWindow) ShowFromTray() {
 
 // onCloseRequested 在用户点击窗口关闭按钮时被调用。
 //
-// LightMode 开启时整个 UI 子进程退出，内存由操作系统彻底回收；
-// 业务进程不受影响，托盘可随时重新拉起 UI。非轻量模式仅隐藏窗口，
-// 由业务进程 MsgShow 再次显示（快速恢复、保留内存）。
+// LightMode 开启时(默认)整个 UI 子进程退出, 内存由操作系统彻底回收;
+// 业务进程不受影响, 托盘可随时重新拉起 UI。需要「关闭即隐藏、由托盘
+// 恢复」的轻量行为可以在「设置」里手动关闭 LightMode。
 func (m *MainWindow) onCloseRequested() {
 	if GlobalSettings.LightMode {
 		m.Close()

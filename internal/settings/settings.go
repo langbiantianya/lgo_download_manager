@@ -38,9 +38,10 @@ func Load(st *store.Store, forceLight bool) (store.Settings, error) {
 		persisted.FTPPassive = true
 		persisted.Prealloc = true
 		persisted.TaskSort = store.SortCreatedDesc
-		// LightMode 默认关闭：关闭主窗口只隐藏窗口，便于随时通过托盘恢复。
-		// 用户可在「设置」里手动开启，开启后关闭主窗口会同时退出 UI 进程。
-		persisted.LightMode = false
+		// LightMode 默认开启:点击主窗口 X 直接退出 UI 子进程,
+		// 行为符合大多数用户对窗口关闭按钮的直觉。需要「关闭即隐藏、
+		// 托盘随时恢复」的用户可以在「设置」里手动取消。
+		persisted.LightMode = true
 	}
 	if forceLight {
 		persisted.LightMode = true

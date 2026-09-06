@@ -13,9 +13,9 @@ import (
 	"lgo_download_manager/internal/store"
 )
 
-// TestLoad_FirstRunDefaults 验证首次运行的默认值——尤其是 LightMode 默认关闭:
-// 关闭主窗口只隐藏窗口, UI 子进程保持存活, 托盘可随时重新拉起窗口。
-// 这避免了用户预期「X 只是关闭窗口」时,UI 却被完整退出。
+// TestLoad_FirstRunDefaults 验证首次运行的默认值——尤其是 LightMode
+// 默认开启:点击主窗口 X 直接退出 UI 子进程,符合用户对窗口关闭按钮的
+// 直觉预期;想要「关闭即隐藏」的用户可以在「设置」里手动取消。
 func TestLoad_FirstRunDefaults(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	st, err := store.Open(dbPath)
@@ -28,8 +28,8 @@ func TestLoad_FirstRunDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got.LightMode != false {
-		t.Errorf("LightMode default = %v, want false (so that closing main window only hides it)", got.LightMode)
+	if !got.LightMode {
+		t.Errorf("LightMode default = %v, want true (so X on main window exits the UI child)", got.LightMode)
 	}
 }
 
