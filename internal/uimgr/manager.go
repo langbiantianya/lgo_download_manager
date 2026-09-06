@@ -337,6 +337,12 @@ func (m *Manager) dispatch(method string, raw json.RawMessage) (any, error) {
 		}
 		return nil, m.sc.Pause(p.ID)
 
+	case ipc.MethodIsPreparing:
+		var p ipc.TaskParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, err
+		}
+		return m.sc.IsPreparing(p.ID), nil
 	case ipc.MethodDelete:
 		var p ipc.TaskParams
 		if err := json.Unmarshal(raw, &p); err != nil {

@@ -27,20 +27,25 @@ type taskRow struct {
 	task *store.Task
 	svc  Service
 
-	// 第一行：名称 + 大小 + 状态
-	name        *widget.Label
-	size        *widget.Label
-	statusLbl   *widget.Label
+	// optimisticStatus 在用户点击 Start/Pause 后立即覆盖渲染,
+	// 真实事件到达(status 与乐观值一致)时由 onEvent 清掉。
+	// 用于消除按钮点击到后端事件回传之间肉眼可见的「卡顿」。
+	optimisticStatus *store.Status
 
-	// 第二行：进度条
+	// 第一行:名称 + 大小 + 状态
+	name      *widget.Label
+	size      *widget.Label
+	statusLbl *widget.Label
+
+	// 第二行:进度条
 	progress *widget.ProgressBar
 
-	// 第三行：左侧按钮，右侧速度+剩余时间+添加时间
+	// 第三行:左侧按钮,右侧速度+剩余时间+添加时间
 	speed        *widget.Label
 	remTime      *widget.Label
 	createdAtLbl *widget.Label
 
-	// 第三行：操作按钮
+	// 第三行:操作按钮
 	startBtn      *widget.Button
 	pauseBtn      *widget.Button
 	cancelBtn     *widget.Button
@@ -132,10 +137,22 @@ func (r *taskRow) bindButtons(t *store.Task, svc Service) {
 		return
 	}
 	taskID := t.ID
-	r.startBtn.OnTapped = func() {
+	// 复制一份供闭包读取当前快照;乐观覆盖则在 refresh 内根据 r.task 计算。
+	startBtn := r.startBtn
+	pauseBtn := r.pauseBtn
+	startBtn.OnTapped = func() {
+		// 乐观更新:让用户立即看到「下载中/准备中」,不等事件回环。
+		down := store.TaskStatus.Downloading
+		r.optimisticStatus = &down
+		fyne.Do(func() { r.refresh() })
 		_ = svc.Start(taskID)
 	}
-	r.pauseBtn.OnTapped = func() { _ = svc.Pause(taskID) }
+	pauseBtn.OnTapped = func() {
+		paused := store.TaskStatus.Paused
+		r.optimisticStatus = &paused
+		fyne.Do(func() { r.refresh() })
+		_ = svc.Pause(taskID)
+	}
 	r.cancelBtn.OnTapped = func() { svc.Delete(taskID) }
 	r.detailsBtn.OnTapped = func() { showChunkDetails(t, svc, globalWin) }
 	r.openFolderBtn.OnTapped = func() {
@@ -157,8 +174,6 @@ func (r *taskRow) refresh() {
 	t := r.task
 	if t == nil {
 		r.name.SetText("")
-		r.createdAtLbl.SetText("")
-		r.statusLbl.SetText("")
 		r.progress.SetValue(0)
 		r.speed.Hide()
 		r.remTime.Hide()
@@ -177,8 +192,14 @@ func (r *taskRow) refresh() {
 		pct = 1
 	}
 
-	// 下载速度和剩余时间仅在 Downloading 状态下显示，其它状态都隐藏。
-	isDownloading := t.Status == store.TaskStatus.Downloading
+	// 乐观状态:用户刚点完 Start/Pause,后端事件还没回环;先按用户意图渲染。
+	// 真实事件(status 与乐观值一致)由 taskList.onEvent 清掉此覆盖,
+	// 中途收到的 progress 事件不清覆盖,直到 status 事件落地。
+	effective := t.Status
+	if r.optimisticStatus != nil {
+		effective = *r.optimisticStatus
+	}
+	isDownloading := effective == store.TaskStatus.Downloading
 	if isDownloading {
 		r.speed.SetText(formatBPS(r.curSpeed))
 		r.remTime.SetText(etaText(t, r.curSpeed))
@@ -189,13 +210,25 @@ func (r *taskRow) refresh() {
 		r.remTime.Hide()
 	}
 
-	switch t.Status {
+	// 准备阶段判定:store 中 Status 仍是 Pending,且 scheduler 已为该任务
+	// 预留了 slot(engine 尚未接管)。乐观覆盖为 Downloading 时不再视为「准备中」,
+	// 用户刚点完 Start 不应再看到「准备中」闪烁。
+	isPreparing := effective == store.TaskStatus.Pending &&
+		r.svc != nil && r.svc.IsPreparing(t.ID)
+
+	switch effective {
 	case store.TaskStatus.Pending:
-		r.statusLbl.SetText("等待中")
-		r.startBtn.SetIcon(theme.MediaPlayIcon())
-		r.startBtn.Importance = widget.LowImportance
-		r.pauseBtn.Hide()
-		r.startBtn.Show()
+		if isPreparing {
+			r.statusLbl.SetText("准备中")
+			r.pauseBtn.Show()
+			r.startBtn.Hide()
+		} else {
+			r.statusLbl.SetText("等待中")
+			r.startBtn.SetIcon(theme.MediaPlayIcon())
+			r.startBtn.Importance = widget.LowImportance
+			r.pauseBtn.Hide()
+			r.startBtn.Show()
+		}
 		r.openFolderBtn.Hide()
 		r.openFileBtn.Hide()
 	case store.TaskStatus.Downloading:
@@ -246,6 +279,7 @@ func displayName(t *store.Task) string {
 	}
 	return t.URL
 }
+
 // formatTime 把 time.Time 渲染为本地时区的 YYYY-MM-DD HH:MM:SS 字符串。
 // 零值返回 "-" 表示尚未发生。
 func formatTime(t time.Time) string {

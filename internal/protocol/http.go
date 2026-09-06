@@ -85,7 +85,7 @@ func (d *httpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("http probe: status %d", resp.StatusCode)
+		return nil, NewStatusError(resp.StatusCode, fmt.Errorf("http probe: status %d", resp.StatusCode))
 	}
 
 	caps := &DriverCapabilities{
@@ -116,7 +116,7 @@ func (d *httpDriver) probeWithRange(ctx context.Context) (*DriverCapabilities, e
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("http probe range: status %d", resp.StatusCode)
+		return nil, NewStatusError(resp.StatusCode, fmt.Errorf("http probe range: status %d", resp.StatusCode))
 	}
 	caps := &DriverCapabilities{
 		SupportRange: resp.StatusCode == http.StatusPartialContent,
@@ -183,7 +183,7 @@ func (d *httpDriver) DownloadChunk(ctx context.Context, start, end int64, file *
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("http chunk: status %d", resp.StatusCode)
+		return NewStatusError(resp.StatusCode, fmt.Errorf("http chunk: status %d", resp.StatusCode))
 	}
 
 	buf := make([]byte, chunkSize)
@@ -229,7 +229,7 @@ func (d *httpDriver) DownloadFallback(ctx context.Context, offset int64, file *o
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return fmt.Errorf("http fallback: status %d", resp.StatusCode)
+		return NewStatusError(resp.StatusCode, fmt.Errorf("http fallback: status %d", resp.StatusCode))
 	}
 
 	buf := make([]byte, chunkSize)

@@ -144,7 +144,7 @@ func (d *webdavDriver) fallbackProbe(ctx context.Context) (*DriverCapabilities, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("webdav probe: status %d", resp.StatusCode)
+		return nil, NewStatusError(resp.StatusCode, fmt.Errorf("webdav probe: status %d", resp.StatusCode))
 	}
 	caps := &DriverCapabilities{
 		TotalSize:    parseInt64(resp.Header.Get("Content-Length")),
@@ -174,7 +174,7 @@ func (d *webdavDriver) DownloadChunk(ctx context.Context, start, end int64, file
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("webdav chunk: status %d", resp.StatusCode)
+		return NewStatusError(resp.StatusCode, fmt.Errorf("webdav chunk: status %d", resp.StatusCode))
 	}
 
 	buf := make([]byte, chunkSize)
@@ -216,7 +216,7 @@ func (d *webdavDriver) DownloadFallback(ctx context.Context, offset int64, file 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return fmt.Errorf("webdav fallback: status %d", resp.StatusCode)
+		return NewStatusError(resp.StatusCode, fmt.Errorf("webdav fallback: status %d", resp.StatusCode))
 	}
 
 	buf := make([]byte, chunkSize)

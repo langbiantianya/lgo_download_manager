@@ -145,15 +145,35 @@ func (tl *taskList) refreshEmptyState() {
 }
 
 // onEvent 刷新列表并将进度事件派发到对应的行。
+// 状态事件到达时,若 row 持有匹配的乐观覆盖,则清掉它,
+// 让 refresh 重新按真实 status 渲染(进度事件不清覆盖,以避免乐观闪烁)。
 func (tl *taskList) onEvent(ev scheduler.Event) {
 	if ev.Task != nil {
 		tl.rowMu.Lock()
 		row, ok := tl.rowMap[ev.Task.ID]
 		tl.rowMu.Unlock()
-		if ok && ev.Why == "progress" {
-			row.onProgress(ev)
-			return
+		if ok {
+			if ev.Why == "progress" {
+				row.onProgress(ev)
+				return
+			}
+			if row.optimisticStatus != nil && *row.optimisticStatus == ev.Task.Status {
+				row.optimisticStatus = nil
+			}
 		}
 	}
 	tl.refresh()
+}
+
+// setOptimistic 给定任务 ID 立刻设置其 row 的乐观状态并刷新。
+// 真实事件(status 与乐观值一致)由 onEvent 清掉,这里只负责「立即看见」。
+func (tl *taskList) setOptimistic(taskID string, st store.Status) {
+	tl.rowMu.Lock()
+	row, ok := tl.rowMap[taskID]
+	tl.rowMu.Unlock()
+	if !ok {
+		return
+	}
+	row.optimisticStatus = &st
+	row.Refresh()
 }

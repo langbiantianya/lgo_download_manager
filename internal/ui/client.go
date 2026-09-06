@@ -258,6 +258,13 @@ func (c *ipcClient) Delete(taskID string) error {
 	return c.request(ipc.MethodDelete, ipc.TaskParams{ID: taskID}, nil)
 }
 
+func (c *ipcClient) IsPreparing(taskID string) bool {
+	var out bool
+	if err := c.request(ipc.MethodIsPreparing, ipc.TaskParams{ID: taskID}, &out); err != nil {
+		return false
+	}
+	return out
+}
 func (c *ipcClient) Probe(url string) (int64, error) {
 	var res ipc.ProbeResult
 	if err := c.request(ipc.MethodProbe, ipc.ProbeParams{URL: url}, &res); err != nil {

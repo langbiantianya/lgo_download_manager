@@ -15,9 +15,83 @@ package protocol
 
 import (
 	"context"
+	"errors"
 	"os"
+	"strconv"
+	"strings"
 )
 
+// StatusError 携带驱动产生的 HTTP/WebDAV 状态码,供 engine 区分
+// 「可重试」(5xx、网络瞬断)与「终止」(4xx、URL 错、不支持)。
+// 驱动应通过 fmt.Errorf("...: %w", &StatusError{Code: 401}) 包装,
+// 或调用 NewStatusError 直接构造。
+type StatusError struct {
+	Code   int
+	Reason string // 底层驱动原始错误信息,用于诊断;非空时 Wrap 后仍会打印。
+}
+
+func (e *StatusError) Error() string {
+	if e.Reason != "" {
+		return "protocol: status " + strconv.Itoa(e.Code) + ": " + e.Reason
+	}
+	return "protocol: status " + strconv.Itoa(e.Code)
+}
+
+// NewStatusError 构造一个带状态码的错误,reason 可为 nil。
+func NewStatusError(code int, reason error) error {
+	se := &StatusError{Code: code}
+	if reason != nil {
+		se.Reason = reason.Error()
+	}
+	return se
+}
+
+// HTTPStatus 返回错误链中第一个 StatusError 的状态码;若不存在则返回 -1。
+func HTTPStatus(err error) int {
+	if err == nil {
+		return -1
+	}
+	var se *StatusError
+	if errors.As(err, &se) {
+		return se.Code
+	}
+	// 兜底:历史错误字符串中含 "status NNN" 字样。允许驱动未升级到
+	// StatusError 时仍然可被 engine 分类,直到所有驱动迁移完。
+	msg := err.Error()
+	const key = "status "
+	if idx := strings.LastIndex(msg, key); idx >= 0 {
+		rest := msg[idx+len(key):]
+		end := 0
+		for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+			end++
+		}
+		if end > 0 {
+			if n, perr := strconv.Atoi(rest[:end]); perr == nil {
+				return n
+			}
+		}
+	}
+	return -1
+}
+
+// IsTerminal 判断该错误是否应立刻终止下载(不可重试)。
+// 4xx 与 401/403/404 等业务错误一律终止;5xx 与网络瞬断留给重试逻辑。
+func IsTerminal(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if os.IsNotExist(err) || os.IsPermission(err) {
+		return true
+	}
+	code := HTTPStatus(err)
+	if code < 0 {
+		return false
+	}
+	return code >= 400 && code < 500
+}
 // DriverCapabilities 是 Probe 成功执行后的结果——包含足够多的元数据，
 // 供引擎规划下载方式。
 type DriverCapabilities struct {

@@ -594,3 +594,180 @@ func TestPauseAll_Timeout(t *testing.T) {
 	// 释放挂起 goroutine 防止测试 goroutine 泄漏。
 	close(released)
 }
+
+// TestPauseDuringPrepare 验证「Start 已预留 slot、但 engine 还没接管」
+// 的准备阶段中,scheduler.Pause 必须能立即中止任务并把状态落盘为
+// Paused,而不是只能等 startAsync 自然跑完探测/预分配。
+func TestPauseDuringPrepare(t *testing.T) {
+	// 一个故意在 probe 阶段挂住的 server：handler 阻塞直到测试主动
+	// 关闭 channel,确保 Start 在探测返回前一直处于准备阶段。
+	releaseProbe := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-releaseProbe
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	sc := New(st)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sc.Run(ctx)
+
+	tk, err := sc.Add(AddTaskInput{
+		URL: srv.URL, SavePath: filepath.Join(dir, "out.bin"),
+		Protocol: protocol.ProtoHTTP, ChunkCount: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.Start(tk.ID); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	// 等到「准备阶段」真的命中：scheduler.jobs 出现 slot,且 IsPreparing 为 true。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if sc.IsPreparing(tk.ID) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !sc.IsPreparing(tk.ID) {
+		close(releaseProbe)
+		t.Fatal("task did not enter prepare phase within deadline")
+	}
+
+	// 订阅事件,验证 abortPrepare 会发出 paused 通知。
+	ch, unsub := sc.Subscribe()
+	defer unsub()
+
+	if err := sc.Pause(tk.ID); err != nil {
+		t.Fatalf("Pause: %v", err)
+	}
+
+	// 必须阻塞到准备阶段退出；2s 足够正常路径。
+	pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer pauseCancel()
+	if err := sc.PauseAll(pauseCtx); err != nil {
+		t.Fatalf("PauseAll: %v", err)
+	}
+
+	// 让挂住的 probe handler 收尾,避免 server 协程泄漏。
+	close(releaseProbe)
+
+	cur, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.Status != store.TaskStatus.Paused {
+		t.Errorf("status after prepare-phase Pause = %s, want Paused", cur.Status)
+	}
+
+	// scheduler.jobs 必须清空。
+	sc.mu.Lock()
+	jobsLeft := len(sc.jobs)
+	sc.mu.Unlock()
+	if jobsLeft != 0 {
+		t.Errorf("scheduler.jobs has %d entries, want 0", jobsLeft)
+	}
+
+	// 收到至少一条 paused 事件。
+	select {
+	case ev := <-ch:
+		if ev.Task == nil || ev.Task.ID != tk.ID || ev.Why != "paused" {
+			t.Errorf("event = %+v, want Why=paused for task %s", ev, tk.ID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("did not receive paused event")
+	}
+}
+
+// TestPauseAllDuringPrepare 验证「暂停全部」同样能命中准备中的任务，
+// 而不是被 wg.Wait() 提前绕过。
+func TestPauseAllDuringPrepare(t *testing.T) {
+	releaseProbe := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-releaseProbe
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	sc := New(st)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sc.Run(ctx)
+
+	var ids []string
+	for i := range 3 {
+		tk, err := sc.Add(AddTaskInput{
+			URL: srv.URL, SavePath: filepath.Join(dir, fmt.Sprintf("out-%d.bin", i)),
+			Protocol: protocol.ProtoHTTP, ChunkCount: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := sc.Start(tk.ID); err != nil {
+			t.Fatalf("Start %d: %v", i, err)
+		}
+		ids = append(ids, tk.ID)
+		// newID 基于毫秒级时间戳,串行添加之间留出 2ms 防止 UNIQUE 冲突。
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// 等所有任务都进入 prepare。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ready := true
+		for _, id := range ids {
+			if !sc.IsPreparing(id) {
+				ready = false
+				break
+			}
+		}
+		if ready {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	for _, id := range ids {
+		if !sc.IsPreparing(id) {
+			close(releaseProbe)
+			t.Fatalf("task %s not in prepare phase", id)
+		}
+	}
+
+	pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer pauseCancel()
+	if err := sc.PauseAll(pauseCtx); err != nil {
+		t.Fatalf("PauseAll: %v", err)
+	}
+	close(releaseProbe)
+
+	for _, id := range ids {
+		cur, err := st.GetTask(id)
+	if err != nil {
+			t.Fatal(err)
+		}
+		if cur.Status != store.TaskStatus.Paused {
+			t.Errorf("task %s status = %s, want Paused", id, cur.Status)
+		}
+	}
+	sc.mu.Lock()
+	jobsLeft := len(sc.jobs)
+	sc.mu.Unlock()
+	if jobsLeft != 0 {
+		t.Errorf("scheduler.jobs has %d entries, want 0", jobsLeft)
+	}
+}

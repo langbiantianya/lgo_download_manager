@@ -244,10 +244,11 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 	j.mu.Unlock()
 
 	var (
-		bytesDone   atomic.Int64
-		chunksDone  atomic.Int32
-		lastTickAt  = time.Now()
-		lastTickVal atomic.Int64
+		bytesDone    atomic.Int64
+		chunksDone   atomic.Int32
+		chunksGaveUp atomic.Int32
+		lastTickAt   = time.Now()
+		lastTickVal  atomic.Int64
 	)
 
 	// resumedBytes 是本次会话开始之前磁盘上已有的字节总数。
@@ -321,11 +322,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		if j.opts.OnPlanChanged != nil {
 			j.opts.OnPlanChanged([]int64{c.start, c.end})
 		}
-		stopErr := j.driver.DownloadFallback(ctx, c.progress, j.dest, func(n int) {
-			bytesDone.Add(int64(n))
-			atomic.AddInt64(&c.progress, int64(n))
-			emit(0)
-		})
+		stopErr := downloadFallbackWithRetry(ctx, j, c, &bytesDone, emit, 0)
 		if j.opts.Progress != nil {
 			j.opts.Progress(Progress{
 				TaskID:          j.opts.TaskID,
@@ -343,57 +340,74 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 	activeCount := 1
 
 	// downloadChunk 运行单个分片的重试循环。
-	downloadChunk := func(c *chunk, idx int, errCh chan<- error) {
-		defer func() {
-			chunksDone.Add(1)
-		}()
+downloadChunk := func(c *chunk, idx int, errCh chan<- error) {
+	defer func() {
+		chunksDone.Add(1)
+	}()
 
-		backoff := 500 * time.Millisecond
-		for {
+	consecutiveFails := 0
+	backoff := 500 * time.Millisecond
+	for {
+		if j.stopped.Load() || ctx.Err() != nil {
+			return
+		}
+		start := atomic.LoadInt64(&c.progress)
+		if start > c.end {
+			j.log.Infof("chunk %d finished  range=%d-%d", idx, c.start, c.end)
+			return
+		}
+
+		chunkCtx, cancel := context.WithCancel(ctx)
+		err := j.driver.DownloadChunk(chunkCtx, start, c.end, j.dest, func(n int) {
+			bytesDone.Add(int64(n))
+			atomic.AddInt64(&c.progress, int64(n))
+			emit(idx)
+		})
+		cancel()
+
+		if err != nil {
 			if j.stopped.Load() || ctx.Err() != nil {
 				return
 			}
-			start := atomic.LoadInt64(&c.progress)
-			if start > c.end {
-				j.log.Infof("chunk %d finished  range=%d-%d", idx, c.start, c.end)
-				return
-			}
-
-			chunkCtx, cancel := context.WithCancel(ctx)
-			err := j.driver.DownloadChunk(chunkCtx, start, c.end, j.dest, func(n int) {
-				bytesDone.Add(int64(n))
-				atomic.AddInt64(&c.progress, int64(n))
-				emit(idx)
-			})
-			cancel()
-
-			if err != nil {
-				if j.stopped.Load() || ctx.Err() != nil {
-					return
-				}
-				j.log.Warnf("chunk %d error: %v  backing off %v", idx, err, backoff)
+			if protocol.IsTerminal(err) {
+				j.log.Warnf("chunk %d terminal error: %v", idx, err)
+				chunksGaveUp.Add(1)
 				select {
 				case errCh <- err:
 				default:
 				}
-				wait := backoff
-				backoff *= 2
-				if backoff > 30*time.Second {
-					backoff = 30 * time.Second
-				}
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(wait):
-				}
-				continue
+				return
 			}
-			return
+			consecutiveFails++
+			j.log.Warnf("chunk %d error: %v  backing off %v  fails=%d/%d", idx, err, backoff, consecutiveFails, maxChunkRetries)
+			select {
+			case errCh <- err:
+			default:
+			}
+			if consecutiveFails >= maxChunkRetries {
+				chunksGaveUp.Add(1)
+				j.log.Warnf("chunk %d giving up after %d consecutive failures: %v", idx, consecutiveFails, err)
+				return
+			}
+			wait := backoff
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(wait):
+			}
+			continue
 		}
+		consecutiveFails = 0
+		backoff = 500 * time.Millisecond
+		return
 	}
+}
 
 	errCh := make(chan error, 1)
-
 	for {
 		j.mu.Lock()
 		curChunks := j.chunks
@@ -423,6 +437,8 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			close(waitDone)
 		}()
 
+		j.log.Infof("round starting  active=%d chunks", toLaunch)
+
 		select {
 		case err := <-errCh:
 			lastErr = err
@@ -445,12 +461,17 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 						TotalSize:       j.total,
 						DownloadedBytes: bytesDone.Load() + resumedBytes,
 						SpeedBPS:        0,
-						CompletedChunks: int(chunksDone.Load()),
+					CompletedChunks: int(chunksDone.Load()),
 					})
 				}
 				return nil
 			}
-			// 还未完成——尝试增加并发。
+			// 所有 active 分片都已放弃但任务尚未完成 —— 整体失败。
+			if int(chunksGaveUp.Load()) >= toLaunch {
+				j.log.Warnf("all active chunks gave up before completion")
+				return errors.New("engine: all chunks exhausted retry budget")
+			}
+			// 还未完成 —— 尝试增加并发。
 			if activeCount < j.chunkCount && activeCount < len(j.chunks) {
 				activeCount++
 				j.log.Infof("chunk completed, growing active chunks to %d", activeCount)
@@ -473,7 +494,16 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			return nil
 		}
 
-		// 缩减。
+		// 业务错误(4xx 等)直接失败:不要对死链无限重试,让任务及时变 Failed。
+		if protocol.IsTerminal(lastErr) {
+			j.log.Warnf("chunk error terminal, failing: %v", lastErr)
+			return lastErr
+		}
+		// 所有 active 分片都已经放弃重试;停止并让上层标记 Failed。
+		if int(chunksGaveUp.Load()) >= toLaunch {
+			j.log.Warnf("all active chunks gave up, failing: %v", lastErr)
+			return lastErr
+		}
 		oldActive := activeCount
 		activeCount = activeCount / 2
 		if activeCount < 1 {
@@ -514,6 +544,52 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 	}
 }
 
+func (j *Job) Close() error { return j.driver.Close() }
+// maxChunkRetries 限制单 chunk 或 streaming 路径上的连续失败次数。
+// 超过此次数后,engine 把 lastErr 返回给 scheduler.fail(),任务变为 Failed。
+const maxChunkRetries = 8
+
+// downloadFallbackWithRetry 是 streaming 路径（不支持 Range）下的重试包装:
+// 业务错误(4xx)立即返回让上层标记 Failed;瞬断则在重试预算内退避重连。
+func downloadFallbackWithRetry(ctx context.Context, j *Job, c *chunk, bytesDone *atomic.Int64, emit func(int), chunkIdx int) error {
+	backoff := 500 * time.Millisecond
+	consecutiveFails := 0
+	for {
+		if j.stopped.Load() || ctx.Err() != nil {
+			return ctx.Err()
+		}
+		start := atomic.LoadInt64(&c.progress)
+		err := j.driver.DownloadFallback(ctx, start, j.dest, func(n int) {
+			bytesDone.Add(int64(n))
+			atomic.AddInt64(&c.progress, int64(n))
+			emit(chunkIdx)
+		})
+		if err == nil {
+			return nil
+		}
+		if j.stopped.Load() || ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if protocol.IsTerminal(err) {
+			return err
+		}
+		consecutiveFails++
+		if consecutiveFails >= maxChunkRetries {
+			return err
+		}
+		j.log.Warnf("streaming chunk error: %v  backs off %v  fails=%d/%d", err, backoff, consecutiveFails, maxChunkRetries)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff *= 2
+		if backoff > 30*time.Second {
+			backoff = 30 * time.Second
+		}
+	}
+}
+
 func (j *Job) sanityCheck() error {
 	stat, err := j.dest.Stat()
 	if err != nil {
@@ -524,7 +600,3 @@ func (j *Job) sanityCheck() error {
 	}
 	return nil
 }
-
-func (j *Job) TotalSize() int64 { return j.total }
-
-func (j *Job) Close() error { return j.driver.Close() }

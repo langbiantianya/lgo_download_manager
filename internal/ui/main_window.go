@@ -110,15 +110,21 @@ func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 		showAddTaskDialog(m.win, m.svc)
 	})
 	pauseAllBtn := widget.NewButtonWithIcon("暂停全部", theme.MediaPauseIcon(), func() {
+		// 不再按 Status 过滤:Start 已经预留 slot 但 engine 还没接管的
+		// 「准备中」任务,scheduler.Pause 也能通过 prepareCancel 立刻中止;
+		// 对已经不在运行的任务 Pause 会返回 error,这里忽略即可。
+		// 同时为每个被请求暂停的 row 设置乐观状态,让 UI 立刻反映。
+		paused := store.TaskStatus.Paused
 		for _, tk := range m.taskList.allTasks() {
-			if tk.Status == store.TaskStatus.Downloading {
-				_ = m.svc.Pause(tk.ID)
-			}
+			m.taskList.setOptimistic(tk.ID, paused)
+			_ = m.svc.Pause(tk.ID)
 		}
 	})
 	resumeAllBtn := widget.NewButtonWithIcon("恢复全部", theme.MediaPlayIcon(), func() {
+		down := store.TaskStatus.Downloading
 		for _, tk := range m.taskList.allTasks() {
 			if tk.Status == store.TaskStatus.Paused || tk.Status == store.TaskStatus.Failed {
+				m.taskList.setOptimistic(tk.ID, down)
 				_ = m.svc.Start(tk.ID)
 			}
 		}

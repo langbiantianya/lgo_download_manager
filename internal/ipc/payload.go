@@ -20,10 +20,12 @@ const (
 	MethodList = "list"
 	// MethodAdd 添加任务（不自动启动）。Params: AddParams；Result: *store.Task。
 	MethodAdd = "add"
-	// MethodStart / MethodPause / MethodDelete 操作单个任务。Params: TaskParams。
 	MethodStart  = "start"
 	MethodPause  = "pause"
 	MethodDelete = "delete"
+	// MethodIsPreparing 报告任务是否处于「Start 已预留 slot 但 engine 尚未启动」
+	// 的准备阶段，供 UI 决定行按钮的可见性。Params: TaskParams;Result: bool。
+	MethodIsPreparing = "is_preparing"
 	// MethodSaveSettings 持久化设置（业务侧同时应用代理配置）。
 	// Params: store.Settings。
 	MethodSaveSettings = "save_settings"

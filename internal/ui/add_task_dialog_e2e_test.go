@@ -52,6 +52,9 @@ func (l *localServiceAdapter) AddTask(in AddTaskInput) (*store.Task, error) {
 func (l *localServiceAdapter) Start(id string) error  { return l.sc.Start(id) }
 func (l *localServiceAdapter) Pause(id string) error  { return l.sc.Pause(id) }
 func (l *localServiceAdapter) Delete(id string) error { return l.sc.Delete(id) }
+func (l *localServiceAdapter) IsPreparing(id string) bool {
+	return l.sc.IsPreparing(id)
+}
 func (l *localServiceAdapter) Probe(_ string) (int64, error) {
 	return 0, nil
 }
@@ -305,13 +308,15 @@ func (e *errStartService) AddTask(in AddTaskInput) (*store.Task, error) {
 func (e *errStartService) Start(_ string) error   { return errStartFailed }
 func (e *errStartService) Pause(id string) error  { return e.inner.Pause(id) }
 func (e *errStartService) Delete(id string) error { return e.inner.Delete(id) }
+func (e *errStartService) IsPreparing(id string) bool {
+	return e.inner.IsPreparing(id)
+}
 func (e *errStartService) Probe(u string) (int64, error) {
 	return e.inner.Probe(u)
 }
 func (e *errStartService) Settings() store.Settings            { return e.inner.Settings() }
 func (e *errStartService) SaveSettings(s store.Settings) error { return e.inner.SaveSettings(s) }
 func (e *errStartService) Close() error                        { return e.inner.Close() }
-
 type startErr string
 
 func (s startErr) Error() string { return string(s) }

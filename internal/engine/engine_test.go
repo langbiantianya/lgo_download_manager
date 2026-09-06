@@ -797,3 +797,78 @@ func TestRealDownload(t *testing.T) {
 		t.Fatalf("last progress DownloadedBytes=%d want %d", lastProg.DownloadedBytes, totalSize)
 	}
 }
+
+// TestRangeChunk404Propagates 验证当 Range 请求返回 404 时,
+// engine 立即把错误上抛(不重试 4xx),让上层 scheduler 尽快把任务标记 Failed。
+func TestRangeChunk404Propagates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	destPath := filepath.Join(dir, "out.bin")
+	const size = 1 * 1024 * 1024
+	dest, err := prealloc.Preallocate(destPath, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dest.Close()
+
+	driver, err := protocol.New(srv.URL, protocol.ProtoHTTP, protocol.Auth{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driver.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	job := NewJob(driver, size, dest, Options{ChunkCount: 2})
+	start := time.Now()
+	err = job.Run(ctx, true)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Run returned nil; want error from 404")
+	}
+	// 4xx 必须快速上抛,而不是 maxChunkRetries 次重试后才能 Failed。
+	if elapsed > 3*time.Second {
+		t.Errorf("Run blocked for %v on 404; want near-instant", elapsed)
+	}
+}
+
+// TestFallback404Propagates 验证 streaming（无 Range）路径同样能快速失败。
+func TestFallback404Propagates(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "nope", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	destPath := filepath.Join(dir, "out.bin")
+	dest, err := prealloc.Preallocate(destPath, 256*1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dest.Close()
+
+	driver, err := protocol.New(srv.URL, protocol.ProtoHTTP, protocol.Auth{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driver.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	job := NewJob(driver, 256*1024, dest, Options{ChunkCount: 1})
+	start := time.Now()
+	err = job.Run(ctx, false)
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("Run returned nil; want error from 404")
+	}
+	if elapsed > 3*time.Second {
+		t.Errorf("Run blocked for %v on 404; want near-instant", elapsed)
+	}
+}

@@ -29,6 +29,10 @@ type Service interface {
 	Pause(taskID string) error
 	Delete(taskID string) error
 
+	// IsPreparing 报告任务是否处于「Start 已预留 slot 但 engine 尚未启动」
+	// 的准备阶段。Pause 必须能在该阶段立即中止任务，UI 用此判断
+	// 是否把按钮渲染为「暂停」而不是「开始」。
+	IsPreparing(taskID string) bool
 	// Probe 探测 URL 目标大小（新建任务对话框的尺寸预览）。
 	Probe(url string) (int64, error)
 

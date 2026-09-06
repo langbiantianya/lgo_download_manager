@@ -48,6 +48,12 @@ type Scheduler struct {
 type runningJob struct {
 	task         *store.Task
 	cancel       context.CancelFunc
+	// prepareCancel 用于在 Start 预留 slot 之后、engine goroutine 启动之前
+	// 的「准备阶段」（probe / 预分配）取消任务。该阶段 rj.cancel 仍为 nil，
+	// 因此 Pause/PauseAll/Cancel/Delete 必须同时调用 prepareCancel,否则
+	// 准备中的任务无法被中止,只能等其跑完探测后变成 Downloading 才能停。
+	prepareCtx    context.Context
+	prepareCancel context.CancelFunc
 	job          *engine.Job
 	dirty        bool       // 需要刷新
 	dirtyMu      sync.Mutex // 保护 dirty、progressToFlush 和 statusToFlush
@@ -122,11 +128,14 @@ func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 // Start 启动(或恢复)一个任务。如果任务在之前的运行中已经存在 chunk_progress,
 // engine 将从这些偏移位置继续下载。
 //
+// Start 启动(或恢复)一个任务。如果任务在之前的运行中已经存在 chunk_progress,
+// engine 将从这些偏移位置继续下载。
+//
 // Start 立即返回 nil，不等待服务器探测（HEAD 请求）或预分配完成。
 // 任何错误都会被写入 store.Task.Status（Failed）并通过事件总线发布
 // （Event{Why: "failed"}），UI 可订阅该事件并展示给用户。
 //
-// 由于探测在后台 goroutine 中进行，调用方可以在 UI 线程上安全地调用 Start：
+// 由于探测在后台 goroutine 中进行,调用方可以在 UI 线程上安全地调用 Start:
 // 不可达的服务器或超大的文件预分配都不会阻塞 UI。
 func (s *Scheduler) Start(taskID string) error {
 	s.mu.Lock()
@@ -134,17 +143,25 @@ func (s *Scheduler) Start(taskID string) error {
 		s.mu.Unlock()
 		return errors.New("scheduler: task already running")
 	}
-	// 立即预留 slot，防止并发的 Start 调用重复触发探测 / 预分配。
-	s.jobs[taskID] = &runningJob{}
+	// 立即预留 slot,携带 prepareCtx/prepareCancel 以便 Pause/PauseAll
+	// 在 probe/预分配阶段也能中止任务;同时把 wg.Add 提到这里,
+	// 让 PauseAll 的 wg.Wait() 覆盖「准备阶段」,不会过早返回。
+	prepareCtx, prepareCancel := context.WithCancel(context.Background())
+	s.jobs[taskID] = &runningJob{
+		prepareCtx:    prepareCtx,
+		prepareCancel: prepareCancel,
+	}
+	s.wg.Add(1)
 	s.mu.Unlock()
 
 	tk, err := s.st.GetTask(taskID)
 	if err != nil {
 		s.releaseSlot(taskID)
+		s.wg.Done()
 		return fmt.Errorf("scheduler: %w", err)
 	}
 
-	// 文件丢失状态：重置进度再继续
+	// 文件丢失状态:重置进度再继续
 	if tk.Status == store.TaskStatus.FileLost {
 		_ = s.st.UpdateTaskProgress(tk.ID, 0, nil, store.TaskStatus.Pending, "")
 		tk, _ = s.st.GetTask(taskID)
@@ -165,6 +182,22 @@ func (s *Scheduler) releaseSlot(taskID string) {
 // 服务器探测 → 元数据持久化 → 文件预分配 → 启动 engine.Run。
 // 任何阶段失败都会把任务标记为 Failed 并发布失败事件，由 UI 监听器显示。
 func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
+	defer s.wg.Done()
+	// 拿到本任务的 prepareCtx,后续所有阻塞调用都挂到它下面,确保
+	// Pause/PauseAll 触发的 prepareCancel 能立即中断 probe/预分配。
+	s.mu.Lock()
+	rj := s.jobs[taskID]
+	s.mu.Unlock()
+	prepareCtx := context.Background()
+	if rj != nil && rj.prepareCtx != nil {
+		prepareCtx = rj.prepareCtx
+	}
+	// 若 startAsync 一进入就已被取消（例如 Pause 在 Start 返回后立刻触发），
+	// 直接走「准备阶段被取消」的快速路径，避免无谓的 probe。
+	if s.prepareCancelled(taskID) {
+		s.abortPrepare(taskID, tk)
+		return
+	}
 	auth := decodeAuth(tk.AuthData)
 	driver, err := protocol.New(tk.URL, protocol.ProtocolKind(tk.Protocol), protocol.Auth{AuthOptions: auth})
 	if err != nil {
@@ -173,15 +206,21 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		return
 	}
 
-	probeCtx, probeCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	probeCtx, probeCancel := context.WithTimeout(prepareCtx, 30*time.Second)
 	caps, err := driver.Probe(probeCtx)
 	probeCancel()
+	if s.prepareCancelled(taskID) {
+		_ = driver.Close()
+		s.abortPrepare(taskID, tk)
+		return
+	}
 	if err != nil {
 		_ = driver.Close()
 		s.fail(tk, err)
 		s.releaseSlot(taskID)
 		return
 	}
+// 准备阶段失败统一经过 fail()/releaseSlot,此处继续走预分配/启动 engine 流程。
 	if caps.TotalSize > 0 {
 		if err := s.st.UpdateTaskMeta(tk.ID, caps.TotalSize, caps.SupportRange, tk.IsAllocated, tk.ChunkCount); err != nil {
 			_ = driver.Close()
@@ -217,8 +256,13 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		tk.IsAllocated = true
 		// 重新打开供 engine 使用(文件已具有正确大小)。
 		dest.Close()
-	}
-	dest, err := os.OpenFile(tk.SavePath, os.O_RDWR, 0o644)
+}
+if s.prepareCancelled(taskID) {
+	_ = driver.Close()
+	s.abortPrepare(taskID, tk)
+	return
+}
+dest, err := os.OpenFile(tk.SavePath, os.O_RDWR, 0o644)
 	if err != nil {
 		_ = driver.Close()
 		s.fail(tk, err)
@@ -258,7 +302,7 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		log.Printf("scheduler: persist chunk ranges: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	rj := &runningJob{
+	newRJ := &runningJob{
 		task:   tk,
 		cancel: cancel,
 		job:    job,
@@ -266,7 +310,7 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	}
 	s.mu.Lock()
 	// 替换之前 Start 预留的空 slot。
-	s.jobs[tk.ID] = rj
+	s.jobs[tk.ID] = newRJ
 	s.mu.Unlock()
 
 	if err := s.st.UpdateTaskProgress(tk.ID, sumInts(tk.ChunkProgress), tk.ChunkProgress, store.TaskStatus.Downloading, ""); err != nil {
@@ -281,7 +325,7 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		defer s.wg.Done()
 		// rjRef 在整个 goroutine 生命周期内持有运行中 job 的引用,
 		// 以便状态/收尾调用能读取最新的 ChunkProgress。
-		rjRef := rj
+		rjRef := newRJ
 		defer func() {
 			// 退出时进行清理(reap)。
 			s.mu.Lock()
@@ -332,10 +376,9 @@ func (s *Scheduler) ReclaimDownloadingTasks() error {
 // 返回 ctx.Err();此时部分 job 仍未退出,DB 中可能仍残留 Downloading,
 // 但这些任务会由下次冷启动的 ReclaimDownloadingTasks 兜底。
 //
-// 预分配阶段(Start 已 reserve slot 但 startAsync 尚未替换为带 cancel 的
-// runningJob)的任务不会被此函数命中——它们的 goroutine 还没启动,没有
-// cancel 可调,也不会计入 wg。这类任务的最终状态由 cold-start 的
-// ReclaimDownloadingTasks 兜底。
+// 准备阶段的 slot(Start 已 reserve 但 startAsync 尚未替换为带 cancel 的
+// runningJob)同样会被取消:同时调用 prepareCancel 与 cancel,并由
+// startAsync 的检查点把状态落盘为 Paused 后通过事件总线通知 UI。
 func (s *Scheduler) PauseAll(ctx context.Context) error {
 	s.mu.Lock()
 	jobs := make([]*runningJob, 0, len(s.jobs))
@@ -345,6 +388,9 @@ func (s *Scheduler) PauseAll(ctx context.Context) error {
 	s.mu.Unlock()
 
 	for _, rj := range jobs {
+		if rj.prepareCancel != nil {
+			rj.prepareCancel()
+		}
 		if rj.cancel != nil {
 			rj.cancel()
 		}
@@ -369,6 +415,9 @@ func (s *Scheduler) Pause(taskID string) error {
 	if !ok {
 		return errors.New("scheduler: task not running")
 	}
+	if rj.prepareCancel != nil {
+		rj.prepareCancel()
+	}
 	if rj.cancel != nil {
 		rj.cancel()
 	}
@@ -381,8 +430,13 @@ func (s *Scheduler) Cancel(taskID string) error {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
 	s.mu.Unlock()
-	if ok && rj.cancel != nil {
-		rj.cancel()
+	if ok {
+		if rj.prepareCancel != nil {
+			rj.prepareCancel()
+		}
+		if rj.cancel != nil {
+			rj.cancel()
+		}
 	}
 	tk, err := s.st.GetTask(taskID)
 	if err != nil {
@@ -396,15 +450,19 @@ func (s *Scheduler) Cancel(taskID string) error {
 	}
 	return nil
 }
-
 // Delete 取消一个运行中的任务(若有),删除其部分文件,
 // 并从 store 中永久移除该行。
 func (s *Scheduler) Delete(taskID string) error {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
 	s.mu.Unlock()
-	if ok && rj.cancel != nil {
-		rj.cancel()
+	if ok {
+		if rj.prepareCancel != nil {
+			rj.prepareCancel()
+		}
+		if rj.cancel != nil {
+			rj.cancel()
+		}
 	}
 	tk, err := s.st.GetTask(taskID)
 	if err == nil && tk != nil && tk.SavePath != "" {
@@ -656,6 +714,47 @@ func statusWhy(s store.Status) string {
 	}
 }
 
+// prepareCancelled 在 startAsync 的关键检查点（probe 前/后、预分配后、
+// 启动 engine 之前）报告 prepare 阶段是否已被 Pause/Cancel/Delete 取消。
+// 仅看 prepareCtx,不看 rj.cancel:后者在准备阶段仍为 nil。
+func (s *Scheduler) prepareCancelled(taskID string) bool {
+	s.mu.Lock()
+	rj, ok := s.jobs[taskID]
+	s.mu.Unlock()
+	if !ok || rj == nil || rj.prepareCtx == nil {
+		return false
+	}
+	return rj.prepareCtx.Err() != nil
+}
+
+// abortPrepare 处理「准备阶段被取消」的快速收尾:
+//   - 释放 slot
+//   - 把任务持久化为 Paused(用户视角:刚点完暂停,任务应当立刻可恢复)
+//   - 发布 Event{Why: "paused"} 通知 UI
+//
+// 调用方须在调用前已自行关闭任何已打开的 driver/dest 资源。
+func (s *Scheduler) abortPrepare(taskID string, tk *store.Task) {
+	s.releaseSlot(taskID)
+	if writeErr := s.st.UpdateTaskProgress(taskID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.Paused, ""); writeErr != nil {
+		fmt.Fprintln(os.Stderr, "scheduler abortPrepare:", writeErr)
+	}
+	if latest, err := s.st.GetTask(taskID); err == nil {
+		s.publish(Event{Why: "paused", Task: latest})
+	}
+}
+
+// IsPreparing 报告指定任务当前是否处于「准备阶段」(Start 已预留 slot,
+// 但 engine 还未接管)。此时 rj.cancel 仍为 nil,Pause 必须通过
+// prepareCancel 才能中止。
+func (s *Scheduler) IsPreparing(taskID string) bool {
+	s.mu.Lock()
+	rj, ok := s.jobs[taskID]
+	s.mu.Unlock()
+	if !ok || rj == nil {
+		return false
+	}
+	return rj.cancel == nil && rj.prepareCancel != nil
+}
 // Run 启动批量刷新 goroutine。请在启动时调用一次;它会一直运行
 // 直到 ctx 被取消。
 func (s *Scheduler) Run(ctx context.Context) {
