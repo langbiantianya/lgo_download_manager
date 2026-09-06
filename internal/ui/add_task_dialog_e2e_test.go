@@ -148,11 +148,18 @@ func TestAddTaskDialog_AddAndStart(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = w.Write(body)
 	}))
-
-	sc := scheduler.New(st)
+	// 等待 scheduler.Run 退出后再关 store:flushAll 在 ctx.Done 上仍会
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go sc.Run(ctx)
+	sc := scheduler.New(st)
+	schedulerDone := make(chan struct{})
+	defer func() {
+		cancel()
+		<-schedulerDone
+	}()
+	go func() {
+		sc.Run(ctx)
+		close(schedulerDone)
+	}()
 
 	svc := &localServiceAdapter{sc: sc, st: st}
 	parent := a.NewWindow("main")
@@ -215,6 +222,7 @@ func TestAddTaskDialog_AddAndStart(t *testing.T) {
 			cur.Status, lastErr)
 	}
 }
+
 // TestAddTaskDialog_StartError_KeepsWindowOpen 验证 Start 失败时窗口不关闭。
 func TestAddTaskDialog_StartError_KeepsWindowOpen(t *testing.T) {
 	a := test.NewApp()
@@ -241,11 +249,18 @@ func TestAddTaskDialog_StartError_KeepsWindowOpen(t *testing.T) {
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
-
+	// 等待 scheduler.Run 退出后再关 store,避免 flushAll 写已关闭的 DB。
 	sc := scheduler.New(st)
+	schedulerDone := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go sc.Run(ctx)
+	defer func() {
+		cancel()
+		<-schedulerDone
+	}()
+	go func() {
+		sc.Run(ctx)
+		close(schedulerDone)
+	}()
 
 	svc := &errStartService{inner: &localServiceAdapter{sc: sc, st: st}}
 	parent := a.NewWindow("main")

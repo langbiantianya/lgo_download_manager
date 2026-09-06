@@ -20,13 +20,6 @@ package main
 import (
 	"context"
 	"flag"
-	"log"
-	"os"
-	"os/signal"
-	"path/filepath"
-	"strings"
-	"syscall"
-
 	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
@@ -36,6 +29,13 @@ import (
 	"lgo_download_manager/internal/ui"
 	"lgo_download_manager/internal/uimgr"
 	"lgo_download_manager/internal/urllauncher"
+	"log"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
 )
 
 const defaultDBPath = "ldm.sqlite"
@@ -102,6 +102,13 @@ func main() {
 
 	// 调度器。
 	sc := scheduler.New(st)
+
+	// 冷启动兜底：上次进程崩溃/被 kill -9 时,残留的 Downloading 任务
+	// 没有 engine 在跑,必须在 Run 之前把它们回收成 Paused,否则 UI 会
+	// 把这些任务显示为「下载中」却永远没有进度,用户无法恢复。
+	if err := sc.ReclaimDownloadingTasks(); err != nil {
+		log.Printf("scheduler: reclaim downloading tasks: %v", err)
+	}
 	go sc.Run(ctx)
 
 	// 业务进程对 URL 转发的处理：探测 protocol、推导保存路径，
@@ -111,7 +118,6 @@ func main() {
 		req, err := urllauncher.HandleURL(rawURL)
 		if err != nil {
 			log.Printf("invalid URL: %v", err)
-			return
 		}
 		log.Printf("adding download: %s", req.URL)
 
@@ -179,9 +185,23 @@ func main() {
 			log.Printf("uimgr: cannot start UI child: %v", err)
 		}
 	}
-
 	<-quit
 	log.Println("shutting down...")
+	// 先停掉所有正在下载的 engine job 并落盘 Paused, 再 cancel root ctx。
+	// 顺序很重要:scheduler.Run 在 ctx.Done 上调用 flushAll, 会用
+	// rj.status(=Downloading)覆盖 store;PauseAll 在 cancel 之前跑完,
+	// 那些 job 都已从 s.jobs 删除、状态已是 Paused,flushAll 不会再写回。
+	//
+	// 阻塞上限 5s:任何 job 超过这个时间还没退出,就不再等,直接 log 后
+	// os.Exit(1) 兜底结束进程(残余 Downloading 由下次冷启动的
+	// ReclaimDownloadingTasks 回收)。
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	pauseErr := sc.PauseAll(shutdownCtx)
+	shutdownCancel()
+	if pauseErr != nil {
+		log.Printf("scheduler: pause all timed out after 5s, forcing exit: %v", pauseErr)
+		os.Exit(1)
+	}
 	cancel()
 	uim.Close()
 	tray.Stop()

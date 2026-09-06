@@ -72,11 +72,18 @@ func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 		t.Fatalf("store.Open: %v", err)
 	}
 	defer st.Close()
-
+	// 等待 scheduler.Run 退出后再关 store,避免 flushAll 写已关闭的 DB。
 	sc := scheduler.New(st)
+	schedulerDone := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go sc.Run(ctx)
+	defer func() {
+		cancel()
+		<-schedulerDone
+	}()
+	go func() {
+		sc.Run(ctx)
+		close(schedulerDone)
+	}()
 
 	tk, err := sc.Add(scheduler.AddTaskInput{
 		URL:        srv.URL,
