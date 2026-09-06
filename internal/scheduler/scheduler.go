@@ -26,6 +26,7 @@ import (
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/store"
 )
+
 const FlushInterval = 2 * time.Second
 
 // Scheduler 是面向用户的下载编排器。
@@ -35,22 +36,27 @@ type Scheduler struct {
 	mu   sync.Mutex
 	jobs map[string]*runningJob
 
+	// wg 跟踪所有由 startAsync 启动的 per-job goroutine。PauseAll 通过
+	// wg.Wait() 确保每个 job 都已落盘 Paused 后再返回,避免"已 cancel 但
+	// DB 仍是 Downloading"的窗口。
+	wg sync.WaitGroup
+
 	// 事件订阅者(GUI)。筛选逻辑在消费侧完成。
 	Subs []chan Event
 }
 
 type runningJob struct {
-	task    *store.Task
-	cancel  context.CancelFunc
-	job     *engine.Job
-	dirty   bool        // 需要刷新
-	dirtyMu sync.Mutex  // 保护 dirty、progressToFlush 和 statusToFlush
-	stopped bool
+	task         *store.Task
+	cancel       context.CancelFunc
+	job          *engine.Job
+	dirty        bool       // 需要刷新
+	dirtyMu      sync.Mutex // 保护 dirty、progressToFlush 和 statusToFlush
+	stopped      bool
 	lastSnapshot engine.Progress // 用于追赶式刷新
 
-	status        store.Status
+	status          store.Status
 	progressToFlush engine.Progress
-	errMsg         string
+	errMsg          string
 }
 
 // New 构造一个由给定 Store 支撑的 Scheduler。
@@ -253,26 +259,26 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	rj := &runningJob{
-		task:    tk,
-		cancel:  cancel,
-		job:     job,
-		status:  store.TaskStatus.Downloading,
+		task:   tk,
+		cancel: cancel,
+		job:    job,
+		status: store.TaskStatus.Downloading,
 	}
 	s.mu.Lock()
 	// 替换之前 Start 预留的空 slot。
 	s.jobs[tk.ID] = rj
 	s.mu.Unlock()
 
-
 	if err := s.st.UpdateTaskProgress(tk.ID, sumInts(tk.ChunkProgress), tk.ChunkProgress, store.TaskStatus.Downloading, ""); err != nil {
 		// 非致命错误——稍后的批量刷新会追赶上来。
 	}
 	s.publish(Event{Why: "started", Task: tk.Clone()})
 
-
 	// 在 goroutine 内同步运行 job;该 goroutine 会一直存活到
 	// 任务完成或被取消。
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		// rjRef 在整个 goroutine 生命周期内持有运行中 job 的引用,
 		// 以便状态/收尾调用能读取最新的 ChunkProgress。
 		rjRef := rj
@@ -296,11 +302,66 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	}()
 }
 
-// Pause 取消一个运行中的任务。该任务在 store 中保留进度,可被 Resume。
+// ReclaimDownloadingTasks 把上次进程异常退出后残留的 Downloading 任务
+// 全部重置为 Paused, 保留 chunk_progress 与 downloaded 字节数,
+// 以便用户后续手动「恢复」即可续传。
 //
-// 注意：若 Start 仍在探测/预分配阶段（仅占位 slot），Pause 不会中断探测，
-// 仅在后续 startAsync 启动 engine.Run 前生效；这是已知的"探测期不可取消"权衡，
-// 避免锁/取消逻辑把简单路径复杂化。
+// 必须在任何 Start 之前调用一次(冷启动路径),否则 UI 会把这些任务显示
+// 为「下载中」却永远没有进度。
+func (s *Scheduler) ReclaimDownloadingTasks() error {
+	tasks, err := s.st.ListTasks(store.FilterDownloading, store.SortCreatedDesc)
+	if err != nil {
+		return err
+	}
+	for _, tk := range tasks {
+		if err := s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.Paused, ""); err != nil {
+			return err
+		}
+		latest, err := s.st.GetTask(tk.ID)
+		if err != nil {
+			return err
+		}
+		s.publish(Event{Why: "paused", Task: latest})
+	}
+	return nil
+}
+
+// PauseAll 优雅取消所有正在运行的 job, 并阻塞至每个 job 都已落盘 Paused
+//
+// ctx 用于控制最大阻塞时间——若 ctx 被取消(典型用法是 5s 超时),函数立即
+// 返回 ctx.Err();此时部分 job 仍未退出,DB 中可能仍残留 Downloading,
+// 但这些任务会由下次冷启动的 ReclaimDownloadingTasks 兜底。
+//
+// 预分配阶段(Start 已 reserve slot 但 startAsync 尚未替换为带 cancel 的
+// runningJob)的任务不会被此函数命中——它们的 goroutine 还没启动,没有
+// cancel 可调,也不会计入 wg。这类任务的最终状态由 cold-start 的
+// ReclaimDownloadingTasks 兜底。
+func (s *Scheduler) PauseAll(ctx context.Context) error {
+	s.mu.Lock()
+	jobs := make([]*runningJob, 0, len(s.jobs))
+	for _, rj := range s.jobs {
+		jobs = append(jobs, rj)
+	}
+	s.mu.Unlock()
+
+	for _, rj := range jobs {
+		if rj.cancel != nil {
+			rj.cancel()
+		}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
 func (s *Scheduler) Pause(taskID string) error {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
@@ -355,10 +416,12 @@ func (s *Scheduler) Delete(taskID string) error {
 	s.publish(Event{Why: "deleted", Task: nil})
 	return nil
 }
+
 // UI 侧边栏应当传 StoreFilterAll 或其它 StatusFilter 来获取子集。
 func (s *Scheduler) List(filter store.StatusFilter, sort store.TaskSort) ([]*store.Task, error) {
 	return s.st.ListTasks(filter, sort)
 }
+
 // ValidateFileExistence 检查所有已完成和下载中任务的文件是否存在，
 // 不存在则将状态更新为 FileLost。用于窗口重新聚焦时的文件完整性检查。
 func (s *Scheduler) ValidateFileExistence() {
