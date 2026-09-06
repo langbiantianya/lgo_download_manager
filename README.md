@@ -3,6 +3,10 @@
 单文件可执行程序的下载管理器，提供 Fyne GUI、持久化的 SQLite 状态、
 并发的分片下载，以及用于浏览器接力的 `lgom://` URL 协议。
 
+业务进程与 UI 子进程通过 Unix socket + 长度前缀 JSON 帧通信：业务进程
+持有 SQLite 与 scheduler、UI 子进程是单独的 Fyne 进程；托盘常驻业务进程，
+随时可以重新拉起 UI。
+
 ## 功能特性
 
 - 基于 Range 的并发下载（HTTP、HTTPS、FTP、WebDAV）。
@@ -15,9 +19,9 @@
 - `lgom://download?url=...&name=...&ua=...&headers=...&cookies=...` URL 协议 — 将其注册为桌面协议处理程序，即可通过 Unix socket 将 URL 从浏览器转发到正在运行的程序。
 - 任务列表与配置持久化到 SQLite（`ldm.sqlite`）。
 - GUI 中实时显示进度、每个分片的速度条、下载速率与剩余时间（ETA）。
-- 系统托盘：关闭窗口后保留在托盘，托盘菜单支持重新打开窗口与退出。
-- 轻量模式：关闭主窗口时释放 widget tree 与 GL 渲染缓存，下次打开时重建。
-- 单实例锁：第二次启动会把 URL 转发给主实例后退出。
+- 系统托盘常驻业务进程：菜单提供「显示窗口」与「退出」，托盘 Quit 与 SIGINT/SIGTERM 等价，触发同一条优雅退出路径。
+- 进程崩溃/被 kill -9 后的兜底：下次启动会把残留的 `Downloading` 任务回收为 `Paused`（保留字节进度），UI 不会再把没有 engine 在跑的任务显示为「下载中」。
+- 正常退出前会调用 `PauseAll` 把所有运行中的 job 暂停并落盘；上限 5s，超时直接 `os.Exit(1)` 兜底结束进程。
 - 异步任务提交：`Start` 立即返回，HTTP 探测在后台 goroutine 中执行，
   UI 线程不会被不可达 URL 阻塞。
 
@@ -102,10 +106,37 @@ PAC / WPAD 自动配置脚本不在支持范围内。
 | Chunk ranges      | 是         | 引擎实际下发的分片布局 — 分片视图使用                |
 | Chunk progress    | 是         | 每个分片自起始的字节偏移量                           |
 | Total / downloaded | 是         | 累计字节计数                                         |
-| Status            | 是         | `Pending` / `Downloading` / `Paused` / `Completed` / `Failed` |
+| Status            | 是         | `Pending` / `Downloading` / `Paused` / `Completed` / `Failed` / `FileLost` |
 | Error message     | 是         | 失败原因                                               |
 
-`chunk_ranges` 列是后来加入的；老任务首次渲染时会按线程数平均切分，并在下一次启动 Start 后落盘为真实布局。
+`FileLost` 由周期性文件存在性检查（`uimgr.validate`）与重连触发的检查维护——
+目标文件被人为删除后任务会被标记为 `FileLost`，UI 提供「重置 + 重启」入口。
+
+## 进程架构
+
+```
+              ┌────────────────────────┐
+              │ 业务进程（默认）        │
+              │  store / scheduler      │
+              │  托盘 + urllauncher     │
+              │  uimgr.Manager          │
+              └────────────┬───────────┘
+                           │  拉起自身 + env 注入
+                           │  (EnvUIChild=1)
+                           ▼
+              ┌────────────────────────┐
+              │ UI 子进程              │
+              │  Fyne + ipcClient      │
+              │  (RunChild)            │
+              └────────────┬───────────┘
+                           │
+                Unix socket + 长度前缀 JSON 帧
+                (internal/ipc)
+```
+
+`uimgr.Manager` 持有当前 UI 子进程的 socket + token。业务侧的所有方法
+（add/pause/start/...）经 IPC 转发；UI 侧的 scheduler 事件经同一条 socket 反向
+推回。UI 子进程关闭后业务进程不受影响，托盘可随时重新拉起 UI。
 
 ## 架构
 
@@ -118,14 +149,60 @@ internal/engine/               # 分片规划、Range 下载、重试
 internal/scheduler/            # 单任务生命周期、状态事件、进度刷盘、异步 Start
 internal/prealloc/             # 磁盘预分配辅助
 internal/urllauncher/          # lgom:// URL 解析、Unix socket 转发
+internal/settings/             # 首次运行默认值 / --light 覆盖 / 进程级代理同步
+internal/ipc/                  # 长度前缀 JSON 帧协议（业务↔UI 共用）
+internal/uimgr/                # UI 子进程生命周期与 IPC 会话管理
 internal/ui/                   # Fyne 窗口、任务列表、设置对话框、分片视图、系统托盘
+internal/tray/                 # fyne.io/systray 业务进程常驻托盘
 ```
 
-分片规划规则（若服务器不支持 `Accept-Ranges` 则回退为单流）：
+### IPC 协议（业务 ↔ UI 子进程）
 
-- 文件 < 1 MiB：不分块，1 个 chunk。
-- 1 MiB ≤ 文件 < MinChunkSize：按配置的线程数（ChunkCount）等分。
-- 文件 ≥ MinChunkSize：每个 chunk 至少 MinChunkSize，由 ChunkCount 限制上限。
+`internal/ipc` 用长度前缀 JSON 帧（4 字节 big-endian 长度头 + JSON body，
+单条消息上限 1 MiB）序列化所有跨进程消息：
+
+- `MsgHello`（UI→业务）：握手 token
+- `MsgInit`（业务→UI）：权威设置快照
+- `MsgCall`（UI→业务）：`list` / `add` / `start` / `pause` / `delete` / `probe` /
+  `save_settings`，返回 `MsgResult`
+- `MsgEvent`（业务→UI）：scheduler 事件（added / started / progress / paused /
+  completed / failed / updated）
+- `MsgShow`（业务→UI）：托盘「显示窗口」菜单
+- `MsgClose`（业务→UI）：业务进程退出，UI 收到后主动 `a.Quit()`
+
+业务侧只用一个进程对应一个 UI 会话；UI 断开时业务侧 `cmd.Wait()` 触发
+`acceptLoop` 清理，可由托盘「显示窗口」再次拉起。
+
+### 新建任务对话框
+
+「新建任务」使用独立 Fyne 窗口（不是 modal popup）：用户可以在主窗口
+和对话框之间切换，文件大小预览由 `svc.Probe` 异步探测；URL 变化时自动
+从路径末段提取文件名填入保存路径。点击「开始下载」会依次调
+`svc.AddTask` → `svc.Start`（二者都经 IPC 落到业务进程），成功后关闭
+对话框。AddTask / Start 任一返回错误时弹错误对话框，保留窗口供修正。
+
+### 任务生命周期：冷启动回收与优雅退出
+**冷启动** — 业务进程启动后、scheduler.Run 启动前，调用
+`scheduler.ReclaimDownloadingTasks()`：扫 store 中所有 `Downloading` 行
+改成 `Paused`，保留已下载字节与 chunk 进度，并发 `paused` 事件给 UI
+同步行状态。这覆盖了「上次进程被 SIGKILL / 断电 / OOM kill」后留下
+的「下载中却没有 engine 在跑」的脏数据。
+
+**正常退出** — `<-quit`（SIGINT/SIGTERM 或托盘 Quit）触发：
+1. `sc.PauseAll(5s ctx)`：cancel 所有 `cancel != nil` 的 job，
+   `WaitGroup.Wait()` 阻塞到每个 per-job goroutine 把 `Paused`
+   落盘。5s 超时未完成则 `os.Exit(1)` 兜底结束进程。
+2. `cancel()` 根 ctx — scheduler.Run 退出。
+3. `uim.Close()` 发 `MsgClose`，等 2s 后强杀 UI 子进程。
+4. `tray.Stop()` 退出 systray 事件循环。
+
+第 1 步必须在 `cancel()` 之前：scheduler.Run 在 ctx.Done 上会跑最后一次
+`flushAll`，把每个 job 的 `rj.status=Downloading` 写回 store；先让
+PauseAll 把那些 job 从 `s.jobs` 移除并落盘 `Paused`，flushAll 就会
+被空 jobs map 短路，不会回写。
+预分配阶段的 slot（Start 已 reserve 但 `startAsync` 尚未替换为带 cancel
+的 runningJob）不会被 PauseAll 命中——这类任务的最终状态由下次冷启动的
+ReclaimDownloadingTasks 兜底。
 
 ### 异步 Start 与 UI 线程
 
