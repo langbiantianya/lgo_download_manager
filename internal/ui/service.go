@@ -7,6 +7,7 @@
 package ui
 
 import (
+	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
@@ -45,11 +46,16 @@ type Service interface {
 	// Close 释放连接。
 	Close() error
 }
-
 // AddTaskInput 描述一次“添加下载任务”。字段对齐 scheduler.AddTaskInput。
 type AddTaskInput struct {
 	URL          string
 	SavePath     string
 	ChunkCount   int
 	MinChunkSize int64
+	// Auth 由调用方预填：业务进程在收到 MethodAdd 后,直接把 Auth 透传给
+	// scheduler.Add 的 AuthOptions,进而落到 store.Task.AuthData。
+	// "新建下载任务"对话框用 GlobalSettings.UserAgent/Cookies 填充,
+	// 使设置中的默认 UA 立即对所有新任务生效;命令行/URL 路径则用各自
+	// 自带的凭据覆盖。
+	Auth protocol.AuthOptions
 }

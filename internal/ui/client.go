@@ -239,6 +239,7 @@ func (c *ipcClient) AddTask(in AddTaskInput) (*store.Task, error) {
 	params := ipc.AddParams{
 		URL:          in.URL,
 		SavePath:     in.SavePath,
+		Auth:         in.Auth,
 		ChunkCount:   in.ChunkCount,
 		MinChunkSize: in.MinChunkSize,
 	}

@@ -20,6 +20,8 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
+
+	"lgo_download_manager/internal/protocol"
 )
 
 // archiveCompressionExts 列出常见的归档/压缩单段扩展名。任何"<x>.<archive>"
@@ -184,12 +186,20 @@ func showAddTaskDialog(parent fyne.Window, svc Service) {
 		if url == "" || savePath == "" {
 			return
 		}
-
+		// 用 GlobalSettings 预填默认 UA/Cookie:用户改设置后再开对话框,
+		// 立即生效;留空也照样透传(业务进程据此把 UA 字段保留为空)。
+		// 仅设置中已存在的字段才会真正下发,避免给 URL/FTP 驱动传
+		// 与协议无关的代理/凭据导致副作用。
+		taskAuth := protocol.AuthOptions{
+			UserAgent: GlobalSettings.UserAgent,
+			Cookies:   GlobalSettings.Cookies,
+		}
 		tk, err := svc.AddTask(AddTaskInput{
 			URL:          url,
 			SavePath:     savePath,
 			ChunkCount:   GlobalSettings.DefaultThreads,
 			MinChunkSize: GlobalSettings.MinChunkSize,
+			Auth:         taskAuth,
 		})
 		if err != nil {
 			dialog.ShowError(err, parent)

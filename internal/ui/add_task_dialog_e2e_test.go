@@ -8,6 +8,7 @@ package ui
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -44,6 +45,7 @@ func (l *localServiceAdapter) AddTask(in AddTaskInput) (*store.Task, error) {
 		URL:          in.URL,
 		SavePath:     in.SavePath,
 		Protocol:     protocol.ProtoHTTP,
+		Auth:         in.Auth,
 		ChunkCount:   in.ChunkCount,
 		MinChunkSize: in.MinChunkSize,
 	})
@@ -225,6 +227,91 @@ func TestAddTaskDialog_AddAndStart(t *testing.T) {
 			cur.Status, lastErr)
 	}
 }
+
+// TestAddTaskDialog_PicksUpConfiguredUA 回归测试:用户在「设置」里把默认
+// UA 改成非默认值之后,「新建下载任务」对话框提交的任务必须继承该 UA。
+// 之前 ui.AddTaskInput 没有 Auth 字段,所以持久化下来的 AuthData 是 "{}",
+func TestAddTaskDialog_PicksUpConfiguredUA(t *testing.T) {
+	// 本测试不打开对话框(由 TestAddTaskDialog_AddAndStart 覆盖)——
+	// 我们直接构造与 showAddTaskDialog 的 startDownload 完全相同的
+	// AddTaskInput,验证 Auth 字段透传到 store.Task.AuthData。
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "ldm.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	saveDir := filepath.Join(dir, "dl")
+	if err := st.SaveSettings(store.Settings{
+		DefaultSaveDir: saveDir,
+		DefaultThreads: 2,
+		MinChunkSize:   1 << 20,
+		// 关键字段:不是默认的 Wget/1.21.3。
+		UserAgent: "Mozilla/5.0 (X11; configured-test)",
+		Cookies:   "session=abc",
+	}); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	GlobalSettings, _ = st.LoadSettings()
+	if GlobalSettings.UserAgent == "" {
+		t.Fatalf("precondition: GlobalSettings.UserAgent must be set after SaveSettings/LoadSettings")
+	}
+
+	// HTTP server:只回应 200,不做实际下载——本测试只关心持久化的 AuthData。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	// 用 localServiceAdapter 直连 scheduler/store,跳过 IPC;确认的是
+	// UI → ui.AddTaskInput.Auth → scheduler.Add → store.Task.AuthData
+	// 的整条链路。本测试不调 sc.Run——Start 会拉起 engine,与本测试无关。
+	sc := scheduler.New(st)
+	svc := &localServiceAdapter{sc: sc, st: st}
+
+	// 与 showAddTaskDialog 内部 startDownload 一致的 Auth 预填。
+	url := srv.URL + "/file.bin"
+	savePath := filepath.Join(saveDir, "out.bin")
+	tk, err := svc.AddTask(AddTaskInput{
+		URL:          url,
+		SavePath:     savePath,
+		ChunkCount:   GlobalSettings.DefaultThreads,
+		MinChunkSize: GlobalSettings.MinChunkSize,
+		Auth: protocol.AuthOptions{
+			UserAgent: GlobalSettings.UserAgent,
+			Cookies:   GlobalSettings.Cookies,
+		},
+	})
+	if err != nil {
+		t.Fatalf("AddTask: %v", err)
+	}
+
+	// 关键断言:持久化的 AuthData 必须包含配置的 UA 与 Cookies。
+	persisted, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatalf("GetTask: %v", err)
+	}
+	var got struct {
+		UserAgent string `json:"UserAgent"`
+		Cookies   string `json:"Cookies"`
+	}
+	if err := json.Unmarshal([]byte(persisted.AuthData), &got); err != nil {
+		t.Fatalf("AuthData %q is not valid JSON: %v", persisted.AuthData, err)
+	}
+	if got.UserAgent != GlobalSettings.UserAgent {
+		t.Fatalf("UserAgent in AuthData = %q, want %q (regression: dialog dropped configured UA)",
+			got.UserAgent, GlobalSettings.UserAgent)
+	}
+	if got.Cookies != GlobalSettings.Cookies {
+		t.Fatalf("Cookies in AuthData = %q, want %q (regression: dialog dropped configured cookies)",
+			got.Cookies, GlobalSettings.Cookies)
+	}
+}
+
+
 
 // TestAddTaskDialog_StartError_KeepsWindowOpen 验证 Start 失败时窗口不关闭。
 func TestAddTaskDialog_StartError_KeepsWindowOpen(t *testing.T) {
