@@ -25,7 +25,7 @@ func platformPrealloc(f *os.File, size int64) error {
 	// 将指针移动到 size,然后 SetEndOfFile 使用当前位置作为新的 EOF。
 	var newPos int64
 	r, _, e := procSetFilePointerEx.Call(
-		h,
+		uintptr(f.Fd()),
 		uintptr(size),
 		uintptr(unsafe.Pointer(&newPos)),
 		uintptr(0), // FILE_BEGIN
@@ -33,7 +33,7 @@ func platformPrealloc(f *os.File, size int64) error {
 	if r == 0 {
 		return fmt.Errorf("SetFilePointerEx: %v", e)
 	}
-	r, _, e = procSetEndOfFile.Call(h)
+	r, _, e = procSetEndOfFile.Call(uintptr(f.Fd()))
 	if r == 0 {
 		return fmt.Errorf("SetEndOfFile: %v", e)
 	}
