@@ -42,6 +42,8 @@ func Load(st *store.Store, forceLight bool) (store.Settings, error) {
 		// 行为符合大多数用户对窗口关闭按钮的直觉。需要「关闭即隐藏、
 		// 托盘随时恢复」的用户可以在「设置」里手动取消。
 		persisted.LightMode = true
+		// 首次运行:同时下载任务数默认 3,与主流下载器轻量场景对齐。
+		persisted.MaxConcurrent = store.DefaultMaxConcurrent
 	}
 	if forceLight {
 		persisted.LightMode = true

@@ -300,6 +300,7 @@ func TestSettingsRoundtrip(t *testing.T) {
 		FTPPassive:     false,
 		Prealloc:       true,
 		TaskSort:       SortNameAsc,
+		MaxConcurrent:  5,
 	}
 	if err := s.SaveSettings(want); err != nil {
 		t.Fatal(err)
@@ -325,5 +326,8 @@ func TestSettingsRoundtrip(t *testing.T) {
 	}
 	if got.FTPPassive != want.FTPPassive {
 		t.Fatalf("FTPPassive: got %v want %v", got.FTPPassive, want.FTPPassive)
+	}
+	if got.MaxConcurrent != want.MaxConcurrent {
+		t.Fatalf("MaxConcurrent: got %d want %d", got.MaxConcurrent, want.MaxConcurrent)
 	}
 }

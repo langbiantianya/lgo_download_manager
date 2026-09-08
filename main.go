@@ -103,6 +103,12 @@ func main() {
 	// 调度器。
 	sc := scheduler.New(st)
 
+	// 把设置中的并发上限推到 scheduler。SetMaxConcurrent 还会触发一次
+	// promotePending,确保上次进程残留的 Pending 任务在当前 cap 下被
+	// 合理启动(老库可能没有 max_concurrent 列,EffectiveMaxConcurrent
+	// 会回退到 DefaultMaxConcurrent)。
+	sc.SetMaxConcurrent(cur.EffectiveMaxConcurrent())
+
 	// 冷启动兜底：上次进程崩溃/被 kill -9 时,残留的 Downloading 任务
 	// 没有 engine 在跑,必须在 Run 之前把它们回收成 Paused,否则 UI 会
 	// 把这些任务显示为「下载中」却永远没有进度,用户无法恢复。
@@ -111,10 +117,10 @@ func main() {
 	}
 	go sc.Run(ctx)
 
-	// 业务进程对 URL 转发的处理：探测 protocol、推导保存路径，
-	// 然后通过 scheduler 添加任务并启动；与 UI 子进程的 IPC
-	// 调用走的是同一条路径。
-	handleDownloadURL := func(rawURL string) {
+// 业务进程对 URL 转发的处理：探测 protocol、推导保存路径，
+// 然后通过 scheduler 添加任务并启动；与 UI 子进程的 IPC
+// 调用走的是同一条路径。
+handleDownloadURL := func(rawURL string) {
 		req, err := urllauncher.HandleURL(rawURL)
 		if err != nil {
 			log.Printf("invalid URL: %v", err)

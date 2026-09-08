@@ -223,16 +223,17 @@ func (s *Store) migrate() error {
 		created_at      DATETIME NOT NULL,
 		updated_at      DATETIME NOT NULL
 	);
-	CREATE TABLE IF NOT EXISTS settings (
-		id              INTEGER PRIMARY KEY CHECK (id = 1),
-		default_save_dir    TEXT NOT NULL DEFAULT '',
-		default_threads     INTEGER NOT NULL DEFAULT 4,
-		min_chunk_size      INTEGER NOT NULL DEFAULT 1048576,
-		user_agent          TEXT NOT NULL DEFAULT '',
-		cookies             TEXT NOT NULL DEFAULT '',
-		ftp_passive         INTEGER NOT NULL DEFAULT 1,
-		prealloc            INTEGER NOT NULL DEFAULT 1
-	);`
+CREATE TABLE IF NOT EXISTS settings (
+	id              INTEGER PRIMARY KEY CHECK (id = 1),
+	default_save_dir    TEXT NOT NULL DEFAULT '',
+	default_threads     INTEGER NOT NULL DEFAULT 4,
+	min_chunk_size      INTEGER NOT NULL DEFAULT 1048576,
+	user_agent          TEXT NOT NULL DEFAULT '',
+	cookies             TEXT NOT NULL DEFAULT '',
+	ftp_passive         INTEGER NOT NULL DEFAULT 1,
+	prealloc            INTEGER NOT NULL DEFAULT 1,
+	max_concurrent      INTEGER NOT NULL DEFAULT 0
+);`
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
 	}
@@ -256,6 +257,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 	if err := s.addColumnIfMissing("settings", "light_mode", `INTEGER NOT NULL DEFAULT 1`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "max_concurrent", `INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
 	return nil
@@ -504,6 +508,24 @@ type Settings struct {
 	// 释放任务行、磁盘条等占用的内存，仅保留调度器和系统托盘。
 	// 重新打开主窗口时按需重建。
 	LightMode bool
+
+	// MaxConcurrent 是同时运行的最大下载任务数。<=0 表示使用默认值
+	// (DefaultMaxConcurrent)。设置被改小不会自动暂停正在运行的下载,
+	// 但超出限额后新加入的任务会保持 Pending 直到有 slot 释放。
+	MaxConcurrent int
+}
+
+// DefaultMaxConcurrent 是 MaxConcurrent 为 0/负数时的兜底默认值;
+// 同时也是首次运行 / 列缺省时落盘的初始值。设 3 是为了与主流下载器
+// (aria2c 默认 5、IDM 默认 4) 的轻量级场景对齐。
+const DefaultMaxConcurrent = 3
+
+// EffectiveMaxConcurrent 返回 MaxConcurrent 的有效值:<=0 视为默认。
+func (s Settings) EffectiveMaxConcurrent() int {
+	if s.MaxConcurrent <= 0 {
+		return DefaultMaxConcurrent
+	}
+	return s.MaxConcurrent
 }
 // 则插入一条全零的记录（由调用方负责套用默认值），
 // 并返回零值的 Settings。
@@ -524,14 +546,16 @@ func (s *Store) LoadSettings() (Settings, error) {
 		proxyURL    string
 		proxyBypass string
 		lightMode   int
+		maxConc     int
 	)
 	err := s.db.QueryRow(`SELECT default_save_dir, default_threads, min_chunk_size,
 		user_agent, cookies, ftp_passive, prealloc, task_sort,
 		COALESCE(proxy_mode, ''), COALESCE(proxy_url, ''), COALESCE(proxy_bypass, ''),
-		COALESCE(light_mode, 1)
+		COALESCE(light_mode, 1),
+		COALESCE(max_concurrent, 0)
 		FROM settings WHERE id=1`,
 	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc, &taskSort,
-		&proxyMode, &proxyURL, &proxyBypass, &lightMode)
+		&proxyMode, &proxyURL, &proxyBypass, &lightMode, &maxConc)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 首次运行：插入一条全零行，以便后续 LoadSettings 能读到。
 		_, ierr := s.db.Exec(`INSERT OR IGNORE INTO settings (id) VALUES (1)`)
@@ -564,11 +588,12 @@ func (s *Store) LoadSettings() (Settings, error) {
 		Prealloc:       prealloc != 0,
 		TaskSort:       TaskSort(taskSort),
 		ProxyMode:      mode,
-		ProxyURL:       proxyURL,
-		ProxyBypass:    proxyBypass,
 		// light_mode 列缺省值为 1（轻量模式为新用户的默认）；
 		// 老数据库在迁移后会得到这个缺省，无需特别处理。
 		LightMode: lightMode != 0,
+		// max_concurrent 列缺省值为 0(<DefaultMaxConcurrent 视为未配置);
+		// 调用方 (settings.Load) 会套用首次运行默认值。
+		MaxConcurrent: maxConc,
 	}, nil
 }
 // SaveSettings upsert 已持久化的 settings 行。
@@ -577,8 +602,8 @@ func (s *Store) SaveSettings(s2 Settings) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO settings (id, default_save_dir, default_threads,
 		min_chunk_size, user_agent, cookies, ftp_passive, prealloc, task_sort,
-		proxy_mode, proxy_url, proxy_bypass, light_mode)
-	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		proxy_mode, proxy_url, proxy_bypass, light_mode, max_concurrent)
+	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 			default_save_dir=excluded.default_save_dir,
 			default_threads=excluded.default_threads,
@@ -591,12 +616,14 @@ func (s *Store) SaveSettings(s2 Settings) error {
 			proxy_mode=excluded.proxy_mode,
 			proxy_url=excluded.proxy_url,
 			proxy_bypass=excluded.proxy_bypass,
-			light_mode=excluded.light_mode`,
+			light_mode=excluded.light_mode,
+			max_concurrent=excluded.max_concurrent`,
 		s2.DefaultSaveDir, s2.DefaultThreads, s2.MinChunkSize,
 		s2.UserAgent, s2.Cookies, boolToInt(s2.FTPPassive), boolToInt(s2.Prealloc),
 		string(s2.TaskSort),
 		string(protocol.ProxyMode(s2.ProxyMode).String()), s2.ProxyURL, s2.ProxyBypass,
 		boolToInt(s2.LightMode),
+		s2.MaxConcurrent,
 	)
 	if err != nil {
 		return fmt.Errorf("settings save: %w", err)

@@ -36,6 +36,11 @@ type Scheduler struct {
 	mu   sync.Mutex
 	jobs map[string]*runningJob
 
+	// maxConcurrent 是同时运行的最大任务数。Start 会把超出限额的新
+	// 加入任务留在 Pending(等于「等待中」),直到有 slot 释放再 promote。
+	// 0 表示尚未初始化;SetMaxConcurrent 负责套用默认值并触发 promote。
+	maxConcurrent int
+
 	// wg 跟踪所有由 startAsync 启动的 per-job goroutine。PauseAll 通过
 	// wg.Wait() 确保每个 job 都已落盘 Paused 后再返回,避免"已 cancel 但
 	// DB 仍是 Downloading"的窗口。
@@ -68,8 +73,67 @@ type runningJob struct {
 // New 构造一个由给定 Store 支撑的 Scheduler。
 func New(s *store.Store) *Scheduler {
 	return &Scheduler{
-		st:   s,
-		jobs: map[string]*runningJob{},
+		st:            s,
+		jobs:   map[string]*runningJob{},
+		maxConcurrent: store.DefaultMaxConcurrent,
+	}
+}
+
+// SetMaxConcurrent 设置同时运行的最大任务数。n<=0 时套用默认值。
+// 改动后会触发 promotePending 把超出限额期间累计的 Pending 任务按
+// FIFO 顺序提升到 Downloading(只要当前有空闲 slot)。
+func (s *Scheduler) SetMaxConcurrent(n int) {
+	if n <= 0 {
+		n = store.DefaultMaxConcurrent
+	}
+	s.mu.Lock()
+	s.maxConcurrent = n
+	s.mu.Unlock()
+	s.promotePending()
+}
+
+// promotePending 把 store 里最早创建的 Pending 任务(尚未占 slot 的)
+// 按 FIFO 顺序提升到 Downloading,直到达到 MaxConcurrent 上限或没有
+// 候选任务为止。每个候选走一次 Start——Start 内部仍受并发上限保护,
+// 因此本方法在并发调用下也是安全的。
+func (s *Scheduler) promotePending() {
+	for {
+		s.mu.Lock()
+		cap := s.maxConcurrent
+		active := len(s.jobs)
+		s.mu.Unlock()
+		if active >= cap {
+			return
+		}
+		// 取最早一个没有 slot 的 Pending 任务。status=Pending + jobs map
+		// 中不存在 = 候选。
+		pending, err := s.st.ListTasks("", store.SortCreatedAsc)
+		if err != nil {
+			return
+		}
+		var picked string
+		for _, tk := range pending {
+			if tk.Status != store.TaskStatus.Pending {
+				continue
+			}
+			s.mu.Lock()
+			_, busy := s.jobs[tk.ID]
+			s.mu.Unlock()
+			if busy {
+				continue
+			}
+			picked = tk.ID
+			break
+		}
+		if picked == "" {
+			return
+		}
+		// Start 自身会再次核对 cap,这里只是按 FIFO 顺序给候选一个机会。
+		if err := s.Start(picked); err != nil {
+			return
+		}
+		// Start 在没有抢到 slot 时返回 nil(静默排队);但只要它真正启动,
+		// 就会让 len(s.jobs) 增加,下一次循环自然判定 active>=cap。
 	}
 }
 
@@ -143,6 +207,20 @@ func (s *Scheduler) Start(taskID string) error {
 		s.mu.Unlock()
 		return errors.New("scheduler: task already running")
 	}
+	// 并发上限检查:任务已经在引擎中跑时直接放行;Pending 任务
+	// (新加入的)若当前 slots 已满,留在 Pending 不报错——调用方
+	// (UI 对话框)无需特殊处理,等待 promotePending 自然提升即可。
+	tk0, err := s.st.GetTask(taskID)
+	if err != nil {
+		s.mu.Unlock()
+		return fmt.Errorf("scheduler: %w", err)
+	}
+	if tk0.Status == store.TaskStatus.Pending && len(s.jobs) >= s.maxConcurrent {
+		s.mu.Unlock()
+		// 静默排队:不分配 slot、不增 wg;后续有任务完成时由
+		// promotePending 把它提升到 Downloading。
+		return nil
+	}
 	// 立即预留 slot,携带 prepareCtx/prepareCancel 以便 Pause/PauseAll
 	// 在 probe/预分配阶段也能中止任务;同时把 wg.Add 提到这里,
 	// 让 PauseAll 的 wg.Wait() 覆盖「准备阶段」,不会过早返回。
@@ -154,28 +232,24 @@ func (s *Scheduler) Start(taskID string) error {
 	s.wg.Add(1)
 	s.mu.Unlock()
 
-	tk, err := s.st.GetTask(taskID)
-	if err != nil {
-		s.releaseSlot(taskID)
-		s.wg.Done()
-		return fmt.Errorf("scheduler: %w", err)
-	}
-
 	// 文件丢失状态:重置进度再继续
-	if tk.Status == store.TaskStatus.FileLost {
-		_ = s.st.UpdateTaskProgress(tk.ID, 0, nil, store.TaskStatus.Pending, "")
-		tk, _ = s.st.GetTask(taskID)
+	if tk0.Status == store.TaskStatus.FileLost {
+		_ = s.st.UpdateTaskProgress(tk0.ID, 0, nil, store.TaskStatus.Pending, "")
+		tk0, _ = s.st.GetTask(taskID)
 	}
 
-	go s.startAsync(taskID, tk)
+	go s.startAsync(taskID, tk0)
 	return nil
 }
 
 // releaseSlot 释放预留的 slot；用于 Start 的快速失败路径（探测/构造尚未开始）。
+// 任意一次 slot 释放都触发 FIFO 提升——既能消化积压的 Pending,
+// 也能让「用户把 MaxConcurrent 调大」立即可见。
 func (s *Scheduler) releaseSlot(taskID string) {
 	s.mu.Lock()
 	delete(s.jobs, taskID)
 	s.mu.Unlock()
+	s.promotePending()
 }
 
 // startAsync 在独立 goroutine 中执行 Start 的慢路径：
@@ -332,6 +406,8 @@ dest, err := os.OpenFile(tk.SavePath, os.O_RDWR, 0o644)
 			delete(s.jobs, tk.ID)
 			s.mu.Unlock()
 			_ = dest.Close()
+			// 引擎正常完成/失败/取消后都要尝试把排队的 Pending 提升上来。
+			s.promotePending()
 		}()
 		err := job.Run(ctx, caps.SupportRange && caps.TotalSize > 0)
 		if err != nil && ctx.Err() == nil {
@@ -734,10 +810,14 @@ func (s *Scheduler) prepareCancelled(taskID string) bool {
 //
 // 调用方须在调用前已自行关闭任何已打开的 driver/dest 资源。
 func (s *Scheduler) abortPrepare(taskID string, tk *store.Task) {
-	s.releaseSlot(taskID)
+	// 先把状态写为 Paused,再 releaseSlot 触发 promotePending——
+	// 顺序至关重要:promotePending 通过 store 查询 Pending 任务,
+	// 如果 releaseSlot 先跑,promotePending 会看到自己刚被取消的
+	// 任务还显示为 Pending,导致无限重新启动。
 	if writeErr := s.st.UpdateTaskProgress(taskID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.Paused, ""); writeErr != nil {
 		fmt.Fprintln(os.Stderr, "scheduler abortPrepare:", writeErr)
 	}
+	s.releaseSlot(taskID)
 	if latest, err := s.st.GetTask(taskID); err == nil {
 		s.publish(Event{Why: "paused", Task: latest})
 	}

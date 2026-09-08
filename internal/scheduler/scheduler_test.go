@@ -771,3 +771,277 @@ func TestPauseAllDuringPrepare(t *testing.T) {
 		t.Errorf("scheduler.jobs has %d entries, want 0", jobsLeft)
 	}
 }
+
+// blockingServer 返回一个 HTTP handler,会一直等到 releaseProbe 关闭
+// 才向客户端回写响应——用于让 task 稳定停留在 sc.jobs 的 prepare slot 里。
+func blockingServer(t *testing.T, releaseProbe <-chan struct{}) (*httptest.Server, string) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-releaseProbe
+		w.Header().Set("Content-Length", "1")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte{0})
+	}))
+	t.Cleanup(srv.Close)
+	return srv, srv.URL
+}
+
+// newTestScheduler 创建一个由 st 支撑的 scheduler 与已激活的 Run loop。
+// 返回的 cleanup 函数 stop Run 并等所有 job 落盘后返回——必须在 defer st.Close()
+// 之前调用,否则 worker 写 store 时 DB 已关闭,导致 TempDir 清理失败。
+func newTestScheduler(t *testing.T, st *store.Store, cap int) (sc *Scheduler, cleanup func()) {
+	t.Helper()
+	sc = New(st)
+	sc.SetMaxConcurrent(cap)
+	ctx, cancel := context.WithCancel(context.Background())
+	go sc.Run(ctx)
+	return sc, func() {
+		cancel()
+		sc.PauseAll(context.Background())
+	}
+}
+// TestMaxConcurrent_QueuesNewTasksBeyondCap 验证:占住 slot 后,新加入的
+// Start 在 cap 已达时静默排队,不报错、不占 slot,任务保持 Pending。
+func TestMaxConcurrent_QueuesNewTasksBeyondCap(t *testing.T) {
+	releaseProbe := make(chan struct{})
+	_, url := blockingServer(t, releaseProbe)
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	sc := New(st)
+	sc.SetMaxConcurrent(1) // 单 slot
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sc.Run(ctx)
+
+	a, err := sc.Add(AddTaskInput{
+		URL: url, SavePath: filepath.Join(dir, "a.bin"),
+		Protocol: protocol.ProtoHTTP, ChunkCount: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := sc.Add(AddTaskInput{
+		URL: url, SavePath: filepath.Join(dir, "b.bin"),
+		Protocol: protocol.ProtoHTTP, ChunkCount: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 启动 A;等其占住 slot。
+	if err := sc.Start(a.ID); err != nil {
+		t.Fatalf("Start A: %v", err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return sc.IsPreparing(a.ID) })
+
+	// 关键断言:Start B 在 cap 已达时必须返回 nil 且 B 不进入 prepare。
+	if err := sc.Start(b.ID); err != nil {
+		t.Fatalf("Start B at cap should silently queue, got %v", err)
+	}
+	if sc.IsPreparing(b.ID) {
+		t.Fatalf("B should not be in prepare phase; cap should have queued it")
+	}
+	cur, err := st.GetTask(b.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.Status != store.TaskStatus.Pending {
+		t.Fatalf("B status = %s, want Pending", cur.Status)
+	}
+
+	// 收尾:先解锁 probe 让 HTTP handler 退出,再 PauseAll 让 worker 落盘。
+	close(releaseProbe)
+	pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer pauseCancel()
+	if err := sc.PauseAll(pauseCtx); err != nil {
+		t.Fatalf("PauseAll: %v", err)
+	}
+}
+
+// TestMaxConcurrent_PromotesFIFOOnCompletion 验证:有多个 Pending 排队时,
+// 提升顺序按 created_at 升序(FIFO),不是后进先出。
+func TestMaxConcurrent_PromotesFIFOOnCompletion(t *testing.T) {
+	releaseProbe := make(chan struct{})
+	_, url := blockingServer(t, releaseProbe)
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	sc := New(st)
+	sc.SetMaxConcurrent(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sc.Run(ctx)
+
+	// 创建 A、B、C,串行调用 newID 需要至少 1ms 间隔,避免 ts- 同。
+	mk := func(name string) string {
+		t.Helper()
+		tk, err := sc.Add(AddTaskInput{
+			URL: url, SavePath: filepath.Join(dir, name),
+			Protocol: protocol.ProtoHTTP, ChunkCount: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
+		return tk.ID
+	}
+	a, b, c := mk("a.bin"), mk("b.bin"), mk("c.bin")
+
+	if err := sc.Start(a); err != nil {
+		t.Fatalf("Start A: %v", err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return sc.IsPreparing(a) })
+
+	// B、C 直接超 cap 排队。
+	if err := sc.Start(b); err != nil {
+		t.Fatalf("Start B at cap: %v", err)
+	}
+	if err := sc.Start(c); err != nil {
+		t.Fatalf("Start C at cap: %v", err)
+	}
+// 解锁 probe: A 完成/失败 → promotePending 应按 FIFO 拉 B 而不是 C。
+close(releaseProbe)
+
+// 订阅事件流;等 B 收到 started,而不是 C——证明 FIFO 顺序。
+ch, unsub := sc.Subscribe()
+defer unsub()
+bStartedFirst := false
+timeoutCh := time.After(3 * time.Second)
+for !bStartedFirst {
+	select {
+	case ev := <-ch:
+		if ev.Task == nil {
+			continue
+		}
+		if ev.Task.ID == c && ev.Why == "started" {
+			t.Fatalf("C was promoted before B — promote is not FIFO")
+		}
+		if ev.Task.ID == b && ev.Why == "started" {
+			bStartedFirst = true
+		}
+	case <-timeoutCh:
+		t.Fatalf("B was never promoted within 3s; FIFO broken")
+	}
+}
+
+// 收尾。
+pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer pauseCancel()
+	if err := sc.PauseAll(pauseCtx); err != nil {
+		t.Fatalf("PauseAll: %v", err)
+	}
+}
+
+// TestMaxConcurrent_RaiseCapPromotesPending 验证:用户在设置里把
+// MaxConcurrent 调大时,SetMaxConcurrent 立即把超额期间累积的 Pending
+// 任务提升到 Downloading,直到达到新上限。
+func TestMaxConcurrent_RaiseCapPromotesPending(t *testing.T) {
+	releaseProbe := make(chan struct{})
+	_, url := blockingServer(t, releaseProbe)
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	sc := New(st)
+	sc.SetMaxConcurrent(1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sc.Run(ctx)
+
+	mk := func(name string) string {
+		t.Helper()
+		tk, err := sc.Add(AddTaskInput{
+			URL: url, SavePath: filepath.Join(dir, name),
+			Protocol: protocol.ProtoHTTP, ChunkCount: 2,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(2 * time.Millisecond)
+		return tk.ID
+	}
+	a, b, c := mk("a.bin"), mk("b.bin"), mk("c.bin")
+
+// A 占用 slot;B、C 在 cap=1 下保持 Pending。
+	if err := sc.Start(a); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, 2*time.Second, func() bool { return sc.IsPreparing(a) })
+	if err := sc.Start(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.Start(c); err != nil {
+		t.Fatal(err)
+	}
+
+	// 把 cap 从 1 调到 2;SetMaxConcurrent 内部应当触发 promotePending,
+	// 提升一个排队任务(预期 B,FIFO)。
+	sc.SetMaxConcurrent(2)
+
+	promoted := waitForPick(t, 3*time.Second, func() string {
+		if sc.IsPreparing(b) {
+			return "B"
+		}
+		if sc.IsPreparing(c) {
+			return "C"
+		}
+		return ""
+	})
+	if promoted != "B" {
+		t.Fatalf("after raising cap, expected B to be promoted first, got %q", promoted)
+	}
+	// C 仍应是 Pending(没那么多 slot)。
+	if sc.IsPreparing(c) {
+		t.Fatalf("C should remain Pending; cap is 2 with A and B using both slots")
+	}
+
+	// 收尾。
+	close(releaseProbe)
+	pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer pauseCancel()
+	if err := sc.PauseAll(pauseCtx); err != nil {
+		t.Fatalf("PauseAll: %v", err)
+	}
+}
+
+// waitFor 轮询 cond,直到返回 true 或 timeout。失败时调用 t.Fatal。
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("condition not met within %v", timeout)
+}
+
+// waitForPick 等 cond 返回非空字符串,返回该字符串;否则超时 fatal。
+func waitForPick(t *testing.T, timeout time.Duration, cond func() string) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if s := cond(); s != "" {
+			return s
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no pick within %v", timeout)
+	return ""
+}

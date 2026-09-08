@@ -12,6 +12,9 @@
 - 基于 Range 的并发下载（HTTP、HTTPS、FTP、WebDAV）。
 - 支持断点续传：暂停/恢复后会从已下载的字节偏移处继续，已完成的分片不会重新下载。
 - 任务级参数设置（URL、保存路径、并发数、分片大小、UA、Cookies、FTP 模式、代理）。
+- 并发任务数量上限：可在「设置」里配置同时下载的最大任务数（默认 3）。超出限额
+  的新任务保持 `Pending`（UI 显示为「等待中」），按 FIFO 顺序在有 slot 释放时自动启动；
+  上限调小不会强制暂停正在运行的任务（仅影响后续新增）。
 - HTTP/HTTPS 代理三种模式：系统代理（自动检测桌面会话代理设置）、
   不使用代理（始终直连）、手动设置代理（自定义 URL + 绕过列表）。
   自动按平台检测：Linux (GNOME `gsettings` / KDE `kioslaverc` / `/etc/environment`)、
@@ -88,6 +91,7 @@ PAC / WPAD 自动配置脚本不在支持范围内。
 | Default save dir    | `~/Downloads`    | 「新建任务」对话框默认使用                 |
 | Default threads     | 4                | 单任务允许的最大并发连接数                 |
 | Min chunk size      | 10 MiB           | 引擎对分片尺寸的下限                       |
+| Max concurrent      | 3                | 同时下载任务数上限（超额任务 FIFO 排队）   |
 | User-Agent          | `Wget/1.21.3`    | 每次请求都会附带                           |
 | Cookies             | ""               | Cookie 请求头字符串                        |
 | FTP passive mode    | true             | FTP 被动模式 / 主动模式                    |
@@ -211,6 +215,28 @@ ReclaimDownloadingTasks 兜底。
 失败时任务被标记为 `Failed`，错误信息持久化并通过事件总线推送给 UI。
 所有调度器事件经 `fyne.Do()` 在 Fyne 主线程上应用到 widget，确保线程安全。
 
+### 并发任务数量上限与 FIFO 提升
+
+`MaxConcurrent`（默认 3，可通过「设置」调整）限制同时占用 engine slot
+的任务数。`scheduler.Start` 在入参任务处于 `Pending` 且 `len(jobs) >= cap`
+时静默返回 nil——任务在 store 里保持 `Pending`（UI 渲染为「等待中」），
+不占 slot、不增 wg，等待被 `promotePending` 拉起。
+
+`releaseSlot` 与 `startAsync` 的清理 defer 都会触发 `promotePending`：
+扫 store 中所有 `Pending` 且无 slot 的任务，按 `created_at ASC` 顺序，
+逐个 `Start` 提升到 `Downloading`，直到 `len(jobs) == MaxConcurrent` 或
+没有候选。任一 slot 释放都会让排队中的最早一个任务自动接上。
+
+`SetMaxConcurrent(n)` 是运行时调入口：用户在「设置」调大上限时立即
+触发 promote，把累积的 Pending 任务按 FIFO 拉起；调小上限只影响后续
+新增的任务，正在跑的不会自动暂停。UI 的 `MethodSaveSettings` 经
+`uimgr.Manager.SetSettings` 把新值推到 scheduler。
+
+`abortPrepare`（任务在 probe/预分配阶段被 Pause 取消的快速收尾）的
+执行顺序为「先写 store 为 Paused，再 `releaseSlot`」：必须先持久化状态，
+否则 `releaseSlot` 触发的 promote 会看到自己刚被取消的任务仍显示为
+`Pending` 并再次 Start，导致死循环。
+
 ### 代理配置层
 
 `protocol.SetProxyConfig()` 在进程内设置全局代理模式；每个任务可通过
@@ -231,6 +257,13 @@ go test ./...
 `internal/scheduler/scheduler_test.go` 中 `TestStartIsAsync` 用不可达端口验证：
 - `Start()` 在 500ms 内返回
 - 任务最终进入 `Failed` 状态且 `ErrorMessage` 非空
+
+`internal/scheduler/scheduler_test.go` 中的 `TestMaxConcurrent_*` 覆盖并发上限：
+- `_QueuesNewTasksBeyondCap`：`len(jobs) >= cap` 时 `Start` 静默排队、不占 slot
+- `_PromotesFIFOOnCompletion`：slot 释放后按 `created_at` 升序拉起 Pending
+- `_RaiseCapPromotesPending`：`SetMaxConcurrent` 调大时立即 promote 积压任务
+这些测试用 `blockingServer` 让 HTTP probe 稳定停留在 prepare 阶段，
+以便精确断言 cap 触发与 promote 时机。
 
 ## 许可证
 

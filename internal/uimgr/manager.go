@@ -75,6 +75,10 @@ func (m *Manager) SetSettings(s store.Settings) {
 	m.mu.Lock()
 	m.settings = s
 	m.mu.Unlock()
+	// 把并发上限推到 scheduler:用户在「设置」里改 MaxConcurrent 后,
+	// 下次保存就会触发 promotePending——可能提升之前因超出限额而
+	// 排队的 Pending 任务。
+	m.sc.SetMaxConcurrent(s.EffectiveMaxConcurrent())
 }
 
 // Settings 返回当前权威设置的副本。

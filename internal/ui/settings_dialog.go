@@ -87,14 +87,27 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 		persist()
 	}
 
-	// 代理相关控件
-	proxyURLEntry := widget.NewEntry()
-	proxyURLEntry.SetText(GlobalSettings.ProxyURL)
-	proxyURLEntry.SetPlaceHolder("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
-	proxyURLEntry.OnChanged = func(s string) {
-		GlobalSettings.ProxyURL = strings.TrimSpace(s)
-		persist()
+	// 同时下载任务数上限。空值/非正数会被 settings.Load 套用默认值;
+	// 这里仍接受用户输入并在持久化前做基本校验(正整数),
+	// 以免 store 收到 0/负数(EffectiveMaxConcurrent 会兜底但 UX 不直观)。
+	maxConcEntry := widget.NewEntry()
+	maxConcEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveMaxConcurrent()))
+	maxConcEntry.SetPlaceHolder("正整数，默认 3")
+	maxConcEntry.OnChanged = func(s string) {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+			GlobalSettings.MaxConcurrent = n
+			persist()
+		}
 	}
+
+// 代理相关控件
+proxyURLEntry := widget.NewEntry()
+proxyURLEntry.SetText(GlobalSettings.ProxyURL)
+proxyURLEntry.SetPlaceHolder("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
+proxyURLEntry.OnChanged = func(s string) {
+	GlobalSettings.ProxyURL = strings.TrimSpace(s)
+	persist()
+}
 
 	proxyBypassEntry := widget.NewEntry()
 	proxyBypassEntry.SetText(GlobalSettings.ProxyBypass)
@@ -203,6 +216,7 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 	form := widget.NewForm(
 		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
 		widget.NewFormItem("默认并发线程数", threadsEntry),
+		widget.NewFormItem("同时下载任务数", maxConcEntry),
 		widget.NewFormItem("最小分块大小", chunkSizeRow),
 		widget.NewFormItem("默认 User-Agent", uaEntry),
 		widget.NewFormItem("默认 Cookie", cookiesEntry),
