@@ -1,4 +1,8 @@
 ldm
+ldm.exe
+bin/
+dist/
+.tools/
 ldm.sqlite
 ldm.sqlite-shm
 ldm.sqlite-wal

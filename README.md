@@ -28,11 +28,66 @@
 - 异步任务提交：`Start` 立即返回，HTTP 探测在后台 goroutine 中执行，
   UI 线程不会被不可达 URL 阻塞。
 
-## 编译
+## 构建
+
+项目使用 GNU Make 驱动整个构建流程（详见 `Makefile`）：
+
+```sh
+make help                # 列出全部 target
+make build                # 构建当前平台二进制到 bin/ldm
+make build-windows        # 交叉构建 bin/ldm.exe（windows/amd64）
+make icon                 # 用 Pillow 重新生成 assets/ldm.ico
+make installer            # 构建 Windows 安装包（自动从 jrsoftware 拉
+                          # Inno Setup 6.7.3，提取 ISCC.exe；详见下）
+make iscc-fetch           # 仅下载 Inno Setup bootstrap 到 .tools/inno/
+make iscc                 # 仅从已缓存的 bootstrap 提取 ISCC.exe
+make test                 # go test ./...
+make clean                # 删除 bin/、dist/、.tools/
+```
+
+直接调用 `go build` 也可以：
 
 ```sh
 go build -o ldm .
 ```
+
+非 Windows 主机交叉编译 ldm.exe 需要 mingw-w64（`x86_64-w64-mingw32-gcc`
+在 PATH 上）——Fyne 在 Windows 上是 CGO + GLFW。Windows 主机自带
+MSYS2 / `gcc` 即可。
+
+### 版本元数据
+
+`internal/version` 包提供 `Version` / `Commit` / `Date` 三个变量，默认
+是开发期占位符；`Makefile` 通过 `-ldflags -X` 在链接期把它们覆盖成
+`git describe` / `git rev-parse --short HEAD` / `date -u` 的真实结果。
+启动时 `ldm` 会在日志中打印一行 `ldm <version> (commit <c>, built <d>)`。
+
+### 安装包（Windows）
+
+1. `make build-windows` → `bin/ldm.exe`；
+2. 首次调用 `make installer` 会下载官方 Inno Setup 6.7.3 bootstrap
+   到 `.tools/inno/innosetup-6.7.3.exe`，再用 `innounp`（假定在 PATH
+   上）从中提取出 `ISCC.exe`，整个过程无管理员、无 UI 弹窗；
+3. `.tools/inno/ISCC.exe installer/installer.iss` →
+   `dist/ldm-setup-<version>.exe`。
+
+如需绕过下载（比如内网、GitHub 被封），把 `innosetup-6.7.3.exe`
+放到 `.tools/inno/innosetup-6.7.3.exe` 后再跑 `make installer`；Makefile
+检测到目标文件已存在就跳过下载步骤。
+
+脚本 `installer/installer.iss` 做了这些事：
+
+- 用户态安装到 `%LOCALAPPDATA%\Programs\lgo_download_manager`，
+  `PrivilegesRequired=lowest`，无需 UAC / 管理员权限。
+- 写 `HKCU\Software\Classes\lgom` 注册 `lgom://` 协议处理程序，命令
+  行是 `"<install>\ldm.exe" "%1"`。浏览器把 URL 作为 `argv[1]` 传给主
+  程序；`main.go` 已经会把位置参数里的 `lgom://` URL 直接派发到主实例
+  的处理队列里。HKCU 路径不需要提权，且与 HKLM 的等效项不冲突。
+- 安装/卸载时分别创建/删除「开始菜单」快捷方式，桌面图标可勾选。
+- `UninstallRun` 用 `taskkill /IM ldm.exe /F` 兜底结束正在跑的实例，
+  避免文件被占用导致卸载失败。
+
+### 运行
 
 带 GUI 运行：
 

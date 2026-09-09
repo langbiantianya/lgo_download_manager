@@ -29,6 +29,7 @@ import (
 	"lgo_download_manager/internal/ui"
 	"lgo_download_manager/internal/uimgr"
 	"lgo_download_manager/internal/urllauncher"
+	"lgo_download_manager/internal/version"
 	"log"
 	"os"
 	"os/signal"
@@ -41,7 +42,7 @@ import (
 const defaultDBPath = "ldm.sqlite"
 
 func main() {
-	// UI 子进程角色：直接把控制权交给 ui.RunChild。必须最先判断，
+	log.Printf("ldm %s", version.String())
 	// 这样业务子进程即便被误调用也不会去解析业务 flag 或拉起 store。
 	if os.Getenv(ipc.EnvUIChild) == "1" {
 		os.Exit(ui.RunChild())
