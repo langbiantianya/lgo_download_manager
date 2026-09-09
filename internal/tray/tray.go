@@ -12,15 +12,16 @@ package tray
 import (
 	_ "embed"
 	"log"
+	"os"
+	"path/filepath"
 	"runtime"
 
 	"fyne.io/systray"
 )
-
-// 嵌入托盘图标。三种尺寸分别覆盖：
-//   - tray-22.png：Linux libappindicator 兼容性最佳
-//   - tray-32.png：Linux 桌面高 DPI / Windows
-//   - tray.png    ：macOS / 一般 fallback（64×64）
+// 嵌入托盘图标。各平台格式由 fyne.io/systray 的接口契约决定：
+//   - Windows：必须是 .ico（Win32 LoadImageW + IMAGE_ICON 才能解码）。
+//     当前文件含 16/32/48 三档 RGBA 图，任务栏会按系统 DPI 自动挑尺寸。
+//   - macOS / Linux：PNG 即可。
 //
 //go:embed assets/tray-22.png
 var trayIcon22 []byte
@@ -30,6 +31,9 @@ var trayIcon32 []byte
 
 //go:embed assets/tray.png
 var trayIcon64 []byte
+
+//go:embed assets/tray.ico
+var trayIconICO []byte
 
 // Callbacks 描述托盘菜单触发的回调。
 //
@@ -50,15 +54,15 @@ type Callbacks struct {
 // 它会一直阻塞直到 systray.Quit() 被调用——因此必须在主流程中
 // 以独立 goroutine 启动。
 //
-// 启动后，托盘自带一个 “Open” 与 “退出” 菜单项；点击会触发对应的回调。
 func Start(cb Callbacks) {
 	onReady := func() {
 		systray.SetTitle("下载管理器")
 		systray.SetTooltip("下载管理器")
 
-		systray.SetIcon(trayIconForPlatform())
+		if err := setPlatformIcon(); err != nil {
+			log.Printf("tray: set icon: %v", err)
+		}
 		systray.SetTemplateIcon(trayIcon32, trayIcon32)
-
 		mOpen := systray.AddMenuItem("显示窗口", "显示主窗口")
 		mQuit := systray.AddMenuItem("退出", "退出下载管理器")
 		systray.AddSeparator()
@@ -92,7 +96,24 @@ func Stop() {
 	systray.Quit()
 }
 
-// trayIconForPlatform 返回最适合当前平台的托盘图标字节。
+// setPlatformIcon 按平台设置托盘图标。
+//
+// Windows 上 fyne.io/systray 会把传入的字节写入无扩展名的临时文件再交
+// 给 Win32 LoadImageW；为了让 LoadImageW 可靠嗅探出图标资源，我们直接
+// 走 SetIconFromFilePath，自行落盘一个 .ico 临时文件。
+func setPlatformIcon() error {
+	if runtime.GOOS == "windows" {
+		path := filepath.Join(os.TempDir(), "lgo_download_manager_tray.ico")
+		if err := os.WriteFile(path, trayIconICO, 0o644); err != nil {
+			return err
+		}
+		return systray.SetIconFromFilePath(path)
+	}
+	systray.SetIcon(trayIconForPlatform())
+	return nil
+}
+
+// trayIconForPlatform 返回最适合当前平台的托盘图标字节（非 Windows）。
 func trayIconForPlatform() []byte {
 	switch runtime.GOOS {
 	case "darwin":
