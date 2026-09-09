@@ -22,6 +22,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"lgo_download_manager/internal/protocol"
+	"lgo_download_manager/internal/ui/nativefolder"
 )
 
 // archiveCompressionExts 列出常见的归档/压缩单段扩展名。任何"<x>.<archive>"
@@ -114,13 +115,28 @@ func showAddTaskDialog(parent fyne.Window, svc Service) {
 
 	savePathEntry := widget.NewEntry()
 	savePathEntry.SetText(uniqueSavePath(filepath.Join(GlobalSettings.DefaultSaveDir, "download.bin")))
+	// 「浏览」按钮：调用系统原生文件夹选择对话框(资源管理器 / Finder /
+	// GTK/Qt 通用 chooser),不走 fyne 自带的 dialog.ShowFolderOpen。
+	// 同步阻塞在 UI 线程上,直接在 goroutine 中执行,选择结束后用
+	// fyne.Do 把结果切回 UI 线程。
 	browseBtn := widget.NewButton("浏览...", func() {
-		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
-			if err != nil || uri == nil {
+		go func() {
+			startDir := filepath.Dir(savePathEntry.Text)
+			if startDir == "" || startDir == "." {
+				startDir = GlobalSettings.DefaultSaveDir
+			}
+			chosen, err := nativefolder.PickFolder(startDir)
+			if err != nil {
+				if nativefolder.IsCancelled(err) {
+					return
+				}
+				fyne.Do(func() { dialog.ShowError(err, parent) })
 				return
 			}
-			savePathEntry.SetText(uniqueSavePath(filepath.Join(uri.Path(), filepath.Base(savePathEntry.Text))))
-		}, parent)
+			fyne.Do(func() {
+				savePathEntry.SetText(uniqueSavePath(filepath.Join(chosen, filepath.Base(savePathEntry.Text))))
+			})
+		}()
 	})
 
 	// 文件大小预览标签
