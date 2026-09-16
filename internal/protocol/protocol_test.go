@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -742,15 +743,21 @@ func TestHTTPDownloadChunkNon206(t *testing.T) {
 
 	d := makeHTTPDriver(srv.URL)
 	dir := t.TempDir()
-	f, _ := os.Create(filepath.Join(dir, "junk.bin"))
-	os.Truncate(filepath.Join(dir, "junk.bin"), 100)
-	f, _ = os.OpenFile(filepath.Join(dir, "junk.bin"), os.O_RDWR, 0)
+	// os.Create 已是 O_RDWR；用同一个句柄截断即可，不要再 open 一次
+	// （旧的写法把首个句柄覆盖掉，从未 Close，t.TempDir 清理会失败）。
+	f, err := os.Create(filepath.Join(dir, "junk.bin"))
+	if err != nil {
+		t.Fatalf("create junk file: %v", err)
+	}
+	defer f.Close()
+	if err := f.Truncate(100); err != nil {
+		t.Fatalf("truncate junk file: %v", err)
+	}
 
-	err := d.DownloadChunk(context.Background(), 0, 99, f, nil)
+	err = d.DownloadChunk(context.Background(), 0, 99, f, nil)
 	if err == nil {
 		t.Errorf("DownloadChunk err=nil, want error for 404")
 	}
-	f.Close()
 	d.Close()
 }
 
@@ -835,7 +842,6 @@ func TestHTTPClose(t *testing.T) {
 		t.Errorf("Close again: %v", err)
 	}
 }
-
 
 // ---------------------------------------------------------------------------
 // WebDAV Driver 测试
@@ -978,13 +984,20 @@ func TestWebDAVClose(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// FTP Driver 测试（使用 Python ftpdlib 虚拟环境）
+// FTP Driver 测试（使用 scripts/ftp_test_server 的 Go 测试服务器）
 // ---------------------------------------------------------------------------
 
-	// pythonVenv 是 pyftpdlib FTP 测试服务器的 Python 虚拟环境路径。
-	// 由 TestMain 在测试开始前创建。
-	// 如需修改，请同时更新 scripts/setup_test_env.sh 和 scripts/ftp_test_server/setup.sh 中的路径。
-	var pythonVenv = "/tmp/ftp_pytest_venv"
+// ftpdBinaryPath 返回预编译 FTP 测试服务器二进制的路径。
+// Windows 上 `go build -o <name>` 实际输出 <name>.exe，因此必须补上
+// 后缀，否则 exec.Command 会以 "executable file not found in %PATH%"
+// 失败，FTP 代码路径在这条主力平台上就完全失去覆盖。
+func ftpdBinaryPath() string {
+	name := fmt.Sprintf("ftpd_test_%d", os.Getpid())
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	return filepath.Join(os.TempDir(), name)
+}
 
 // startFTPServer 启动一个纯 Go 编写的 FTP 测试服务器，
 // 将 testFile 写入根目录，返回服务器地址和清理函数。
@@ -1009,7 +1022,7 @@ func startFTPServer(t *testing.T, testFile string, fileSize int) (addr string, c
 	}
 
 	// 预编译为临时二进制文件，避免 go run 进程组残留
-	ftpdBin := filepath.Join(os.TempDir(), fmt.Sprintf("ftpd_test_%d", os.Getpid()))
+	ftpdBin := ftpdBinaryPath()
 	buildCmd := exec.Command("go", "build", "-o", ftpdBin, scriptPath)
 	buildCmd.Dir = filepath.Dir(scriptPath)
 	if out, err := buildCmd.CombinedOutput(); err != nil {
@@ -1076,7 +1089,7 @@ func startFTPServerWithPayload(t *testing.T, fileName string, payload []byte) (a
 	}
 
 	// 预编译为临时二进制文件
-	ftpdBin := filepath.Join(os.TempDir(), fmt.Sprintf("ftpd_test_%d", os.Getpid()))
+	ftpdBin := ftpdBinaryPath()
 	buildCmd := exec.Command("go", "build", "-o", ftpdBin, scriptPath)
 	buildCmd.Dir = filepath.Dir(scriptPath)
 	if out, err := buildCmd.CombinedOutput(); err != nil {
@@ -1193,17 +1206,9 @@ func TestFTPDownloadFallbackNoServer(t *testing.T) {
 	d.Close()
 }
 
-
-// TestFTPLive* 通过真实的 Python ftpdlib FTP 服务器测试完整的 Probe 与
-// DownloadChunk 流程。pyftpdlib 虚拟环境由 scripts/setup_test_env.sh 创建。
-//
-// 如需运行，先初始化环境后启动 FTP 服务器：
-//   ./scripts/setup_test_env.sh
-//   /tmp/ftp_pytest_venv/bin/python3 scripts/ftp_server.py
-// 然后运行测试（TestFTPLive* 默认跳过，需手动取消 Skip 或用 -run 精确匹配）。
-//
-// 注意：在某些容器环境中 setsid(1) 无法正常守护化 Python 进程，
-// 导致连接立即被 RST。如遇此问题请改用手动启动服务器的方式。
+// TestFTPLive* 通过真实的 FTP 服务器（scripts/ftp_test_server/ftpd.go，
+// 由测试自行编译并拉起）测试完整的 Probe、DownloadChunk 与
+// DownloadFallback 流程，不依赖任何外部服务或 Python 环境。
 func TestFTPLiveProbe(t *testing.T) {
 	addr, cleanup := startFTPServer(t, "probe_test.bin", 12345)
 	defer cleanup()
@@ -1313,7 +1318,6 @@ func TestFTPClose(t *testing.T) {
 		t.Errorf("Close: %v", err)
 	}
 }
-
 
 func TestAllDriversImplementProtocolDriver(t *testing.T) {
 	// 编译时验证：*httpDriver、*webdavDriver 满足 ProtocolDriver
@@ -1446,27 +1450,5 @@ func parseRangeFromHeader(h string, total int) (start, end int64) {
 	return
 }
 
-// ---------------------------------------------------------------------------
-// TestMain：初始化 Python 虚拟环境
-// ---------------------------------------------------------------------------
-
-// TestMain：初始化 Python 虚拟环境
-func TestMain(m *testing.M) {
-	// 初始化 Python 虚拟环境（pyftpdlib）。
-	// 虚拟环境由 scripts/setup_test_env.sh 创建，或由本函数在首次运行时自动创建。
-	// 如需手动初始化，请运行：./scripts/setup_test_env.sh
-	venv := "/tmp/ftp_pytest_venv"
-	if _, err := os.Stat(venv); os.IsNotExist(err) {
-		if out, err := exec.Command("python3", "-m", "venv", venv).CombinedOutput(); err != nil {
-			fmt.Printf("cannot create venv: %v\n%s\n", err, out)
-			os.Exit(1)
-		}
-		if out, err := exec.Command(filepath.Join(venv, "bin", "pip"), "install", "pyftpdlib", "-q").CombinedOutput(); err != nil {
-			fmt.Printf("cannot install pyftpdlib: %v\n%s\n", err, out)
-			os.Exit(1)
-		}
-	}
-	pythonVenv = venv
-
-	os.Exit(m.Run())
-}
+// 本包不再需要 TestMain：FTP 的 live 测试自带 Go 测试服务器，
+// 无需预先准备 Python/pyftpdlib 虚拟环境。

@@ -56,30 +56,56 @@ func detectWindows() (Config, bool) {
 
 // parseWinINETProxyServer 解析 "ProxyServer" 字符串。
 //
-// 策略：优先 https=http；http=http；socks=socks5。其余条目忽略。
+// 两种形式：
+//
+//	a) "host:port"              —— 单一代理，所有协议共享
+//	b) "http=h:p;https=h:p;..." —— 按协议拆分
+//
+// 策略：优先级固定为 https > http > socks，与条目在字符串中的
+// 出现顺序无关（Windows 写入的顺序并不稳定）。没有可用条目时返回 ""。
 func parseWinINETProxyServer(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
 	if !strings.Contains(s, "=") {
 		// 形式 (a)：host:port —— 默认 HTTP 代理。
 		return "http://" + s
 	}
-	parts := strings.Split(s, ";")
-	for _, kv := range parts {
+	var httpsHost, httpHost, socksHost string
+	for _, kv := range strings.Split(s, ";") {
 		eq := strings.IndexByte(kv, '=')
 		if eq < 0 {
 			continue
 		}
 		k := strings.ToLower(strings.TrimSpace(kv[:eq]))
 		v := strings.TrimSpace(kv[eq+1:])
+		if v == "" {
+			continue
+		}
 		switch k {
-		case "https", "http":
-			if v != "" {
-				return "http://" + v
+		case "https":
+			if httpsHost == "" {
+				httpsHost = v
+			}
+		case "http":
+			if httpHost == "" {
+				httpHost = v
 			}
 		case "socks":
-			if v != "" {
-				return "socks5://" + v
+			if socksHost == "" {
+				socksHost = v
 			}
 		}
+	}
+	// Go 的 Transport 对 http/https 代理都使用 http:// 形式的代理地址。
+	switch {
+	case httpsHost != "":
+		return "http://" + httpsHost
+	case httpHost != "":
+		return "http://" + httpHost
+	case socksHost != "":
+		return "socks5://" + socksHost
 	}
 	return ""
 }

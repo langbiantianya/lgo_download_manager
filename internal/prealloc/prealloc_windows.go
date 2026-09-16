@@ -16,9 +16,9 @@ import (
 )
 
 var (
-	kernel32              = syscall.NewLazyDLL("kernel32.dll")
-	procSetFilePointerEx  = kernel32.NewProc("SetFilePointerEx")
-	procSetEndOfFile      = kernel32.NewProc("SetEndOfFile")
+	kernel32             = syscall.NewLazyDLL("kernel32.dll")
+	procSetFilePointerEx = kernel32.NewProc("SetFilePointerEx")
+	procSetEndOfFile     = kernel32.NewProc("SetEndOfFile")
 )
 
 func platformPrealloc(f *os.File, size int64) error {
@@ -37,9 +37,8 @@ func platformPrealloc(f *os.File, size int64) error {
 	if r == 0 {
 		return fmt.Errorf("SetEndOfFile: %v", e)
 	}
-	// 为调用者将指针重置到开头。
-	if _, err := f.Seek(0, 0); err != nil {
-		return fmt.Errorf("seek: %w", err)
-	}
+	// 不再把文件指针移回开头:SetEndOfFile 已按当前位置确定 EOF,而所有
+	// 调用方(http/ftp/webdav 的 chunk 写入)都使用 WriteAt,文件位置
+	// 对它们没有意义——这里省掉一次多余的 syscall。
 	return nil
 }

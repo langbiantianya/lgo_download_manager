@@ -1,5 +1,7 @@
 ldm
 ldm.exe
+lgo_download_manager
+lgo_download_manager.exe
 bin/
 dist/
 .tools/

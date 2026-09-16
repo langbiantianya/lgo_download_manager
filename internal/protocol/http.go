@@ -10,10 +10,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -21,39 +23,76 @@ import (
 // 256 KiB 在顺序吞吐与系统调用开销之间取得较好的折中。
 const chunkSize = 256 * 1024
 
-// httpDriver 为 HTTP 与 HTTPS 实现 ProtocolDriver。每个驱动实例
-// 仅持有一个 http.Client，因为每个分块 goroutine 都会使用自己
-// 的短生命周期客户端（Transport 中的 round-tripper 可被复用）。
-type httpDriver struct {
+// bufPool 复用 chunkSize 大小的读缓冲。每个 DownloadChunk /
+// DownloadFallback（以及引擎的每一次重试）都需要一块这样的缓冲，
+// 现用现分配会持续制造 256 KiB 的堆垃圾并加重 GC。
+// 池中元素类型为 *[]byte，其 len 恒为 chunkSize。
+var bufPool = sync.Pool{
+	New: func() interface{} {
+		b := make([]byte, chunkSize)
+		return &b
+	},
+}
+
+// getBuf 取出一块长度为 chunkSize 的读缓冲，调用方必须用 putBuf 归还。
+func getBuf() *[]byte {
+	b, _ := bufPool.Get().(*[]byte)
+	return b
+}
+
+// putBuf 归还读缓冲。尺寸被改动过的（长度为 0 或不再是 chunkSize）
+// 直接丢弃，避免把异常缓冲混进池中。
+func putBuf(b *[]byte) {
+	if b == nil || len(*b) != chunkSize {
+		return
+	}
+	bufPool.Put(b)
+}
+
+// httpBase 承担 httpDriver 与 webdavDriver 共有的部分：URL、鉴权选项、
+// 底层 http.Client，以及 decorate / DownloadChunk / DownloadFallback /
+// Close。两个驱动只在各自的 Probe 上有差异（HEAD + Range GET 对比
+// PROPFIND）。
+type httpBase struct {
+	kind string // 错误信息前缀："http" 或 "webdav"
 	url  string
 	auth AuthOptions
 	cli  *http.Client
 }
 
-// newHTTPDriver 是由 New(...) 调用的工厂入口。
-func newHTTPDriver(raw string, auth AuthOptions) (ProtocolDriver, error) {
+// newHTTPBase 构造两个 HTTP 语义驱动共用的客户端。kind 仅用于错误信息前缀。
+//
+// 这里刻意不设置 http.Client.Timeout——整体时限由引擎传入的 ctx 控制，
+// 客户端级超时会在慢速大文件下载中途无差别掐断连接。但 Transport 必须
+// 自带拨号与响应头超时：否则服务器接受 TCP 连接却迟迟不发响应头时，
+// 任务会永久挂住（ctx 只有在引擎主动取消时才生效）。
+func newHTTPBase(kind, raw string, auth AuthOptions) (httpBase, error) {
 	if raw == "" {
-		return nil, fmt.Errorf("http: empty url")
+		return httpBase{}, fmt.Errorf("%s: empty url", kind)
 	}
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 	tr := &http.Transport{
 		Proxy:                 proxyFunc(effectiveAuth(auth)),
+		DialContext:           dialer.DialContext,
 		MaxIdleConns:          16,
 		MaxIdleConnsPerHost:   16,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
 	}
-	return &httpDriver{
+	return httpBase{
+		kind: kind,
 		url:  raw,
 		auth: auth,
-		cli:  &http.Client{Transport: tr, Timeout: 0}, // 不设整体超时；由引擎的 ctx 控制
+		cli:  &http.Client{Transport: tr, Timeout: 0},
 	}, nil
 }
 
 // decorate 将用户选项应用到新请求上：User-Agent、Cookies、Referer，
-// 以及（可选的）Basic Auth。仅当用户名与密码均非空时才会发送
-// Basic Auth——避免发送一组不完整的 Authorization 头。
-func (d *httpDriver) decorate(req *http.Request) {
+// 以及（可选的）Basic Auth。仅当用户名与密码任一方非空时才会发送
+// Basic Auth。
+func (d *httpBase) decorate(req *http.Request) {
 	if d.auth.UserAgent != "" {
 		req.Header.Set("User-Agent", d.auth.UserAgent)
 	}
@@ -66,6 +105,125 @@ func (d *httpDriver) decorate(req *http.Request) {
 	if d.auth.Username != "" || d.auth.Password != "" {
 		req.SetBasicAuth(d.auth.Username, d.auth.Password)
 	}
+}
+
+// DownloadChunk 以 "Range: bytes=start-end" 发起 GET，
+// 并将响应体从 `start` 偏移处开始写入 file。每次 Read 后，
+// 都会以本次追加的字节数调用 onData（便于实时进度展示）。
+func (d *httpBase) DownloadChunk(ctx context.Context, start, end int64, file *os.File, onData func(n int)) error {
+	if start < 0 || end < start {
+		return fmt.Errorf("%s chunk: invalid range [%d,%d]", d.kind, start, end)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.url, nil)
+	if err != nil {
+		return fmt.Errorf("%s chunk build: %w", d.kind, err)
+	}
+	d.decorate(req)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+
+	resp, err := d.cli.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s chunk do: %w", d.kind, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return NewStatusError(resp.StatusCode, fmt.Errorf("%s chunk: status %d", d.kind, resp.StatusCode))
+	}
+
+	bufp := getBuf()
+	defer putBuf(bufp)
+	buf := *bufp
+	off := start
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := file.WriteAt(buf[:n], off); werr != nil {
+				return fmt.Errorf("%s chunk write: %w", d.kind, werr)
+			}
+			off += int64(n)
+			if onData != nil {
+				onData(n)
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return fmt.Errorf("%s chunk read: %w", d.kind, rerr)
+		}
+		if off > end+1 {
+			// 防御性处理：部分服务器会超出请求的 end 边界。
+			// 一旦越过 boundary 即停止写入。
+			break
+		}
+	}
+	return nil
+}
+
+// DownloadFallback 是针对不支持 Range 的服务器的单流回退方案，
+// 从 `offset` 偏移处开始写入。
+func (d *httpBase) DownloadFallback(ctx context.Context, offset int64, file *os.File, onData func(n int)) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.url, nil)
+	if err != nil {
+		return fmt.Errorf("%s fallback build: %w", d.kind, err)
+	}
+	d.decorate(req)
+
+	resp, err := d.cli.Do(req)
+	if err != nil {
+		return fmt.Errorf("%s fallback do: %w", d.kind, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return NewStatusError(resp.StatusCode, fmt.Errorf("%s fallback: status %d", d.kind, resp.StatusCode))
+	}
+
+	bufp := getBuf()
+	defer putBuf(bufp)
+	buf := *bufp
+	off := offset
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := file.WriteAt(buf[:n], off); werr != nil {
+				return fmt.Errorf("%s fallback write: %w", d.kind, werr)
+			}
+			off += int64(n)
+			if onData != nil {
+				onData(n)
+			}
+		}
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return fmt.Errorf("%s fallback read: %w", d.kind, rerr)
+		}
+	}
+	return nil
+}
+
+// Close 关闭底层 http.Client 的空闲连接。可以重复调用。
+func (d *httpBase) Close() error {
+	if tr, ok := d.cli.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+	return nil
+}
+
+// httpDriver 为 HTTP 与 HTTPS 实现 ProtocolDriver：用 HEAD（失败时
+// 回退为 1 字节的 Range GET）探测，再按字节区间分片下载。
+type httpDriver struct {
+	httpBase
+}
+
+// newHTTPDriver 是由 New(...) 调用的工厂入口。
+func newHTTPDriver(raw string, auth AuthOptions) (ProtocolDriver, error) {
+	base, err := newHTTPBase("http", raw, auth)
+	if err != nil {
+		return nil, err
+	}
+	return &httpDriver{httpBase: base}, nil
 }
 
 // Probe 发起 HEAD 请求（失败时回退为 1 字节的 Range GET）以探测
@@ -162,103 +320,4 @@ func parseTotalFromContentRange(s string) int64 {
 		return -1
 	}
 	return parseInt64(strings.TrimSpace(s[idx+1:]))
-}
-// DownloadChunk 以 "Range: bytes=start-end" 发起 HTTP GET，
-// 并将响应体从 `start` 偏移处开始写入 file。每次 Read 后，
-// 都会以本次追加的字节数调用 onData（便于实时进度展示）。
-func (d *httpDriver) DownloadChunk(ctx context.Context, start, end int64, file *os.File, onData func(n int)) error {
-	if start < 0 || end < start {
-		return fmt.Errorf("http chunk: invalid range [%d,%d]", start, end)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.url, nil)
-	if err != nil {
-		return fmt.Errorf("http chunk build: %w", err)
-	}
-	d.decorate(req)
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
-
-	resp, err := d.cli.Do(req)
-	if err != nil {
-		return fmt.Errorf("http chunk do: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return NewStatusError(resp.StatusCode, fmt.Errorf("http chunk: status %d", resp.StatusCode))
-	}
-
-	buf := make([]byte, chunkSize)
-	off := start
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := file.WriteAt(buf[:n], off); werr != nil {
-				return fmt.Errorf("http chunk write: %w", werr)
-			}
-			off += int64(n)
-			if onData != nil {
-				onData(n)
-			}
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			return fmt.Errorf("http chunk read: %w", rerr)
-		}
-		if off > end+1 {
-			// 防御性处理：部分服务器会超出请求的 end 边界。
-			// 一旦越过 boundary 即停止写入。
-			break
-		}
-	}
-	return nil
-}
-
-// DownloadFallback 是针对不支持 Range 的服务器的单流回退方案，
-// 从 `offset` 偏移处开始写入。
-func (d *httpDriver) DownloadFallback(ctx context.Context, offset int64, file *os.File, onData func(n int)) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.url, nil)
-	if err != nil {
-		return fmt.Errorf("http fallback build: %w", err)
-	}
-	d.decorate(req)
-
-	resp, err := d.cli.Do(req)
-	if err != nil {
-		return fmt.Errorf("http fallback do: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return NewStatusError(resp.StatusCode, fmt.Errorf("http fallback: status %d", resp.StatusCode))
-	}
-
-	buf := make([]byte, chunkSize)
-	off := offset
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := file.WriteAt(buf[:n], off); werr != nil {
-				return fmt.Errorf("http fallback write: %w", werr)
-			}
-			off += int64(n)
-			if onData != nil {
-				onData(n)
-			}
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			return fmt.Errorf("http fallback read: %w", rerr)
-		}
-	}
-	return nil
-}
-
-// Close 关闭底层 http.Client 的空闲连接。可以重复调用。
-func (d *httpDriver) Close() error {
-	if tr, ok := d.cli.Transport.(*http.Transport); ok {
-		tr.CloseIdleConnections()
-	}
-	return nil
 }

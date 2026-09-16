@@ -55,8 +55,10 @@ type Manager struct {
 	conn   *ipc.Conn
 	cancel context.CancelFunc
 	waitCh chan struct{} // 会话结束通知
+	gen    uint64        // 会话代号：清理路径据此识别自己是否仍属当前会话
 
-	onExit func() // UI 会话结束后回调（业务侧日志/状态）
+	onExit   func()     // UI 会话结束后回调（业务侧日志/状态）
+	exitOnce *sync.Once // 每个会话一个，保证 onExit 只触发一次
 }
 
 // New 创建 UI 管理器。
@@ -115,7 +117,10 @@ func (m *Manager) Open() {
 func (m *Manager) Start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.conn != nil {
+	// conn 非 nil 表示已有可用会话；cancel 非 nil 表示会话正在握手
+	// （子进程已拉起但尚未挂上连接），两种情况都不允许再拉起第二个
+	// UI 子进程，否则会留下一个无人回收的窗口。
+	if m.conn != nil || m.cancel != nil {
 		return fmt.Errorf("uimgr: UI already running")
 	}
 
@@ -127,82 +132,134 @@ func (m *Manager) Start() error {
 	if err != nil {
 		return err
 	}
-	m.uiSock = sock
-	m.token = token
 
 	ln, err := ipc.Listen(sock)
 	if err != nil {
 		return err
 	}
+	// Listen 成功之后的任何失败都要关掉监听并删掉 socket 文件，
+	// 否则会留下一个无人监听的残留路径。
+	fail := func(err error) error {
+		ln.Close()
+		_ = os.Remove(sock)
+		return err
+	}
 
 	self, err := os.Executable()
 	if err != nil {
-		ln.Close()
-		return fmt.Errorf("uimgr: resolve self executable: %w", err)
+		return fail(fmt.Errorf("uimgr: resolve self executable: %w", err))
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	m.cancel = cancel
-	m.cmd = exec.Command(self)
-	m.cmd.Env = append(os.Environ(),
+	cmd := exec.Command(self)
+	cmd.Env = append(os.Environ(),
 		ipc.EnvUIChild+"=1",
 		ipc.EnvUISocket+"="+sock,
 		ipc.EnvUIToken+"="+token,
 	)
-	m.cmd.Stdout = os.Stdout
-	m.cmd.Stderr = os.Stderr
-	if err := m.cmd.Start(); err != nil {
-		ln.Close()
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
 		cancel()
-		m.cmd = nil
-		return fmt.Errorf("uimgr: spawn UI child: %w", err)
+		return fail(fmt.Errorf("uimgr: spawn UI child: %w", err))
 	}
 
+	m.gen++
+	gen := m.gen
+	m.uiSock = sock
+	m.token = token
+	m.cancel = cancel
+	m.cmd = cmd
+	m.exitOnce = &sync.Once{}
+
+	// 子进程的唯一回收点：Wait 必须被且仅被调用一次。无论握手/init
+	// 是否成功，进程消亡都会在这里被回收（失败路径另行 Kill），
+	// 避免未完成握手的 UI 子进程变成无主进程、带着窗口一直存活。
+	// 这里只捕获局部 cmd，不再读写 m.cmd，消除与 finishSession 的竞态。
+	go func() {
+		err := cmd.Wait()
+		log.Printf("uimgr: UI child exited: %v", err)
+		cancel()
+	}()
+
 	// 接受握手（后台，不阻塞业务启动流程）。
-	go m.acceptLoop(ln, ctx)
+	go m.acceptLoop(ln, ctx, gen)
 	return nil
 }
 
-// acceptLoop 接受一次 UI 子进程连接并驱动会话；进程退出/断开后清理。
-func (m *Manager) acceptLoop(ln net.Listener, ctx context.Context) {
+// killChild 终止会话 gen 的 UI 子进程（若它仍属于该会话）。被 Kill 的
+// 进程仍由 Start 中的回收 goroutine 负责 Wait，不会留下僵尸进程。
+func (m *Manager) killChild(gen uint64) {
+	m.mu.Lock()
+	cmd := m.cmd
+	cur := m.gen == gen
+	m.mu.Unlock()
+	if !cur || cmd == nil || cmd.Process == nil {
+		return
+	}
+	_ = cmd.Process.Kill()
+}
+
+// acceptLoop 接受一次 UI 子进程连接并驱动会话。它是会话 gen 的唯一
+// 结束者：无论握手成败，返回时都会 finishSession，并在失败路径主动
+// 结束子进程。
+func (m *Manager) acceptLoop(ln net.Listener, ctx context.Context, gen uint64) {
 	defer ln.Close()
+	// 子进程早退或会话被 Close 关停时关掉监听，避免 Accept 永久阻塞。
+	stopped := make(chan struct{})
+	defer close(stopped)
+	go func() {
+		select {
+		case <-ctx.Done():
+			ln.Close()
+		case <-stopped:
+		}
+	}()
+	// 子进程必须在 budget 内完成连接与握手，否则同样是失败路径：
+	// 关掉监听让 Accept 返回，从而 Kill 掉可能已经僵死的子进程并结束
+	// 会话，而不是让会话永远停在「正在启动」。
+	deadline := time.AfterFunc(handshakeTimeout, func() { ln.Close() })
+	defer deadline.Stop()
+	defer m.finishSession(gen)
+
 	conn, err := ln.Accept()
 	if err != nil {
-		m.finishSession()
+		m.killChild(gen)
 		return
 	}
 	ch := ipc.NewConn(conn)
 	if err := m.handshake(ch); err != nil {
 		log.Printf("uimgr: handshake failed: %v", err)
 		ch.Close()
-		m.finishSession()
+		m.killChild(gen)
 		return
 	}
+	// 握手已完成：连接/握手预算不再适用（后续读取由各自的 deadline 管）。
+	deadline.Stop()
 
-	// 推送初始快照（权威设置）。
-	initMsg, _ := ipc.Encode(ipc.InitData{Settings: m.Settings()})
-	initMsg.Type = ipc.MsgInit
-	if err := ch.Send(initMsg); err != nil {
+	// 推送初始快照（权威设置）。负载已序列化，直接拼帧发出去。
+	initMsg, err := ipc.Encode(ipc.InitData{Settings: m.Settings()})
+	if err == nil {
+		err = ch.SendPayload(ipc.MsgInit, initMsg.Data)
+	}
+	if err != nil {
+		log.Printf("uimgr: send init: %v", err)
 		ch.Close()
-		m.finishSession()
+		m.killChild(gen)
 		return
 	}
 
 	m.mu.Lock()
-	m.conn = ch
-	prevCancel := m.cancel
+	if m.gen != gen {
+		// 会话已在握手期间被回收：不要再把连接挂到管理器上。
+		m.mu.Unlock()
+		ch.Close()
+		return
+	}
 	waitCh := make(chan struct{})
+	m.conn = ch
 	m.waitCh = waitCh
 	m.mu.Unlock()
-
-	// 进程退出监视：UI 进程消亡 → 关闭会话。
-	go func() {
-		err := m.cmd.Wait()
-		log.Printf("uimgr: UI child exited: %v", err)
-		prevCancel()
-		ch.Close()
-		m.finishSession()
-	}()
 
 	// 业务侧文件存在性轮询（原 UI 焦点 ticker，随会话启停）。
 	go m.validateLoop(ctx)
@@ -216,24 +273,38 @@ func (m *Manager) acceptLoop(ln net.Listener, ctx context.Context) {
 	close(waitCh)
 }
 
-// finishSession 清理当前会话状态（conn/cmd/订阅）。
-func (m *Manager) finishSession() {
+// finishSession 结束会话 gen：清空 conn/cmd/取消函数并移除 socket 文件。
+// 只有仍是当前会话的调用会生效——重复清理、已被新会话取代的清理都是
+// 空操作；onExit 因此每个会话只触发一次。
+func (m *Manager) finishSession(gen uint64) {
 	m.mu.Lock()
+	if m.gen != gen {
+		m.mu.Unlock()
+		return
+	}
+	m.gen++ // 使本会话的后续清理失效
 	ch := m.conn
+	once := m.exitOnce
+	onExit := m.onExit
 	m.conn = nil
+	m.exitOnce = nil
+	m.waitCh = nil
 	if m.cancel != nil {
 		m.cancel()
 	}
+	m.cancel = nil
 	if m.uiSock != "" {
 		_ = os.Remove(m.uiSock)
+		m.uiSock = ""
 	}
 	m.cmd = nil
 	m.mu.Unlock()
+
 	if ch != nil {
 		_ = ch.Close()
 	}
-	if m.onExit != nil {
-		m.onExit()
+	if once != nil && onExit != nil {
+		once.Do(onExit)
 	}
 }
 
@@ -418,7 +489,7 @@ func (m *Manager) forwardEvents(ch *ipc.Conn, ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case ev := <-evCh:
-			payload, err := ipc.Encode(ipc.EventData{
+			msg, err := ipc.Encode(ipc.EventData{
 				Why:      ev.Why,
 				Task:     ev.Task,
 				SpeedBPS: ev.SpeedBPS,
@@ -426,8 +497,8 @@ func (m *Manager) forwardEvents(ch *ipc.Conn, ctx context.Context) {
 			if err != nil {
 				continue
 			}
-			payload.Type = ipc.MsgEvent
-			if err := ch.Send(payload); err != nil {
+			// 负载已序列化，直接拼帧发送，避免整包再 marshal 一次。
+			if err := ch.SendPayload(ipc.MsgEvent, msg.Data); err != nil {
 				return
 			}
 		}
@@ -448,24 +519,36 @@ func (m *Manager) validateLoop(ctx context.Context) {
 	}
 }
 
-// Close 优雅关闭 UI 子进程：先发 MsgClose，等其退出，超时后强杀。
+// Close 关闭 UI 子进程：先安排超时强杀，再发 MsgClose 等其自行退出。
 func (m *Manager) Close() {
 	m.mu.Lock()
+	gen := m.gen
 	ch := m.conn
 	cmd := m.cmd
 	m.mu.Unlock()
+
 	if ch != nil {
-		_ = m.send(ipc.Message{Type: ipc.MsgClose})
+		// 兜底 Kill 必须先于 Send 排上定时器：Send 是持 wmu 的阻塞写，
+		// 子进程僵死时可能永不返回，只有定时器能保证退出一定发生，
+		// 不至于吃掉 main 的 5s 退出预算。
+		var killTimer *time.Timer
+		if cmd != nil && cmd.Process != nil {
+			killTimer = time.AfterFunc(closeGrace, func() { _ = cmd.Process.Kill() })
+		}
+		_ = ch.Send(ipc.Message{Type: ipc.MsgClose})
 		// 给 UI 一段窗口期自行退出。
 		select {
 		case <-time.After(closeGrace):
 		case <-m.waitDone():
 		}
+		if killTimer != nil {
+			killTimer.Stop()
+		}
 	}
 	if cmd != nil && cmd.Process != nil {
 		_ = cmd.Process.Kill()
 	}
-	m.finishSession()
+	m.finishSession(gen)
 }
 
 func (m *Manager) waitDone() <-chan struct{} {

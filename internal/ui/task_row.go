@@ -56,7 +56,44 @@ type taskRow struct {
 	// 在事件之间缓存的速度
 	curSpeed float64
 
+	// st 缓存上一次写入控件的值：进度事件每个 tick 都会到达，无差异判断
+	// 地重复 SetText/Show/Hide/SetIcon 会触发高开销的布局与重绘。
+	st rowState
+
 	inner *fyne.Container
+}
+
+// rowButtons 是操作按钮可见性位图（cancel/details 始终可见，不参与）。
+type rowButtons uint8
+
+const (
+	showStart rowButtons = 1 << iota
+	showPause
+	showFolder
+	showFile
+)
+
+// rowState 缓存上一次渲染写入控件的值，用于短路无变化的写入。
+// valid 为 false 时表示尚未渲染过（或任务已被解绑），所有字段都要重写。
+type rowState struct {
+	valid bool
+
+	// 进度部分
+	name      string
+	size      string
+	createdAt string
+	pct       float64
+	speed     string
+	eta       string
+
+	// speedShown/buttons 记录的是「已经应用到控件上的可见性」，
+	// 其零值与 build() 结束时的控件状态一致（相关控件均被隐藏）。
+	speedShown bool
+	buttons    rowButtons
+
+	// 状态部分
+	status    store.Status
+	preparing bool
 }
 
 func newTaskRow(_ *store.Task) *taskRow {
@@ -96,6 +133,15 @@ func (r *taskRow) build() {
 	for _, b := range []*widget.Button{r.startBtn, r.pauseBtn, r.cancelBtn, r.detailsBtn, r.openFolderBtn, r.openFileBtn} {
 		b.Importance = widget.LowImportance
 	}
+	// 控件默认可见，先按「无任务」隐藏状态相关的控件：这样 rowState 的
+	// 零值就等于控件的实际状态，refresh 只需处理真正的差异。
+	// 首次 refresh（bind 时会立即发生）会按状态重新显示。
+	r.startBtn.Hide()
+	r.pauseBtn.Hide()
+	r.openFolderBtn.Hide()
+	r.openFileBtn.Hide()
+	r.speed.Hide()
+	r.remTime.Hide()
 
 	// 第一行：名称（可扩展）[大小][状态]
 	row1 := container.NewBorder(
@@ -173,17 +219,46 @@ func (r *taskRow) bindButtons(t *store.Task, svc Service) {
 func (r *taskRow) refresh() {
 	t := r.task
 	if t == nil {
+		// 未绑定任务：清空显示并隐藏动作按钮；下一次 bind 全量重渲染。
+		r.st.valid = false
 		r.name.SetText("")
 		r.progress.SetValue(0)
-		r.speed.Hide()
-		r.remTime.Hide()
-		r.startBtn.Hide()
-		r.pauseBtn.Hide()
+		r.setVis(r.startBtn, showStart, false)
+		r.setVis(r.pauseBtn, showPause, false)
+		r.setSpeedVisible(false)
 		return
 	}
-	r.name.SetText(displayName(t))
-	r.createdAtLbl.SetText("添加于: " + formatTime(t.CreatedAt))
-	r.size.SetText(formatBytes(t.TotalSize))
+	eff, preparing := r.effectiveStatus(t)
+	// 进度部分逐值短路；状态部分只在 effective status / 准备中判定变化时执行。
+	r.refreshProgress(t, eff)
+	r.refreshStatus(eff, preparing)
+}
+
+// effectiveStatus 返回实际用于渲染的状态：乐观覆盖优先于后端快照。
+//
+// 乐观状态：用户刚点完 Start/Pause，后端事件还没回环，先按用户意图渲染；
+// 真实事件（status 与乐观值一致）由 taskList.onEvent 清掉覆盖，
+// 中途收到的 progress 事件不清覆盖，直到 status 事件落地。
+//
+// 准备阶段判定：store 中 Status 仍是 Pending，且 scheduler 已为该任务预留了
+// slot（engine 尚未接管）。乐观覆盖为 Downloading 时不再视为「准备中」，
+// 用户刚点完 Start 不应再看到「准备中」闪烁。
+func (r *taskRow) effectiveStatus(t *store.Task) (store.Status, bool) {
+	eff := t.Status
+	if r.optimisticStatus != nil {
+		eff = *r.optimisticStatus
+	}
+	preparing := eff == store.TaskStatus.Pending && r.svc != nil && r.svc.IsPreparing(t.ID)
+	return eff, preparing
+}
+
+// refreshProgress 写入随进度变化的部分：名称、添加时间、大小、进度条，
+// 以及下载中才显示的速度与剩余时间。每个值都先与上次渲染值比较。
+func (r *taskRow) refreshProgress(t *store.Task, eff store.Status) {
+	r.setText(r.name, &r.st.name, displayName(t))
+	r.setText(r.createdAtLbl, &r.st.createdAt, "添加于: "+formatTime(t.CreatedAt))
+	r.setText(r.size, &r.st.size, formatBytes(t.TotalSize))
+
 	pct := 0.0
 	if t.TotalSize > 0 {
 		pct = float64(t.Downloaded) / float64(t.TotalSize)
@@ -191,82 +266,118 @@ func (r *taskRow) refresh() {
 	if pct > 1 {
 		pct = 1
 	}
-
-	// 乐观状态:用户刚点完 Start/Pause,后端事件还没回环;先按用户意图渲染。
-	// 真实事件(status 与乐观值一致)由 taskList.onEvent 清掉此覆盖,
-	// 中途收到的 progress 事件不清覆盖,直到 status 事件落地。
-	effective := t.Status
-	if r.optimisticStatus != nil {
-		effective = *r.optimisticStatus
-	}
-	isDownloading := effective == store.TaskStatus.Downloading
-	if isDownloading {
-		r.speed.SetText(formatBPS(r.curSpeed))
-		r.remTime.SetText(etaText(t, r.curSpeed))
-		r.speed.Show()
-		r.remTime.Show()
-	} else {
-		r.speed.Hide()
-		r.remTime.Hide()
+	if !r.st.valid || r.st.pct != pct {
+		r.st.pct = pct
+		r.progress.SetValue(pct)
 	}
 
-	// 准备阶段判定:store 中 Status 仍是 Pending,且 scheduler 已为该任务
-	// 预留了 slot(engine 尚未接管)。乐观覆盖为 Downloading 时不再视为「准备中」,
-	// 用户刚点完 Start 不应再看到「准备中」闪烁。
-	isPreparing := effective == store.TaskStatus.Pending &&
-		r.svc != nil && r.svc.IsPreparing(t.ID)
+	downloading := eff == store.TaskStatus.Downloading
+	r.setSpeedVisible(downloading)
+	if downloading {
+		r.setText(r.speed, &r.st.speed, formatBPS(r.curSpeed))
+		r.setText(r.remTime, &r.st.eta, etaText(t, r.curSpeed))
+	}
+}
 
-	switch effective {
+// refreshStatus 只在 effective status（或「准备中」判定）变化时更新状态标签、
+// 按钮可见性与图标——这些操作会触发布局与图标绘制，是每个 tick 里最贵的部分。
+func (r *taskRow) refreshStatus(eff store.Status, preparing bool) {
+	s := &r.st
+	if s.valid && s.status == eff && s.preparing == preparing {
+		return
+	}
+	s.status = eff
+	s.preparing = preparing
+	s.valid = true
+
+	switch eff {
 	case store.TaskStatus.Pending:
-		if isPreparing {
+		if preparing {
 			r.statusLbl.SetText("准备中")
-			r.pauseBtn.Show()
-			r.startBtn.Hide()
+			r.setVis(r.pauseBtn, showPause, true)
+			r.setVis(r.startBtn, showStart, false)
 		} else {
 			r.statusLbl.SetText("等待中")
 			r.startBtn.SetIcon(theme.MediaPlayIcon())
 			r.startBtn.Importance = widget.LowImportance
-			r.pauseBtn.Hide()
-			r.startBtn.Show()
+			r.setVis(r.pauseBtn, showPause, false)
+			r.setVis(r.startBtn, showStart, true)
 		}
-		r.openFolderBtn.Hide()
-		r.openFileBtn.Hide()
+		r.setVis(r.openFolderBtn, showFolder, false)
+		r.setVis(r.openFileBtn, showFile, false)
 	case store.TaskStatus.Downloading:
 		r.statusLbl.SetText("下载中")
-		r.startBtn.Hide()
-		r.pauseBtn.Show()
-		r.openFolderBtn.Hide()
-		r.openFileBtn.Hide()
+		r.setVis(r.startBtn, showStart, false)
+		r.setVis(r.pauseBtn, showPause, true)
+		r.setVis(r.openFolderBtn, showFolder, false)
+		r.setVis(r.openFileBtn, showFile, false)
 	case store.TaskStatus.Paused:
 		r.statusLbl.SetText("已暂停")
 		r.startBtn.SetIcon(theme.MediaPlayIcon())
 		r.startBtn.Importance = widget.LowImportance
-		r.startBtn.Show()
-		r.pauseBtn.Hide()
-		r.openFolderBtn.Hide()
-		r.openFileBtn.Hide()
+		r.setVis(r.startBtn, showStart, true)
+		r.setVis(r.pauseBtn, showPause, false)
+		r.setVis(r.openFolderBtn, showFolder, false)
+		r.setVis(r.openFileBtn, showFile, false)
 	case store.TaskStatus.Completed:
 		r.statusLbl.SetText("已完成")
-		r.pauseBtn.Hide()
-		r.startBtn.Hide()
-		r.openFolderBtn.Show()
-		r.openFileBtn.Show()
+		r.setVis(r.pauseBtn, showPause, false)
+		r.setVis(r.startBtn, showStart, false)
+		r.setVis(r.openFolderBtn, showFolder, true)
+		r.setVis(r.openFileBtn, showFile, true)
 	case store.TaskStatus.FileLost:
 		r.statusLbl.SetText("文件丢失")
 		r.startBtn.SetIcon(theme.DownloadIcon())
 		r.startBtn.Importance = widget.HighImportance
-		r.startBtn.Show()
-		r.pauseBtn.Hide()
-		r.openFolderBtn.Hide()
-		r.openFileBtn.Hide()
+		r.setVis(r.startBtn, showStart, true)
+		r.setVis(r.pauseBtn, showPause, false)
+		r.setVis(r.openFolderBtn, showFolder, false)
+		r.setVis(r.openFileBtn, showFile, false)
 	case store.TaskStatus.Failed:
 		r.statusLbl.SetText("失败")
 		r.startBtn.SetIcon(theme.MediaReplayIcon())
 		r.startBtn.Importance = widget.LowImportance
-		r.startBtn.Show()
-		r.pauseBtn.Hide()
+		r.setVis(r.startBtn, showStart, true)
+		r.setVis(r.pauseBtn, showPause, false)
 	}
-	r.progress.SetValue(pct)
+}
+
+// setText 仅在文本与上次写入的不同（或尚未渲染过）时写标签。
+func (r *taskRow) setText(l *widget.Label, cached *string, text string) {
+	if r.st.valid && *cached == text {
+		return
+	}
+	*cached = text
+	l.SetText(text)
+}
+
+// setVis 仅在期望可见性与上次应用的不同的 Show/Hide 按钮。
+func (r *taskRow) setVis(btn *widget.Button, bit rowButtons, want bool) {
+	if (r.st.buttons&bit != 0) == want {
+		return
+	}
+	if want {
+		r.st.buttons |= bit
+		btn.Show()
+		return
+	}
+	r.st.buttons &^= bit
+	btn.Hide()
+}
+
+// setSpeedVisible 统一控制速度与剩余时间两个标签的可见性。
+func (r *taskRow) setSpeedVisible(show bool) {
+	if r.st.speedShown == show {
+		return
+	}
+	r.st.speedShown = show
+	if show {
+		r.speed.Show()
+		r.remTime.Show()
+		return
+	}
+	r.speed.Hide()
+	r.remTime.Hide()
 }
 func (r *taskRow) CreateRenderer() fyne.WidgetRenderer {
 	return widget.NewSimpleRenderer(r.inner)

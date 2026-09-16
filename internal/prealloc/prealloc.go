@@ -48,7 +48,7 @@ func Preallocate(path string, size int64) (*os.File, error) {
 		return f, nil
 	}
 	if err := platformPrealloc(f, size); err != nil {
-// 回退:尽力而为。至少执行 truncate+seek-write 以强制 OS 预留字节。
+		// 回退:尽力而为。至少执行 truncate+seek-write 以强制 OS 预留字节。
 		if err2 := truncateFallback(f, size); err2 != nil {
 			f.Close()
 			return nil, fmt.Errorf("prealloc native=%v fallback=%w", err, err2)
@@ -56,6 +56,10 @@ func Preallocate(path string, size int64) (*os.File, error) {
 	}
 	return f, nil
 }
+
+// zeroByte 是回退路径写往文件末尾的 1 字节 probe;放在包级避免每次调用
+// 都分配一个切片。
+var zeroByte = []byte{0}
 
 // truncateFallback 通过截断然后在 size-1 偏移处写入单个字节,强制内核预留
 // `size` 字节。在 sparse filesystem(支持 sparse 特性的 ext4、NTFS、APFS)
@@ -70,7 +74,7 @@ func truncateFallback(f *os.File, size int64) error {
 	}
 	// 触及最后一个字节以实际提交 extent。这比写入整个文件便宜得多,
 	// 并确保 FS 知道它。
-	if _, err := f.WriteAt([]byte{0}, size-1); err != nil {
+	if _, err := f.WriteAt(zeroByte, size-1); err != nil {
 		return fmt.Errorf("probe-write: %w", err)
 	}
 	if _, err := f.Seek(0, 0); err != nil {

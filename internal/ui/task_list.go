@@ -34,6 +34,14 @@ type taskList struct {
 	// rowMap 将 taskID 映射到活动的 taskRow，以便 O(1) 地派发事件。
 	rowMu  sync.Mutex
 	rowMap map[string]*taskRow
+
+	// cacheMu 保护过滤结果缓存。Length()/UpdateItem()/空状态判断都会
+	// 查询过滤结果，没有缓存时每个事件、每一个可见行都要走一次
+	// svc.List（阻塞 IPC，最长 30s 超时）。
+	cacheMu    sync.Mutex
+	cache      []*store.Task
+	cacheKey   string
+	cacheValid bool
 }
 
 func newTaskList(svc Service, filter binding.String) *taskList {
@@ -49,29 +57,111 @@ func newTaskList(svc Service, filter binding.String) *taskList {
 
 func (tl *taskList) container() *fyne.Container { return tl.panel }
 
+// allTasks 直接向后端取一次当前状态筛选下的全部任务。
+// 用于「暂停全部/恢复全部」这类一次性用户操作——它们要的是后端权威快照，
+// 且不受搜索框影响，因此不走 filtered() 的缓存。
 func (tl *taskList) allTasks() []*store.Task {
 	fv, _ := tl.filter.Get()
 	tks, _ := tl.svc.List(store.StatusFilter(fv), GlobalSettings.TaskSort)
 	return tks
 }
 
-// filtered 用后端过滤（status）+ 内存内的搜索文本过滤。
-// 状态过滤由业务侧完成；搜索框匹配 URL 或保存路径，在内存里完成。
-func (tl *taskList) filtered() []*store.Task {
+// filterKey 返回过滤条件的组合键：状态筛选 + 排序 + 搜索文本。
+// 三者任一变化都必须重新向后端取数。
+func (tl *taskList) filterKey() string {
+	fv, _ := tl.filter.Get()
 	sv, _ := tl.searchQ.Get()
-	tasks := tl.allTasks()
-	if sv == "" {
+	return string(fv) + "\x00" + string(GlobalSettings.TaskSort) + "\x00" + sv
+}
+
+// filtered 返回当前过滤条件下的任务快照。
+//
+// 结果被缓存：状态过滤由业务侧（SQL）完成，搜索框匹配 URL 或保存路径，
+// 在内存里完成。只有过滤条件本身变化，或集合发生变化（added/deleted、
+// 状态筛选下的归属变化）时才会重新调用 svc.List。
+func (tl *taskList) filtered() []*store.Task {
+	key := tl.filterKey()
+	tl.cacheMu.Lock()
+	if tl.cacheValid && tl.cacheKey == key {
+		tasks := tl.cache
+		tl.cacheMu.Unlock()
 		return tasks
 	}
-	needle := strings.ToLower(sv)
+	tl.cacheMu.Unlock()
+
+	// 取数在锁外进行：svc.List 是阻塞 IPC，不应阻塞事件派发路径。
+	fv, _ := tl.filter.Get()
+	tasks, _ := tl.svc.List(store.StatusFilter(fv), GlobalSettings.TaskSort)
+	sv, _ := tl.searchQ.Get()
+	tasks = filterBySearch(tasks, strings.ToLower(sv))
+
+	tl.cacheMu.Lock()
+	tl.cache, tl.cacheKey, tl.cacheValid = tasks, key, true
+	tl.cacheMu.Unlock()
+	return tasks
+}
+
+// filterBySearch 返回匹配搜索关键字（URL 或保存路径，大小写不敏感）的任务。
+// needle 必须已小写化；空关键字匹配所有任务。
+func filterBySearch(tasks []*store.Task, needle string) []*store.Task {
+	if needle == "" {
+		return tasks
+	}
 	var out []*store.Task
 	for _, t := range tasks {
-		if strings.Contains(strings.ToLower(t.URL), needle) ||
-			strings.Contains(strings.ToLower(t.SavePath), needle) {
+		if matchesSearch(t, needle) {
 			out = append(out, t)
 		}
 	}
 	return out
+}
+
+// matchesSearch 报告任务是否匹配已小写的搜索关键字。
+func matchesSearch(t *store.Task, needle string) bool {
+	return strings.Contains(strings.ToLower(t.URL), needle) ||
+		strings.Contains(strings.ToLower(t.SavePath), needle)
+}
+
+// invalidate 标记过滤缓存失效：下一次 filtered() 重新向后端取数。
+func (tl *taskList) invalidate() {
+	tl.cacheMu.Lock()
+	tl.cacheValid = false
+	tl.cacheMu.Unlock()
+}
+
+// patch 用事件携带的任务快照就地更新缓存，避免为一次变化重跑整表查询。
+// 返回 true 表示缓存的归属/顺序需要后端重新确认（调用方应 invalidate）。
+func (tl *taskList) patch(t *store.Task) bool {
+	sv, _ := tl.searchQ.Get()
+	needle := strings.ToLower(sv)
+	fv, _ := tl.filter.Get()
+	statusFiltered := fv != "" && fv != string(store.FilterAll)
+
+	tl.cacheMu.Lock()
+	defer tl.cacheMu.Unlock()
+	if !tl.cacheValid {
+		// 还没有缓存，下一次 filtered() 会整体取数。
+		return false
+	}
+	for i, cur := range tl.cache {
+		if cur == nil || cur.ID != t.ID {
+			continue
+		}
+		// 状态筛选下，状态变化可能让任务进出集合，且它在结果中的排序位置
+		// 由后端 SQL 决定——UI 不在这里复制那份映射，交给 filtered() 重查。
+		if statusFiltered && cur.Status != t.Status {
+			return true
+		}
+		if needle != "" && !matchesSearch(t, needle) {
+			// 搜索条件不再匹配：就地移除即可，无需重查。
+			tl.cache = append(tl.cache[:i], tl.cache[i+1:]...)
+			return false
+		}
+		tl.cache[i] = t
+		return false
+	}
+	// 不在缓存中：若它应当出现，其在排序中的位置只能由后端给出。
+	return !statusFiltered && (needle == "" || matchesSearch(t, needle))
 }
 
 // build 组装任务列表面板：表头行加可滚动列表。
@@ -144,23 +234,42 @@ func (tl *taskList) refreshEmptyState() {
 	}
 }
 
-// onEvent 刷新列表并将进度事件派发到对应的行。
-// 状态事件到达时,若 row 持有匹配的乐观覆盖,则清掉它,
-// 让 refresh 重新按真实 status 渲染(进度事件不清覆盖,以避免乐观闪烁)。
+// onEvent 把事件反应到列表与对应的行上。
+//
+// 事件已经携带任务快照，因此非集合类事件只需就地打补丁：progress 事件
+// 只更新对应行，状态事件就地替换缓存快照后再刷新可见行，两者都不再触发
+// svc.List。只有集合真正变化（added/deleted、状态筛选下的归属变化）才
+// 重新向后端取数。
+//
+// 状态事件到达时，若 row 持有匹配的乐观覆盖，则清掉它，让 refresh 重新按
+// 真实 status 渲染（进度事件不清覆盖，以避免乐观闪烁）。
 func (tl *taskList) onEvent(ev scheduler.Event) {
-	if ev.Task != nil {
-		tl.rowMu.Lock()
-		row, ok := tl.rowMap[ev.Task.ID]
-		tl.rowMu.Unlock()
+	if ev.Task == nil {
+		// 集合变化事件（deleted 不带任务快照）：必须重新取数。
+		tl.invalidate()
+		tl.refresh()
+		return
+	}
+
+	tl.rowMu.Lock()
+	row, ok := tl.rowMap[ev.Task.ID]
+	tl.rowMu.Unlock()
+
+	if ev.Why == "progress" {
+		// 进度事件只影响该行的进度显示：就地打补丁后直接派发，
+		// 不触碰列表本身。
+		tl.patch(ev.Task)
 		if ok {
-			if ev.Why == "progress" {
-				row.onProgress(ev)
-				return
-			}
-			if row.optimisticStatus != nil && *row.optimisticStatus == ev.Task.Status {
-				row.optimisticStatus = nil
-			}
+			row.onProgress(ev)
 		}
+		return
+	}
+
+	if ok && row.optimisticStatus != nil && *row.optimisticStatus == ev.Task.Status {
+		row.optimisticStatus = nil
+	}
+	if ev.Why == "added" || tl.patch(ev.Task) {
+		tl.invalidate()
 	}
 	tl.refresh()
 }

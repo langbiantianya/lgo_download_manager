@@ -19,9 +19,9 @@ func platformPrealloc(f *os.File, size int64) error {
 	const _F_PREALLOCATE = 42
 	const _F_ALLOCATECONTIG = 2
 
-// 来自 <sys/fcntl.h> 的 struct fstore
-// 对应 xnu: uint32_t flags, uint32_t posmode, off_t offset, off_t length,
-//             off_t bytesdone, uint32_t mode
+	// 来自 <sys/fcntl.h> 的 struct fstore
+	// 对应 xnu: uint32_t flags, uint32_t posmode, off_t offset, off_t length,
+	//             off_t bytesdone, uint32_t mode
 	type fstoreT struct {
 		Flags     uint32
 		Posmode   uint32
@@ -45,8 +45,6 @@ func platformPrealloc(f *os.File, size int64) error {
 	if errno != 0 {
 		return fmt.Errorf("fcntl F_PREALLOCATE: %v", errno)
 	}
-	if _, err := f.Seek(0, 0); err != nil {
-		return fmt.Errorf("seek: %w", err)
-	}
+	// 调用方只用 WriteAt 写入（WriteAt 自带偏移），无需把文件位置复位。
 	return nil
 }

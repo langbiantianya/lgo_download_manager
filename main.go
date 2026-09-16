@@ -72,17 +72,23 @@ func main() {
 	}
 	if !isPrimary {
 		if len(urls) > 0 {
+			// 逐个转发并汇总:首个失败不应丢弃后续 URL。
+			var failed int
 			for _, u := range urls {
 				if err := urllauncher.SendURL(u); err != nil {
-					log.Fatalf("failed to forward URL: %v", err)
+					log.Printf("failed to forward URL %q: %v", u, err)
+					failed++
 				}
+			}
+			if failed > 0 {
+				log.Printf("failed to forward %d of %d URL(s) to the primary instance", failed, len(urls))
+				os.Exit(1)
 			}
 			log.Printf("forwarded %d URL(s) to primary instance", len(urls))
 		} else {
 			log.Println("another instance is already running")
 		}
 		os.Exit(0)
-		return
 	}
 	defer release()
 
@@ -118,13 +124,22 @@ func main() {
 	}
 	go sc.Run(ctx)
 
-// 业务进程对 URL 转发的处理：探测 protocol、推导保存路径，
-// 然后通过 scheduler 添加任务并启动；与 UI 子进程的 IPC
-// 调用走的是同一条路径。
-handleDownloadURL := func(rawURL string) {
+	// 业务进程对 URL 转发的处理：探测 protocol、推导保存路径，
+	// 然后通过 scheduler 添加任务并启动；与 UI 子进程的 IPC
+	// 调用走的是同一条路径。
+	handleDownloadURL := func(rawURL string) {
 		req, err := urllauncher.HandleURL(rawURL)
 		if err != nil {
 			log.Printf("invalid URL: %v", err)
+			return
+		}
+		// 从 URL 推导协议：此前这里传空串，导致 scheduler.startAsync 里
+		// protocol.New 报 "no driver for kind="，任何 lgom:// 触发的下载
+		// 都会立刻变成 Failed。
+		kind, err := protocol.DetectKind(req.URL, "")
+		if err != nil {
+			log.Printf("unsupported URL %s: %v", req.URL, err)
+			return
 		}
 		log.Printf("adding download: %s", req.URL)
 
@@ -136,7 +151,7 @@ handleDownloadURL := func(rawURL string) {
 		tk, err := sc.Add(scheduler.AddTaskInput{
 			URL:          req.URL,
 			SavePath:     savePathFor(cur, req.URL, req.Name),
-			Protocol:     "",
+			Protocol:     kind,
 			Auth:         auth,
 			ChunkCount:   defaultChunks(cur.DefaultThreads),
 			MinChunkSize: cur.MinChunkSize,

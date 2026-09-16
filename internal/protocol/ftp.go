@@ -22,11 +22,9 @@ import (
 )
 
 // ftpDriver 为 FTP 实现 ProtocolDriver。每个分块 goroutine 持有
-// 自己的 ServerConn，因为 FTP 数据连接在单次传输中是独占的；
-// 共享同一条连接会把分块串行化。所有 ServerConn 使用同一组
+// 自己的 ServerConn：FTP 控制连接是串行协议，jlaffaye/ftp 的
+// ServerConn 并非并发安全（见 connFor）。所有 ServerConn 使用同一组
 // 凭据登录；由 Probe 探测可用性。
-//
-// 我们有意将连接池并发数限制为分块数上限，以避免资源泄漏。
 type ftpDriver struct {
 	host     string // host:port
 	path     string // 远程路径
@@ -114,7 +112,10 @@ func (d *ftpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 		// 不支持 SIZE 的情况较为罕见；视为未知。
 		caps.TotalSize = -1
 	}
-	// 探测 RESUME：在探测连接上发送 REST 0。
+	// 探测 RESUME：发送一条 REST 0。jlaffaye/ftp 的 ServerConn 不暴露
+	// 发送裸控制命令的入口（RetrFrom 会顺带拉起数据连接），因此这里
+	// 必须另开一条短控制连接。它带 10s 读写超时，并在本函数返回前
+	// 同步关闭，不会泄漏连接也不会挂起。
 	d.mu.Lock()
 	probe, err := dialRaw(d.host)
 	if err == nil {
@@ -122,7 +123,7 @@ func (d *ftpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 		if cerr == nil && strings.HasPrefix(msg, "350") {
 			d.reserved = true
 		}
-		probe.Close()
+		_ = probe.Close()
 	}
 	d.mu.Unlock()
 	caps.SupportRange = d.reserved
@@ -130,40 +131,53 @@ func (d *ftpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	return caps, nil
 }
 
-// dialRaw 打开一个被动的文本模式连接，仅用于发送一条 REST 命令。
+// rawReplyBufSize 是原始控制连接上按行读取回复所用的缓冲大小。
+// FTP 的回复行长都很短（含 FEAT 多行回复），1 KiB 足够。
+const rawReplyBufSize = 1024
+
+// rawTimeout 是原始控制连接的读写超时。这类探测连接一旦对端
+// 不说话必须尽快失败，否则 Probe 会永久挂起（net.DialTimeout 只能
+// 限制建连阶段）。
+const rawTimeout = 10 * time.Second
+
+// dialRaw 打开一条原始文本模式连接，仅用于发送一条控制命令。
 // 由 Probe 使用，以便干净地测试断点续传支持。
 func dialRaw(addr string) (*rawConn, error) {
-	c, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	c, err := net.DialTimeout("tcp", addr, rawTimeout)
 	if err != nil {
 		return nil, err
 	}
-	rc := &rawConn{c: c, rd: c}
+	rc := &rawConn{c: c, rd: c, buf: make([]byte, rawReplyBufSize)}
 	rc.welcome()
 	return rc, nil
 }
 
 type rawConn struct {
-	c  net.Conn
-	rd io.Reader
+	c   net.Conn
+	rd  io.Reader
+	buf []byte // 复用的回复读取缓冲，避免每次读取都重新分配
 }
+
+// touch 重置整条连接的读写 deadline，保证每次读写都有界。
+func (r *rawConn) touch() { _ = r.c.SetDeadline(time.Now().Add(rawTimeout)) }
 
 // welcome 读取 220 banner。后续的读/写都按行协议进行。
 func (r *rawConn) welcome() {
-	buf := make([]byte, 1024)
-	_, _ = r.rd.Read(buf)
+	r.touch()
+	_, _ = r.rd.Read(r.buf)
 }
 
 // readReply 返回下一行状态及其延续行，直到遇到形如 "NNN "（空格）的
 // 终结符为止。
 func (r *rawConn) readReply() (string, error) {
 	var sb strings.Builder
-	tmp := make([]byte, 1024)
 	for {
-		n, err := r.rd.Read(tmp)
+		r.touch()
+		n, err := r.rd.Read(r.buf)
 		if err != nil {
 			return sb.String(), err
 		}
-		sb.Write(tmp[:n])
+		sb.Write(r.buf[:n])
 		s := sb.String()
 		if l := strings.Split(s, "\r\n"); len(l) >= 2 && len(l[len(l)-2]) >= 4 {
 			line := l[len(l)-2]
@@ -177,6 +191,7 @@ func (r *rawConn) readReply() (string, error) {
 // cmd 发送单条命令并返回响应文本。探测场景下 expected 取 -1（任意）。
 func (r *rawConn) cmd(_ int, format string, args ...interface{}) (int, string, error) {
 	line := fmt.Sprintf(format, args...) + "\r\n"
+	r.touch()
 	if _, err := r.c.Write([]byte(line)); err != nil {
 		return 0, "", err
 	}
@@ -196,6 +211,11 @@ func (r *rawConn) cmd(_ int, format string, args ...interface{}) (int, string, e
 func (r *rawConn) Close() error { return r.c.Close() }
 
 // connFor 为单个分块传输打开一次全新的登录。
+//
+// 有意为每个分片单独 dial + login：FTP 控制连接是严格的串行请求/响应
+// 协议，jlaffaye/ftp 的 ServerConn 并非并发安全，多条分片共享一条控制
+// 连接会把下载串行化，并可能把 A 分片的响应配给 B 分片。
+// 请勿改成连接池/共享连接。
 func (d *ftpDriver) connFor(ctx context.Context) (*ftp.ServerConn, error) {
 	return d.dial(ctx)
 }
@@ -224,7 +244,9 @@ func (d *ftpDriver) DownloadChunk(ctx context.Context, start, end int64, file *o
 	}
 	defer r.Close()
 
-	buf := make([]byte, chunkSize)
+	bufp := getBuf()
+	defer putBuf(bufp)
+	buf := *bufp
 	off := start
 	for {
 		if err := ctx.Err(); err != nil {
@@ -273,7 +295,9 @@ func (d *ftpDriver) DownloadFallback(ctx context.Context, offset int64, file *os
 	}
 	defer r.Close()
 
-	buf := make([]byte, chunkSize)
+	bufp := getBuf()
+	defer putBuf(bufp)
+	buf := *bufp
 	off := offset
 	for {
 		if err := ctx.Err(); err != nil {

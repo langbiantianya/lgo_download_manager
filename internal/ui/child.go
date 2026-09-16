@@ -73,6 +73,8 @@ func RunChild() int {
 
 	win.Show()
 	a.Run()
+	// 事件循环已退出：停掉周期性的后台任务（磁盘空间刷新）并取消订阅。
+	win.Close()
 	_ = c.Close()
 	return 0
 }

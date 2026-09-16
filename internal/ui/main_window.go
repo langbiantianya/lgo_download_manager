@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"image/color"
 	"path/filepath"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -24,6 +25,10 @@ import (
 
 	"lgo_download_manager/internal/store"
 )
+
+// diskRefreshInterval 是状态栏磁盘空间信息的刷新间隔。磁盘占用会因为
+// 其它进程的写入而变化，只在启动时算一次会长期显示过期数据。
+const diskRefreshInterval = 30 * time.Second
 
 // MainWindow 保存所有 GUI 状态以及顶层 Fyne 窗口。
 type MainWindow struct {
@@ -37,6 +42,10 @@ type MainWindow struct {
 	statusBar *statusBar
 
 	unsub func()
+
+	// diskTicker 周期性刷新状态栏的磁盘空间；关闭 diskDone 即退出该循环。
+	diskTicker *time.Ticker
+	diskDone   chan struct{}
 }
 
 // NewMainWindow 构建附加到 app 的主窗口。
@@ -57,6 +66,7 @@ func NewMainWindow(a fyne.App, svc Service) *MainWindow {
 	m.buildMainUI()
 	m.subscribe()
 	m.statusBar.refreshDiskSpace()
+	m.startDiskTicker()
 	return m
 }
 func (m *MainWindow) buildMainUI() {
@@ -225,11 +235,42 @@ func (m *MainWindow) onCloseRequested() {
 	m.win.Hide()
 }
 
-// Close 清理事件订阅（进程退出路径）。
+// Close 清理事件订阅与后台周期任务（进程退出路径）。
 func (m *MainWindow) Close() {
 	if m.unsub != nil {
 		m.unsub()
 		m.unsub = nil
+	}
+	m.stopDiskTicker()
+}
+
+// startDiskTicker 启动状态栏磁盘空间的周期刷新。
+func (m *MainWindow) startDiskTicker() {
+	ticker := time.NewTicker(diskRefreshInterval)
+	done := make(chan struct{})
+	m.diskTicker, m.diskDone = ticker, done
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				// 读取设置与改动控件都必须在 Fyne 事件线程上进行。
+				fyne.Do(m.statusBar.refreshDiskSpace)
+			}
+		}
+	}()
+}
+
+// stopDiskTicker 停止周期刷新；重复调用是安全的。
+func (m *MainWindow) stopDiskTicker() {
+	if m.diskTicker != nil {
+		m.diskTicker.Stop()
+		m.diskTicker = nil
+	}
+	if m.diskDone != nil {
+		close(m.diskDone)
+		m.diskDone = nil
 	}
 }
 

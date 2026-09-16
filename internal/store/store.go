@@ -48,12 +48,12 @@ type Status string
 
 // 内部常量：禁止外部包直接引用，只能通过 TaskStatus 枚举类访问。
 const (
-	_pending      Status = "Pending"
+	_pending     Status = "Pending"
 	_downloading Status = "Downloading"
-	_paused       Status = "Paused"
-	_completed    Status = "Completed"
-	_failed       Status = "Failed"
-	_fileLost     Status = "FileLost"
+	_paused      Status = "Paused"
+	_completed   Status = "Completed"
+	_failed      Status = "Failed"
+	_fileLost    Status = "FileLost"
 )
 
 // TaskStatus 是状态枚举类，提供所有合法的 Status 值。
@@ -87,17 +87,21 @@ func (s Status) IsActive() bool { return s == _pending || s == _downloading }
 type StatusFilter string
 
 const (
-	FilterAll        StatusFilter = "all"
+	FilterAll         StatusFilter = "all"
+	FilterPending     StatusFilter = "pending"
 	FilterDownloading StatusFilter = "downloading"
-	FilterPaused    StatusFilter = "paused"
-	FilterCompleted StatusFilter = "completed"
-	FilterFailed   StatusFilter = "failed"
-	FilterFileLost  StatusFilter = "filelost"
+	FilterPaused      StatusFilter = "paused"
+	FilterCompleted   StatusFilter = "completed"
+	FilterFailed      StatusFilter = "failed"
+	FilterFileLost    StatusFilter = "filelost"
 )
+
 // filterStatus 把 StatusFilter 映射到对应的 DB Status 值。
 // 返回的 bool 表示该筛选器是否需要在 SQL WHERE 中加 status 条件。
 func (f StatusFilter) filterStatus() (Status, bool) {
 	switch f {
+	case FilterPending:
+		return _pending, true
 	case FilterDownloading:
 		return _downloading, true
 	case FilterPaused:
@@ -135,12 +139,17 @@ func (s TaskSort) orderByClause() string {
 	switch s {
 	case SortCreatedAsc:
 		return "ORDER BY created_at ASC, id ASC"
+	case SortCreatedDesc:
+		// 必须按 created_at 排序：曾经这里用的是 updated_at，导致
+		// 默认视图会随着每 2 秒的进度刷盘不断重新排序（行跳动），
+		// 也与「按添加时间倒序」的语义不符。
+		return "ORDER BY created_at DESC, id ASC"
 	case SortNameAsc:
 		return "ORDER BY save_path ASC, id ASC"
 	case SortNameDesc:
 		return "ORDER BY save_path DESC, id ASC"
 	default:
-		return "ORDER BY updated_at DESC, id ASC"
+		return "ORDER BY created_at DESC, id ASC"
 	}
 }
 
@@ -161,37 +170,58 @@ type Task struct {
 	ChunkProgress []int64   `json:"chunk_progress"` // 每个分块从起点开始的偏移量
 	ChunkRanges   []int64   `json:"chunk_ranges"`   // [start0,end0,start1,end1,...] — 实际的 engine 分块布局
 	Status        Status    `json:"status"`
-	AuthData      string    `json:"auth_data"`  // JSON：{username,password,...}
+	AuthData      string    `json:"auth_data"` // JSON：{username,password,...}
 	ErrorMessage  string    `json:"error_message"`
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 	CompletedAt   time.Time `json:"completed_at"` // 零值表示尚未完成
 }
 
-// Store 用 engine 使用的 prepared 语句封装 *sql.DB。
+// Store 封装 *sql.DB，并缓存进度刷盘用的 prepared statement。
 // 它是并发安全的；底层 sqlite 驱动在进程级别加锁，
 // 因此写入通过 mu 串行化。
 type Store struct {
 	mu sync.Mutex
 	db *sql.DB
+
+	// 高频刷盘语句的缓存：UpdateTaskProgress 每 2 秒会被每个下载中的
+	// 任务调用一次，缓存在此避免每次都让驱动重新编译 SQL。
+	stmtProgress  *sql.Stmt
+	stmtCompleted *sql.Stmt
 }
 
+// 进度刷盘语句（UpdateTaskProgress / UpdateTasksProgress 共用同一份 SQL：
+// Open 会把它们预编译成 prepared statement，避免每次 Exec 重新编译）。
+const (
+	sqlProgress = `UPDATE tasks SET
+		downloaded=?, chunk_progress=?, status=?, error_message=?, updated_at=?
+		WHERE id=?`
+	sqlProgressCompleted = `UPDATE tasks SET
+		downloaded=?, chunk_progress=?, status=?, error_message=?, updated_at=?,
+		completed_at=COALESCE(completed_at, ?)
+		WHERE id=?`
+)
+
+// maxOpenConns 限制连接池大小。SQLite 只有单个写者，写入已由 mu 串行化；
+// 读可以并发（WAL 下读不阻塞写），4 条连接足够覆盖 UI 列表 + 状态刷盘，
+// 同时避免连接与 page cache 无上限增长。
+const maxOpenConns = 4
+
 // Open 打开 path 指定的数据库，必要时创建父目录。
-// 所使用的 DSN 启用 WAL 与 busy_timeout，以应对并发连接
-//（当用户频繁启停任务时，engine 可能有多个 writer）。
+// DSN 启用 WAL、synchronous=NORMAL（WAL 下的推荐组合：提交不做 fsync，
+// 仅 checkpoint 时落盘）与 5 秒 busy_timeout。
 func Open(path string) (*Store, error) {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return nil, fmt.Errorf("store mkdir: %w", err)
 		}
 	}
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)", path)
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)", path)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("store open: %w", err)
 	}
-	// 出于安全考虑的 PRAGMA：关闭外键（此处未使用），synchronous=NORMAL，
-	// 以及 5 秒的 busy_timeout。modernc.org/sqlite 已经通过 DSN 设置这些。
+	db.SetMaxOpenConns(maxOpenConns)
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store ping: %w", err)
@@ -200,6 +230,15 @@ func Open(path string) (*Store, error) {
 	if err := s.migrate(); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("store migrate: %w", err)
+	}
+	if s.stmtProgress, err = db.Prepare(sqlProgress); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("store prepare progress: %w", err)
+	}
+	if s.stmtCompleted, err = db.Prepare(sqlProgressCompleted); err != nil {
+		s.stmtProgress.Close()
+		db.Close()
+		return nil, fmt.Errorf("store prepare completed: %w", err)
 	}
 	return s, nil
 }
@@ -216,6 +255,7 @@ func (s *Store) migrate() error {
 		support_range   INTEGER NOT NULL DEFAULT 0,
 		is_allocated    INTEGER NOT NULL DEFAULT 0,
 		chunk_count     INTEGER NOT NULL DEFAULT 4,
+		min_chunk_size  INTEGER NOT NULL DEFAULT 1048576,
 		chunk_progress  TEXT NOT NULL DEFAULT '[]',
 		status          TEXT NOT NULL DEFAULT 'Pending',
 		auth_data       TEXT NOT NULL DEFAULT '{}',
@@ -233,11 +273,20 @@ CREATE TABLE IF NOT EXISTS settings (
 	ftp_passive         INTEGER NOT NULL DEFAULT 1,
 	prealloc            INTEGER NOT NULL DEFAULT 1,
 	max_concurrent      INTEGER NOT NULL DEFAULT 0
-);`
+);
+-- 索引与 ListTasks 的筛选/排序形状对齐（见 TaskSort.orderByClause）：
+-- status 服务侧边栏筛选，另外两条让默认排序与文件名排序免于全表排序。
+CREATE INDEX IF NOT EXISTS idx_tasks_status       ON tasks(status);
+CREATE INDEX IF NOT EXISTS idx_tasks_created      ON tasks(created_at DESC, id ASC);
+CREATE INDEX IF NOT EXISTS idx_tasks_save_path    ON tasks(save_path ASC, id ASC);
+`
 	if _, err := s.db.Exec(ddl); err != nil {
 		return err
 	}
 	// 幂等的列迁移：向已存在的 tasks 表新增列，且不丢数据。
+	if err := s.addColumnIfMissing("tasks", "min_chunk_size", "INTEGER NOT NULL DEFAULT 1048576"); err != nil {
+		return err
+	}
 	if err := s.addColumnIfMissing("tasks", "chunk_ranges", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
@@ -264,23 +313,43 @@ CREATE TABLE IF NOT EXISTS settings (
 	}
 	return nil
 }
-// modernc.org/sqlite 通过 PRAGMA 暴露 table_info。
-func (s *Store) addColumnIfMissing(table, col, decl string) error {
+
+// columnExists 报告 table 是否已有 col 列。
+//
+// 注意：必须在返回前关闭 rows。曾经这里直接在 rows 未关闭的情况下返回，
+// 导致一条连接连同其读语句被永久 pin 住——后果是 WAL 无法 checkpoint
+// （实测 WAL 增长到 27MB 且不回收）且 Store.Close() 之后数据库文件仍被
+// 占用（Windows 上表现为文件无法删除）。
+func (s *Store) columnExists(table, col string) (bool, error) {
 	rows, err := s.db.Query(`PRAGMA table_info(` + table + `)`)
 	if err != nil {
-		return err
+		return false, err
 	}
+	defer rows.Close()
 	for rows.Next() {
 		var cid int
 		var name, ctype string
 		var notnull, pk int
 		var dflt sql.NullString
 		if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk); err != nil {
-			return err
+			return false, err
 		}
 		if name == col {
-			return nil
+			return true, nil
 		}
+	}
+	return false, rows.Err()
+}
+
+// addColumnIfMissing 是幂等的列迁移：列已存在时不做任何事。
+// 先关闭探测用的 rows 再执行 ALTER，避免在同一连接上嵌套语句。
+func (s *Store) addColumnIfMissing(table, col, decl string) error {
+	found, err := s.columnExists(table, col)
+	if err != nil {
+		return fmt.Errorf("inspect %s: %w", table, err)
+	}
+	if found {
+		return nil
 	}
 	if _, err := s.db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + col + ` ` + decl); err != nil {
 		return fmt.Errorf("alter %s add %s: %w", table, col, err)
@@ -289,7 +358,15 @@ func (s *Store) addColumnIfMissing(table, col, decl string) error {
 }
 
 // Close 释放数据库句柄。engine 在关闭时应通过 defer 调用。
-func (s *Store) Close() error { return s.db.Close() }
+func (s *Store) Close() error {
+	if s.stmtProgress != nil {
+		_ = s.stmtProgress.Close()
+	}
+	if s.stmtCompleted != nil {
+		_ = s.stmtCompleted.Close()
+	}
+	return s.db.Close()
+}
 
 // CreateTask 插入一条新的任务记录。返回插入后的 Task（CreatedAt/UpdatedAt 已填充）或错误。
 func (s *Store) CreateTask(t *Task) error {
@@ -312,11 +389,12 @@ func (s *Store) CreateTask(t *Task) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO tasks (
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		is_allocated,chunk_count,chunk_progress,chunk_ranges,status,
+		is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
 		auth_data,error_message,created_at,updated_at,completed_at
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		t.ID, t.URL, t.SavePath, t.Protocol, t.TotalSize, t.Downloaded,
 		boolToInt(t.SupportRange), boolToInt(t.IsAllocated), t.ChunkCount,
+		t.MinChunkSize,
 		string(cpJSON), string(rgJSON), string(t.Status), t.AuthData,
 		t.ErrorMessage, t.CreatedAt, t.UpdatedAt, nil,
 	)
@@ -326,31 +404,91 @@ func (s *Store) CreateTask(t *Task) error {
 	return nil
 }
 
+// ProgressUpdate 是一次进度刷盘的内容。
+type ProgressUpdate struct {
+	ID            string
+	Downloaded    int64
+	ChunkProgress []int64
+	Status        Status
+	ErrMsg        string
+}
+
+// progressArgs 把一次进度更新编码为 SQL 参数。
+func progressArgs(u ProgressUpdate, now time.Time) ([]any, error) {
+	if u.ChunkProgress == nil {
+		u.ChunkProgress = []int64{}
+	}
+	cpJSON, err := json.Marshal(u.ChunkProgress)
+	if err != nil {
+		return nil, fmt.Errorf("store marshal chunk progress: %w", err)
+	}
+	args := []any{u.Downloaded, string(cpJSON), string(u.Status), u.ErrMsg, now}
+	if u.Status == _completed {
+		args = append(args, now, u.ID)
+	} else {
+		args = append(args, u.ID)
+	}
+	return args, nil
+}
+
+// writeProgress 用 prepared statement 写一条进度（单条路径）。
+func (s *Store) writeProgress(u ProgressUpdate, now time.Time) error {
+	args, err := progressArgs(u, now)
+	if err != nil {
+		return err
+	}
+	var stmt *sql.Stmt
+	if u.Status == _completed {
+		stmt = s.stmtCompleted
+	} else {
+		stmt = s.stmtProgress
+	}
+	_, err = stmt.Exec(args...)
+	return err
+}
+
 // UpdateTaskProgress 是 engine 使用的高频刷盘路径。仅更新易变列
 // （downloaded、chunk_progress、status）。当状态变为 Completed 时，
 // 自动写入 completed_at；其余情况保持原值。
 func (s *Store) UpdateTaskProgress(id string, downloaded int64, chunkProgress []int64, status Status, errMsg string) error {
-	if chunkProgress == nil {
-		chunkProgress = []int64{}
-	}
-	cpJSON, _ := json.Marshal(chunkProgress)
+	u := ProgressUpdate{ID: id, Downloaded: downloaded, ChunkProgress: chunkProgress, Status: status, ErrMsg: errMsg}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	now := time.Now().UTC()
-	if status == _completed {
-		_, err := s.db.Exec(`UPDATE tasks SET
-			downloaded=?, chunk_progress=?, status=?, error_message=?, updated_at=?,
-			completed_at=COALESCE(completed_at, ?)
-		WHERE id=?`,
-			downloaded, string(cpJSON), string(status), errMsg, now, now, id)
-		return err
-	}
-	_, err := s.db.Exec(`UPDATE tasks SET
-		downloaded=?, chunk_progress=?, status=?, error_message=?, updated_at=?
-		WHERE id=?`,
-		downloaded, string(cpJSON), string(status), errMsg, now, id)
-	return err
+	return s.writeProgress(u, time.Now().UTC())
 }
+
+// UpdateTasksProgress 在一个事务里批量落盘多条进度。
+// scheduler 的 2 秒 tick 用它把本周期所有 dirty 任务合并为一次提交，
+// 取代逐任务一次 Exec/一次提交的写法。
+func (s *Store) UpdateTasksProgress(updates []ProgressUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("store begin: %w", err)
+	}
+	now := time.Now().UTC()
+	for _, u := range updates {
+		args, aerr := progressArgs(u, now)
+		if aerr != nil {
+			_ = tx.Rollback()
+			return aerr
+		}
+		query := sqlProgress
+		if u.Status == _completed {
+			query = sqlProgressCompleted
+		}
+		if _, err := tx.Exec(query, args...); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 // UpdateTaskMeta 在 Probe 完成后更新非易变字段。
 func (s *Store) UpdateTaskMeta(id string, totalSize int64, supportRange, isAllocated bool, chunkCount int) error {
 	s.mu.Lock()
@@ -367,7 +505,7 @@ func (s *Store) UpdateTaskMeta(id string, totalSize int64, supportRange, isAlloc
 func (s *Store) GetTask(id string) (*Task, error) {
 	row := s.db.QueryRow(`SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		is_allocated,chunk_count,chunk_progress,chunk_ranges,status,
+		is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
 		auth_data,error_message,created_at,updated_at,completed_at
 		FROM tasks WHERE id=?`, id)
 	return scanTask(row)
@@ -380,7 +518,7 @@ func (s *Store) ListTasks(filter StatusFilter, sort TaskSort) ([]*Task, error) {
 	statusVal, useWhere := filter.filterStatus()
 	query := `SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		is_allocated,chunk_count,chunk_progress,chunk_ranges,status,
+		is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
 		auth_data,error_message,created_at,updated_at,completed_at
 		FROM tasks`
 	if useWhere {
@@ -466,7 +604,7 @@ func scanTask(s scanner) (*Task, error) {
 		completedAtNS sql.NullTime
 	)
 	err := s.Scan(&t.ID, &t.URL, &t.SavePath, &t.Protocol, &total, &dwn,
-		&support, &alloc, &t.ChunkCount, &cp, &rg, &t.Status, &t.AuthData,
+		&support, &alloc, &t.ChunkCount, &t.MinChunkSize, &cp, &rg, &t.Status, &t.AuthData,
 		&t.ErrorMessage, &t.CreatedAt, &t.UpdatedAt, &completedAtNS)
 	if err != nil {
 		return nil, err
@@ -488,6 +626,7 @@ func scanTask(s scanner) (*Task, error) {
 	}
 	return &t, nil
 }
+
 type Settings struct {
 	DefaultSaveDir string
 	DefaultThreads int
@@ -497,11 +636,10 @@ type Settings struct {
 	FTPPassive     bool
 	Prealloc       bool
 	TaskSort       TaskSort // 任务列表排序方式
-	ProxyMode protocol.ProxyMode
-
+	ProxyMode      protocol.ProxyMode
 
 	// ProxyURL 是 Manual 模式下使用的代理地址；其他模式忽略。
-	ProxyURL string
+	ProxyURL    string
 	ProxyBypass string
 
 	// LightMode 为 true 时，关闭主窗口会同时销毁窗口内的 widget 树，
@@ -527,6 +665,7 @@ func (s Settings) EffectiveMaxConcurrent() int {
 	}
 	return s.MaxConcurrent
 }
+
 // 则插入一条全零的记录（由调用方负责套用默认值），
 // 并返回零值的 Settings。
 func (s *Store) LoadSettings() (Settings, error) {
@@ -596,6 +735,7 @@ func (s *Store) LoadSettings() (Settings, error) {
 		MaxConcurrent: maxConc,
 	}, nil
 }
+
 // SaveSettings upsert 已持久化的 settings 行。
 func (s *Store) SaveSettings(s2 Settings) error {
 	s.mu.Lock()

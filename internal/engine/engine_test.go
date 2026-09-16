@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,7 +24,6 @@ import (
 	"lgo_download_manager/internal/prealloc"
 	"lgo_download_manager/internal/protocol"
 )
-
 
 // ---------------------------------------------------------------------------
 // makeJob 构造一个 *Job 用于 plan() 逻辑验证。
@@ -161,11 +161,11 @@ func TestPlanChunkSizesOverride(t *testing.T) {
 // 按 ChunkCount 等分，忽略 MinChunkSize。
 func TestPlanFileBetweenOneMiBAndMinChunkSize(t *testing.T) {
 	tests := []struct {
-		name               string
-		total, minChunk    int64
-		chunkCount         int
-		wantChunks         int
-		wantStepOrSize     int64 // 验证每个 chunk 大致相等（允许首尾差 ±1）
+		name            string
+		total, minChunk int64
+		chunkCount      int
+		wantChunks      int
+		wantStepOrSize  int64 // 验证每个 chunk 大致相等（允许首尾差 ±1）
 	}{
 		{
 			name: "2MiB_min8MiB_chunk4", total: 2 * oneMiB, minChunk: 8 * oneMiB, chunkCount: 4,
@@ -215,12 +215,12 @@ func TestPlanFileBetweenOneMiBAndMinChunkSize(t *testing.T) {
 // 回退为 1 个 chunk。
 func TestPlanFileBetweenOneMiBAndMinChunkSize_ChunkCountZero(t *testing.T) {
 	// 3 MiB 文件，MinChunkSize=8 MiB，ChunkCount=0 → 回退为 1 chunk
-	job := makeJob(3*oneMiB, Options{MinChunkSize: 8*oneMiB, ChunkCount: -1})
+	job := makeJob(3*oneMiB, Options{MinChunkSize: 8 * oneMiB, ChunkCount: -1})
 	cs := chunksOf(job)
 	if len(cs) != 1 {
 		if len(cs) != 4 {
-		t.Errorf("got %d chunks, want 4 (3MiB/4 chunks)", len(cs))
-	}
+			t.Errorf("got %d chunks, want 4 (3MiB/4 chunks)", len(cs))
+		}
 	}
 	if cs[0].Start != 0 || cs[0].End != 3*oneMiB-1 {
 	}
@@ -477,14 +477,23 @@ func TestChunkedDownload(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	var progressCalls atomic.Int32
-	var lastProg Progress
+	// 进度回调可能被多个分片 goroutine 并发触发：用互斥保护，并断言
+	// 「观测到的最大字节数」达到文件大小（不依赖回调顺序）。
+	var (
+		progressCalls atomic.Int32
+		progMu        sync.Mutex
+		lastProg      Progress
+	)
 	job := NewJob(driver, int64(size), dest, Options{
 		ChunkCount:    8,
 		ProgressEvery: 50 * time.Millisecond,
 		Progress: func(p Progress) {
 			progressCalls.Add(1)
-			lastProg = p
+			progMu.Lock()
+			if p.DownloadedBytes >= lastProg.DownloadedBytes {
+				lastProg = p
+			}
+			progMu.Unlock()
 		},
 	})
 
@@ -508,8 +517,11 @@ func TestChunkedDownload(t *testing.T) {
 	if progressCalls.Load() == 0 {
 		t.Fatalf("progress never fired")
 	}
-	if lastProg.DownloadedBytes != size {
-		t.Fatalf("last progress DownloadedBytes=%d, want %d", lastProg.DownloadedBytes, size)
+	progMu.Lock()
+	gotBytes := lastProg.DownloadedBytes
+	progMu.Unlock()
+	if gotBytes != size {
+		t.Fatalf("last progress DownloadedBytes=%d, want %d", gotBytes, size)
 	}
 }
 
@@ -765,14 +777,22 @@ func TestRealDownload(t *testing.T) {
 	// 给下载最多 2 分钟——某些镜像源连接较慢。
 	defer cancel()
 
-	var progressCalls atomic.Int32
-	var lastProg Progress
+	// 同 TestChunkedDownload：并发回调下用互斥 + 最大值断言。
+	var (
+		progressCalls atomic.Int32
+		progMu        sync.Mutex
+		lastProg      Progress
+	)
 	job := NewJob(driver, totalSize, dest, Options{
 		ChunkCount:    4,
 		ProgressEvery: 1 * time.Second,
 		Progress: func(p Progress) {
 			progressCalls.Add(1)
-			lastProg = p
+			progMu.Lock()
+			if p.DownloadedBytes >= lastProg.DownloadedBytes {
+				lastProg = p
+			}
+			progMu.Unlock()
 		},
 	})
 
@@ -793,8 +813,11 @@ func TestRealDownload(t *testing.T) {
 	if progressCalls.Load() == 0 {
 		t.Fatal("progress never fired")
 	}
-	if lastProg.DownloadedBytes != totalSize {
-		t.Fatalf("last progress DownloadedBytes=%d want %d", lastProg.DownloadedBytes, totalSize)
+	progMu.Lock()
+	gotBytes := lastProg.DownloadedBytes
+	progMu.Unlock()
+	if gotBytes != totalSize {
+		t.Fatalf("last progress DownloadedBytes=%d want %d", gotBytes, totalSize)
 	}
 }
 

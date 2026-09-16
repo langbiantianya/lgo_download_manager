@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"lgo_download_manager/internal/engine"
@@ -28,6 +29,10 @@ import (
 )
 
 const FlushInterval = 2 * time.Second
+
+// stopWait 是 Cancel/Delete 等待引擎写者停止的上限。超过后仍继续执行
+// （删除文件/写字终态），因为继续等待会让 UI 卡住。
+const stopWait = 5 * time.Second
 
 // Scheduler 是面向用户的下载编排器。
 type Scheduler struct {
@@ -51,30 +56,83 @@ type Scheduler struct {
 }
 
 type runningJob struct {
-	task         *store.Task
-	cancel       context.CancelFunc
-	// prepareCancel 用于在 Start 预留 slot 之后、engine goroutine 启动之前
-	// 的「准备阶段」（probe / 预分配）取消任务。该阶段 rj.cancel 仍为 nil，
-	// 因此 Pause/PauseAll/Cancel/Delete 必须同时调用 prepareCancel,否则
-	// 准备中的任务无法被中止,只能等其跑完探测后变成 Downloading 才能停。
+	task *store.Task
+	// cancel 取消 engine 的运行上下文；prepareCancel 用于在 Start 预留 slot
+	// 之后、engine goroutine 启动之前的「准备阶段」（probe / 预分配）取消
+	// 任务。该阶段 cancel 仍为 nil，因此 Pause/PauseAll/Cancel/Delete 必须
+	// 同时调用 prepareCancel，否则准备中的任务无法被中止，只能等其跑完
+	// 探测后变成 Downloading 才能停。
 	prepareCtx    context.Context
 	prepareCancel context.CancelFunc
-	job          *engine.Job
-	dirty        bool       // 需要刷新
-	dirtyMu      sync.Mutex // 保护 dirty、progressToFlush 和 statusToFlush
-	stopped      bool
+	cancel        context.CancelFunc
+	job           *engine.Job
+
+	// dirtyMu 保护 task 的易变字段（Downloaded/ChunkProgress/Status/
+	// ErrorMessage/ChunkRanges）以及 dirty/status/lastSnapshot。
+	// 访问这些字段的三条路径——engine 的进度回调、2 秒刷盘 ticker、
+	// Pause/Fail/Complete 收尾——都必须持锁。
+	//
+	// 锁序：持 dirtyMu 时禁止调用 engine 的任何方法（engine.Chunks() 会取
+	// engine 自己的 mu，而 engine 回调 OnPlanChanged/Progress 时会反过来取
+	// dirtyMu，形成 ABBA 死锁）。因此所有 Chunks() 调用都在加锁之前完成。
+	dirtyMu      sync.Mutex
+	dirty        bool
+	status       store.Status
 	lastSnapshot engine.Progress // 用于追赶式刷新
 
-	status          store.Status
-	progressToFlush engine.Progress
-	errMsg          string
+	// sess 是任务级会话：engine goroutine 彻底退出（槽位已释放、终态已
+	// 落盘、文件句柄已关闭）后关闭其 done，Cancel/Delete 借此等待写者
+	// 停止后再删文件/写终态。Start 预留的占位符与之后替换进来的
+	// runningJob 共享同一个 sess。
+	sess *jobSession
+}
+
+// jobSession 是任务级生命周期信号，由 runningJob 共享。
+type jobSession struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func newJobSession() *jobSession { return &jobSession{done: make(chan struct{})} }
+
+// finish 关闭 done，多次调用只生效一次。
+func (js *jobSession) finish() {
+	if js == nil {
+		return
+	}
+	js.once.Do(func() { close(js.done) })
+}
+
+// setError 记录失败原因，供 markStatusFromJob 落盘。
+func (rj *runningJob) setError(err error) {
+	if rj == nil || rj.task == nil || err == nil {
+		return
+	}
+	rj.dirtyMu.Lock()
+	rj.task.ErrorMessage = err.Error()
+	rj.dirtyMu.Unlock()
+}
+
+// chunkProgressFrom 把引擎快照换算成「相对分片起点的偏移」数组。
+func chunkProgressFrom(cs []engine.ChunkSnapshot) []int64 {
+	if len(cs) == 0 {
+		return nil
+	}
+	out := make([]int64, len(cs))
+	for i, c := range cs {
+		out[i] = c.Progress - c.Start
+		if out[i] < 0 {
+			out[i] = 0
+		}
+	}
+	return out
 }
 
 // New 构造一个由给定 Store 支撑的 Scheduler。
 func New(s *store.Store) *Scheduler {
 	return &Scheduler{
 		st:            s,
-		jobs:   map[string]*runningJob{},
+		jobs:          map[string]*runningJob{},
 		maxConcurrent: store.DefaultMaxConcurrent,
 	}
 }
@@ -96,44 +154,33 @@ func (s *Scheduler) SetMaxConcurrent(n int) {
 // 按 FIFO 顺序提升到 Downloading,直到达到 MaxConcurrent 上限或没有
 // 候选任务为止。每个候选走一次 Start——Start 内部仍受并发上限保护,
 // 因此本方法在并发调用下也是安全的。
+//
+// 候选集合由 SQL 层按 status 过滤后一次取回（此前是每个候选做一次
+// 全表 ListTasks，在历史任务多时是 O(N²) 的扫描 + JSON 解码）。
 func (s *Scheduler) promotePending() {
-	for {
+	s.mu.Lock()
+	limit := s.maxConcurrent
+	s.mu.Unlock()
+
+	pending, err := s.st.ListTasks(store.FilterPending, store.SortCreatedAsc)
+	if err != nil {
+		return
+	}
+	for _, tk := range pending {
 		s.mu.Lock()
-		cap := s.maxConcurrent
-		active := len(s.jobs)
+		_, busy := s.jobs[tk.ID]
+		full := len(s.jobs) >= limit
 		s.mu.Unlock()
-		if active >= cap {
+		if full {
 			return
 		}
-		// 取最早一个没有 slot 的 Pending 任务。status=Pending + jobs map
-		// 中不存在 = 候选。
-		pending, err := s.st.ListTasks("", store.SortCreatedAsc)
-		if err != nil {
-			return
+		if busy {
+			continue
 		}
-		var picked string
-		for _, tk := range pending {
-			if tk.Status != store.TaskStatus.Pending {
-				continue
-			}
-			s.mu.Lock()
-			_, busy := s.jobs[tk.ID]
-			s.mu.Unlock()
-			if busy {
-				continue
-			}
-			picked = tk.ID
-			break
+		// Start 自身会再次核对 cap；单个候选失败不阻断其余候选。
+		if err := s.Start(tk.ID); err != nil {
+			continue
 		}
-		if picked == "" {
-			return
-		}
-		// Start 自身会再次核对 cap,这里只是按 FIFO 顺序给候选一个机会。
-		if err := s.Start(picked); err != nil {
-			return
-		}
-		// Start 在没有抢到 slot 时返回 nil(静默排队);但只要它真正启动,
-		// 就会让 len(s.jobs) 增加,下一次循环自然判定 active>=cap。
 	}
 }
 
@@ -202,6 +249,13 @@ func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 // 由于探测在后台 goroutine 中进行,调用方可以在 UI 线程上安全地调用 Start:
 // 不可达的服务器或超大的文件预分配都不会阻塞 UI。
 func (s *Scheduler) Start(taskID string) error {
+	// 先读任务（SQLite 查询 + JSON 解码）再取锁：不能持 s.mu 做 I/O，
+	// 否则忙时（busy_timeout 最长 5s）整个调度器都会被卡住。
+	tk0, err := s.st.GetTask(taskID)
+	if err != nil {
+		return fmt.Errorf("scheduler: %w", err)
+	}
+
 	s.mu.Lock()
 	if _, ok := s.jobs[taskID]; ok {
 		s.mu.Unlock()
@@ -210,11 +264,6 @@ func (s *Scheduler) Start(taskID string) error {
 	// 并发上限检查:任务已经在引擎中跑时直接放行;Pending 任务
 	// (新加入的)若当前 slots 已满,留在 Pending 不报错——调用方
 	// (UI 对话框)无需特殊处理,等待 promotePending 自然提升即可。
-	tk0, err := s.st.GetTask(taskID)
-	if err != nil {
-		s.mu.Unlock()
-		return fmt.Errorf("scheduler: %w", err)
-	}
 	if tk0.Status == store.TaskStatus.Pending && len(s.jobs) >= s.maxConcurrent {
 		s.mu.Unlock()
 		// 静默排队:不分配 slot、不增 wg;后续有任务完成时由
@@ -228,6 +277,7 @@ func (s *Scheduler) Start(taskID string) error {
 	s.jobs[taskID] = &runningJob{
 		prepareCtx:    prepareCtx,
 		prepareCancel: prepareCancel,
+		sess:          newJobSession(),
 	}
 	s.wg.Add(1)
 	s.mu.Unlock()
@@ -263,9 +313,21 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	rj := s.jobs[taskID]
 	s.mu.Unlock()
 	prepareCtx := context.Background()
+	var sess *jobSession
 	if rj != nil && rj.prepareCtx != nil {
 		prepareCtx = rj.prepareCtx
 	}
+	if rj != nil {
+		sess = rj.sess
+	}
+	// 准备阶段结束时若还没有把 session 交给 engine goroutine，就由这里
+	// 关闭它：否则等待 sess.done 的 Cancel/Delete 会一直阻塞到超时。
+	handedOver := false
+	defer func() {
+		if !handedOver {
+			sess.finish()
+		}
+	}()
 	// 若 startAsync 一进入就已被取消（例如 Pause 在 Start 返回后立刻触发），
 	// 直接走「准备阶段被取消」的快速路径，避免无谓的 probe。
 	if s.prepareCancelled(taskID) {
@@ -273,7 +335,15 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		return
 	}
 	auth := decodeAuth(tk.AuthData)
-	driver, err := protocol.New(tk.URL, protocol.ProtocolKind(tk.Protocol), protocol.Auth{AuthOptions: auth})
+	kind := protocol.ProtocolKind(tk.Protocol)
+	if kind == "" {
+		// 兼容历史数据：早期通过 lgom:// 添加的任务 protocol 落库为空串，
+		// 直接用空 kind 调 protocol.New 会得到 "no driver for kind="。
+		if detected, derr := protocol.DetectKind(tk.URL, ""); derr == nil {
+			kind = detected
+		}
+	}
+	driver, err := protocol.New(tk.URL, kind, protocol.Auth{AuthOptions: auth})
 	if err != nil {
 		s.fail(tk, err)
 		s.releaseSlot(taskID)
@@ -294,7 +364,7 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		s.releaseSlot(taskID)
 		return
 	}
-// 准备阶段失败统一经过 fail()/releaseSlot,此处继续走预分配/启动 engine 流程。
+	// 准备阶段失败统一经过 fail()/releaseSlot,此处继续走预分配/启动 engine 流程。
 	if caps.TotalSize > 0 {
 		if err := s.st.UpdateTaskMeta(tk.ID, caps.TotalSize, caps.SupportRange, tk.IsAllocated, tk.ChunkCount); err != nil {
 			_ = driver.Close()
@@ -330,13 +400,13 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		tk.IsAllocated = true
 		// 重新打开供 engine 使用(文件已具有正确大小)。
 		dest.Close()
-}
-if s.prepareCancelled(taskID) {
-	_ = driver.Close()
-	s.abortPrepare(taskID, tk)
-	return
-}
-dest, err := os.OpenFile(tk.SavePath, os.O_RDWR, 0o644)
+	}
+	if s.prepareCancelled(taskID) {
+		_ = driver.Close()
+		s.abortPrepare(taskID, tk)
+		return
+	}
+	dest, err := os.OpenFile(tk.SavePath, os.O_RDWR, 0o644)
 	if err != nil {
 		_ = driver.Close()
 		s.fail(tk, err)
@@ -357,7 +427,11 @@ dest, err := os.OpenFile(tk.SavePath, os.O_RDWR, 0o644)
 		},
 		TaskID: tk.ID,
 		OnPlanChanged: func(ranges []int64) {
+			// engine 保证在调用本回调时不持有自己的锁（见 engine.Run 契约），
+			// 因此这里可以取 dirtyMu 安全更新共享任务快照。
+			rj.dirtyMu.Lock()
 			tk.ChunkRanges = ranges
+			rj.dirtyMu.Unlock()
 			if err := s.st.UpdateTaskChunkRanges(tk.ID, ranges); err != nil {
 				log.Printf("scheduler: persist chunk ranges: %v", err)
 			}
@@ -371,47 +445,69 @@ dest, err := os.OpenFile(tk.SavePath, os.O_RDWR, 0o644)
 	for _, c := range cs {
 		ranges = append(ranges, c.Start, c.End)
 	}
+	rj.dirtyMu.Lock()
 	tk.ChunkRanges = ranges
+	rj.dirtyMu.Unlock()
 	if err := s.st.UpdateTaskChunkRanges(tk.ID, ranges); err != nil {
 		log.Printf("scheduler: persist chunk ranges: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	newRJ := &runningJob{
-		task:   tk,
-		cancel: cancel,
-		job:    job,
-		status: store.TaskStatus.Downloading,
-	}
+
+	// 复用 Start 预留的那个 runningJob（而不是新建一个替换掉它）：
+	// 这样 sess 与 job/cancel 都挂在同一个对象上，Cancel/Delete 无论
+	// 抓到的是哪个阶段的对象都能等到引擎真正退出。
 	s.mu.Lock()
-	// 替换之前 Start 预留的空 slot。
-	s.jobs[tk.ID] = newRJ
+	if _, alive := s.jobs[tk.ID]; !alive {
+		// 已被 Pause/Cancel/Delete 摘掉槽位：不要启动 engine。
+		s.mu.Unlock()
+		cancel()
+		_ = job.Close()
+		_ = dest.Close()
+		return
+	}
+	rj.task = tk
+	rj.cancel = cancel
+	rj.job = job
 	s.mu.Unlock()
+
+	rj.dirtyMu.Lock()
+	rj.status = store.TaskStatus.Downloading
+	tk.Status = store.TaskStatus.Downloading
+	startedSnapshot := tk.Clone()
+	rj.dirtyMu.Unlock()
 
 	if err := s.st.UpdateTaskProgress(tk.ID, sumInts(tk.ChunkProgress), tk.ChunkProgress, store.TaskStatus.Downloading, ""); err != nil {
 		// 非致命错误——稍后的批量刷新会追赶上来。
 	}
-	s.publish(Event{Why: "started", Task: tk.Clone()})
+	s.publish(Event{Why: "started", Task: startedSnapshot})
 
 	// 在 goroutine 内同步运行 job;该 goroutine 会一直存活到
-	// 任务完成或被取消。
+	// 任务完成或被取消。session 的关闭责任随之移交给它。
+	handedOver = true
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
 		// rjRef 在整个 goroutine 生命周期内持有运行中 job 的引用,
 		// 以便状态/收尾调用能读取最新的 ChunkProgress。
-		rjRef := newRJ
+		rjRef := rj
 		defer func() {
 			// 退出时进行清理(reap)。
 			s.mu.Lock()
 			delete(s.jobs, tk.ID)
 			s.mu.Unlock()
 			_ = dest.Close()
+			// 引擎已停止写文件、终态已落盘 —— 现在再放行等待中的
+			// Cancel/Delete（它们会删文件并写 Failed）。
+			rjRef.sess.finish()
 			// 引擎正常完成/失败/取消后都要尝试把排队的 Pending 提升上来。
 			s.promotePending()
 		}()
 		err := job.Run(ctx, caps.SupportRange && caps.TotalSize > 0)
 		if err != nil && ctx.Err() == nil {
-			s.fail(tk, err)
+			// 失败路径同样使用引擎的权威 chunk 偏移，避免把进度写成
+			// 快照里的旧值（表现为进度“回退”）。
+			rjRef.setError(err)
+			s.markStatusFromJob(tk.ID, store.TaskStatus.Failed, rjRef)
 			return
 		}
 		if ctx.Err() != nil {
@@ -464,18 +560,23 @@ func (s *Scheduler) PauseAll(ctx context.Context) error {
 	s.mu.Unlock()
 
 	for _, rj := range jobs {
-		if rj.prepareCancel != nil {
-			rj.prepareCancel()
-		}
-		if rj.cancel != nil {
-			rj.cancel()
-		}
+		stopJob(rj)
 	}
 
 	done := make(chan struct{})
 	go func() {
-		s.wg.Wait()
-		close(done)
+		waited := make(chan struct{})
+		go func() {
+			s.wg.Wait()
+			close(waited)
+		}()
+		// 同时监听 ctx：否则超时返回后这个 goroutine 会一直挂在
+		// wg.Wait() 上（每个超时一次泄漏）。
+		select {
+		case <-waited:
+			close(done)
+		case <-ctx.Done():
+		}
 	}()
 	select {
 	case <-done:
@@ -484,12 +585,11 @@ func (s *Scheduler) PauseAll(ctx context.Context) error {
 		return ctx.Err()
 	}
 }
-func (s *Scheduler) Pause(taskID string) error {
-	s.mu.Lock()
-	rj, ok := s.jobs[taskID]
-	s.mu.Unlock()
-	if !ok {
-		return errors.New("scheduler: task not running")
+
+// stopJob 取消一个 job 的两个上下文（准备阶段与 engine 阶段）。
+func stopJob(rj *runningJob) {
+	if rj == nil {
+		return
 	}
 	if rj.prepareCancel != nil {
 		rj.prepareCancel()
@@ -497,22 +597,48 @@ func (s *Scheduler) Pause(taskID string) error {
 	if rj.cancel != nil {
 		rj.cancel()
 	}
+}
+
+// waitStopped 等待 job 的写者真正停止（引擎退出、文件句柄已关闭、
+// 终态已落盘）。ctx 到期即返回 false，调用方据此继续但需容忍竞争。
+func waitStopped(ctx context.Context, rj *runningJob) bool {
+	if rj == nil || rj.sess == nil {
+		return true
+	}
+	select {
+	case <-rj.sess.done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Scheduler) Pause(taskID string) error {
+	s.mu.Lock()
+	rj, ok := s.jobs[taskID]
+	s.mu.Unlock()
+	if !ok {
+		return errors.New("scheduler: task not running")
+	}
+	stopJob(rj)
 	return nil
 }
 
 // Cancel 暂停任务并删除其部分文件。store 中的行会被保留,
 // status 置为 Failed,供事后查看。
+//
+// 必须先等引擎退出再删文件、写 Failed：否则引擎的收尾路径
+// (markStatusFromJob(Paused)) 会在其后覆盖这个 Failed，状态会在
+// Failed/Paused 之间翻转，同时删文件也会与写者竞争。
 func (s *Scheduler) Cancel(taskID string) error {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
 	s.mu.Unlock()
 	if ok {
-		if rj.prepareCancel != nil {
-			rj.prepareCancel()
-		}
-		if rj.cancel != nil {
-			rj.cancel()
-		}
+		stopJob(rj)
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), stopWait)
+		_ = waitStopped(waitCtx, rj)
+		cancelWait()
 	}
 	tk, err := s.st.GetTask(taskID)
 	if err != nil {
@@ -526,6 +652,7 @@ func (s *Scheduler) Cancel(taskID string) error {
 	}
 	return nil
 }
+
 // Delete 取消一个运行中的任务(若有),删除其部分文件,
 // 并从 store 中永久移除该行。
 func (s *Scheduler) Delete(taskID string) error {
@@ -533,12 +660,12 @@ func (s *Scheduler) Delete(taskID string) error {
 	rj, ok := s.jobs[taskID]
 	s.mu.Unlock()
 	if ok {
-		if rj.prepareCancel != nil {
-			rj.prepareCancel()
-		}
-		if rj.cancel != nil {
-			rj.cancel()
-		}
+		stopJob(rj)
+		// 与 Cancel 同理：等写者停止后再删文件/删行，避免引擎收尾
+		// 路径在行被删后仍去写状态。
+		waitCtx, cancelWait := context.WithTimeout(context.Background(), stopWait)
+		_ = waitStopped(waitCtx, rj)
+		cancelWait()
 	}
 	tk, err := s.st.GetTask(taskID)
 	if err == nil && tk != nil && tk.SavePath != "" {
@@ -556,6 +683,14 @@ func (s *Scheduler) List(filter store.StatusFilter, sort store.TaskSort) ([]*sto
 	return s.st.ListTasks(filter, sort)
 }
 
+// running 报告任务当前是否占着 slot（含准备阶段）。
+func (s *Scheduler) running(taskID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.jobs[taskID]
+	return ok
+}
+
 // ValidateFileExistence 检查所有已完成和下载中任务的文件是否存在，
 // 不存在则将状态更新为 FileLost。用于窗口重新聚焦时的文件完整性检查。
 func (s *Scheduler) ValidateFileExistence() {
@@ -570,8 +705,16 @@ func (s *Scheduler) ValidateFileExistence() {
 		if tk.SavePath == "" {
 			continue
 		}
+		// 正在下载的任务其文件必然存在（引擎持有句柄），不要因为
+		// 短时的 stat 失败（杀软扫描/占用）把它误判为 FileLost。
+		if s.running(tk.ID) {
+			continue
+		}
 		if _, err := os.Stat(tk.SavePath); os.IsNotExist(err) {
-			_ = s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.FileLost, "文件已丢失")
+			if err := s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.FileLost, "文件已丢失"); err != nil {
+				continue
+			}
+			tk.Status = store.TaskStatus.FileLost
 			s.publish(Event{Why: "updated", Task: tk})
 		}
 	}
@@ -579,6 +722,11 @@ func (s *Scheduler) ValidateFileExistence() {
 
 // ResetTask 将任务进度清零、状态重置为 Pending，用于文件丢失后重新下载。
 func (s *Scheduler) ResetTask(taskID string) error {
+	// 运行中的任务不能重置：否则引擎会继续为一行「Pending」的任务
+	// 推进进度（UI 上表现为状态与进度自相矛盾）。
+	if s.running(taskID) {
+		return errors.New("scheduler: task is running, pause it first")
+	}
 	tk, err := s.st.GetTask(taskID)
 	if err != nil {
 		return err
@@ -629,9 +777,13 @@ func (s *Scheduler) markProgress(taskID string, p engine.Progress) {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
 	s.mu.Unlock()
-	if !ok {
+	if !ok || rj == nil || rj.job == nil {
 		return
 	}
+	// 先取引擎的权威分片快照，再进 dirtyMu：锁序要求持 dirtyMu 时
+	// 不得调用引擎方法（engine.Chunks() 会取引擎自身的锁）。
+	cs := rj.job.Chunks()
+
 	rj.dirtyMu.Lock()
 	rj.dirty = true
 	rj.lastSnapshot = p
@@ -643,19 +795,12 @@ func (s *Scheduler) markProgress(taskID string, p engine.Progress) {
 	rj.task.Status = store.TaskStatus.Downloading
 	// 将 engine 的每个 chunk 偏移回写到 task,这样下次 flushAll
 	// 之前若发生快速 Pause,也能通过 rj.task 看到最新值。
-	cs := rj.job.Chunks()
-	if len(cs) > 0 {
-		cp := make([]int64, len(cs))
-		for i, c := range cs {
-			cp[i] = c.Progress - c.Start
-			if cp[i] < 0 {
-				cp[i] = 0
-			}
-		}
+	if cp := chunkProgressFrom(cs); cp != nil {
 		rj.task.ChunkProgress = cp
 	}
+	snapshot := rj.task.Clone()
 	rj.dirtyMu.Unlock()
-	s.publish(Event{Why: "progress", Task: rj.task.Clone(), SpeedBPS: p.SpeedBPS})
+	s.publish(Event{Why: "progress", Task: snapshot, SpeedBPS: p.SpeedBPS})
 }
 
 // markStatus(Paused/Completed/Failed)把最新的内存任务状态写入
@@ -670,19 +815,18 @@ func (s *Scheduler) markStatus(taskID string, st store.Status) error {
 	rj, hasRJ := s.jobs[taskID]
 	s.mu.Unlock()
 
+	var cs []engine.ChunkSnapshot
+	if hasRJ && rj != nil && rj.job != nil {
+		// 先取引擎快照（锁序：不得持 dirtyMu 调引擎）。
+		cs = rj.job.Chunks()
+	}
+
 	if hasRJ && rj != nil {
 		rj.dirtyMu.Lock()
 		downloaded = rj.task.Downloaded
 		// 优先使用 engine 的最新 chunk 偏移,而不是过时的任务快照。
-		cs := rj.job.Chunks()
-		if len(cs) > 0 {
-			chunkProg = make([]int64, len(cs))
-			for i, c := range cs {
-				chunkProg[i] = c.Progress - c.Start
-				if chunkProg[i] < 0 {
-					chunkProg[i] = 0
-				}
-			}
+		if progress := chunkProgressFrom(cs); progress != nil {
+			chunkProg = progress
 		} else {
 			chunkProg = append([]int64(nil), rj.task.ChunkProgress...)
 		}
@@ -715,17 +859,22 @@ func (s *Scheduler) markStatusFromJob(taskID string, st store.Status, rj *runnin
 		_ = s.markStatus(taskID, st)
 		return
 	}
+	// 先取引擎快照，再进 dirtyMu（锁序）。
+	var cs []engine.ChunkSnapshot
+	if rj.job != nil {
+		cs = rj.job.Chunks()
+	}
 	rj.dirtyMu.Lock()
-	cs := rj.job.Chunks()
-	progress := make([]int64, len(cs))
-	for i, c := range cs {
-		progress[i] = c.Progress - c.Start
-		if progress[i] < 0 {
-			progress[i] = 0
-		}
+	progress := chunkProgressFrom(cs)
+	if progress == nil {
+		progress = append([]int64(nil), rj.task.ChunkProgress...)
 	}
 	downloaded := rj.task.Downloaded
 	errMsg := rj.task.ErrorMessage
+	rj.task.Status = st
+	if errMsg != "" {
+		rj.task.ErrorMessage = errMsg
+	}
 	rj.dirtyMu.Unlock()
 
 	if err := s.st.UpdateTaskProgress(taskID, downloaded, progress, st, errMsg); err != nil {
@@ -748,26 +897,32 @@ func (s *Scheduler) completeFromEngine(taskID string, rj *runningJob) {
 		s.markStatus(taskID, store.TaskStatus.Completed)
 		return
 	}
-	cs := rj.job.Chunks()
-	progress := make([]int64, len(cs))
+	// 先取引擎快照，再进 dirtyMu（锁序）。
+	var cs []engine.ChunkSnapshot
+	if rj.job != nil {
+		cs = rj.job.Chunks()
+	}
+	progress := chunkProgressFrom(cs)
 	var total int64
-	for i, c := range cs {
-		progress[i] = c.Progress - c.Start
-		if progress[i] < 0 {
-			progress[i] = 0
-		}
-		total += progress[i]
+	for _, v := range progress {
+		total += v
 	}
 	if err := s.st.UpdateTaskProgress(taskID, total, progress, store.TaskStatus.Completed, ""); err != nil {
 		fmt.Fprintln(os.Stderr, "scheduler completeFromEngine:", err)
 	}
+	rj.dirtyMu.Lock()
 	rj.task.ChunkProgress = progress
 	rj.task.Downloaded = total
+	rj.task.Status = store.TaskStatus.Completed
+	rj.dirtyMu.Unlock()
 	if tk, err := s.st.GetTask(taskID); err == nil {
 		s.publish(Event{Why: "completed", Task: tk})
 	}
 }
 
+// fail 把任务标记为 Failed。仅用于「准备阶段」失败（探测/预分配/打开文件）：
+// 此时引擎尚未运行，直接使用 store 中的快照即可。
+// 引擎运行期间失败走 markStatusFromJob，以便落盘引擎权威的 chunk 偏移。
 func (s *Scheduler) fail(tk *store.Task, err error) {
 	if writeErr := s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.Failed, err.Error()); writeErr != nil {
 		fmt.Fprintln(os.Stderr, "scheduler fail:", writeErr)
@@ -835,6 +990,7 @@ func (s *Scheduler) IsPreparing(taskID string) bool {
 	}
 	return rj.cancel == nil && rj.prepareCancel != nil
 }
+
 // Run 启动批量刷新 goroutine。请在启动时调用一次;它会一直运行
 // 直到 ctx 被取消。
 func (s *Scheduler) Run(ctx context.Context) {
@@ -859,9 +1015,21 @@ func (s *Scheduler) flushAll() {
 	}
 	s.mu.Unlock()
 
+	type dirtyJob struct {
+		rj       *runningJob
+		update   store.ProgressUpdate
+		progress []int64
+	}
+	dirty := make([]dirtyJob, 0, len(jobs))
 	for _, rj := range jobs {
+		// 先取引擎快照（锁序：不得持 dirtyMu 调引擎）。
+		var cs []engine.ChunkSnapshot
+		if rj.job != nil {
+			cs = rj.job.Chunks()
+		}
+
 		rj.dirtyMu.Lock()
-		if !rj.dirty {
+		if !rj.dirty || rj.task == nil {
 			rj.dirtyMu.Unlock()
 			continue
 		}
@@ -869,25 +1037,45 @@ func (s *Scheduler) flushAll() {
 		status := rj.status
 		rj.dirty = false
 		rj.dirtyMu.Unlock()
-		// 将 chunk 快照映射回“相对于 chunk 起始的偏移”。
-		cs := rj.job.Chunks()
-		progress := make([]int64, len(cs))
-		for i, c := range cs {
-			progress[i] = c.Progress - c.Start
-			if progress[i] < 0 {
-				progress[i] = 0
-			}
+
+		progress := chunkProgressFrom(cs)
+		if progress == nil {
+			progress = []int64{}
 		}
-		if err := s.st.UpdateTaskProgress(rj.task.ID, p.DownloadedBytes, progress, status, ""); err != nil {
-			fmt.Fprintln(os.Stderr, "flush:", err)
-			// 标记为 dirty,以便下一个周期重试。
-			rj.dirtyMu.Lock()
-			rj.dirty = true
-			rj.dirtyMu.Unlock()
-			continue
+		dirty = append(dirty, dirtyJob{
+			rj:       rj,
+			progress: progress,
+			update: store.ProgressUpdate{
+				ID:            rj.task.ID,
+				Downloaded:    p.DownloadedBytes,
+				ChunkProgress: progress,
+				Status:        status,
+			},
+		})
+	}
+	if len(dirty) == 0 {
+		return
+	}
+	// 本周期所有 dirty 任务合并为一次事务提交。
+	updates := make([]store.ProgressUpdate, 0, len(dirty))
+	for _, d := range dirty {
+		updates = append(updates, d.update)
+	}
+	if err := s.st.UpdateTasksProgress(updates); err != nil {
+		fmt.Fprintln(os.Stderr, "flush:", err)
+		// 整批失败：全部标记回 dirty，下个周期重试。
+		for _, d := range dirty {
+			d.rj.dirtyMu.Lock()
+			d.rj.dirty = true
+			d.rj.dirtyMu.Unlock()
 		}
-		rj.task.ChunkProgress = progress
-		rj.task.Downloaded = p.DownloadedBytes
+		return
+	}
+	for _, d := range dirty {
+		d.rj.dirtyMu.Lock()
+		d.rj.task.ChunkProgress = d.progress
+		d.rj.task.Downloaded = d.update.Downloaded
+		d.rj.dirtyMu.Unlock()
 	}
 }
 
@@ -909,10 +1097,16 @@ func sumInts(xs []int64) int64 {
 	return s
 }
 
-// newID 基于毫秒级时间戳生成 ID,并附加一个小的随机后缀以保证
-// 快速连续添加时的唯一性。
+// idSeq 是进程内自增序号，用于消除同毫秒内的 ID 碰撞。
+var idSeq atomic.Uint64
+
+// newID 生成任务 ID。
+//
+// 只靠「毫秒 + pid」并不唯一：实测连续调用 500 次只得到 1 个不同值，
+// 而 id 是主键，同毫秒内加入的第二个任务会因 UNIQUE 约束插入失败并被
+// 上层丢弃（批量转发 URL 时可复现）。因此追加进程内自增序号。
 func newID() string {
-	return fmt.Sprintf("ts-%d-%d", time.Now().UnixMilli(), os.Getpid())
+	return fmt.Sprintf("ts-%d-%d-%d", time.Now().UnixMilli(), os.Getpid(), idSeq.Add(1))
 }
 
 // EnsureSaveDir 确保本地路径的父目录存在。由 UI 调用。

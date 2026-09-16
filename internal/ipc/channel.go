@@ -53,6 +53,39 @@ func (x *Conn) Send(m Message) error {
 	return err
 }
 
+// SendPayload 发送一条负载已序列化好的消息。它省掉了 Send 对整个信封的
+// 二次 marshal 与拷贝：信封在此组装（除类型名外不做任何转义/拷贝），
+// 与 4 字节长度前缀一起一次性写出整帧。
+//
+// 前提：payload 必须是合法 JSON 原始字节（无消息 ID 需求的消息）。调用方
+// 应传入 ipc.Encode/Reply 产出的 Data。
+//
+// 大小上限与线程安全语义与 Send 一致。线程安全。
+func (x *Conn) SendPayload(msgType string, payload []byte) error {
+	// 类型名用 json.Marshal 转义，避免 strconv.AppendQuote 的 Go 语法
+	// 转义（\xNN）在畸形类型名下产生非法 JSON。
+	quotedType, err := json.Marshal(msgType)
+	if err != nil {
+		return fmt.Errorf("ipc marshal type: %w", err)
+	}
+	// 前 4 字节先占位给长度前缀。
+	frame := make([]byte, 4, 4+len(quotedType)+len(payload)+8)
+	frame = append(frame, `{"type":`...)
+	frame = append(frame, quotedType...)
+	frame = append(frame, `,"data":`...)
+	frame = append(frame, payload...)
+	frame = append(frame, '}')
+	n := len(frame) - 4
+	if n > maxMessageBytes {
+		return fmt.Errorf("ipc message too large: %d bytes", n)
+	}
+	binary.BigEndian.PutUint32(frame[:4], uint32(n))
+	x.wmu.Lock()
+	defer x.wmu.Unlock()
+	_, err = x.c.Write(frame)
+	return err
+}
+
 // Recv 阻塞读取下一条消息。
 func (x *Conn) Recv() (Message, error) {
 	var header [4]byte

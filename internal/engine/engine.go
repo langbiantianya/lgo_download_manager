@@ -12,7 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
+	"math/rand/v2"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -32,13 +32,13 @@ type Progress struct {
 }
 
 type Options struct {
-	ChunkCount    int
-	ChunkSizes    []int64
-	ResumeFrom    []int64
-	MinChunkSize  int64
-	Progress      func(Progress)
-	ProgressEvery time.Duration
-	TaskID        string
+	ChunkCount            int
+	ChunkSizes            []int64
+	ResumeFrom            []int64
+	MinChunkSize          int64
+	Progress              func(Progress)
+	ProgressEvery         time.Duration
+	TaskID                string
 	OnChunkCountDecreased func(newCount int)
 	// OnPlanChanged 在引擎合并或重新规划其分片时触发
 	// (例如当服务器不支持字节区间时,引擎回退到单个流式分片)。
@@ -83,7 +83,6 @@ type Job struct {
 	log        Logger
 }
 
-
 const oneMiB = 1 << 20
 
 type chunk struct {
@@ -93,6 +92,11 @@ type chunk struct {
 	progress int64
 }
 
+// NewJob 构造一个分片下载任务。
+//
+// 所有权约定：dest 由调用方持有并负责 Close（调度器在引擎 goroutine 退出时
+// 关闭它）；Job.Close() 只关闭 driver。Run 只通过 WriteAt 写入 dest，
+// 因此 dest 必须支持随机写且已按 total 预分配。
 func NewJob(driver protocol.ProtocolDriver, total int64, dest *os.File, opts Options) *Job {
 	opts.defaults()
 	if opts.Logger == nil {
@@ -113,6 +117,11 @@ func NewJob(driver protocol.ProtocolDriver, total int64, dest *os.File, opts Opt
 func (j *Job) plan() {
 	j.mu.Lock()
 	defer j.mu.Unlock()
+	j.planLocked()
+}
+
+// planLocked 是 plan 的主体，调用方须持有 j.mu。
+func (j *Job) planLocked() {
 	j.chunks = nil
 
 	if len(j.opts.ChunkSizes) > 0 {
@@ -201,7 +210,79 @@ func (j *Job) plan() {
 	}
 }
 
+// resumedBytes 返回本次会话开始前磁盘上已有的字节数。plan() 已把
+// ResumeFrom 折算进每个分片的 progress，因此这里按「分片内已完成字节」
+// 求和即可——不能直接累加 ResumeFrom/ChunkSizes，否则在流式（total<=0）
+// 或显式分片场景下会把未落盘的字节也算进去。
+func (j *Job) resumedBytes() int64 {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	var n int64
+	for i := range j.chunks {
+		if d := j.chunks[i].progress - j.chunks[i].start; d > 0 {
+			n += d
+		}
+	}
+	return n
+}
+
+// chunkConcurrencyLimit 返回分片路径允许的最大并发（受配置与实际分片数限制）。
+func (j *Job) chunkConcurrencyLimit() int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	n := j.chunkCount
+	if n < 1 {
+		n = 1
+	}
+	if n > len(j.chunks) {
+		n = len(j.chunks)
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// unfinishedIndexes 返回当前计划中尚未完成的分片下标。
+func (j *Job) unfinishedIndexes() []int {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	out := make([]int, 0, len(j.chunks))
+	for i := range j.chunks {
+		if atomic.LoadInt64(&j.chunks[i].progress) <= j.chunks[i].end {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// replan 按每个分片已完成的偏移重新切分剩余区间，返回新的
+// [start0,end0,start1,end1,...]。必须在所有写者停止后调用（调用方保证）。
+func (j *Job) replan() []int64 {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	resume := make([]int64, len(j.chunks))
+	for i := range j.chunks {
+		d := atomic.LoadInt64(&j.chunks[i].progress) - j.chunks[i].start
+		if d < 0 {
+			d = 0
+		}
+		resume[i] = d
+	}
+	j.opts.ResumeFrom = resume
+	j.planLocked()
+	ranges := make([]int64, 0, 2*len(j.chunks))
+	for i := range j.chunks {
+		ranges = append(ranges, j.chunks[i].start, j.chunks[i].end)
+	}
+	return ranges
+}
+
+// Chunks 返回当前分片进度的快照。持锁读取，避免与 plan()/replan()
+// 的切片重建竞争（调度器会在刷盘与事件路径上调用它）。
 func (j *Job) Chunks() []ChunkSnapshot {
+	j.mu.Lock()
+	defer j.mu.Unlock()
 	out := make([]ChunkSnapshot, len(j.chunks))
 	for i := range j.chunks {
 		c := &j.chunks[i]
@@ -223,7 +304,7 @@ type ChunkSnapshot struct {
 }
 
 func (j *Job) IsStopped() bool { return j.stopped.Load() }
-func (j *Job) Stop()          { j.stopped.Store(true) }
+func (j *Job) Stop()           { j.stopped.Store(true) }
 
 func (j *Job) Run(ctx context.Context, useRange bool) error {
 	j.stopped.Store(false)
@@ -243,49 +324,35 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 	j.log.Infof("starting download  total=%d bytes  range=%v  maxChunks=%d", j.total, useRange, j.chunkCount)
 	j.mu.Unlock()
 
+	// bytesDone 是本次会话累计写入的字节；resumedBytes 是会话开始前磁盘上
+	// 已有的字节数。Progress 上报的是两者之和，因此断点续传时 UI 不会回退。
 	var (
-		bytesDone    atomic.Int64
-		chunksDone   atomic.Int32
-		chunksGaveUp atomic.Int32
-		lastTickAt   = time.Now()
-		lastTickVal  atomic.Int64
+		bytesDone   atomic.Int64
+		chunksDone  atomic.Int32
+		lastTickAt  atomic.Int64
+		lastTickVal atomic.Int64
 	)
-
-	// resumedBytes 是本次会话开始之前磁盘上已有的字节总数。
-	// bytesDone 是会话级别的累加;Progress 回调报告的是累计总量,
-	// 这样在断点续传时 UI 不会回退到 0。
-	var resumedBytes int64
-	for _, off := range j.opts.ResumeFrom {
-		if off > 0 {
-			resumedBytes += off
-		}
-	}
-	if len(j.opts.ChunkSizes) > 0 {
-		for i := 0; i+1 < len(j.opts.ChunkSizes); i += 2 {
-			resumedBytes += j.opts.ChunkSizes[i]
-		}
-	}
+	lastTickAt.Store(time.Now().UnixNano())
+	resumedBytes := j.resumedBytes()
 
 	emit := func(activeIdx int) {
-		now := time.Now()
-		if now.Sub(lastTickAt) < j.opts.ProgressEvery {
+		now := time.Now().UnixNano()
+		prev := lastTickAt.Load()
+		if now-prev < int64(j.opts.ProgressEvery) {
+			return
+		}
+		// 进度回调由多个分片 goroutine 并发触发，CAS 保证只有一个越过
+		// 节流窗口（同时消除节流状态本身的数据竞争）。
+		if !lastTickAt.CompareAndSwap(prev, now) {
 			return
 		}
 		cur := bytesDone.Load()
-		dt := now.Sub(lastTickAt).Seconds()
 		diff := cur - lastTickVal.Load()
+		lastTickVal.Store(cur)
 		var bps float64
-		if dt > 0 {
+		if dt := float64(now-prev) / float64(time.Second); dt > 0 {
 			bps = float64(diff) / dt
 		}
-		lastTickVal.Store(cur)
-		lastTickAt = now
-		slog.Info("engine progress",
-			"taskID", j.opts.TaskID,
-			"downloaded", cur+resumedBytes,
-			"total", j.total,
-			"speed", bps,
-		)
 		if j.opts.Progress != nil {
 			j.opts.Progress(Progress{
 				TaskID:           j.opts.TaskID,
@@ -303,12 +370,11 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 	j.mu.Unlock()
 
 	if isStreaming {
+		// 将计划合并为覆盖整个文件的单个分片，这样 Chunks() 只在一个
+		// 分片上报告进度，而不是 N 个分片中只有 chunks[0] 真正被写入。
+		// 否则调度器会从不声明 Accept-Ranges 的服务器上读到类似
+		// [N, 0, 0, 0] 的进度——UI 只会点亮第一块马赛克。
 		j.mu.Lock()
-		// 将计划合并为覆盖整个文件的单个分片,这样
-		// Chunks() 只在一个分片上报告进度,而不是 N 个分片
-		// 中只有 chunks[0] 真正被写入。否则,调度器会从
-		// 不声明 Accept-Ranges 的服务器上读到类似 [N, 0, 0, 0]
-		// 的进度——UI 只会点亮第一块马赛克。
 		var progress int64
 		if len(j.chunks) > 0 {
 			progress = j.chunks[0].progress
@@ -318,43 +384,179 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			end = j.total - 1
 		}
 		j.chunks = []chunk{{idx: 0, start: progress, end: end, progress: progress}}
-		c := &j.chunks[0]
+		plan := [2]int64{progress, end}
+		j.mu.Unlock()
+
+		// 回调不持锁调用：调度器会在回调里访问引擎与数据库。
 		if j.opts.OnPlanChanged != nil {
-			j.opts.OnPlanChanged([]int64{c.start, c.end})
+			j.opts.OnPlanChanged([]int64{plan[0], plan[1]})
 		}
-		stopErr := downloadFallbackWithRetry(ctx, j, c, &bytesDone, emit, 0)
+		stopErr := downloadFallbackWithRetry(ctx, j, j.streamingChunk(), &bytesDone, emit, 0)
 		if j.opts.Progress != nil {
 			j.opts.Progress(Progress{
 				TaskID:          j.opts.TaskID,
 				TotalSize:       bytesDone.Load() + resumedBytes,
 				DownloadedBytes: bytesDone.Load() + resumedBytes,
-				SpeedBPS:        0,
 				CompletedChunks: 1,
 			})
 		}
 		return stopErr
 	}
-	// 保守的并发增长策略:从 1 个分片开始。如果某个分片顺利完成,
-	// 就再增加一个。一旦出现错误,就停止增长并回退。
 
-	activeCount := 1
+	// ---- 分片路径：worker 池 ----
+	//
+	// 目标并发从 1 开始，每有一个分片成功完成就 +1（上限为配置的
+	// ChunkCount）；一旦出现非终态失败就减半，重试预算用尽则整体失败。
+	//
+	// 关键：重新规划必须在所有在跑的分片退出之后进行。此前实现收到第一个
+	// 错误就立刻重规划并重启分片，旧 goroutine 仍在写同一区间，导致重复
+	// 下载与 bytesDone 重复计数。
+	maxConc := j.chunkConcurrencyLimit()
+	target := 1
+	backoff := time.Second
+	rounds := 0
 
-	// downloadChunk 运行单个分片的重试循环。
-downloadChunk := func(c *chunk, idx int, errCh chan<- error) {
-	defer func() {
-		chunksDone.Add(1)
-	}()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if j.stopped.Load() {
+			return errJobStopped
+		}
+
+		queue := j.unfinishedIndexes()
+		if len(queue) == 0 {
+			// 全部完成：补一次速度归零的终态进度。
+			if j.opts.Progress != nil {
+				j.opts.Progress(Progress{
+					TaskID:          j.opts.TaskID,
+					TotalSize:       j.total,
+					DownloadedBytes: bytesDone.Load() + resumedBytes,
+					CompletedChunks: int(chunksDone.Load()),
+				})
+			}
+			return nil
+		}
+
+		roundCtx, roundCancel := context.WithCancel(ctx)
+		results := make(chan error, len(queue))
+		var wg sync.WaitGroup
+		inflight := 0
+		var lastErr error
+
+		for {
+			for inflight < target && len(queue) > 0 {
+				idx := queue[0]
+				queue = queue[1:]
+				inflight++
+				wg.Add(1)
+				go func(idx int) {
+					defer wg.Done()
+					// results 容量足够，worker 永不阻塞。
+					results <- j.downloadChunk(roundCtx, idx, &bytesDone, &chunksDone, emit)
+				}(idx)
+			}
+			if inflight == 0 {
+				break
+			}
+			err := <-results
+			inflight--
+			if err == nil {
+				// 成功完成一路：允许再开一路（保守增长）。
+				if target < maxConc {
+					target++
+				}
+				continue
+			}
+			lastErr = err
+			break
+		}
+		roundCancel()
+		// 等本轮所有分片真正退出，之后才能安全地重新规划。
+		wg.Wait()
+
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if j.stopped.Load() {
+			return errJobStopped
+		}
+		if lastErr == nil {
+			// 本轮队列已空且无错误：回到外层判断是否全部完成。
+			continue
+		}
+		if protocol.IsTerminal(lastErr) {
+			return lastErr
+		}
+		rounds++
+		if rounds > maxReplanRounds {
+			j.log.Warnf("giving up after %d replan rounds: %v", rounds-1, lastErr)
+			return lastErr
+		}
+		old := target
+		target /= 2
+		if target < 1 {
+			target = 1
+		}
+		if old != target {
+			j.log.Warnf("reducing chunk concurrency %d -> %d  last error: %v", old, target, lastErr)
+			if j.opts.OnChunkCountDecreased != nil {
+				j.opts.OnChunkCountDecreased(target)
+			}
+		} else {
+			j.log.Warnf("chunk error: %v", lastErr)
+		}
+		// 回调不持锁调用：调度器会在回调里访问引擎与数据库。
+		ranges := j.replan()
+		if j.opts.OnPlanChanged != nil {
+			j.opts.OnPlanChanged(ranges)
+		}
+		wait := backoff + jitter(backoff)
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+}
+
+// streamingChunk 返回流式路径当前使用的那个分片。
+func (j *Job) streamingChunk() *chunk {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	if len(j.chunks) == 0 {
+		return &chunk{idx: 0, start: 0, end: -1}
+	}
+	return &j.chunks[0]
+}
+
+// downloadChunk 运行单个分片的重试循环。返回 nil 表示该分片已完成；
+// 返回错误表示它遇到终态错误或已耗尽重试预算。
+//
+// 调用方须保证计划（j.chunks）在本次调用期间不变：重新规划只会在
+// 所有分片退出后（wg.Wait 之后）进行。
+func (j *Job) downloadChunk(ctx context.Context, idx int, bytesDone *atomic.Int64, chunksDone *atomic.Int32, emit func(int)) error {
+	j.mu.Lock()
+	if idx >= len(j.chunks) {
+		j.mu.Unlock()
+		return nil
+	}
+	c := &j.chunks[idx]
+	j.mu.Unlock()
 
 	consecutiveFails := 0
 	backoff := 500 * time.Millisecond
 	for {
 		if j.stopped.Load() || ctx.Err() != nil {
-			return
+			return ctx.Err()
 		}
 		start := atomic.LoadInt64(&c.progress)
 		if start > c.end {
 			j.log.Infof("chunk %d finished  range=%d-%d", idx, c.start, c.end)
-			return
+			return nil
 		}
 
 		chunkCtx, cancel := context.WithCancel(ctx)
@@ -365,189 +567,55 @@ downloadChunk := func(c *chunk, idx int, errCh chan<- error) {
 		})
 		cancel()
 
-		if err != nil {
-			if j.stopped.Load() || ctx.Err() != nil {
-				return
-			}
-			if protocol.IsTerminal(err) {
-				j.log.Warnf("chunk %d terminal error: %v", idx, err)
-				chunksGaveUp.Add(1)
-				select {
-				case errCh <- err:
-				default:
-				}
-				return
-			}
-			consecutiveFails++
-			j.log.Warnf("chunk %d error: %v  backing off %v  fails=%d/%d", idx, err, backoff, consecutiveFails, maxChunkRetries)
-			select {
-			case errCh <- err:
-			default:
-			}
-			if consecutiveFails >= maxChunkRetries {
-				chunksGaveUp.Add(1)
-				j.log.Warnf("chunk %d giving up after %d consecutive failures: %v", idx, consecutiveFails, err)
-				return
-			}
-			wait := backoff
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(wait):
-			}
-			continue
-		}
-		consecutiveFails = 0
-		backoff = 500 * time.Millisecond
-		return
-	}
-}
-
-	errCh := make(chan error, 1)
-	for {
-		j.mu.Lock()
-		curChunks := j.chunks
-		j.mu.Unlock()
-
-		toLaunch := activeCount
-		if toLaunch > len(curChunks) {
-			toLaunch = len(curChunks)
-		}
-
-		wg := sync.WaitGroup{}
-		for i := 0; i < toLaunch; i++ {
-			wg.Add(1)
-			go func(idx int) {
-				defer wg.Done()
-				downloadChunk(&curChunks[idx], idx, errCh)
-			}(i)
-		}
-
-		j.log.Infof("round starting  active=%d chunks", toLaunch)
-
-		// 等待分片结束或出现错误。
-		var lastErr error
-		waitDone := make(chan struct{})
-		go func() {
-			wg.Wait()
-			close(waitDone)
-		}()
-
-		j.log.Infof("round starting  active=%d chunks", toLaunch)
-
-		select {
-		case err := <-errCh:
-			lastErr = err
-		case <-waitDone:
-			// 所有分片已完成且无错误。
-			j.mu.Lock()
-			allDone := true
-			for _, c := range j.chunks {
-				if atomic.LoadInt64(&c.progress) <= c.end {
-					allDone = false
-					break
-				}
-			}
-			j.mu.Unlock()
-			if allDone {
-				j.log.Infof("download completed  %d bytes", bytesDone.Load()+resumedBytes)
-				if j.opts.Progress != nil {
-					j.opts.Progress(Progress{
-						TaskID:          j.opts.TaskID,
-						TotalSize:       j.total,
-						DownloadedBytes: bytesDone.Load() + resumedBytes,
-						SpeedBPS:        0,
-					CompletedChunks: int(chunksDone.Load()),
-					})
-				}
-				return nil
-			}
-			// 所有 active 分片都已放弃但任务尚未完成 —— 整体失败。
-			if int(chunksGaveUp.Load()) >= toLaunch {
-				j.log.Warnf("all active chunks gave up before completion")
-				return errors.New("engine: all chunks exhausted retry budget")
-			}
-			// 还未完成 —— 尝试增加并发。
-			if activeCount < j.chunkCount && activeCount < len(j.chunks) {
-				activeCount++
-				j.log.Infof("chunk completed, growing active chunks to %d", activeCount)
-			}
-			continue
-		case <-ctx.Done():
-			j.log.Infof("download stopped")
-			return ctx.Err()
-		}
-
-		// 错误路径。
-		if lastErr == nil {
-			continue
-		}
-
-		j.log.Warnf("chunk error: %v  pausing growth, backing off 1s", lastErr)
-
-		if j.stopped.Load() || ctx.Err() != nil {
-			j.log.Infof("download stopped")
+		if err == nil {
+			chunksDone.Add(1)
 			return nil
 		}
-
-		// 业务错误(4xx 等)直接失败:不要对死链无限重试,让任务及时变 Failed。
-		if protocol.IsTerminal(lastErr) {
-			j.log.Warnf("chunk error terminal, failing: %v", lastErr)
-			return lastErr
+		if j.stopped.Load() || ctx.Err() != nil {
+			return ctx.Err()
 		}
-		// 所有 active 分片都已经放弃重试;停止并让上层标记 Failed。
-		if int(chunksGaveUp.Load()) >= toLaunch {
-			j.log.Warnf("all active chunks gave up, failing: %v", lastErr)
-			return lastErr
+		if protocol.IsTerminal(err) {
+			j.log.Warnf("chunk %d terminal error: %v", idx, err)
+			return err
 		}
-		oldActive := activeCount
-		activeCount = activeCount / 2
-		if activeCount < 1 {
-			activeCount = 1
+		consecutiveFails++
+		j.log.Warnf("chunk %d error: %v  backing off %v  fails=%d/%d", idx, err, backoff, consecutiveFails, maxChunkRetries)
+		if consecutiveFails >= maxChunkRetries {
+			j.log.Warnf("chunk %d giving up after %d consecutive failures: %v", idx, consecutiveFails, err)
+			return err
 		}
-
-		if oldActive != activeCount {
-			j.mu.Lock()
-			j.chunkCount = activeCount
-			j.mu.Unlock()
-			if j.opts.OnChunkCountDecreased != nil {
-				j.opts.OnChunkCountDecreased(activeCount)
-			}
-			j.log.Warnf("reduced active chunks %d -> %d", oldActive, activeCount)
+		wait := backoff + jitter(backoff)
+		if backoff < 30*time.Second {
+			backoff *= 2
 		}
-
-		// 重新规划。
-		j.mu.Lock()
-		progress := make([]int64, len(j.chunks))
-		for i, c := range j.chunks {
-			progress[i] = atomic.LoadInt64(&c.progress) - c.start
-		}
-		j.opts.ResumeFrom = progress
-		j.plan()
-		if j.opts.OnPlanChanged != nil {
-			ranges := make([]int64, 0, 2*len(j.chunks))
-			for _, c := range j.chunks {
-				ranges = append(ranges, c.start, c.end)
-			}
-			j.opts.OnPlanChanged(ranges)
-		}
-		j.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(1 * time.Second):
+		case <-time.After(wait):
 		}
 	}
 }
 
 func (j *Job) Close() error { return j.driver.Close() }
+
 // maxChunkRetries 限制单 chunk 或 streaming 路径上的连续失败次数。
 // 超过此次数后,engine 把 lastErr 返回给 scheduler.fail(),任务变为 Failed。
 const maxChunkRetries = 8
+
+// maxReplanRounds 限制「失败 → 重新规划」的轮数：单个区间的总尝试次数
+// 约为 maxChunkRetries × maxReplanRounds。
+const maxReplanRounds = 3
+
+// errJobStopped 表示任务被显式 Stop()（区别于 ctx 取消导致的暂停）。
+var errJobStopped = errors.New("engine: job stopped")
+
+// jitter 返回 [0, d/2) 的随机抖动，避免多个任务在同一时刻重试形成尖峰。
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(d) / 2))
+}
 
 // downloadFallbackWithRetry 是 streaming 路径（不支持 Range）下的重试包装:
 // 业务错误(4xx)立即返回让上层标记 Failed;瞬断则在重试预算内退避重连。
@@ -581,7 +649,7 @@ func downloadFallbackWithRetry(ctx context.Context, j *Job, c *chunk, bytesDone 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(backoff + jitter(backoff)):
 		}
 		backoff *= 2
 		if backoff > 30*time.Second {

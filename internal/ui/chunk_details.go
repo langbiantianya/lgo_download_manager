@@ -11,6 +11,9 @@ import (
 	"fmt"
 	"image/color"
 	"path/filepath"
+	"slices"
+	"sync"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/canvas"
@@ -32,6 +35,11 @@ const maxTiles = 1024
 // 小方块会排列成一面瓦片墙。
 const tileSize = 12
 
+// mosaicThrottle 是两次瓦片重建之间的最小间隔。进度事件远密于此，
+// 而每次重建都要新建最多 maxTiles 个 canvas.Rectangle 并触发两次
+// Refresh()，是详情窗口的主要开销。
+const mosaicThrottle = 400 * time.Millisecond
+
 // chunkMosaic 将文件渲染为一面由小方块组成的瓦片墙。
 // 每个瓦片代表 blockSize 字节（对于超大文件可能更多，
 // 以保证 widget 数量不超过 maxTiles）。已完成的范围将
@@ -49,6 +57,31 @@ type chunkMosaic struct {
 	total   int64
 	blockSz int64
 	blocks  int
+
+	// mu 串行化全部内部状态与 widget 树变更。
+	// update/resizeForTotal 会被事件派发 goroutine 与窗口自身并发调用
+	// （测试与关闭路径直接调用，不经过 fyne.Do），没有这把锁就会
+	// 并发重建 m.wrap.Objects 并踩到 Fyne 的 renderer 缓存。
+	mu sync.Mutex
+
+	// seq 每次 update() 递增；补渲染捕获自己的值，若期间已有更新的
+	// 输入到达就放弃补渲染，避免把旧状态盖回去。
+	seq uint64
+
+	// applied* 是上一次实际重建瓦片所用的输入，用于跳过重复渲染。
+	appliedAt     time.Time
+	appliedProg   []int64
+	appliedRanges []int64
+	appliedTotal  int64
+
+	// pending* 是节流窗口内被丢弃的最新输入；窗口结束后由 flushPending
+	// 补渲染一次，保证最终状态不会因为落在窗口内而永久丢失。
+	pending       bool
+	pendingSeq    uint64
+	pendingProg   []int64
+	pendingRanges []int64
+	pendingTotal  int64
+	flushTimer    *time.Timer
 }
 
 // showChunkDetails 打开一个窗口，展示任务按分块的下载进度。
@@ -120,6 +153,13 @@ func newChunkMosaic(taskID string) *chunkMosaic {
 
 // resizeForTotal 根据文件大小重建 wrap，并使用正确数量的瓦片。
 func (m *chunkMosaic) resizeForTotal(total int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.resizeLocked(total)
+}
+
+// resizeLocked 是 resizeForTotal 的实现；调用者必须持有 m.mu。
+func (m *chunkMosaic) resizeLocked(total int64) {
 	// 每个瓦片代表 blockSize 字节（对于超大文件可能更多，
 	// 以保证瓦片总数不超过 maxTiles）。
 	if total <= 0 {
@@ -152,15 +192,81 @@ func (m *chunkMosaic) resizeForTotal(total int64) {
 }
 
 // update 根据给定的分块布局和进度，使用新绘制的瓦片重建 wrap。
+//
+// 进度事件远比肉眼可辨的刷新率密集，而每次重建都要新建最多 maxTiles 个
+// canvas.Rectangle 并触发两次 Refresh()。因此这里做两件事：
+//   - 输入与上一次实际渲染完全相同 → 直接返回；
+//   - 距上次重建不足 mosaicThrottle → 只记下最新输入，
+//     窗口结束后由 flushPending 补渲染（最终状态不会丢失）。
 func (m *chunkMosaic) update(chunkProgress, chunkRanges []int64, totalSize int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.seq++
+
+	if !m.appliedAt.IsZero() && m.appliedTotal == totalSize &&
+		slices.Equal(m.appliedProg, chunkProgress) &&
+		slices.Equal(m.appliedRanges, chunkRanges) {
+		return
+	}
+
+	if since := time.Since(m.appliedAt); since < mosaicThrottle {
+		m.pending = true
+		m.pendingSeq = m.seq
+		// 拷贝输入：调用方的切片可能被复用/改写。
+		m.pendingProg = append(m.pendingProg[:0], chunkProgress...)
+		m.pendingRanges = append(m.pendingRanges[:0], chunkRanges...)
+		m.pendingTotal = totalSize
+		if m.flushTimer == nil {
+			m.flushTimer = time.AfterFunc(mosaicThrottle-since, m.flushPending)
+		}
+		return
+	}
+
+	m.applyLocked(chunkProgress, chunkRanges, totalSize)
+}
+
+// flushPending 在节流窗口结束后补渲染最后一次被丢弃的输入。
+func (m *chunkMosaic) flushPending() {
+	m.mu.Lock()
+	m.flushTimer = nil
+	if !m.pending {
+		m.mu.Unlock()
+		return
+	}
+	seq := m.pendingSeq
+	prog := m.pendingProg
+	ranges := m.pendingRanges
+	total := m.pendingTotal
+	m.pending = false
+	m.mu.Unlock()
+
+	// 定时器回调不在 Fyne 事件线程上，widget 树的改动必须回到事件线程。
+	fyne.Do(func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if m.seq != seq || m.pending {
+			// 期间已有更新的输入：要么已经渲染，要么已有新的补渲染在排队。
+			return
+		}
+		m.applyLocked(prog, ranges, total)
+	})
+}
+
+// applyLocked 用给定的分块布局和进度重建瓦片。调用者必须持有 m.mu。
+func (m *chunkMosaic) applyLocked(chunkProgress, chunkRanges []int64, totalSize int64) {
 	// 算法与之前相同：遍历每个分块的范围，确定每个瓦片字节范围内
 	// 被覆盖的比例。
 	//
 	// chunkProgress 是每个分块自起始位置的偏移；chunkRanges 是成对的
 	// [start0,end0,start1,end1,...]，end 为闭区间。
+	m.appliedAt = time.Now()
+	m.appliedTotal = totalSize
+	m.appliedProg = append(m.appliedProg[:0], chunkProgress...)
+	m.appliedRanges = append(m.appliedRanges[:0], chunkRanges...)
+
 	if totalSize != m.total {
 		m.total = totalSize
-		m.resizeForTotal(totalSize)
+		m.resizeLocked(totalSize)
 	}
 	if totalSize <= 0 || m.blocks == 0 {
 		return

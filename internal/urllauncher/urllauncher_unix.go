@@ -17,13 +17,17 @@ import (
 	"os"
 	"sync"
 	"syscall"
+	"time"
 )
+
+// readTimeout 是单个 URL 帧的读取上限:防止空连接长期占用 goroutine 与 fd。
+const readTimeout = 5 * time.Second
 
 // AcquireLock attempts to acquire an exclusive flock on the lock file.
 // Returns isPrimary=true if this instance holds the lock.
 // Returns isPrimary=false, release=nil, err=nil if another instance holds the lock.
 func AcquireLock() (isPrimary bool, release func(), err error) {
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
 		return false, nil, fmt.Errorf("creating base dir: %w", err)
 	}
 
@@ -61,7 +65,7 @@ func AcquireLock() (isPrimary bool, release func(), err error) {
 // ListenAndServe starts a Unix socket server on socketPath and calls onURL
 // for each received URL.
 func ListenAndServe(onURL func(url string)) error {
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
+	if err := os.MkdirAll(baseDir, 0o700); err != nil {
 		return fmt.Errorf("creating base dir: %w", err)
 	}
 
@@ -76,8 +80,12 @@ func ListenAndServe(onURL func(url string)) error {
 		return fmt.Errorf("listen unix: %w", err)
 	}
 
-	// Set socket permissions (world-accessible for forwarding)
-	syscall.Chmod(socketPath, 0777)
+	// 权限与 ipc.Listen 保持一致(0o600):只有当前用户能连接,否则同机
+	// 任意本地用户都能往下载队列里投递 URL。
+	if err := syscall.Chmod(socketPath, 0o600); err != nil {
+		ln.Close()
+		return fmt.Errorf("chmod socket: %w", err)
+	}
 
 	var wg sync.WaitGroup
 	for {
@@ -95,6 +103,12 @@ func ListenAndServe(onURL func(url string)) error {
 }
 
 func handleConn(c *net.UnixConn, onURL func(url string)) {
+	// 空连接不得无限占用 goroutine/fd:整帧读取(4 字节长度 + 负载)必须
+	// 在 readTimeout 内完成。
+	if err := c.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+		return
+	}
+
 	// Read 4-byte big-endian length prefix
 	var length uint32
 	if err := binary.Read(c, binary.BigEndian, &length); err != nil {
