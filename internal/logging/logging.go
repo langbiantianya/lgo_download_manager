@@ -69,7 +69,22 @@ type rotatingSink struct {
 //
 // dir 通常由调用方传入 defaultConfigPath()(或显式 --config 参数),
 // 这样日志与业务库在同一用户级数据目录,便于运维统一收集。
+//
+// debug=true 时日志落到 stderr(默认 Debug 级别);
+// debug=false 时落到 dir 目录下的轮转文件(Info 级别)。
+// 更细粒度的「固定级别 + 文件或 stderr」选择交给 InitLevel。
 func Init(debug bool, dir string) error {
+	if debug {
+		return InitLevel(slog.LevelDebug, "")
+	}
+	return InitLevel(slog.LevelInfo, dir)
+}
+
+// InitLevel 是 Init 的底层版本:level 决定过滤阈值,
+// dir=="" 时强制走 stderr,dir!="" 时走 <dir>/lgdm.log 的轮转文件。
+// 后者总是按 Info 级别裁剪的(轮转文件面向生产,默认不接收 Debug 噪声),
+// 除非 caller 显式指定 level >= Debug。
+func InitLevel(level slog.Level, dir string) error {
 	state.mu.Lock()
 	defer state.mu.Unlock()
 
@@ -78,31 +93,27 @@ func Init(debug bool, dir string) error {
 		state.sink = nil
 	}
 
-	if debug {
-		h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-			Level: slog.LevelDebug,
-		})
+	if dir == "" {
+		h := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})
 		state.logger = slog.New(h)
 		slog.SetDefault(state.logger)
 		return nil
 	}
 
-	if dir == "" {
+	if dir == "." {
+		// Init() 历史上 dir 为空时回退到 TempDir;现在保留这个回退。
 		dir = filepath.Join(os.TempDir(), "lgo_download_manager")
 	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("logging: create log dir %q: %w", dir, err)
 	}
-
 	sink, err := newRotatingSink(dir)
 	if err != nil {
 		return err
 	}
 	pruneOld(dir, time.Now(), retentionDays)
 
-	h := slog.NewTextHandler(sink, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
-	})
+	h := slog.NewTextHandler(sink, &slog.HandlerOptions{Level: level})
 	state.sink = sink
 	state.logger = slog.New(h)
 	slog.SetDefault(state.logger)

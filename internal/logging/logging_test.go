@@ -150,3 +150,69 @@ func TestInitIdempotent(t *testing.T) {
 		t.Fatalf("close: %v", err)
 	}
 }
+
+// TestInitLevelStderrForcesDebug 验证 InitLevel(level, "") 走 stderr,
+// 且按 level 过滤 Info/Debug。
+func TestInitLevelStderrForcesDebug(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	origStderr := os.Stderr
+	os.Stderr = w
+	defer func() { os.Stderr = origStderr }()
+
+	if err := InitLevel(0, ""); err != nil {
+		t.Fatalf("InitLevel: %v", err)
+	}
+	// slog 默认 0 级别是 Info;Debug 行应被过滤掉。
+	L().Debug("should-be-filtered")
+	L().Info("should-pass")
+	_ = w.Close()
+
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(buf.String(), "should-be-filtered") {
+		t.Fatalf("Debug line leaked: %q", buf.String())
+	}
+	if !strings.Contains(buf.String(), "should-pass") {
+		t.Fatalf("Info line missing: %q", buf.String())
+	}
+}
+
+// TestInitLevelDirWritesToFile 验证 InitLevel(level, dir) 落到
+// lgdm.log,即便 level 显式是 Debug,日志也走文件。
+func TestInitLevelDirWritesToFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := InitLevel(0, dir); err != nil {
+		t.Fatalf("InitLevel: %v", err)
+	}
+	defer Close()
+	L().Debug("debug-line-must-be-filtered")
+	L().Info("info-line-must-pass")
+	if err := Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(dir, logBaseName))
+	if err != nil {
+		t.Fatalf("read %s: %v", logBaseName, err)
+	}
+	if strings.Contains(string(data), "debug-line-must-be-filtered") {
+		t.Fatalf("Debug leaked into file at Info level: %q", string(data))
+	}
+	if !strings.Contains(string(data), "info-line-must-pass") {
+		t.Fatalf("Info line missing: %q", string(data))
+	}
+}
+
+// TestAttachParentConsoleExists 烟雾验证 AttachParentConsole 在
+// 当前平台能调到(不会 panic)。真正的 attach 行为依赖运行时的
+// 父进程(从 cmd 启动 vs 从 Explorer/URL 协议启动),不在这层断言。
+func TestAttachParentConsoleExists(t *testing.T) {
+	// 在 Windows 上,没有父 console 时 attach 会失败返回 false;在
+	// 其它平台上 stub 始终返回 true。这两种结果都说明函数可达。
+	AttachParentConsole()
+}

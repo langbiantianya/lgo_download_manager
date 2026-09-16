@@ -21,6 +21,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
 	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
@@ -64,13 +65,28 @@ func main() {
 	// UI 子进程在 spawn 时也会走到这里(被业务进程自我复刻拉起),
 	// 它没有自己的 --debug,但父进程已经把 LGDM_DEBUG 传过来。
 	childDebug := os.Getenv(envLogDebug) == "1"
+	debugEnabled := childDebug || *debug
 	// 日志与 db 落在同一目录:用户传 --config 时跟 --config,否则跟 defaultConfigPath()。
 	// 这样运维上 db 与 log 总在同一处,便于打包收集。
 	logDir := *configPath
 	if logDir == "" {
 		logDir = "."
 	}
-	if err := logging.Init(childDebug || *debug, logDir); err != nil {
+	// Windows 上二进制是用 -H windowsgui 编译的——运行时没有 console。
+	// 当用户从 cmd/PowerShell 加 --debug 启动时,我们要把进程挂回父
+	// console,让日志直接落到终端而不是凭空消失;若 attach 失败
+	// (从 Explorer/浏览器 URL 协议拉起),则回退到文件日志(同样开
+	// Debug 级别),保证 debug 信息不丢。非 Windows 平台 AttachParentConsole
+	// 永远返回 true,行为不变。
+	logLevel := slog.LevelInfo
+	logToStderr := false
+	if debugEnabled {
+		logLevel = slog.LevelDebug
+		if logging.AttachParentConsole() {
+			logToStderr = true
+		}
+	}
+	if err := logging.InitLevel(logLevel, pickLogTarget(logToStderr, logDir)); err != nil {
 		fmt.Fprintf(os.Stderr, "logging init: %v\n", err)
 		os.Exit(1)
 	}
@@ -301,6 +317,17 @@ func defaultConfigPath() string {
 		return filepath.Join(home, ".config", "lgo_download_manager")
 	}
 	return "."
+}
+
+// pickLogTarget 把 logging.InitLevel 的 dir 解析出来:
+//   - stderr=true 时传 "",触发 InitLevel 走 stderr handler;
+//   - 否则传 logDir,让日志落到配置目录里的 lgdm.log。
+// 仅作为日志目标的归一化入口,本身没有副作用。
+func pickLogTarget(stderr bool, logDir string) string {
+	if stderr {
+		return ""
+	}
+	return logDir
 }
 
 // defaultSaveDir 返回当前平台合适的下载目录。

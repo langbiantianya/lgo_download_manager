@@ -353,8 +353,12 @@ function Invoke-Build([pscustomobject]$Spec, [string]$CC) {
     $date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
     New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
+    # -H windowsgui 让 Windows 不再为 lgdm 弹出 console 窗口
+    # (浏览器 lgom:// 协议/资源管理器拉起时不再闪黑窗);用户从 cmd 加
+    # --debug 启动时由内部 AttachConsole 把日志挂回终端,行为不变。
     $ldflags = @(
         '-s', '-w',
+        '-H', 'windowsgui',
         '-X', "lgo_download_manager/internal/version.Version=$v",
         '-X', "lgo_download_manager/internal/version.Commit=$commit",
         '-X', "lgo_download_manager/internal/version.Date=$date"

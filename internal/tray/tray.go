@@ -72,8 +72,8 @@ func Start(cb Callbacks) {
 			systray.SetTemplateIcon(trayIcon32, trayIcon32)
 		}
 		mOpen := systray.AddMenuItem("显示窗口", "显示主窗口")
-		mQuit := systray.AddMenuItem("退出", "退出下载管理器")
 		systray.AddSeparator()
+		mQuit := systray.AddMenuItem("退出", "退出下载管理器")
 
 		go func() {
 			for {

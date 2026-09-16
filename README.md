@@ -35,6 +35,12 @@ go build -o bin/lgdm.exe .        # Windows,本机架构(手工调试用;打包�
 go build -o bin/lgdm .            # Linux / macOS
 ```
 
+Windows 上**正式发布**的二进制是 GUI 子系统构建（`go build -ldflags "-H windowsgui"`），
+从 lgom:// 协议 / 资源管理器拉起时不会闪出黑色控制台窗口；从 cmd / PowerShell
+加 `--debug` 启动时由 `internal/logging.AttachParentConsole` 把进程挂回父
+终端，日志照常输出；GUI 子系统下 attach 失败（无父 console）则回退到文件
+日志（同样 Debug 级别），保证调试信息不丢。
+
 Windows 上要**安装包**（MSI / EXE，x64 与 arm64）用打包脚本，细节见下一节：
 
 ```powershell
