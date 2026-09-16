@@ -31,28 +31,54 @@
 ## 构建
 
 ```sh
-go build -o bin/ldm.exe .        # Windows
+go build -o bin/ldm.exe .        # Windows,本机架构(手工调试用;打包脚本统一产出 bin\ldm-<arch>.exe)
 go build -o bin/ldm .            # Linux / macOS
 ```
 
-Windows 上如果需要**安装包**，用打包脚本一次完成「编译 + 出安装包」：
+Windows 上如果需要**安装包**，用打包脚本一次完成「按架构编译 + 出安装包」：
 
 ```powershell
-pwsh -File scripts\package.ps1                 # MSI(WiX) + EXE(Inno Setup)
-pwsh -File scripts\package.ps1 -Format msi     # 只出 MSI
-pwsh -File scripts\package.ps1 -Format exe     # 只出 EXE
-pwsh -File scripts\package.ps1 -SkipBuild      # 复用已有的 bin\ldm.exe
+pwsh -File scripts\package.ps1                     # x64 + arm64 的 MSI 与 EXE
+pwsh -File scripts\package.ps1 -Format msi         # 只出 MSI
+pwsh -File scripts\package.ps1 -Format exe         # 只出 EXE
+pwsh -File scripts\package.ps1 -Arch x64           # 只出 x64
+pwsh -File scripts\package.ps1 -SkipBuild          # 复用已有的 bin\ldm-<arch>.exe
 pwsh -File scripts\package.ps1 -Version v1.0.0 -WinVersion 1.0.0.0
 ```
 
-产物落在 `dist\ldm-setup-<版本>.msi` 与 `dist\ldm-setup-<版本>.exe`。
+产物（每个架构一份，MSI 一个包只能装一种架构，所以必须分开）：
 
-完整参数（`-OutputDir` / `-SkipToolInstall` / `-WixPath` / `-IsccPath` 等）见
-`Get-Help .\scripts\package.ps1` 或脚本头部注释。
+```
+dist\ldm-setup-<版本>-x64.msi       dist\ldm-setup-<版本>-arm64.msi
+dist\ldm-setup-<版本>-x64.exe       dist\ldm-setup-<版本>-arm64.exe
+```
+
+完整参数（`-Arch` / `-OutputDir` / `-SkipToolInstall` / `-WixPath` /
+`-IsccPath` / `-CCX64` / `-CCArm64` 等）见 `Get-Help .\scripts\package.ps1`
+或脚本头部注释。
+
+### C 工具链（cgo）
+
+Fyne 在 Windows 上是 CGO + GLFW/OpenGL，所以编译需要 C 编译器，且编译器必须
+是 **gcc 风格命令行**的：GCC 或 clang。
+
+- **MSVC 的 `cl.exe` 不能用作 `CC`**：cgo 直接用 `-c/-o/-I/-D` 这类 gcc 参数
+  调用编译器，`cl.exe` 的 `/c`、`/Fo`、`/I` 语法与之不兼容，Go 也一直没有
+  支持 MSVC（golang/go#20982）。
+- **clang 可以**：`LLVM-MinGW`（winget 包 `MartinStorsjo.LLVM-MinGW.UCRT`）
+  是 clang + mingw-w64 sysroot 的发行版，一个包同时提供 `x86_64-w64-mingw32-clang`
+  与 `aarch64-w64-mingw32-clang`，正好覆盖 x64 / arm64 两个架构。
+- 脚本按 `-CCX64`/`-CCArm64` → PATH 上的 `x86_64-w64-mingw32-clang` /
+  `aarch64-w64-mingw32-clang` → winget 的 LLVM-MinGW 安装目录 解析；x64 在
+  找不到 clang 时退回主机默认 `gcc`。arm64 必须给 aarch64 工具链
+  （`GOARCH=arm64` 时 Go 会关掉 cgo，没有交叉工具链直接编译失败）。
+- 手工编译 arm64：`$env:GOARCH='arm64'; $env:CC='aarch64-w64-mingw32-clang'; go build ...`。
+- 打完包后脚本会读 PE 头的 `Machine` 字段校验产物架构（x64=0x8664、
+  arm64=0xAA64），避免 `-SkipBuild` 复用了另一个架构的二进制。
 
 非 Windows 主机交叉编译 ldm.exe 需要 mingw-w64（`x86_64-w64-mingw32-gcc`
 在 PATH 上）——Fyne 在 Windows 上是 CGO + GLFW。Windows 主机自带
-MSYS2 / `gcc` 即可。
+MSYS2 / `gcc`，或按上面装 LLVM-MinGW 即可。
 
 ### 版本元数据
 
@@ -64,15 +90,22 @@ MSYS2 / `gcc` 即可。
 
 ### 安装包（Windows）
 
-两种安装包功能对等，**任选其一**安装即可（不要同时装两个）：
+每个架构一份产物，同一架构上两种格式功能对等，**任选其一**安装即可
+（不要同时装两个）：
 
-| 格式 | 源文件 | 打包工具 |
-| --- | --- | --- |
-| MSI | `installer/ldm.wxs` | WiX Toolset CLI（`WiXToolset.WiXCLI`，v6 及以下） |
-| EXE | `installer/installer.iss` | Inno Setup 6（`JRSoftware.InnoSetup`） |
+| 格式 | 源文件 | 打包工具 | 架构控制 |
+| --- | --- | --- | --- |
+| MSI | `installer/ldm.wxs` | WiX Toolset CLI（`WiXToolset.WiXCLI`，v6 及以下） | `wix build -arch x64\|arm64` + `-d Arch=…` |
+| EXE | `installer/installer.iss` | Inno Setup 6（`JRSoftware.InnoSetup`） | `ISCC /DMyArch=x64\|arm64` |
+
+- x64 包用 `ArchitecturesAllowed=x64compatible` / WiX `-arch x64`；arm64 包用
+  `ArchitecturesAllowed=arm64` / WiX `-arch arm64`（Inno 没有 `arm64compatible`
+  这个标识，写了会编译报错）。x64 包在 ARM64 上也能装——走 x64 模拟运行。
+- 载荷分别是 `bin\ldm-x64.exe` 与 `bin\ldm-arm64.exe`，装到目标机器上统一
+  改名为 `ldm.exe`。
 
 打包工具缺失时脚本会用 `winget` 自动安装（`-SkipToolInstall` 关闭该行为，
-`-WixPath` / `-IsccPath` 可以指向已有的安装）。
+`-WixPath` / `-IsccPath` / `-CCArm64` 可以指向已有的安装）。
 
 > WiX v7 起命令行要求接受 OSMF EULA，本项目不引入这个依赖：脚本只用
 > WiX v6/v5，遇到 v7 会明确报错并给出降级安装命令。

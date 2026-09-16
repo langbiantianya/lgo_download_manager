@@ -4,7 +4,8 @@
 
   由 scripts/package.ps1 调用,一般不手工执行:
 
-      wix build installer\ldm.wxs -arch x64 -d ProductVersion=0.1.0.0 -o dist\ldm-setup-0.1.0.msi
+      wix build installer\ldm.wxs -arch x64 -d ProductVersion=0.1.0.0 -d Arch=x64 \
+          -o dist\ldm-setup-0.1.0-x64.msi
 
   设计要点(与 installer/installer.iss 的 EXE 安装包保持一致):
 
@@ -15,6 +16,12 @@
       再退出(见 internal/urllauncher/urllauncher_windows.go)。
     - 安装/升级/卸载前先用 taskkill 结束正在运行的 ldm,避免 exe 被占用。
     - ProductVersion 由 -d 传入,必须是 X.Y.Z.W 数字形式(MSI 只比较前三段)。
+
+  架构:MSI 一个包只能装一种架构,所以 -arch 与 -d Arch 必须成对出现
+    -arch x64   -d Arch=x64    → bin\ldm-x64.exe
+    -arch arm64 -d Arch=arm64  → bin\ldm-arm64.exe
+  (<Package> 的平台由 wix build -arch 决定;$(var.Arch) 只用来选待打包的
+  二进制,两者不一致会打出「架构与载荷不匹配」的包。)
 
   源文件路径以 $(sys.SOURCEFILEDIR) 为基准,因此从任意工作目录调用
   wix build 都能解析到仓库里的 bin/、assets/、LICENSE。
@@ -107,7 +114,10 @@
   <Fragment>
     <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
       <Component Id="MainExecutable" Guid="61E3E212-05B7-4BE4-A37C-5508FF676C85">
-        <File Id="LdmExe" Source="$(sys.SOURCEFILEDIR)\..\bin\ldm.exe" KeyPath="yes">
+        <!-- Name 覆盖 File 表里的文件名:Source 是 bin\ldm-<架构>.exe,装到
+             目标机器上统一叫 ldm.exe —— 协议注册表命令行、快捷方式、
+             taskkill 自定义动作都按这个名字找。 -->
+        <File Id="LdmExe" Source="$(sys.SOURCEFILEDIR)\..\bin\ldm-$(var.Arch).exe" Name="ldm.exe" KeyPath="yes">
           <Shortcut Id="StartMenuShortcut"
                     Directory="AppMenuFolder"
                     Name="lgo_download_manager"

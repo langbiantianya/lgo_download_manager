@@ -18,8 +18,30 @@
 ; 版本号来自环境变量,由 scripts/package.ps1 设置:
 ;     LDM_VERSION      AppVersion,形如 v0.1.0-3-gabc1234
 ;     LDM_WIN_VERSION  VersionInfoVersion 需要的 X.Y.Z.W 数字版本
+;
+; 架构由 scripts/package.ps1 用 /DMyArch=x64|arm64 传入(缺省 x64):
+;     x64   → ArchitecturesAllowed=x64compatible,载荷 bin\ldm-x64.exe
+;     arm64 → ArchitecturesAllowed=arm64,          载荷 bin\ldm-arm64.exe
+; Inno 6 的架构标识只有 arm64 / x64compatible / x86compatible / arm32compatible,
+; 没有 arm64compatible(用了会编译报错)。
+
+#ifndef MyArch
+  #define MyArch "x64"
+#endif
+
+#if MyArch == "arm64"
+  #define MyArchAllowed "arm64"
+  #define MyArchInstallMode "arm64"
+  #define MyAppSourceExe "ldm-arm64.exe"
+#else
+  #define MyArchAllowed "x64compatible"
+  #define MyArchInstallMode "x64compatible"
+  #define MyAppSourceExe "ldm-x64.exe"
+#endif
 
 #define MyAppName "lgo_download_manager"
+; 装到目标机器上的文件名固定是 ldm.exe(协议注册表里的命令行、托盘/UI 自复制
+; 都按这个名字找),架构只体现在 bin\ 里的待打包文件名上。
 #define MyAppExeName "ldm.exe"
 #define MyAppPublisher "langbiantianya"
 #define MyAppURL "https://github.com/langbiantianya/lgo_download_manager"
@@ -59,8 +81,8 @@ DisableDirPage=auto
 DisableProgramGroupPage=yes
 AllowNoIcons=yes
 
-ArchitecturesAllowed=x64compatible
-ArchitecturesInstallIn64BitMode=x64compatible
+ArchitecturesAllowed={#MyArchAllowed}
+ArchitecturesInstallIn64BitMode={#MyArchInstallMode}
 
 ; 安装/升级前让 Restart Manager 关掉正在运行的 ldm,否则 exe 被占用
 ; 会变成「重启后替换」。
@@ -76,7 +98,7 @@ MergeDuplicateFiles=yes
 
 ; 路径一律锚在脚本所在目录,便于从任意 CWD 调用 ISCC。
 OutputDir={#SourcePath}\..\dist
-OutputBaseFilename=ldm-setup-{#MyAppVersionStr}
+OutputBaseFilename=ldm-setup-{#MyAppVersionStr}-{#MyArch}
 SetupIconFile={#SourcePath}\..\assets\ldm.ico
 
 [Languages]
@@ -89,7 +111,7 @@ Name: "startmenu"; Description: "创建开始菜单快捷方式"; GroupDescripti
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "快捷方式:"; Flags: unchecked
 
 [Files]
-Source: "{#SourcePath}\..\bin\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourcePath}\..\bin\{#MyAppSourceExe}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 Source: "{#SourcePath}\..\assets\ldm.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 

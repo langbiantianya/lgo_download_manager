@@ -1,31 +1,50 @@
 ﻿<#
 .SYNOPSIS
-    为 lgo_download_manager (ldm) 打包 Windows 安装包:MSI(WiX)或 EXE(Inno Setup)。
+    为 lgo_download_manager (ldm) 打包 Windows 安装包:MSI(WiX)或 EXE(Inno Setup),
+    x64 与 arm64 各出一份。
 
 .DESCRIPTION
-    一条命令完成「编译二进制 → 打包安装包」:
+    一条命令完成「按架构编译二进制 → 打包安装包」:
 
-        pwsh -File scripts\package.ps1                 # MSI + EXE
-        pwsh -File scripts\package.ps1 -Format msi     # 只出 MSI
-        pwsh -File scripts\package.ps1 -Format exe     # 只出 EXE
+        pwsh -File scripts\package.ps1                    # x64 + arm64 的 MSI 与 EXE
+        pwsh -File scripts\package.ps1 -Format msi        # 只出 MSI
+        pwsh -File scripts\package.ps1 -Arch x64          # 只出 x64
+        pwsh -File scripts\package.ps1 -Format exe -Arch arm64
 
-    两个安装包功能对等,任选其一安装即可(不要同时装两个):
+    产物:
+
+        dist\ldm-setup-<版本>-x64.msi     dist\ldm-setup-<版本>-arm64.msi
+        dist\ldm-setup-<版本>-x64.exe     dist\ldm-setup-<版本>-arm64.exe
+
+    MSI 一个包只能承载一种架构,所以必须按架构分开;两个安装包(MSI / EXE)
+    功能对等,同一架构上**任选其一**安装即可(不要同时装两个):
 
       - 用户态安装到 %LOCALAPPDATA%\Programs\lgo_download_manager,不弹 UAC;
       - 注册 HKCU\Software\Classes\lgom,命令行 "<install>\ldm.exe" "%1";
       - 装好后浏览器/资源管理器里的 lgom://download?url=... 会拉起 ldm 并开始下载;
         ldm 已在运行时,新进程把 URL 经命名管道转发给主实例后退出;
-      - 安装/升级/卸载前会结束正在运行的 ldm 实例,避免 exe 被占用。
+      - 安装/升级/卸载前会结束正在运行的 ldm 实例,避免 exe 被占用;
+      - 卸载时连同用户数据目录一起删除,覆盖安装/升级不动它。
 
-    依赖的打包工具如果缺失,脚本会尝试用 winget 安装(可用 -SkipToolInstall
-    关闭,或用 -WixPath / -IsccPath 指向已有安装):
+    依赖的工具如果缺失,脚本会尝试用 winget 安装(可用 -SkipToolInstall 关闭,
+    或用 -WixPath / -IsccPath / -CCX64 / -CCArm64 指向已有安装):
 
-      - MSI: WiX Toolset CLI(WiXToolset.WiXCLI)。注意 WiX v7 要求接受 OSMF
-        EULA,本脚本只用 v6/v5。
+      - MSI: WiX Toolset CLI(WiXToolset.WiXCLI)。WiX v7 要求接受 OSMF EULA,
+        本脚本只用 v6/v5。
       - EXE: Inno Setup 6(JRSoftware.InnoSetup)。
+      - C 工具链:cgo 只接受 gcc 风格命令行的编译器 —— GCC 或 clang。
+        **MSVC 的 cl.exe 不能用作 CC**(Go 从未支持 MSVC:cgo 用 -o/-c/-I/-D
+        这类 gcc 参数直接调编译器,cl.exe 的 /Fo、/c 语法与之不兼容)。
+        clang 可以,LLVM-MinGW(MartinStorsjo.LLVM-MinGW.UCRT)是 clang +
+        mingw-w64 sysroot 的发行版,一个包同时提供 x86_64 与 aarch64 两个
+        target,所以两个架构可以共用同一套工具链。
 
 .PARAMETER Format
     打包格式:msi / exe / both(默认 both)。
+
+.PARAMETER Arch
+    要打包的架构,逗号分隔(默认 x64,arm64)。取值:x64 / arm64,
+    也接受 amd64 / aarch64。
 
 .PARAMETER Version
     覆盖版本号(默认取 `git describe --tags --always --dirty`),写进二进制的
@@ -39,10 +58,10 @@
     安装包输出目录,默认 <repo>\dist。
 
 .PARAMETER SkipBuild
-    跳过 go build,直接使用已有的 bin\ldm.exe。
+    跳过 go build,直接使用已有的 bin\ldm-<arch>.exe(仍会校验 PE 架构)。
 
 .PARAMETER SkipToolInstall
-    打包工具缺失时直接报错,不尝试 winget 安装。
+    工具缺失时直接报错,不尝试 winget 安装。
 
 .PARAMETER WixPath
     显式指定 wix.exe(Windows Installer XML 命令行)。
@@ -50,11 +69,18 @@
 .PARAMETER IsccPath
     显式指定 ISCC.exe(Inno Setup 命令行编译器)。
 
+.PARAMETER CCX64
+    x64 的 C 编译器。缺省按 x86_64-w64-mingw32-clang → 主机默认 gcc 解析。
+
+.PARAMETER CCArm64
+    arm64 的 C 交叉编译器。缺省按 aarch64-w64-mingw32-clang →
+    winget 安装的 LLVM-MinGW 解析。
+
 .EXAMPLE
     pwsh -File scripts\package.ps1
 
 .EXAMPLE
-    pwsh -File scripts\package.ps1 -Format msi -Version v1.0.0 -WinVersion 1.0.0.0
+    pwsh -File scripts\package.ps1 -Format msi -Arch arm64 -Version v1.0.0 -WinVersion 1.0.0.0
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -62,13 +88,17 @@ param(
     [ValidateSet('msi', 'exe', 'both')]
     [string]$Format = 'both',
 
+    [string[]]$Arch = @('x64', 'arm64'),
+
     [string]$Version,
     [string]$WinVersion,
     [string]$OutputDir,
     [switch]$SkipBuild,
     [switch]$SkipToolInstall,
     [string]$WixPath,
-    [string]$IsccPath
+    [string]$IsccPath,
+    [string]$CCX64,
+    [string]$CCArm64
 )
 
 $ErrorActionPreference = 'Stop'
@@ -77,8 +107,10 @@ Set-StrictMode -Version Latest
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $OutputDir) { $OutputDir = Join-Path $RepoRoot 'dist' }
 
+# 装到目标机器上的文件名固定是 ldm.exe(协议注册表命令行、托盘/UI 自复制都按
+# 这个名字找);架构只体现在 bin\ 里待打包的文件名上。
 $AppExeName = 'ldm.exe'
-$BinPath = Join-Path $RepoRoot ('bin\' + $AppExeName)
+$BinDir = Join-Path $RepoRoot 'bin'
 $IconPath = Join-Path $RepoRoot 'assets\ldm.ico'
 $WxsPath = Join-Path $RepoRoot 'installer\ldm.wxs'
 $IssPath = Join-Path $RepoRoot 'installer\installer.iss'
@@ -88,6 +120,12 @@ $MaxFreeWixMajor = 6
 $WixWingetId = 'WiXToolset.WiXCLI'
 $WixWingetVersion = '6.0.2'
 $InnoWingetId = 'JRSoftware.InnoSetup'
+# clang + mingw-w64 sysroot,同时提供 x86_64 与 aarch64 target。
+$MingwWingetId = 'MartinStorsjo.LLVM-MinGW.UCRT'
+
+# PE 头的 Machine 字段。
+$PeMachineX64 = 0x8664
+$PeMachineArm64 = 0xAA64
 
 function Write-Step([string]$Message) {
     Write-Host ''
@@ -114,6 +152,158 @@ function Invoke-Native([string]$FilePath, [string[]]$Arguments, [string]$Working
         throw ("{0} 退出码为 {1}" -f (Split-Path -Leaf $FilePath), $code)
     }
 }
+
+# ---------------------------------------------------------------------------
+# 架构
+# ---------------------------------------------------------------------------
+
+# 规范化 -Arch:接受 x64/amd64 与 arm64/aarch64,去重并保持用户给定顺序。
+function Resolve-Architectures {
+    $seen = @{}
+    $result = @()
+    foreach ($item in $Arch) {
+        foreach ($part in ($item -split ',')) {
+            $slug = $part.Trim().ToLowerInvariant()
+            switch ($slug) {
+                'x64' { $slug = 'x64' }
+                'amd64' { $slug = 'x64' }
+                'arm64' { $slug = 'arm64' }
+                'aarch64' { $slug = 'arm64' }
+                default { throw "不支持的架构「$part」;可用:x64、arm64(也接受 amd64/aarch64)" }
+            }
+            if (-not $seen.ContainsKey($slug)) {
+                $seen[$slug] = $true
+                $result += $slug
+            }
+        }
+    }
+    if ($result.Count -eq 0) { throw '-Arch 至少需要一个架构' }
+    return $result
+}
+
+# slug → Go 的 GOARCH、WiX 的平台标识、待打包的二进制路径。
+function Get-ArchSpec([string]$Slug) {
+    if ($Slug -eq 'arm64') {
+        return [pscustomobject]@{
+            Slug    = 'arm64'
+            Goarch  = 'arm64'
+            WixArch = 'arm64'
+            PE      = $PeMachineArm64
+            ExePath = (Join-Path $BinDir 'ldm-arm64.exe')
+        }
+    }
+    return [pscustomobject]@{
+        Slug    = 'x64'
+        Goarch  = 'amd64'
+        WixArch = 'x64'
+        PE      = $PeMachineX64
+        ExePath = (Join-Path $BinDir 'ldm-x64.exe')
+    }
+}
+
+# 读 PE 头的 Machine 字段,确认产物确实是目标架构。
+# 防的是「-SkipBuild 复用了另一个架构的 bin 文件」和「工具链 target 传错」,
+# 这两种情况都会打出架构与载荷不匹配的安装包(装上去直接跑不起来)。
+function Get-PEMachine([string]$Path) {
+    $fs = [System.IO.File]::OpenRead($Path)
+    try {
+        $br = New-Object System.IO.BinaryReader($fs)
+        $fs.Position = 0x3C
+        $peOffset = $br.ReadInt32()
+        $fs.Position = $peOffset
+        if ($br.ReadUInt32() -ne 0x4550) { return 0 }   # "PE\0\0"
+        return [int]$br.ReadUInt16()
+    } finally {
+        $fs.Dispose()
+    }
+}
+
+function Assert-PEMachine([pscustomobject]$Spec) {
+    $machine = Get-PEMachine $Spec.ExePath
+    if ($machine -eq $Spec.PE) { return }
+    $msg = "{0} 的 PE 架构是 0x{1:X4},期望 0x{2:X4}({3});请检查工具链 target,或去掉 -SkipBuild 重新编译。" -f `
+        $Spec.ExePath, $machine, $Spec.PE, $Spec.Slug
+    throw $msg
+}
+
+# ---------------------------------------------------------------------------
+# C 工具链(cgo 需要 gcc 风格命令行:gcc 或 clang;MSVC 的 cl.exe 不可用)
+# ---------------------------------------------------------------------------
+
+# 在已安装的工具目录里找带前缀的 mingw 编译器。winget 把 LLVM-MinGW 解到
+# %LOCALAPPDATA%\Microsoft\WinGet\Packages\MartinStorsjo.LLVM-MinGW.*\ 下,
+# 且不一定进 PATH,所以要显式找;搜索范围限定在几个已知位置,避免全盘递归。
+function Find-PrefixedMingwCC([string[]]$Names) {
+    $roots = @()
+    if (${env:LOCALAPPDATA}) {
+        $pkgs = Join-Path ${env:LOCALAPPDATA} 'Microsoft\WinGet\Packages'
+        if (Test-Path -LiteralPath $pkgs) {
+            $roots += @(Get-ChildItem -LiteralPath $pkgs -Directory -Filter '*LLVM-MinGW*' -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.FullName })
+        }
+    }
+    foreach ($rel in @('llvm-mingw', 'Program Files\llvm-mingw', 'Program Files (x86)\llvm-mingw')) {
+        $roots += (Join-Path $env:SystemDrive $rel)
+    }
+
+    foreach ($root in $roots) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $hit = Get-ChildItem -LiteralPath $root -Recurse -Depth 4 -File -ErrorAction SilentlyContinue |
+            Where-Object { $Names -contains $_.Name } |
+            Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
+}
+
+# 解析某个架构的 CC。返回编译器的绝对路径,或 $null 表示交给 Go 用自己的默认 CC。
+# 找不到 arm64 工具链时会先尝试 winget 安装 LLVM-MinGW。
+function Resolve-CC([string]$Slug) {
+    $explicit = $null
+    if ($Slug -eq 'arm64') { $explicit = $CCArm64 } else { $explicit = $CCX64 }
+    if ($explicit) {
+        if (-not (Test-Path -LiteralPath $explicit)) { throw "指向的 C 编译器不存在: $explicit" }
+        return (Resolve-Path -LiteralPath $explicit).Path
+    }
+
+    # clang 优先:同一个工具链包同时覆盖两个架构,且 winget 可自动获取。
+    if ($Slug -eq 'arm64') {
+        $names = @('aarch64-w64-mingw32-clang.exe', 'aarch64-w64-mingw32-gcc.exe')
+    } else {
+        $names = @('x86_64-w64-mingw32-clang.exe', 'x86_64-w64-mingw32-gcc.exe')
+    }
+    foreach ($name in $names) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd) { return $cmd.Source }
+    }
+    $found = Find-PrefixedMingwCC $names
+    if ($found) { return $found }
+
+    if ($Slug -eq 'x64') {
+        # 主机上已有 gcc 就让 Go 用默认 CC(与历史构建一致)。
+        if (Get-Command 'gcc.exe' -ErrorAction SilentlyContinue) { return $null }
+        throw @"
+x64 需要 C 编译器(gcc 或 LLVM-MinGW 的 x86_64-w64-mingw32-clang):Fyne 的 GL 绑定是 cgo,没有 C 工具链编不过。
+    winget install --id $MingwWingetId --exact --silent
+"@
+    }
+
+    Write-Step "安装 arm64 C 工具链(LLVM-MinGW:$MingwWingetId)"
+    Install-WingetPackage $MingwWingetId $null
+    $found = Find-PrefixedMingwCC $names
+    if ($found) { return $found }
+
+    throw @"
+找不到 aarch64 的 C 交叉编译器(arm64 构建必需:Fyne 的 GL 绑定是 cgo,GOARCH=arm64 时 Go 会关掉 cgo 并编译失败)。
+请装 LLVM-MinGW 或用 -CCArm64 指向已有的编译器(如 aarch64-w64-mingw32-clang):
+
+    winget install --id $MingwWingetId --exact --silent
+"@
+}
+
+# ---------------------------------------------------------------------------
+# 版本
+# ---------------------------------------------------------------------------
 
 # Git 元数据:拿不到就退回占位符,保证在非 git 目录(源码压缩包)里也能打包。
 function Invoke-Git([string[]]$Arguments) {
@@ -152,13 +342,17 @@ function Get-WindowsVersion([string]$BuildVersion) {
     return ("{0}.{1}.{2}.{3}" -f $major, $minor, $patch, $rev)
 }
 
-function Invoke-Build {
+# ---------------------------------------------------------------------------
+# 编译
+# ---------------------------------------------------------------------------
+
+function Invoke-Build([pscustomobject]$Spec, [string]$CC) {
     $v = Get-BuildVersion
     $commit = Invoke-Git @('rev-parse', '--short', 'HEAD')
     if (-not $commit) { $commit = 'unknown' }
     $date = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 
-    New-Item -ItemType Directory -Path (Split-Path -Parent $BinPath) -Force | Out-Null
+    New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
     $ldflags = @(
         '-s', '-w',
         '-X', "lgo_download_manager/internal/version.Version=$v",
@@ -166,11 +360,28 @@ function Invoke-Build {
         '-X', "lgo_download_manager/internal/version.Date=$date"
     ) -join ' '
 
-    Invoke-Native 'go' @('build', '-trimpath', '-ldflags', $ldflags, '-o', $BinPath, '.') $RepoRoot
+    $env:GOOS = 'windows'
+    $env:GOARCH = $Spec.Goarch
+    # 交叉编译(GOARCH != 主机架构)时 Go 默认把 cgo 关掉,而 Fyne 的 GL 绑定
+    # 只有 cgo 实现,关掉就是 "build constraints exclude all Go files"。
+    $env:CGO_ENABLED = '1'
+    if ($CC) { $env:CC = $CC }
+    try {
+        Invoke-Native 'go' @('build', '-trimpath', '-ldflags', $ldflags, '-o', $Spec.ExePath, '.') $RepoRoot
+    } finally {
+        Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
+        if ($CC) { Remove-Item Env:CC -ErrorAction SilentlyContinue }
+    }
 
-    $size = [math]::Round((Get-Item -LiteralPath $BinPath).Length / 1MB, 1)
-    Write-Note ("built {0} ({1} MB, version {2}, commit {3})" -f $BinPath, $size, $v, $commit)
+    $size = [math]::Round((Get-Item -LiteralPath $Spec.ExePath).Length / 1MB, 1)
+    $ccLabel = if ($CC) { Split-Path -Leaf $CC } else { 'go default (gcc)' }
+    Write-Note ("built {0} ({1} MB, GOARCH={2}, CC={3}, version {4}, commit {5})" -f
+        $Spec.ExePath, $size, $Spec.Goarch, $ccLabel, $v, $commit)
 }
+
+# ---------------------------------------------------------------------------
+# 打包工具
+# ---------------------------------------------------------------------------
 
 # 查找 wix.exe:显式指定 → PATH → WiX 官方安装目录(Program Files\WiX Toolset v*)。
 # 返回 @{ Path = ...; Major = ... };找不到返回 $null。
@@ -266,8 +477,12 @@ function Install-WingetPackage([string]$Id, [string]$RequiredVersion) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# 出包
+# ---------------------------------------------------------------------------
+
 function New-MsiPackage {
-    param([string]$BuildVersion, [string]$NumericVersion)
+    param([pscustomobject]$Spec, [string]$BuildVersion, [string]$NumericVersion)
 
     $wix = Find-Wix
     if (-not $wix) {
@@ -289,18 +504,20 @@ wix.exe 是 v$($wix.Major)($($wix.Path)),它要求接受 OSMF EULA 才能运行,
 "@
     }
 
-    $outMsi = Join-Path $OutputDir ("ldm-setup-{0}.msi" -f $BuildVersion)
+    $outMsi = Join-Path $OutputDir ("ldm-setup-{0}-{1}.msi" -f $BuildVersion, $Spec.Slug)
+    # -arch 决定 <Package> 的平台,-d Arch 决定打哪个二进制,两者必须一致。
     Invoke-Native $wix.Path @(
         'build', $WxsPath,
-        '-arch', 'x64',
+        '-arch', $Spec.WixArch,
         '-d', ("ProductVersion={0}" -f $NumericVersion),
+        '-d', ("Arch={0}" -f $Spec.Slug),
         '-o', $outMsi
     ) $RepoRoot
     return $outMsi
 }
 
 function New-ExePackage {
-    param([string]$BuildVersion, [string]$NumericVersion)
+    param([pscustomobject]$Spec, [string]$BuildVersion, [string]$NumericVersion)
 
     $iscc = Find-Iscc
     if (-not $iscc) {
@@ -312,19 +529,19 @@ function New-ExePackage {
         throw "找不到 ISCC.exe。请安装 Inno Setup($InnoWingetId)或用 -IsccPath 指定。"
     }
 
-    # .iss 从环境变量读版本号(ISPP 的 GetEnv),避免在脚本里拼字符串;
+    # .iss 从环境变量读版本号(ISPP 的 GetEnv),/DMyArch 选架构与载荷,
     # 输出目录用 ISCC 的 /O 覆盖 .iss 里的 OutputDir(默认 dist\)。
     $env:LDM_VERSION = $BuildVersion
     $env:LDM_WIN_VERSION = $NumericVersion
     try {
-        Invoke-Native $iscc @(('/O{0}' -f $OutputDir), $IssPath) $RepoRoot
+        Invoke-Native $iscc @(('/DMyArch={0}' -f $Spec.Slug), ('/O{0}' -f $OutputDir), $IssPath) $RepoRoot
     } finally {
         Remove-Item Env:LDM_VERSION -ErrorAction SilentlyContinue
         Remove-Item Env:LDM_WIN_VERSION -ErrorAction SilentlyContinue
     }
 
-    # OutputBaseFilename 在 .iss 里固定为 ldm-setup-<版本>.exe。
-    return (Join-Path $OutputDir ("ldm-setup-{0}.exe" -f $BuildVersion))
+    # .iss 里 OutputBaseFilename = ldm-setup-<版本>-<架构>.exe。
+    return (Join-Path $OutputDir ("ldm-setup-{0}-{1}.exe" -f $BuildVersion, $Spec.Slug))
 }
 
 # ---------------------------------------------------------------------------
@@ -333,35 +550,48 @@ function New-ExePackage {
 
 foreach ($required in @($WxsPath, $IssPath, $IconPath)) {
     if (-not (Test-Path -LiteralPath $required)) {
-        throw "缺少打包所需文件: $required(图标可用 scripts/gen_icon.py 重新生成)"
+        throw "缺少打包所需文件: $required"
     }
 }
 
 $buildVersion = Get-BuildVersion
 $numericVersion = Get-WindowsVersion $buildVersion
+$archSlugs = Resolve-Architectures
 
 Write-Step "打包 lgo_download_manager"
 Write-Note "repo        $RepoRoot"
 Write-Note "format      $Format"
+Write-Note "arch        $($archSlugs -join ', ')"
 Write-Note "version     $buildVersion (MSI/VersionInfo: $numericVersion)"
-
-if (-not $SkipBuild) {
-    Write-Step 'go build'
-    Invoke-Build
-} elseif (-not (Test-Path -LiteralPath $BinPath)) {
-    throw "-SkipBuild 指定为跳过编译,但 $BinPath 不存在。"
-}
 
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
-$artifacts = @()
-if ($Format -eq 'msi' -or $Format -eq 'both') {
-    Write-Step 'MSI(WiX)'
-    $artifacts += (New-MsiPackage $buildVersion $numericVersion)
+$specs = @()
+foreach ($slug in $archSlugs) {
+    $spec = Get-ArchSpec $slug
+
+    if (-not $SkipBuild) {
+        # 只在真要编译时才解析/安装 C 工具链。
+        $cc = Resolve-CC $slug
+        Write-Step ("go build ({0})" -f $spec.Slug)
+        Invoke-Build $spec $cc
+    } elseif (-not (Test-Path -LiteralPath $spec.ExePath)) {
+        throw ("-SkipBuild 指定为跳过编译,但 {0} 不存在" -f $spec.ExePath)
+    }
+    Assert-PEMachine $spec
+    $specs += $spec
 }
-if ($Format -eq 'exe' -or $Format -eq 'both') {
-    Write-Step 'EXE(Inno Setup)'
-    $artifacts += (New-ExePackage $buildVersion $numericVersion)
+
+$artifacts = @()
+foreach ($spec in $specs) {
+    if ($Format -eq 'msi' -or $Format -eq 'both') {
+        Write-Step ("MSI(WiX, {0})" -f $spec.Slug)
+        $artifacts += (New-MsiPackage $spec $buildVersion $numericVersion)
+    }
+    if ($Format -eq 'exe' -or $Format -eq 'both') {
+        Write-Step ("EXE(Inno Setup, {0})" -f $spec.Slug)
+        $artifacts += (New-ExePackage $spec $buildVersion $numericVersion)
+    }
 }
 
 Write-Step '产物'
