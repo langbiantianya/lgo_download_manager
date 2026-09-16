@@ -212,6 +212,16 @@ proxyURLEntry.OnChanged = func(s string) {
 	})
 	lightModeCheck.SetChecked(GlobalSettings.LightMode)
 
+	// 开机自启:启用后业务进程会在操作系统登录时以静默方式自启——
+	// 不显示主窗口,只保留调度器 + 系统托盘;用户在托盘菜单恢复 UI。
+	// UI 提交后由 settings.Save → ApplyAutoStart 在业务侧把
+	// 注册表/.desktop/LaunchAgent 调到与开关一致,失败只记日志。
+	autoStartCheck := widget.NewCheck("开机自启（静默拉起,不显示主窗口）", func(checked bool) {
+		GlobalSettings.AutoStart = checked
+		persist()
+	})
+	autoStartCheck.SetChecked(GlobalSettings.AutoStart)
+
 	sortSelect.SetSelected(currentLabel)
 	form := widget.NewForm(
 		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
@@ -226,6 +236,7 @@ proxyURLEntry.OnChanged = func(s string) {
 		widget.NewFormItem("FTP 模式", ftpPassive),
 		widget.NewFormItem("磁盘预分配", prealloc),
 		widget.NewFormItem("轻量模式", lightModeCheck),
+		widget.NewFormItem("开机自启", autoStartCheck),
 		widget.NewFormItem("任务列表排序", sortSelect),
 	)
 
