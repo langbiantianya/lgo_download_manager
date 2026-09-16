@@ -8,7 +8,6 @@ package ui
 
 import (
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"time"
 
@@ -205,14 +204,13 @@ func (r *taskRow) bindButtons(t *store.Task, svc Service) {
 		if t.SavePath == "" {
 			return
 		}
-		dir := filepath.Dir(t.SavePath)
-		exec.Command("xdg-open", dir).Run()
+		openFolder(filepath.Dir(t.SavePath))
 	}
 	r.openFileBtn.OnTapped = func() {
 		if t.SavePath == "" {
 			return
 		}
-		exec.Command("xdg-open", t.SavePath).Run()
+		openFile(t.SavePath)
 	}
 }
 
