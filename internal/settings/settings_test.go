@@ -81,3 +81,53 @@ func TestLoad_PersistedLightModeHonored(t *testing.T) {
 		t.Errorf("LightMode = %v, want true (user explicitly set it)", got.LightMode)
 	}
 }
+
+// TestAutoStart_DefaultOff 验证首次运行 AutoStart 默认关闭——
+// 「默认不打扰用户」原则;用户在「设置」里显式开启才会注册。
+func TestAutoStart_DefaultOff(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	got, err := Load(st, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.AutoStart {
+		t.Errorf("AutoStart default = %v, want false (do not bother users on first run)", got.AutoStart)
+	}
+}
+
+// TestAutoStart_PersistedRoundTrip 验证用户开启 AutoStart 后,
+// 后续 Load 能读到持久化的 true 值;使用 store.SaveSettings 直接落盘
+// 以避免在测试里实际写注册表/.desktop/LaunchAgent。
+func TestAutoStart_PersistedRoundTrip(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	// 首次运行后,模拟用户在 UI 中勾选 AutoStart=true 并提交。
+	if _, err := Load(st, false); err != nil {
+		t.Fatalf("first Load: %v", err)
+	}
+	if err := st.SaveSettings(store.Settings{
+		DefaultSaveDir: t.TempDir(), // firstRun=false
+		AutoStart:      true,
+	}); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	got, err := Load(st, false)
+	if err != nil {
+		t.Fatalf("second Load: %v", err)
+	}
+	if !got.AutoStart {
+		t.Errorf("AutoStart = %v, want true (user explicitly toggled it on)", got.AutoStart)
+	}
+}

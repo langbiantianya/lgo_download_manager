@@ -311,6 +311,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_save_path    ON tasks(save_path ASC, id ASC
 	if err := s.addColumnIfMissing("settings", "max_concurrent", `INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
+	if err := s.addColumnIfMissing("settings", "auto_start", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -651,6 +654,13 @@ type Settings struct {
 	// (DefaultMaxConcurrent)。设置被改小不会自动暂停正在运行的下载,
 	// 但超出限额后新加入的任务会保持 Pending 直到有 slot 释放。
 	MaxConcurrent int
+
+	// AutoStart 控制操作系统登录后是否自动启动业务主进程。
+	// 启用时,业务进程会以静默(隐藏主窗口)方式拉起,
+	// 只保留调度器与系统托盘;用户在托盘菜单「显示窗口」恢复 UI。
+	// 持久化与实际注册表/.desktop/LaunchAgent 是否一致由
+	// settings.ApplyAutoStart 在 Save/启动时调和。
+	AutoStart bool
 }
 
 // DefaultMaxConcurrent 是 MaxConcurrent 为 0/负数时的兜底默认值;
@@ -686,15 +696,17 @@ func (s *Store) LoadSettings() (Settings, error) {
 		proxyBypass string
 		lightMode   int
 		maxConc     int
+		autoStart   int
 	)
 	err := s.db.QueryRow(`SELECT default_save_dir, default_threads, min_chunk_size,
 		user_agent, cookies, ftp_passive, prealloc, task_sort,
 		COALESCE(proxy_mode, ''), COALESCE(proxy_url, ''), COALESCE(proxy_bypass, ''),
 		COALESCE(light_mode, 1),
-		COALESCE(max_concurrent, 0)
+		COALESCE(max_concurrent, 0),
+		COALESCE(auto_start, 0)
 		FROM settings WHERE id=1`,
 	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc, &taskSort,
-		&proxyMode, &proxyURL, &proxyBypass, &lightMode, &maxConc)
+		&proxyMode, &proxyURL, &proxyBypass, &lightMode, &maxConc, &autoStart)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 首次运行：插入一条全零行，以便后续 LoadSettings 能读到。
 		_, ierr := s.db.Exec(`INSERT OR IGNORE INTO settings (id) VALUES (1)`)
@@ -733,6 +745,9 @@ func (s *Store) LoadSettings() (Settings, error) {
 		// max_concurrent 列缺省值为 0(<DefaultMaxConcurrent 视为未配置);
 		// 调用方 (settings.Load) 会套用首次运行默认值。
 		MaxConcurrent: maxConc,
+		// auto_start 列缺省值为 0:首次运行不自动开机自启,符合
+		// 「默认不打扰用户」原则;用户在「设置」里显式开启才会注册。
+		AutoStart: autoStart != 0,
 	}, nil
 }
 
@@ -742,8 +757,8 @@ func (s *Store) SaveSettings(s2 Settings) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO settings (id, default_save_dir, default_threads,
 		min_chunk_size, user_agent, cookies, ftp_passive, prealloc, task_sort,
-		proxy_mode, proxy_url, proxy_bypass, light_mode, max_concurrent)
-	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		proxy_mode, proxy_url, proxy_bypass, light_mode, max_concurrent, auto_start)
+	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 			default_save_dir=excluded.default_save_dir,
 			default_threads=excluded.default_threads,
@@ -757,13 +772,15 @@ func (s *Store) SaveSettings(s2 Settings) error {
 			proxy_url=excluded.proxy_url,
 			proxy_bypass=excluded.proxy_bypass,
 			light_mode=excluded.light_mode,
-			max_concurrent=excluded.max_concurrent`,
+			max_concurrent=excluded.max_concurrent,
+			auto_start=excluded.auto_start`,
 		s2.DefaultSaveDir, s2.DefaultThreads, s2.MinChunkSize,
 		s2.UserAgent, s2.Cookies, boolToInt(s2.FTPPassive), boolToInt(s2.Prealloc),
 		string(s2.TaskSort),
 		string(protocol.ProxyMode(s2.ProxyMode).String()), s2.ProxyURL, s2.ProxyBypass,
 		boolToInt(s2.LightMode),
 		s2.MaxConcurrent,
+		boolToInt(s2.AutoStart),
 	)
 	if err != nil {
 		return fmt.Errorf("settings save: %w", err)

@@ -285,6 +285,7 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 | `-open-url` | `""`            | 一条 `lgom://...` URL，加入队列               |
 | `-light`    | `false`         | 强制开启轻量模式（关闭主窗口时释放 widget 树） |
 | `-debug`    | `false`         | 把日志写到 stderr 而不是轮转文件（详见「日志」） |
+| `-autostart`| `false`         | 由 OS 登录启动项触发:静默拉起(只保留调度器 + 托盘,不显示主窗口) |
 
 `-config` 默认值：Windows 上是 `%LOCALAPPDATA%\lgo_download_manager`（绝对路径
 —— 安装后的 lgdm 会被 `lgom://` 协议从任意工作目录拉起，相对路径会因 CWD
@@ -337,6 +338,32 @@ UI 子进程，避免子进程的日志悄悄落到文件里。
 
 PAC / WPAD 自动配置脚本不在支持范围内。
 
+## 开机自启
+
+「设置」里的 **Auto start** 开关启用后，业务主进程会在操作系统登录时
+以**静默**方式自启——不显示主窗口，只保留下载调度器与系统托盘；
+用户从托盘菜单「显示窗口」恢复 UI 后才能看到任务列表。
+
+各平台的注册位置：
+
+| 平台   | 注册位置                                                                  | 命令/参数 |
+| ------ | ------------------------------------------------------------------------- | --------- |
+| Windows | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（无需管理员权限）  | `"<exe>" --autostart` |
+| Linux  | `$XDG_CONFIG_HOME/autostart/lgo_download_manager.desktop`（缺省 `~/.config`） | `Exec=<exe> --autostart` + `X-GNOME-Autostart-enabled=true` |
+| macOS  | `~/Library/LaunchAgents/org.langbiantianya.LGDM.plist`                    | `ProgramArguments` 数组形式，`RunAtLoad=true`、`ProcessType=Background` |
+
+`--autostart` 由各平台注册项附加，业务进程读到后跳过 `uim.Start()`，
+保留调度器 + 托盘常驻。Windows / Linux / macOS 三平台行为对齐。
+
+启动时 `settings.ReconcileAutoStart` 会把持久化的开关与操作系统真实状态
+调和：用户在第三方工具（任务管理器「启动」标签、GNOME Tweaks、系统设置）
+里手动改过、或者安装/卸载有残留，都以持久化的 AutoStart 为准重新对齐。
+注册失败（如 HKCU 权限不足）只记日志、不让 UI 提交整笔失败，便于排障。
+
+Linux 上 `NoDisplay=true` 让 `.desktop` 不出现在应用启动器里，仅作自启用途；
+macOS 上 `ProcessType=Background` 标记为后台进程，不进入前台应用的内存
+压力管理名单。Windows 上写 HKCU 不需要 UAC，符合「用户态安装」原则。
+
 ## 设置
 
 存储在 `lgdm.sqlite` 的 `settings` 表中，对新建的下载生效。可通过 GUI 中的 **设置** 页面编辑。
@@ -355,6 +382,7 @@ PAC / WPAD 自动配置脚本不在支持范围内。
 | Proxy URL           | ""               | 手动模式下的代理 URL                       |
 | Proxy bypass        | ""               | 手动模式下的绕过列表（逗号分隔）           |
 | Light mode          | true             | 关闭主窗口时释放 widget 树                 |
+| Auto start          | false            | 操作系统登录后是否静默自启（详见「开机自启」） |
 
 每次修改都会立即持久化。
 
@@ -409,7 +437,8 @@ internal/scheduler/            # 单任务生命周期、状态事件、进度�
 internal/prealloc/             # 磁盘预分配辅助
 internal/urllauncher/          # lgom:// URL 解析、单实例锁、URL 转发
                                #   （Windows 命名管道 / 其它平台 Unix socket）
-internal/settings/             # 首次运行默认值 / --light 覆盖 / 进程级代理同步
+internal/settings/             # 首次运行默认值 / --light 覆盖 / 进程级代理同步 / 开机自启调和
+internal/autostart/            # 跨平台开机自启：HKCU Run / XDG autostart / LaunchAgent
 internal/logging/              # log/slog 门面：轮转文件 / --debug stderr / Windows console 挂接
 internal/ipc/                  # 长度前缀 JSON 帧协议（业务↔UI 共用）
 internal/uimgr/                # UI 子进程生命周期与 IPC 会话管理

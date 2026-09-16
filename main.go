@@ -54,6 +54,7 @@ func main() {
 	openURL := flag.String("open-url", "", "download URL (lgom://... format)")
 	light := flag.Bool("light", false, "force lightweight mode (destroy UI on close)")
 	debug := flag.Bool("debug", false, "log to stderr instead of rotating file")
+	autostartSilent := flag.Bool("autostart", false, "invoked by OS login autostart: stay headless (tray only, no main window)")
 	flag.Parse()
 
 	// 把 --debug 通过环境变量传给即将拉起的 UI 子进程,
@@ -158,6 +159,9 @@ func main() {
 	if err != nil {
 		logging.Fatalf("settings: %v", err)
 	}
+	// 启动调和:用户开关位与 OS 真实注册状态可能漂移(第三方工具、
+	// 安装/卸载残留),以持久化的 AutoStart 为准重新对齐。
+	settings.ReconcileAutoStart(cur.AutoStart)
 
 	// 调度器。
 	sc := scheduler.New(st)
@@ -197,8 +201,12 @@ func main() {
 		}
 		logging.Printf("queueing URL for dialog: %s", req.URL)
 
-		if *noGUI {
-			// CLI / 服务场景:业务侧直接创建并启动,无对话框可弹。
+		// --no-gui 与 --autostart 都没有 UI 实例可弹:都走「业务侧
+		// 直接 Add+Start」。autostart 路径主要处理 lgom:// 转发协议
+		// 在 OS 登录后立即触发 URL 的边角场景(罕见但真实:浏览器
+		// 启动后立刻点链接)。
+		if *noGUI || *autostartSilent {
+			// CLI / 服务 / autostart 场景:业务侧直接创建并启动,无对话框可弹。
 			addAndStartFromURL(sc, cur, req)
 			return
 		}
@@ -244,10 +252,15 @@ func main() {
 		},
 	})
 
-	// 默认拉起 UI(除非 -no-gui)。本进程的本地 --open-url / 位置参数
+	// 默认拉起 UI(除非 -no-gui 或 --autostart)。本进程的本地 --open-url / 位置参数
 	// URL 在 uim 起来之前就已经被上面循环处理——SendShowAddTask 内部会
 	// 等待握手,首条消息不会丢失。
-	if !*noGUI {
+	//
+	// --autostart 是 OS 登录启动项触发的静默拉起:用户没有点托盘菜单就
+	// 不会有 UI 需求;只保留调度器 + 系统托盘,等用户在托盘「显示窗口」。
+	// 这与 Windows 资源管理器/HKCU Run 的「登录后立即拉起」、Linux
+	// XDG autostart、macOS launchd RunAtLoad 的语义对齐。
+	if !*noGUI && !*autostartSilent {
 		if err := uim.Start(); err != nil {
 			logging.Printf("uimgr: cannot start UI child: %v", err)
 		}
