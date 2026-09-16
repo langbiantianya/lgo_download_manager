@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  lgo_download_manager (ldm) — WiX 源文件,产出 MSI 安装包。
+
+  由 scripts/package.ps1 调用,一般不手工执行:
+
+      wix build installer\ldm.wxs -arch x64 -d ProductVersion=0.1.0.0 -o dist\ldm-setup-0.1.0.msi
+
+  设计要点(与 installer/installer.iss 的 EXE 安装包保持一致):
+
+    - 用户态安装(Scope="perUser"),目录 %LOCALAPPDATA%\Programs\lgo_download_manager,
+      不需要管理员权限,只写 HKCU。
+    - 注册 lgom:// 协议:命令行 "<install>\ldm.exe" "%1"。浏览器把 URL 作为
+      argv[1] 交给新进程;主实例已在运行时,新进程通过命名管道把 URL 转发过去
+      再退出(见 internal/urllauncher/urllauncher_windows.go)。
+    - 安装/升级/卸载前先用 taskkill 结束正在运行的 ldm,避免 exe 被占用。
+    - ProductVersion 由 -d 传入,必须是 X.Y.Z.W 数字形式(MSI 只比较前三段)。
+
+  源文件路径以 $(sys.SOURCEFILEDIR) 为基准,因此从任意工作目录调用
+  wix build 都能解析到仓库里的 bin/、assets/、LICENSE。
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+
+  <Package Name="lgo_download_manager"
+           Manufacturer="langbiantianya"
+           Version="$(var.ProductVersion)"
+           UpgradeCode="5424C3CD-9B6C-489E-8994-66A03DED5C17"
+           Scope="perUser"
+           Language="1033"
+           Compressed="yes">
+
+    <SummaryInformation Description="lgo_download_manager (ldm) — 分片下载管理器" Manufacturer="langbiantianya" />
+
+    <!-- 同版本重装也要走升级路径(开发期反复打包时很常见)。 -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="已安装更高版本的 lgo_download_manager,请先卸载。" />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="LdmIcon" SourceFile="$(sys.SOURCEFILEDIR)\..\assets\ldm.ico" />
+    <Property Id="ARPPRODUCTICON" Value="LdmIcon" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+
+    <!-- 用户级安装目录:%LOCALAPPDATA%\Programs\lgo_download_manager -->
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="ProgramsFolder" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="lgo_download_manager" />
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppMenuFolder" Name="lgo_download_manager" />
+    </StandardDirectory>
+    <StandardDirectory Id="DesktopFolder" />
+
+    <Feature Id="Main" Title="lgo_download_manager" Level="1">
+      <ComponentGroupRef Id="AppFiles" />
+      <ComponentRef Id="UrlScheme" />
+    </Feature>
+
+    <!--
+      安装前结束正在运行的实例。
+
+      必须是 immediate 动作:延迟(deferred/in-script)动作只能排在
+      InstallInitialize 与 InstallFinalize 之间,排在 InstallValidate 之前
+      会以 2762 直接失败 —— 而它恰恰要在 InstallValidate 的「文件被占用」
+      检查之前生效。taskkill 找不到进程时返回非零,所以 Return="ignore"。
+
+      动作与它的调度都必须挂在 <Package> 下 —— WiX v4 起
+      InstallExecuteSequence 不是顶层元素,放在 <Fragment> 里会被静默忽略
+      (表里没有行,动作永远不会执行)。
+
+      工作目录必须是已经存在的目录:System32。指向 INSTALLFOLDER 的话,
+      首次安装时它还不存在,CreateProcess 直接以 1721 失败。
+    -->
+    <CustomAction Id="StopRunningLdm"
+                  Directory="System64Folder"
+                  ExeCommand="taskkill.exe /IM ldm.exe /F"
+                  Execute="immediate"
+                  Return="ignore" />
+
+    <!--
+      卸载时删掉用户数据目录 %LOCALAPPDATA%\lgo_download_manager
+      (ldm.sqlite 任务库 + wal/shm + UI IPC 的 ui-*.sock)。这个目录
+      不是安装包创建的,而是程序首次运行时建的,所以只能用自定义动作删。
+
+      条件里的 UPGRADINGPRODUCTCODE 是关键:大版本升级时,旧产品的卸载
+      序列会完整跑一遍(REMOVE=ALL),不加这个条件就会在升级时把用户的
+      任务列表删掉。运行时走 System32 下的 cmd(工作目录见上一条注释),
+      Return="ignore" 让目录本来就不存在时不影响卸载结果。
+
+      排在 InstallFinalize 之后:删除用户数据的动作不应该落在 MSI 事务里,
+      回滚时也不该把已经删掉的文件"恢复"成半截状态。
+    -->
+    <CustomAction Id="RemoveUserData"
+                  Directory="System64Folder"
+                  ExeCommand="cmd.exe /C rmdir /S /Q &quot;[LocalAppDataFolder]lgo_download_manager&quot;"
+                  Execute="immediate"
+                  Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="StopRunningLdm" Before="InstallValidate" />
+      <Custom Action="RemoveUserData" After="InstallFinalize"
+              Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+
+  <Fragment>
+    <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="61E3E212-05B7-4BE4-A37C-5508FF676C85">
+        <File Id="LdmExe" Source="$(sys.SOURCEFILEDIR)\..\bin\ldm.exe" KeyPath="yes">
+          <Shortcut Id="StartMenuShortcut"
+                    Directory="AppMenuFolder"
+                    Name="lgo_download_manager"
+                    Description="lgo_download_manager (ldm)"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="LdmIcon"
+                    Advertise="no" />
+          <Shortcut Id="DesktopShortcut"
+                    Directory="DesktopFolder"
+                    Name="lgo_download_manager"
+                    Description="lgo_download_manager (ldm)"
+                    WorkingDirectory="INSTALLFOLDER"
+                    Icon="LdmIcon"
+                    Advertise="no" />
+        </File>
+        <RemoveFolder Id="RemoveAppMenuFolder" Directory="AppMenuFolder" On="uninstall" />
+      </Component>
+
+      <Component Id="IconFile" Guid="5D3181F2-D16C-4805-B070-EA625A198155">
+        <File Id="LdmIco" Source="$(sys.SOURCEFILEDIR)\..\assets\ldm.ico" KeyPath="yes" />
+      </Component>
+
+      <Component Id="LicenseFile" Guid="2E2EBBAF-FB75-4694-B1FF-95A2123C24C4">
+        <File Id="LicenseTxt" Source="$(sys.SOURCEFILEDIR)\..\LICENSE" KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <!--
+      lgom:// 协议注册。组件放在 INSTALLFOLDER(用户目录)下,配 HKCU
+      注册表项,满足 ICE 对「组件不得混用 per-user / per-machine 数据」
+      的要求;第一个 RegistryValue 兼作 KeyPath。
+    -->
+    <Component Id="UrlScheme" Directory="INSTALLFOLDER" Guid="03D3D5C1-646E-48EC-90F7-84CDAE425143">
+      <RegistryValue Id="LgomDefault"
+                     Root="HKCU"
+                     Key="Software\Classes\lgom"
+                     Value="URL:lgom Protocol"
+                     Type="string"
+                     KeyPath="yes" />
+      <RegistryValue Id="LgomUrlProtocol"
+                     Root="HKCU"
+                     Key="Software\Classes\lgom"
+                     Name="URL Protocol"
+                     Value=""
+                     Type="string" />
+      <RegistryValue Id="LgomFriendlyName"
+                     Root="HKCU"
+                     Key="Software\Classes\lgom"
+                     Name="FriendlyTypeName"
+                     Value="lgom Download Protocol"
+                     Type="string" />
+      <!-- 现代浏览器(Edge/Chrome)读这个提示位,粘贴 lgom:// URL 时建议处理程序。 -->
+      <RegistryValue Id="LgomEditFlags"
+                     Root="HKCU"
+                     Key="Software\Classes\lgom"
+                     Name="EditFlags"
+                     Value="2"
+                     Type="integer" />
+      <RegistryValue Id="LgomDefaultIcon"
+                     Root="HKCU"
+                     Key="Software\Classes\lgom\DefaultIcon"
+                     Value="&quot;[INSTALLFOLDER]ldm.ico&quot;,0"
+                     Type="string" />
+      <RegistryValue Id="LgomOpenCommand"
+                     Root="HKCU"
+                     Key="Software\Classes\lgom\shell\open\command"
+                     Value="&quot;[INSTALLFOLDER]ldm.exe&quot; &quot;%1&quot;"
+                     Type="string" />
+    </Component>
+  </Fragment>
+
+</Wix>

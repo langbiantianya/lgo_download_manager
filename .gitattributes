@@ -1,0 +1,5 @@
+# 二进制资源:禁止行尾/编码转换。
+# 本机 core.autocrlf=true 时,git 可能把二进制误判成文本做 eol 转换,
+# 图标一旦被改写,打包出的快捷方式/DefaultIcon 就会坏。显式标成二进制。
+*.ico -text -diff
+*.png -text -diff

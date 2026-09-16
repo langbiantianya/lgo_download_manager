@@ -34,12 +34,13 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
 )
 
-const defaultDBPath = "ldm.sqlite"
+const defaultDBFile = "ldm.sqlite"
 
 func main() {
 	log.Printf("ldm %s", version.String())
@@ -48,7 +49,7 @@ func main() {
 		os.Exit(ui.RunChild())
 	}
 
-	dbPath := flag.String("db", defaultDBPath, "path to SQLite database")
+	dbPath := flag.String("db", defaultDBPath(), "path to SQLite database")
 	noGUI := flag.Bool("no-gui", false, "start without spawning the Fyne UI child")
 	openURL := flag.String("open-url", "", "download URL (lgom://... format)")
 	light := flag.Bool("light", false, "force lightweight mode (destroy UI on close)")
@@ -95,7 +96,13 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 存储 + 设置加载。
+	// 存储 + 设置加载。默认库落在用户级数据目录里,那里可能还不存在
+	// (首次安装后直接由 lgom:// 协议拉起时),先建目录再开库。
+	if dir := filepath.Dir(*dbPath); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			log.Fatalf("store: create database directory: %v", err)
+		}
+	}
 	st, err := store.Open(*dbPath)
 	if err != nil {
 		log.Fatalf("store: %v", err)
@@ -242,6 +249,24 @@ func savePathFor(s store.Settings, rawURL, name string) string {
 		}
 	}
 	return filepath.Join(saveDir, name)
+}
+
+// defaultDBPath 返回默认的数据库路径。
+//
+// Windows 上默认值必须落在用户级数据目录,不能是相对路径:安装后
+// 的 ldm 会被 lgom:// 协议从任意工作目录拉起(资源管理器/浏览器的
+// CWD 可能是 System32,普通用户不可写),相对路径会让冷启动直接
+// 开库失败;即使能写,托盘实例与协议实例的工作目录不同也会落到两份
+// 不同的库里,任务列表对不上。
+//
+// 其它平台沿用相对路径(./ldm.sqlite),由桌面环境/安装器决定 CWD。
+func defaultDBPath() string {
+	if runtime.GOOS == "windows" {
+		if dir := os.Getenv("LOCALAPPDATA"); dir != "" {
+			return filepath.Join(dir, "lgo_download_manager", defaultDBFile)
+		}
+	}
+	return defaultDBFile
 }
 
 // defaultSaveDir 返回当前平台合适的下载目录。

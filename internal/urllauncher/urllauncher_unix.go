@@ -9,12 +9,10 @@
 package urllauncher
 
 import (
-	"encoding/binary"
-	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
@@ -22,6 +20,15 @@ import (
 
 // readTimeout 是单个 URL 帧的读取上限:防止空连接长期占用 goroutine 与 fd。
 const readTimeout = 5 * time.Second
+
+// defaultBaseDir 返回 Unix 平台的运行期目录。
+func defaultBaseDir() string {
+	dir, err := os.UserHomeDir()
+	if err != nil || dir == "" {
+		dir = "/tmp"
+	}
+	return filepath.Join(dir, ".local", "share", "lgo_download_manager")
+}
 
 // AcquireLock attempts to acquire an exclusive flock on the lock file.
 // Returns isPrimary=true if this instance holds the lock.
@@ -109,30 +116,12 @@ func handleConn(c *net.UnixConn, onURL func(url string)) {
 		return
 	}
 
-	// Read 4-byte big-endian length prefix
-	var length uint32
-	if err := binary.Read(c, binary.BigEndian, &length); err != nil {
+	rawURL, err := readURLFrame(c)
+	if err != nil {
 		return
 	}
-
-	if length > 1024*1024 { // 1 MB max
-		return
-	}
-
-	buf := make([]byte, length)
-	if _, err := io.ReadFull(c, buf); err != nil {
-		return
-	}
-
-	var msg struct {
-		URL string `json:"url"`
-	}
-	if err := json.Unmarshal(buf, &msg); err != nil {
-		return
-	}
-
-	if msg.URL != "" {
-		onURL(msg.URL)
+	if rawURL != "" {
+		onURL(rawURL)
 	}
 }
 
@@ -147,19 +136,5 @@ func SendURL(url string) error {
 	}
 	defer conn.Close()
 
-	msg := struct {
-		URL string `json:"url"`
-	}{URL: url}
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return fmt.Errorf("json marshal: %w", err)
-	}
-
-	if err := binary.Write(conn, binary.BigEndian, uint32(len(data))); err != nil {
-		return fmt.Errorf("write length: %w", err)
-	}
-	if _, err := conn.Write(data); err != nil {
-		return fmt.Errorf("write data: %w", err)
-	}
-	return nil
+	return writeURLFrame(conn, url)
 }

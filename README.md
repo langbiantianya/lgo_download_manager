@@ -19,7 +19,7 @@
   不使用代理（始终直连）、手动设置代理（自定义 URL + 绕过列表）。
   自动按平台检测：Linux (GNOME `gsettings` / KDE `kioslaverc` / `/etc/environment`)、
   macOS (`scutil --proxy`)、Windows (WinINET 注册表)。
-- `lgom://download?url=...&name=...&ua=...&headers=...&cookies=...` URL 协议 — 将其注册为桌面协议处理程序，即可通过 Unix socket 将 URL 从浏览器转发到正在运行的程序。
+- `lgom://download?url=...&name=...&ua=...&headers=...&cookies=...` URL 协议 — Windows 安装包会把它注册成桌面协议处理程序（`HKCU\Software\Classes\lgom`）：浏览器里的链接直接拉起 ldm 并开始下载；ldm 已在运行时，新进程把 URL 转发给主实例（Windows 命名管道 / 其它平台 Unix socket）后退出。
 - 任务列表与配置持久化到 SQLite（`ldm.sqlite`）。
 - GUI 中实时显示进度、每个分片的速度条、下载速率与剩余时间（ETA）。
 - 系统托盘常驻业务进程：菜单提供「显示窗口」与「退出」，托盘 Quit 与 SIGINT/SIGTERM 等价，触发同一条优雅退出路径。
@@ -30,26 +30,25 @@
 
 ## 构建
 
-项目使用 GNU Make 驱动整个构建流程（详见 `Makefile`）：
-
 ```sh
-make help                # 列出全部 target
-make build                # 构建当前平台二进制到 bin/ldm
-make build-windows        # 交叉构建 bin/ldm.exe（windows/amd64）
-make icon                 # 用 Pillow 重新生成 assets/ldm.ico
-make installer            # 构建 Windows 安装包（自动从 jrsoftware 拉
-                          # Inno Setup 6.7.3，提取 ISCC.exe；详见下）
-make iscc-fetch           # 仅下载 Inno Setup bootstrap 到 .tools/inno/
-make iscc                 # 仅从已缓存的 bootstrap 提取 ISCC.exe
-make test                 # go test ./...
-make clean                # 删除 bin/、dist/、.tools/
+go build -o bin/ldm.exe .        # Windows
+go build -o bin/ldm .            # Linux / macOS
 ```
 
-直接调用 `go build` 也可以：
+Windows 上如果需要**安装包**，用打包脚本一次完成「编译 + 出安装包」：
 
-```sh
-go build -o ldm .
+```powershell
+pwsh -File scripts\package.ps1                 # MSI(WiX) + EXE(Inno Setup)
+pwsh -File scripts\package.ps1 -Format msi     # 只出 MSI
+pwsh -File scripts\package.ps1 -Format exe     # 只出 EXE
+pwsh -File scripts\package.ps1 -SkipBuild      # 复用已有的 bin\ldm.exe
+pwsh -File scripts\package.ps1 -Version v1.0.0 -WinVersion 1.0.0.0
 ```
+
+产物落在 `dist\ldm-setup-<版本>.msi` 与 `dist\ldm-setup-<版本>.exe`。
+
+完整参数（`-OutputDir` / `-SkipToolInstall` / `-WixPath` / `-IsccPath` 等）见
+`Get-Help .\scripts\package.ps1` 或脚本头部注释。
 
 非 Windows 主机交叉编译 ldm.exe 需要 mingw-w64（`x86_64-w64-mingw32-gcc`
 在 PATH 上）——Fyne 在 Windows 上是 CGO + GLFW。Windows 主机自带
@@ -58,34 +57,46 @@ MSYS2 / `gcc` 即可。
 ### 版本元数据
 
 `internal/version` 包提供 `Version` / `Commit` / `Date` 三个变量，默认
-是开发期占位符；`Makefile` 通过 `-ldflags -X` 在链接期把它们覆盖成
-`git describe` / `git rev-parse --short HEAD` / `date -u` 的真实结果。
-启动时 `ldm` 会在日志中打印一行 `ldm <version> (commit <c>, built <d>)`。
+是开发期占位符；`scripts/package.ps1` 通过 `-ldflags -X` 在链接期把它们
+覆盖成 `git describe` / `git rev-parse --short HEAD` / `date -u` 的真实结果
+（手工 `go build` 同样可以加 `-ldflags`）。启动时 `ldm` 会在日志中打印
+一行 `ldm <version> (commit <c>, built <d>)`。
 
 ### 安装包（Windows）
 
-1. `make build-windows` → `bin/ldm.exe`；
-2. 首次调用 `make installer` 会下载官方 Inno Setup 6.7.3 bootstrap
-   到 `.tools/inno/innosetup-6.7.3.exe`，再用 `innounp`（假定在 PATH
-   上）从中提取出 `ISCC.exe`，整个过程无管理员、无 UI 弹窗；
-3. `.tools/inno/ISCC.exe installer/installer.iss` →
-   `dist/ldm-setup-<version>.exe`。
+两种安装包功能对等，**任选其一**安装即可（不要同时装两个）：
 
-如需绕过下载（比如内网、GitHub 被封），把 `innosetup-6.7.3.exe`
-放到 `.tools/inno/innosetup-6.7.3.exe` 后再跑 `make installer`；Makefile
-检测到目标文件已存在就跳过下载步骤。
+| 格式 | 源文件 | 打包工具 |
+| --- | --- | --- |
+| MSI | `installer/ldm.wxs` | WiX Toolset CLI（`WiXToolset.WiXCLI`，v6 及以下） |
+| EXE | `installer/installer.iss` | Inno Setup 6（`JRSoftware.InnoSetup`） |
 
-脚本 `installer/installer.iss` 做了这些事：
+打包工具缺失时脚本会用 `winget` 自动安装（`-SkipToolInstall` 关闭该行为，
+`-WixPath` / `-IsccPath` 可以指向已有的安装）。
+
+> WiX v7 起命令行要求接受 OSMF EULA，本项目不引入这个依赖：脚本只用
+> WiX v6/v5，遇到 v7 会明确报错并给出降级安装命令。
+
+两个安装包做的事一样：
 
 - 用户态安装到 `%LOCALAPPDATA%\Programs\lgo_download_manager`，
-  `PrivilegesRequired=lowest`，无需 UAC / 管理员权限。
-- 写 `HKCU\Software\Classes\lgom` 注册 `lgom://` 协议处理程序，命令
-  行是 `"<install>\ldm.exe" "%1"`。浏览器把 URL 作为 `argv[1]` 传给主
-  程序；`main.go` 已经会把位置参数里的 `lgom://` URL 直接派发到主实例
-  的处理队列里。HKCU 路径不需要提权，且与 HKLM 的等效项不冲突。
-- 安装/卸载时分别创建/删除「开始菜单」快捷方式，桌面图标可勾选。
-- `UninstallRun` 用 `taskkill /IM ldm.exe /F` 兜底结束正在跑的实例，
-  避免文件被占用导致卸载失败。
+  `PrivilegesRequired=lowest` / `Scope="perUser"`，不需要 UAC、不需要管理员。
+- 写 `HKCU\Software\Classes\lgom` 注册 `lgom://` 协议处理程序，命令行
+  是 `"<install>\ldm.exe" "%1"`，并配 `DefaultIcon` 指向安装目录里的
+  `ldm.ico`。HKCU 路径不需要提权，且与 HKLM 的等效项不冲突。
+- 创建开始菜单快捷方式；EXE 安装包额外提供「桌面快捷方式」勾选项，MSI
+  则直接创建。
+- 安装/升级/卸载前结束正在运行的 `ldm.exe`（MSI 用 `StopRunningLdm`（
+  immediate 自定义动作）在 `InstallValidate` 之前 `taskkill`，EXE 用
+  `[Code] PrepareToInstall` + Restart Manager），避免 exe 被占用。
+- 不写 HKLM、不装服务、不动 PATH。卸载时连用户数据目录
+  `%LOCALAPPDATA%\lgo_download_manager`（任务数据库 `ldm.sqlite`、wal/shm、
+  UI IPC 的 `ui-*.sock`）一起删除；覆盖安装/升级不会碰它，任务列表照旧保留。
+
+装完之后，浏览器/资源管理器里的 `lgom://download?url=...` 会拉起 `ldm`
+并把该 URL 加进下载队列：程序没在运行时，这个新进程就是主实例，自己处理
+URL；程序已在运行时（托盘常驻），新进程通过命名管道把 URL 转发给主实例
+再退出。
 
 ### 运行
 
@@ -111,10 +122,16 @@ MSYS2 / `gcc` 即可。
 
 | 参数        | 默认值          | 说明                                          |
 | ----------- | --------------- | --------------------------------------------- |
-| `-db`       | `ldm.sqlite`    | SQLite 数据库文件路径                         |
+| `-db`       | 见下            | SQLite 数据库文件路径                         |
 | `-no-gui`   | `false`         | 启动时不打开 Fyne GUI                         |
 | `-open-url` | `""`            | 一条 `lgom://...` URL，加入队列               |
 | `-light`    | `false`         | 强制开启轻量模式（关闭主窗口时释放 widget 树） |
+
+`-db` 默认值：Windows 上是
+`%LOCALAPPDATA%\lgo_download_manager\ldm.sqlite`（绝对路径 —— 安装后的
+ldm 会被 `lgom://` 协议从任意工作目录拉起，相对路径会因 CWD 不可写而
+开库失败，托盘实例与协议实例也会落到两份不同的库）；其它平台仍是
+相对当前工作目录的 `ldm.sqlite`。
 
 也支持以位置参数的形式传入 `lgom://` URL（某些桌面环境会以位置参数方式传递 URL）。
 
@@ -122,7 +139,11 @@ MSYS2 / `gcc` 即可。
 
 `lgom://download?url=<encoded>[&name=<encoded>[&ua=<encoded>[&headers=<encoded>[&cookies=<encoded>]]]]`
 
-只有 `url` 是必填项。如果程序未运行，第二次启动会把该 URL 转发给主实例后退出。
+只有 `url` 是必填项。URL 由操作系统交给新启动的 `ldm.exe`（Windows 安装包
+注册的命令行是 `"<install>\ldm.exe" "%1"`）：没有实例在运行时，这个进程就是
+主实例，自己把 URL 入队并下载；已有实例在运行时，新进程通过命名管道
+（Windows）/ Unix socket（其它平台）把 URL 转发给主实例后退出，转发失败
+（例如主实例刚好在退出）以非零状态结束并打印原因。
 
 ## 代理
 
@@ -207,12 +228,16 @@ internal/protocol/             # HTTP、HTTPS、FTP、WebDAV 驱动 + 代理 + �
 internal/engine/               # 分片规划、Range 下载、重试
 internal/scheduler/            # 单任务生命周期、状态事件、进度刷盘、异步 Start
 internal/prealloc/             # 磁盘预分配辅助
-internal/urllauncher/          # lgom:// URL 解析、Unix socket 转发
+internal/urllauncher/          # lgom:// URL 解析、单实例锁、URL 转发
+                               #   （Windows 命名管道 / 其它平台 Unix socket）
 internal/settings/             # 首次运行默认值 / --light 覆盖 / 进程级代理同步
 internal/ipc/                  # 长度前缀 JSON 帧协议（业务↔UI 共用）
 internal/uimgr/                # UI 子进程生命周期与 IPC 会话管理
 internal/ui/                   # Fyne 窗口、任务列表、设置对话框、分片视图、系统托盘
 internal/tray/                 # fyne.io/systray 业务进程常驻托盘
+assets/                        # 图标（安装包快捷方式 / lgom:// DefaultIcon 都用它）
+installer/                     # ldm.wxs（WiX MSI）、installer.iss（Inno Setup EXE）
+scripts/package.ps1            # 打包入口：编译 + 出 MSI / EXE 安装包
 ```
 
 ### IPC 协议（业务 ↔ UI 子进程）
