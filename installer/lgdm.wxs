@@ -1,25 +1,25 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  lgo_download_manager (ldm) — WiX 源文件,产出 MSI 安装包。
+  lgo_download_manager (lgdm) — WiX 源文件,产出 MSI 安装包。
 
   由 scripts/package.ps1 调用,一般不手工执行:
 
-      wix build installer\ldm.wxs -arch x64 -d ProductVersion=0.1.0.0 -d Arch=x64 \
-          -o dist\ldm-setup-0.1.0-x64.msi
+      wix build installer\lgdm.wxs -arch x64 -d ProductVersion=0.1.0.0 -d Arch=x64 \
+          -o dist\lgdm-setup-0.1.0-x64.msi
 
   设计要点(与 installer/installer.iss 的 EXE 安装包保持一致):
 
     - 用户态安装(Scope="perUser"),目录 %LOCALAPPDATA%\Programs\lgo_download_manager,
       不需要管理员权限,只写 HKCU。
-    - 注册 lgom:// 协议:命令行 "<install>\ldm.exe" "%1"。浏览器把 URL 作为
+    - 注册 lgom:// 协议:命令行 "<install>\lgdm.exe" "%1"。浏览器把 URL 作为
       argv[1] 交给新进程;主实例已在运行时,新进程通过命名管道把 URL 转发过去
       再退出(见 internal/urllauncher/urllauncher_windows.go)。
-    - 安装/升级/卸载前先用 taskkill 结束正在运行的 ldm,避免 exe 被占用。
+    - 安装/升级/卸载前先用 taskkill 结束正在运行的 lgdm,避免 exe 被占用。
     - ProductVersion 由 -d 传入,必须是 X.Y.Z.W 数字形式(MSI 只比较前三段)。
 
   架构:MSI 一个包只能装一种架构,所以 -arch 与 -d Arch 必须成对出现
-    -arch x64   -d Arch=x64    → bin\ldm-x64.exe
-    -arch arm64 -d Arch=arm64  → bin\ldm-arm64.exe
+    -arch x64   -d Arch=x64    → bin\lgdm-x64.exe
+    -arch arm64 -d Arch=arm64  → bin\lgdm-arm64.exe
   (<Package> 的平台由 wix build -arch 决定;$(var.Arch) 只用来选待打包的
   二进制,两者不一致会打出「架构与载荷不匹配」的包。)
 
@@ -36,14 +36,14 @@
            Language="1033"
            Compressed="yes">
 
-    <SummaryInformation Description="lgo_download_manager (ldm) — 分片下载管理器" Manufacturer="langbiantianya" />
+    <SummaryInformation Description="lgo_download_manager (lgdm) — 分片下载管理器" Manufacturer="langbiantianya" />
 
     <!-- 同版本重装也要走升级路径(开发期反复打包时很常见)。 -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="已安装更高版本的 lgo_download_manager,请先卸载。" />
     <MediaTemplate EmbedCab="yes" />
 
-    <Icon Id="LdmIcon" SourceFile="$(sys.SOURCEFILEDIR)\..\assets\ldm.ico" />
+    <Icon Id="LdmIcon" SourceFile="$(sys.SOURCEFILEDIR)\..\assets\lgdm.ico" />
     <Property Id="ARPPRODUCTICON" Value="LdmIcon" />
     <Property Id="ARPNOMODIFY" Value="1" />
 
@@ -79,15 +79,15 @@
       工作目录必须是已经存在的目录:System32。指向 INSTALLFOLDER 的话,
       首次安装时它还不存在,CreateProcess 直接以 1721 失败。
     -->
-    <CustomAction Id="StopRunningLdm"
+    <CustomAction Id="StopRunningLgdm"
                   Directory="System64Folder"
-                  ExeCommand="taskkill.exe /IM ldm.exe /F"
+                  ExeCommand="taskkill.exe /IM lgdm.exe /F"
                   Execute="immediate"
                   Return="ignore" />
 
     <!--
       卸载时删掉用户数据目录 %LOCALAPPDATA%\lgo_download_manager
-      (ldm.sqlite 任务库 + wal/shm + UI IPC 的 ui-*.sock)。这个目录
+      (lgdm.sqlite 任务库 + wal/shm + UI IPC 的 ui-*.sock)。这个目录
       不是安装包创建的,而是程序首次运行时建的,所以只能用自定义动作删。
 
       条件里的 UPGRADINGPRODUCTCODE 是关键:大版本升级时,旧产品的卸载
@@ -105,7 +105,7 @@
                   Return="ignore" />
 
     <InstallExecuteSequence>
-      <Custom Action="StopRunningLdm" Before="InstallValidate" />
+      <Custom Action="StopRunningLgdm" Before="InstallValidate" />
       <Custom Action="RemoveUserData" After="InstallFinalize"
               Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
     </InstallExecuteSequence>
@@ -114,21 +114,21 @@
   <Fragment>
     <ComponentGroup Id="AppFiles" Directory="INSTALLFOLDER">
       <Component Id="MainExecutable" Guid="61E3E212-05B7-4BE4-A37C-5508FF676C85">
-        <!-- Name 覆盖 File 表里的文件名:Source 是 bin\ldm-<架构>.exe,装到
-             目标机器上统一叫 ldm.exe —— 协议注册表命令行、快捷方式、
+        <!-- Name 覆盖 File 表里的文件名:Source 是 bin\lgdm-<架构>.exe,装到
+             目标机器上统一叫 lgdm.exe —— 协议注册表命令行、快捷方式、
              taskkill 自定义动作都按这个名字找。 -->
-        <File Id="LdmExe" Source="$(sys.SOURCEFILEDIR)\..\bin\ldm-$(var.Arch).exe" Name="ldm.exe" KeyPath="yes">
+        <File Id="LdmExe" Source="$(sys.SOURCEFILEDIR)\..\bin\lgdm-$(var.Arch).exe" Name="lgdm.exe" KeyPath="yes">
           <Shortcut Id="StartMenuShortcut"
                     Directory="AppMenuFolder"
                     Name="lgo_download_manager"
-                    Description="lgo_download_manager (ldm)"
+                    Description="lgo_download_manager (lgdm)"
                     WorkingDirectory="INSTALLFOLDER"
                     Icon="LdmIcon"
                     Advertise="no" />
           <Shortcut Id="DesktopShortcut"
                     Directory="DesktopFolder"
                     Name="lgo_download_manager"
-                    Description="lgo_download_manager (ldm)"
+                    Description="lgo_download_manager (lgdm)"
                     WorkingDirectory="INSTALLFOLDER"
                     Icon="LdmIcon"
                     Advertise="no" />
@@ -137,7 +137,7 @@
       </Component>
 
       <Component Id="IconFile" Guid="5D3181F2-D16C-4805-B070-EA625A198155">
-        <File Id="LdmIco" Source="$(sys.SOURCEFILEDIR)\..\assets\ldm.ico" KeyPath="yes" />
+        <File Id="LdmIco" Source="$(sys.SOURCEFILEDIR)\..\assets\lgdm.ico" KeyPath="yes" />
       </Component>
 
       <Component Id="LicenseFile" Guid="2E2EBBAF-FB75-4694-B1FF-95A2123C24C4">
@@ -179,12 +179,12 @@
       <RegistryValue Id="LgomDefaultIcon"
                      Root="HKCU"
                      Key="Software\Classes\lgom\DefaultIcon"
-                     Value="&quot;[INSTALLFOLDER]ldm.ico&quot;,0"
+                     Value="&quot;[INSTALLFOLDER]lgdm.ico&quot;,0"
                      Type="string" />
       <RegistryValue Id="LgomOpenCommand"
                      Root="HKCU"
                      Key="Software\Classes\lgom\shell\open\command"
-                     Value="&quot;[INSTALLFOLDER]ldm.exe&quot; &quot;%1&quot;"
+                     Value="&quot;[INSTALLFOLDER]lgdm.exe&quot; &quot;%1&quot;"
                      Type="string" />
     </Component>
   </Fragment>

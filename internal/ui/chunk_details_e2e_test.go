@@ -66,7 +66,7 @@ func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 	defer test.NewApp()
 
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "ldm.db")
+	dbPath := filepath.Join(dir, "lgdm.db")
 	st, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)

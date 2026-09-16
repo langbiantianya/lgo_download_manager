@@ -1,4 +1,4 @@
-# ldm — 本地下载管理器
+# lgdm — 本地下载管理器
 
 单文件可执行程序的下载管理器，提供 Fyne GUI、持久化的 SQLite 状态、
 并发的分片下载，以及用于浏览器接力的 `lgom://` URL 协议。
@@ -19,8 +19,8 @@
   不使用代理（始终直连）、手动设置代理（自定义 URL + 绕过列表）。
   自动按平台检测：Linux (GNOME `gsettings` / KDE `kioslaverc` / `/etc/environment`)、
   macOS (`scutil --proxy`)、Windows (WinINET 注册表)。
-- `lgom://download?url=...&name=...&ua=...&headers=...&cookies=...` URL 协议 — Windows 安装包会把它注册成桌面协议处理程序（`HKCU\Software\Classes\lgom`）：浏览器里的链接直接拉起 ldm 并开始下载；ldm 已在运行时，新进程把 URL 转发给主实例（Windows 命名管道 / 其它平台 Unix socket）后退出。
-- 任务列表与配置持久化到 SQLite（`ldm.sqlite`）。
+- `lgom://download?url=...&name=...&ua=...&headers=...&cookies=...` URL 协议 — Windows 安装包会把它注册成桌面协议处理程序（`HKCU\Software\Classes\lgom`）：浏览器里的链接直接拉起 lgdm 并开始下载；lgdm 已在运行时，新进程把 URL 转发给主实例（Windows 命名管道 / 其它平台 Unix socket）后退出。
+- 任务列表与配置持久化到 SQLite（`lgdm.sqlite`）。
 - GUI 中实时显示进度、每个分片的速度条、下载速率与剩余时间（ETA）。
 - 系统托盘常驻业务进程：菜单提供「显示窗口」与「退出」，托盘 Quit 与 SIGINT/SIGTERM 等价，触发同一条优雅退出路径。
 - 进程崩溃/被 kill -9 后的兜底：下次启动会把残留的 `Downloading` 任务回收为 `Paused`（保留字节进度），UI 不会再把没有 engine 在跑的任务显示为「下载中」。
@@ -31,124 +31,203 @@
 ## 构建
 
 ```sh
-go build -o bin/ldm.exe .        # Windows,本机架构(手工调试用;打包脚本统一产出 bin\ldm-<arch>.exe)
-go build -o bin/ldm .            # Linux / macOS
+go build -o bin/lgdm.exe .        # Windows,本机架构(手工调试用;打包脚本统一产出 bin\lgdm-<arch>.exe)
+go build -o bin/lgdm .            # Linux / macOS
 ```
 
-Windows 上如果需要**安装包**，用打包脚本一次完成「按架构编译 + 出安装包」：
+Windows 上要**安装包**（MSI / EXE，x64 与 arm64）用打包脚本，细节见下一节：
 
 ```powershell
-pwsh -File scripts\package.ps1                     # x64 + arm64 的 MSI 与 EXE
-pwsh -File scripts\package.ps1 -Format msi         # 只出 MSI
-pwsh -File scripts\package.ps1 -Format exe         # 只出 EXE
-pwsh -File scripts\package.ps1 -Arch x64           # 只出 x64
-pwsh -File scripts\package.ps1 -SkipBuild          # 复用已有的 bin\ldm-<arch>.exe
-pwsh -File scripts\package.ps1 -Version v1.0.0 -WinVersion 1.0.0.0
+pwsh -File scripts\package.ps1
 ```
-
-产物（每个架构一份，MSI 一个包只能装一种架构，所以必须分开）：
-
-```
-dist\ldm-setup-<版本>-x64.msi       dist\ldm-setup-<版本>-arm64.msi
-dist\ldm-setup-<版本>-x64.exe       dist\ldm-setup-<版本>-arm64.exe
-```
-
-完整参数（`-Arch` / `-OutputDir` / `-SkipToolInstall` / `-WixPath` /
-`-IsccPath` / `-CCX64` / `-CCArm64` 等）见 `Get-Help .\scripts\package.ps1`
-或脚本头部注释。
-
-### C 工具链（cgo）
-
-Fyne 在 Windows 上是 CGO + GLFW/OpenGL，所以编译需要 C 编译器，且编译器必须
-是 **gcc 风格命令行**的：GCC 或 clang。
-
-- **MSVC 的 `cl.exe` 不能用作 `CC`**：cgo 直接用 `-c/-o/-I/-D` 这类 gcc 参数
-  调用编译器，`cl.exe` 的 `/c`、`/Fo`、`/I` 语法与之不兼容，Go 也一直没有
-  支持 MSVC（golang/go#20982）。
-- **clang 可以**：`LLVM-MinGW`（winget 包 `MartinStorsjo.LLVM-MinGW.UCRT`）
-  是 clang + mingw-w64 sysroot 的发行版，一个包同时提供 `x86_64-w64-mingw32-clang`
-  与 `aarch64-w64-mingw32-clang`，正好覆盖 x64 / arm64 两个架构。
-- 脚本按 `-CCX64`/`-CCArm64` → PATH 上的 `x86_64-w64-mingw32-clang` /
-  `aarch64-w64-mingw32-clang` → winget 的 LLVM-MinGW 安装目录 解析；x64 在
-  找不到 clang 时退回主机默认 `gcc`。arm64 必须给 aarch64 工具链
-  （`GOARCH=arm64` 时 Go 会关掉 cgo，没有交叉工具链直接编译失败）。
-- 手工编译 arm64：`$env:GOARCH='arm64'; $env:CC='aarch64-w64-mingw32-clang'; go build ...`。
-- 打完包后脚本会读 PE 头的 `Machine` 字段校验产物架构（x64=0x8664、
-  arm64=0xAA64），避免 `-SkipBuild` 复用了另一个架构的二进制。
-
-非 Windows 主机交叉编译 ldm.exe 需要 mingw-w64（`x86_64-w64-mingw32-gcc`
-在 PATH 上）——Fyne 在 Windows 上是 CGO + GLFW。Windows 主机自带
-MSYS2 / `gcc`，或按上面装 LLVM-MinGW 即可。
 
 ### 版本元数据
 
 `internal/version` 包提供 `Version` / `Commit` / `Date` 三个变量，默认
 是开发期占位符；`scripts/package.ps1` 通过 `-ldflags -X` 在链接期把它们
 覆盖成 `git describe` / `git rev-parse --short HEAD` / `date -u` 的真实结果
-（手工 `go build` 同样可以加 `-ldflags`）。启动时 `ldm` 会在日志中打印
-一行 `ldm <version> (commit <c>, built <d>)`。
+（手工 `go build` 同样可以加 `-ldflags`）。启动时 `lgdm` 会在日志中打印
+一行 `lgdm <version> (commit <c>, built <d>)`。
 
-### 安装包（Windows）
+## Windows 打包（安装包）
 
-每个架构一份产物，同一架构上两种格式功能对等，**任选其一**安装即可
-（不要同时装两个）：
+一条命令完成「按架构编译 + 出 MSI / EXE 安装包」：
 
-| 格式 | 源文件 | 打包工具 | 架构控制 |
-| --- | --- | --- | --- |
-| MSI | `installer/ldm.wxs` | WiX Toolset CLI（`WiXToolset.WiXCLI`，v6 及以下） | `wix build -arch x64\|arm64` + `-d Arch=…` |
-| EXE | `installer/installer.iss` | Inno Setup 6（`JRSoftware.InnoSetup`） | `ISCC /DMyArch=x64\|arm64` |
+```powershell
+pwsh -File scripts\package.ps1          # x64 + arm64 各一份 MSI 与 EXE
+```
 
-- x64 包用 `ArchitecturesAllowed=x64compatible` / WiX `-arch x64`；arm64 包用
-  `ArchitecturesAllowed=arm64` / WiX `-arch arm64`（Inno 没有 `arm64compatible`
-  这个标识，写了会编译报错）。x64 包在 ARM64 上也能装——走 x64 模拟运行。
-- 载荷分别是 `bin\ldm-x64.exe` 与 `bin\ldm-arm64.exe`，装到目标机器上统一
-  改名为 `ldm.exe`。
+### 环境要求
 
-打包工具缺失时脚本会用 `winget` 自动安装（`-SkipToolInstall` 关闭该行为，
-`-WixPath` / `-IsccPath` / `-CCArm64` 可以指向已有的安装）。
+| 依赖 | 说明 |
+| --- | --- |
+| Windows 10/11（x64 打包机） | 脚本是 PowerShell，Windows PowerShell 5.1 与 PowerShell 7+ 都可用 |
+| Go | 版本见 `go.mod` |
+| C 工具链 | Fyne 在 Windows 上是 CGO + GLFW/OpenGL，必须有一个 **gcc 风格命令行** 的 C 编译器（GCC 或 clang），见「C 工具链与架构」 |
+| 打包工具 | WiX CLI（MSI）、Inno Setup 6（EXE）；缺失时脚本用 winget 自动安装 |
 
-> WiX v7 起命令行要求接受 OSMF EULA，本项目不引入这个依赖：脚本只用
-> WiX v6/v5，遇到 v7 会明确报错并给出降级安装命令。
+脚本会自动安装的 winget 包：
 
-两个安装包做的事一样：
+| 工具 | winget 包 | 用途 |
+| --- | --- | --- |
+| WiX Toolset CLI | `WiXToolset.WiXCLI`（脚本固定 `6.0.2`） | 编译 `installer/lgdm.wxs` → MSI |
+| Inno Setup 6 | `JRSoftware.InnoSetup` | 编译 `installer/installer.iss` → EXE |
+| LLVM-MinGW (UCRT) | `MartinStorsjo.LLVM-MinGW.UCRT` | arm64 的 C 交叉工具链（同时含 x64 target） |
+
+`-SkipToolInstall` 关闭自动安装；`-WixPath` / `-IsccPath` / `-CCX64` / `-CCArm64`
+可以指向已有的安装。
+
+### 命令与参数
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `-Format` | `both` | `msi` / `exe` / `both` |
+| `-Arch` | `x64,arm64` | 逗号分隔；接受 `x64`/`amd64`、`arm64`/`aarch64` |
+| `-Version` | `git describe --tags --always --dirty` | 写进二进制 `internal/version` 与安装包文件名 |
+| `-WinVersion` | 从 `-Version` 推导 | MSI `ProductVersion` / `VersionInfoVersion` 需要的 `X.Y.Z.W` |
+| `-OutputDir` | `<repo>\dist` | 产物目录 |
+| `-SkipBuild` | 关 | 复用已有的 `bin\lgdm-<arch>.exe`（仍会校验 PE 架构） |
+| `-SkipToolInstall` | 关 | 工具缺失直接报错，不尝试 winget |
+| `-WixPath` / `-IsccPath` | 自动查找 | 显式指定 `wix.exe` / `ISCC.exe` |
+| `-CCX64` / `-CCArm64` | 自动查找 | 显式指定对应架构的 C 编译器 |
+
+```powershell
+pwsh -File scripts\package.ps1 -Format msi            # 只出 MSI
+pwsh -File scripts\package.ps1 -Format exe -Arch arm64 # 只出 arm64 的 EXE
+pwsh -File scripts\package.ps1 -SkipBuild             # 二进制已编好,只重新出包
+pwsh -File scripts\package.ps1 -Version v1.0.0 -WinVersion 1.0.0.0
+```
+
+### 产物
+
+```
+dist\lgdm-setup-<版本>-x64.msi       dist\lgdm-setup-<版本>-arm64.msi
+dist\lgdm-setup-<版本>-x64.exe       dist\lgdm-setup-<版本>-arm64.exe
+bin\lgdm-x64.exe                     bin\lgdm-arm64.exe
+```
+
+- 每个架构单独一份：**MSI 一个包只能承载一种架构**，无法合并；MSI 与 EXE
+  在同一架构上功能对等，任选其一安装即可（不要同时装两个）。
+- 打包用的二进制是 `bin\lgdm-<arch>.exe`，装到目标机器上统一改名为
+  `lgdm.exe`（协议注册表命令行、快捷方式、`taskkill` 都按 `lgdm.exe` 找）。
+- 中间产物 `*.wixpdb` 与 `dist/`、`bin/` 一样在 `.gitignore` 里。
+
+### C 工具链与架构
+
+- **MSVC 的 `cl.exe` 不能当 `CC`**：cgo 直接用 `-c/-o/-I/-D` 这类 gcc 参数调用
+  编译器，`cl.exe` 的 `/c`、`/Fo`、`/I` 与之不兼容，Go 也一直没有支持 MSVC
+  （golang/go#20982）。
+- **clang 可以**：`LLVM-MinGW`（winget 包 `MartinStorsjo.LLVM-MinGW.UCRT`）是
+  clang + mingw-w64 sysroot 的发行版，一个包同时提供
+  `x86_64-w64-mingw32-clang` 与 `aarch64-w64-mingw32-clang`，两个架构共用。
+- 解析顺序：`-CCX64`/`-CCArm64` → PATH 上的 `<triple>-clang` → winget 的
+  LLVM-MinGW 安装目录；x64 找不到 clang 时退回主机默认 `gcc`。arm64 没有
+  aarch64 工具链就一定编不过（下一条）。
+- **交叉编译要显式打开 cgo**：`GOARCH` 与主机不同时 Go 默认把 cgo 关掉，而
+  Fyne 的 GL 绑定只有 cgo 实现，表现是 `build constraints exclude all Go files
+  ... go-gl/gl/v3.1/gles2`。脚本会设 `CGO_ENABLED=1` 并传入 `CC`；手工编译：
+
+  ```powershell
+  $env:GOARCH='arm64'; $env:CGO_ENABLED='1'
+  $env:CC='C:\...\llvm-mingw-<ver>-ucrt-x86_64\bin\aarch64-w64-mingw32-clang.exe'
+  go build -trimpath -o bin\lgdm-arm64.exe .
+  ```
+
+  `-CCArm64` 也要给 Windows 绝对路径（`/c/...` 这种会被 Go 拒绝：
+  `CC environment variable is relative; must be absolute path`）。
+- 出包前脚本会读 PE 头的 `Machine` 字段校验产物架构（x64=`0x8664`、
+  arm64=`0xAA64`），防止 `-SkipBuild` 复用了另一个架构的二进制、或工具链
+  target 传错，打出「平台与载荷不匹配」的包。
+- 非 Windows 主机交叉编译 `lgdm.exe` 需要 mingw-w64（`x86_64-w64-mingw32-gcc`
+  在 PATH 上）。
+
+### 安装、升级与卸载
+
+两种安装包行为一致：
 
 - 用户态安装到 `%LOCALAPPDATA%\Programs\lgo_download_manager`，
-  `PrivilegesRequired=lowest` / `Scope="perUser"`，不需要 UAC、不需要管理员。
-- 写 `HKCU\Software\Classes\lgom` 注册 `lgom://` 协议处理程序，命令行
-  是 `"<install>\ldm.exe" "%1"`，并配 `DefaultIcon` 指向安装目录里的
-  `ldm.ico`。HKCU 路径不需要提权，且与 HKLM 的等效项不冲突。
-- 创建开始菜单快捷方式；EXE 安装包额外提供「桌面快捷方式」勾选项，MSI
-  则直接创建。
-- 安装/升级/卸载前结束正在运行的 `ldm.exe`（MSI 用 `StopRunningLdm`（
-  immediate 自定义动作）在 `InstallValidate` 之前 `taskkill`，EXE 用
-  `[Code] PrepareToInstall` + Restart Manager），避免 exe 被占用。
-- 不写 HKLM、不装服务、不动 PATH。卸载时连用户数据目录
-  `%LOCALAPPDATA%\lgo_download_manager`（任务数据库 `ldm.sqlite`、wal/shm、
-  UI IPC 的 `ui-*.sock`）一起删除；覆盖安装/升级不会碰它，任务列表照旧保留。
+  `PrivilegesRequired=lowest` / `Scope="perUser"`：不需要 UAC、不需要管理员，
+  不装服务、不动 PATH，协议注册只写 `HKCU`。「应用和功能」里的卸载条目由
+  Windows Installer 自行登记（MSI 按安装上下文落 HKCU 或 HKLM，EXE 安装包
+  固定在 HKCU）。
+- 写 `HKCU\Software\Classes\lgom` 注册 `lgom://` 处理程序，命令行
+  `"<install>\lgdm.exe" "%1"`，`DefaultIcon` 指向安装目录里的 `lgdm.ico`。
+- 开始菜单快捷方式（EXE 安装包另有「桌面快捷方式」勾选项，MSI 直接创建）。
+- 安装/升级/卸载前先结束正在运行的 `lgdm.exe`（MSI 用 immediate 自定义动作
+  `StopRunningLgdm` 排在 `InstallValidate` 之前，EXE 用 `[Code]
+  PrepareToInstall`），避免 exe 被占用。
+- **升级保留数据，卸载删数据**：卸载会删掉安装目录、`lgom` 注册表键、快捷方式，
+  以及用户数据目录 `%LOCALAPPDATA%\lgo_download_manager`（任务库
+  `lgdm.sqlite`、`-wal`/`-shm`、UI IPC 的 `ui-*.sock`）；覆盖安装/升级不碰它。
 
-装完之后，浏览器/资源管理器里的 `lgom://download?url=...` 会拉起 `ldm`
-并把该 URL 加进下载队列：程序没在运行时，这个新进程就是主实例，自己处理
-URL；程序已在运行时（托盘常驻），新进程通过命名管道把 URL 转发给主实例
-再退出。
+静默安装/卸载（脚本化部署用）：
 
-### 运行
+```powershell
+msiexec /i dist\lgdm-setup-v1.0.0-x64.msi /qn                     # MSI 静默装
+.\dist\lgdm-setup-v1.0.0-x64.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+msiexec /x {ProductCode} /qn                                      # ProductCode 见「应用和功能」
+& "$env:LOCALAPPDATA\Programs\lgo_download_manager\unins000.exe" /VERYSILENT
+```
+
+装完之后，浏览器/资源管理器里的 `lgom://download?url=...` 会拉起 `lgdm` 并把
+该 URL 加进下载队列：程序没在运行时，新进程就是主实例，自己处理 URL；程序已在
+运行时（托盘常驻），新进程把 URL 经命名管道转发给主实例后退出。
+
+### 已验证 / 已知限制
+
+在 x64 Windows 上实测过的（`scripts/package.ps1` 全绿）：
+
+- x64 的 MSI 与 EXE：静默安装 → 在 `C:\Windows\System32` 下点 `lgom://`
+  冷启动入队 → 再点一次由运行中实例转发 → 卸载后安装目录、数据目录、注册表键、
+  快捷方式、ARP 条目全部清空；同版本重建再装（升级路径）任务库保留。
+- arm64 的 MSI/EXE：MSI `Template=Arm64`、内部载荷是 ARM64 PE
+  （`machine=0xAA64`），在 x64 上安装被正确拒绝（MSI `1633`
+  「这个处理器类型不支持该安装程序包」、EXE 非 0 退出）。
+- 版本覆盖：`-Version v9.9.9 -WinVersion 9.9.9.4` → EXE `FileVersion=9.9.9.4`、
+  MSI `ProductVersion=9.9.9.4`。
+
+限制：
+
+- **arm64 包没有在真机跑过**：本机是 x64，只验证到「平台/载荷是 arm64 + 在
+  x64 上被拒绝」。要确认 arm64 上能装能跑，需要一台 Windows on ARM。
+- **产物未签名**：没有代码签名步骤，分发后首次运行会触发 SmartScreen 提示；
+  需要签名时给 ISCC 传 `/S` 签名工具、给 `wix build` 传 `-sign`。
+- WiX v7 起要求接受 OSMF EULA，本项目不引入：脚本只用 v6/v5，检测到 v7 会报错
+  并给出降级命令。
+- Inno Setup 的架构标识没有 `arm64compatible`（只有 `arm64` / `x64compatible` /
+  `arm32compatible` / `x86compatible`），写错直接编译失败。
+
+### 排错
+
+| 现象 | 原因 / 处理 |
+| --- | --- |
+| `error WIX7015: You must accept the Open Source Maintenance Fee (OSMF) EULA` | PATH 上的 `wix.exe` 是 v7；`winget install --id WiXToolset.WiXCLI --version 6.0.2 --exact --silent` 或 `-WixPath` 指向 v6 |
+| `error WIX0103: Cannot find the File file ...\bin\lgdm-<arch>.exe` | 该架构的二进制还没编（`-SkipBuild` 时最容易遇到）；去掉 `-SkipBuild` 或先编译 |
+| 安装报 `1633 这个处理器类型不支持该安装程序包` | 装了架构不符的包（如把 arm64 包往 x64 上装）；换对应架构的产物 |
+| `build constraints exclude all Go files ... go-gl/gl/v3.1/gles2` | cgo 被关掉了（交叉编译时的默认行为）；用脚本编译或手工设 `CGO_ENABLED=1` |
+| `go: CC environment variable is relative; must be absolute path` | `CC` 给了 `/c/...` 形式；改成 `C:\...` |
+| `找不到 aarch64 的 C 交叉编译器` | 装工具链：`winget install --id MartinStorsjo.LLVM-MinGW.UCRT --exact --silent`，或 `-CCArm64` 指定 |
+| `winget 安装 ... 返回 -1978335189` | winget 认为已装其它版本；脚本会继续查找已安装的工具，找不到再按提示手动装 |
+| 编辑 `scripts/package.ps1` 后 Windows PowerShell 5.1 报语法错误 | 脚本含中文，必须存成 **UTF-8 with BOM**（PS 7 不敏感，PS 5.1 会按 ANSI 读） |
+
+## 运行
 
 带 GUI 运行：
 
 ```sh
-./ldm
+./lgdm
 ```
 
 无界面模式运行（仅调度器，不启动 Fyne 窗口）：
 
 ```sh
-./ldm -no-gui
+./lgdm -no-gui
 ```
 
 强制开启轻量模式：
 
 ```sh
-./ldm --light
+./lgdm --light
 ```
 
 ## 命令行参数
@@ -161,10 +240,14 @@ URL；程序已在运行时（托盘常驻），新进程通过命名管道把 U
 | `-light`    | `false`         | 强制开启轻量模式（关闭主窗口时释放 widget 树） |
 
 `-db` 默认值：Windows 上是
-`%LOCALAPPDATA%\lgo_download_manager\ldm.sqlite`（绝对路径 —— 安装后的
-ldm 会被 `lgom://` 协议从任意工作目录拉起，相对路径会因 CWD 不可写而
+`%LOCALAPPDATA%\lgo_download_manager\lgdm.sqlite`（绝对路径 —— 安装后的
+lgdm 会被 `lgom://` 协议从任意工作目录拉起，相对路径会因 CWD 不可写而
 开库失败，托盘实例与协议实例也会落到两份不同的库）；其它平台仍是
-相对当前工作目录的 `ldm.sqlite`。
+相对当前工作目录的 `lgdm.sqlite`。
+
+> 库文件名从 `ldm.sqlite` 改成了 `lgdm.sqlite`（安装目录名仍是
+> `lgo_download_manager`）：如果本地还留着旧的 `ldm.sqlite`，程序不会去读它，
+> 需要的话手工改名即可。
 
 也支持以位置参数的形式传入 `lgom://` URL（某些桌面环境会以位置参数方式传递 URL）。
 
@@ -172,8 +255,8 @@ ldm 会被 `lgom://` 协议从任意工作目录拉起，相对路径会因 CWD 
 
 `lgom://download?url=<encoded>[&name=<encoded>[&ua=<encoded>[&headers=<encoded>[&cookies=<encoded>]]]]`
 
-只有 `url` 是必填项。URL 由操作系统交给新启动的 `ldm.exe`（Windows 安装包
-注册的命令行是 `"<install>\ldm.exe" "%1"`）：没有实例在运行时，这个进程就是
+只有 `url` 是必填项。URL 由操作系统交给新启动的 `lgdm.exe`（Windows 安装包
+注册的命令行是 `"<install>\lgdm.exe" "%1"`）：没有实例在运行时，这个进程就是
 主实例，自己把 URL 入队并下载；已有实例在运行时，新进程通过命名管道
 （Windows）/ Unix socket（其它平台）把 URL 转发给主实例后退出，转发失败
 （例如主实例刚好在退出）以非零状态结束并打印原因。
@@ -193,7 +276,7 @@ PAC / WPAD 自动配置脚本不在支持范围内。
 
 ## 设置
 
-存储在 `ldm.sqlite` 的 `settings` 表中，对新建的下载生效。可通过 GUI 中的 **设置** 页面编辑。
+存储在 `lgdm.sqlite` 的 `settings` 表中，对新建的下载生效。可通过 GUI 中的 **设置** 页面编辑。
 
 | 字段                | 默认值           | 说明                                       |
 | ------------------- | ---------------- | ------------------------------------------ |
@@ -269,7 +352,7 @@ internal/uimgr/                # UI 子进程生命周期与 IPC 会话管理
 internal/ui/                   # Fyne 窗口、任务列表、设置对话框、分片视图、系统托盘
 internal/tray/                 # fyne.io/systray 业务进程常驻托盘
 assets/                        # 图标（安装包快捷方式 / lgom:// DefaultIcon 都用它）
-installer/                     # ldm.wxs（WiX MSI）、installer.iss（Inno Setup EXE）
+installer/                     # lgdm.wxs（WiX MSI）、installer.iss（Inno Setup EXE）
 scripts/package.ps1            # 打包入口：编译 + 出 MSI / EXE 安装包
 ```
 

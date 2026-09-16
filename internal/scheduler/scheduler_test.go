@@ -45,7 +45,7 @@ func TestSchedulerEndToEnd(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestSchedulerResume(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,7 +207,7 @@ doneResume:
 // 这是 UI 不卡死的核心保证：探测超时（最长 30s）发生在后台 goroutine。
 func TestStartIsAsync(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,7 +310,7 @@ func parseBytesRange(t *testing.T, rng string, size int64) (int64, int64) {
 // 和 downloaded 字节数,并发出 "paused" 事件供 UI 同步行状态。
 func TestReclaimDownloadingTasks(t *testing.T) {
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +464,7 @@ func TestPauseAll(t *testing.T) {
 	}))
 	defer srv.Close()
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -608,7 +608,7 @@ func TestPauseDuringPrepare(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -698,7 +698,7 @@ func TestPauseAllDuringPrepare(t *testing.T) {
 	defer srv.Close()
 
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -807,7 +807,7 @@ func TestMaxConcurrent_QueuesNewTasksBeyondCap(t *testing.T) {
 	_, url := blockingServer(t, releaseProbe)
 
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -871,7 +871,7 @@ func TestMaxConcurrent_PromotesFIFOOnCompletion(t *testing.T) {
 	_, url := blockingServer(t, releaseProbe)
 
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -951,7 +951,7 @@ func TestMaxConcurrent_RaiseCapPromotesPending(t *testing.T) {
 	_, url := blockingServer(t, releaseProbe)
 
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "ldm.db"))
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
 	if err != nil {
 		t.Fatal(err)
 	}

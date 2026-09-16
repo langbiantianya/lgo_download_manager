@@ -4,7 +4,7 @@
 //
 // Copyright (c) 2026 langbiantianya
 
-// ldm（Local Download Manager）单一可执行文件承载两种角色：
+// lgdm（lgo_download_manager）单一可执行文件承载两种角色：
 //
 //  1. 业务主进程（默认）：SQLite store + 下载 scheduler + 托盘 +
 //     URL 转发 socket server + UI 管理器（拉起 UI 子进程）。
@@ -40,10 +40,10 @@ import (
 	"time"
 )
 
-const defaultDBFile = "ldm.sqlite"
+const defaultDBFile = "lgdm.sqlite"
 
 func main() {
-	log.Printf("ldm %s", version.String())
+	log.Printf("lgdm %s", version.String())
 	// 这样业务子进程即便被误调用也不会去解析业务 flag 或拉起 store。
 	if os.Getenv(ipc.EnvUIChild) == "1" {
 		os.Exit(ui.RunChild())
@@ -254,12 +254,12 @@ func savePathFor(s store.Settings, rawURL, name string) string {
 // defaultDBPath 返回默认的数据库路径。
 //
 // Windows 上默认值必须落在用户级数据目录,不能是相对路径:安装后
-// 的 ldm 会被 lgom:// 协议从任意工作目录拉起(资源管理器/浏览器的
+// 的 lgdm 会被 lgom:// 协议从任意工作目录拉起(资源管理器/浏览器的
 // CWD 可能是 System32,普通用户不可写),相对路径会让冷启动直接
 // 开库失败;即使能写,托盘实例与协议实例的工作目录不同也会落到两份
 // 不同的库里,任务列表对不上。
 //
-// 其它平台沿用相对路径(./ldm.sqlite),由桌面环境/安装器决定 CWD。
+// 其它平台沿用相对路径(./lgdm.sqlite),由桌面环境/安装器决定 CWD。
 func defaultDBPath() string {
 	if runtime.GOOS == "windows" {
 		if dir := os.Getenv("LOCALAPPDATA"); dir != "" {

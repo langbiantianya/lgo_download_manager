@@ -128,7 +128,7 @@ func TestAddTaskDialog_AddAndStart(t *testing.T) {
 	defer test.NewApp()
 
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "ldm.db")
+	dbPath := filepath.Join(dir, "lgdm.db")
 	st, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
@@ -236,7 +236,7 @@ func TestAddTaskDialog_PicksUpConfiguredUA(t *testing.T) {
 	// 我们直接构造与 showAddTaskDialog 的 startDownload 完全相同的
 	// AddTaskInput,验证 Auth 字段透传到 store.Task.AuthData。
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "ldm.db")
+	dbPath := filepath.Join(dir, "lgdm.db")
 	st, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
@@ -319,7 +319,7 @@ func TestAddTaskDialog_StartError_KeepsWindowOpen(t *testing.T) {
 	defer test.NewApp()
 
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "ldm.db")
+	dbPath := filepath.Join(dir, "lgdm.db")
 	st, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)

@@ -1,10 +1,14 @@
-ldm
-ldm.exe
+lgdm
+lgdm.exe
 lgo_download_manager
 lgo_download_manager.exe
 bin/
 dist/
 .tools/
+lgdm.sqlite
+lgdm.sqlite-shm
+lgdm.sqlite-wal
+# 改名前的库名:仓库里可能还留着开发期的旧库,别让二进制库混进提交
 ldm.sqlite
 ldm.sqlite-shm
 ldm.sqlite-wal

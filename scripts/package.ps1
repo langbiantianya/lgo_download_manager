@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    为 lgo_download_manager (ldm) 打包 Windows 安装包:MSI(WiX)或 EXE(Inno Setup),
+    为 lgo_download_manager (lgdm) 打包 Windows 安装包:MSI(WiX)或 EXE(Inno Setup),
     x64 与 arm64 各出一份。
 
 .DESCRIPTION
@@ -13,17 +13,17 @@
 
     产物:
 
-        dist\ldm-setup-<版本>-x64.msi     dist\ldm-setup-<版本>-arm64.msi
-        dist\ldm-setup-<版本>-x64.exe     dist\ldm-setup-<版本>-arm64.exe
+        dist\lgdm-setup-<版本>-x64.msi     dist\lgdm-setup-<版本>-arm64.msi
+        dist\lgdm-setup-<版本>-x64.exe     dist\lgdm-setup-<版本>-arm64.exe
 
     MSI 一个包只能承载一种架构,所以必须按架构分开;两个安装包(MSI / EXE)
     功能对等,同一架构上**任选其一**安装即可(不要同时装两个):
 
       - 用户态安装到 %LOCALAPPDATA%\Programs\lgo_download_manager,不弹 UAC;
-      - 注册 HKCU\Software\Classes\lgom,命令行 "<install>\ldm.exe" "%1";
-      - 装好后浏览器/资源管理器里的 lgom://download?url=... 会拉起 ldm 并开始下载;
-        ldm 已在运行时,新进程把 URL 经命名管道转发给主实例后退出;
-      - 安装/升级/卸载前会结束正在运行的 ldm 实例,避免 exe 被占用;
+      - 注册 HKCU\Software\Classes\lgom,命令行 "<install>\lgdm.exe" "%1";
+      - 装好后浏览器/资源管理器里的 lgom://download?url=... 会拉起 lgdm 并开始下载;
+        lgdm 已在运行时,新进程把 URL 经命名管道转发给主实例后退出;
+      - 安装/升级/卸载前会结束正在运行的 lgdm 实例,避免 exe 被占用;
       - 卸载时连同用户数据目录一起删除,覆盖安装/升级不动它。
 
     依赖的工具如果缺失,脚本会尝试用 winget 安装(可用 -SkipToolInstall 关闭,
@@ -58,7 +58,7 @@
     安装包输出目录,默认 <repo>\dist。
 
 .PARAMETER SkipBuild
-    跳过 go build,直接使用已有的 bin\ldm-<arch>.exe(仍会校验 PE 架构)。
+    跳过 go build,直接使用已有的 bin\lgdm-<arch>.exe(仍会校验 PE 架构)。
 
 .PARAMETER SkipToolInstall
     工具缺失时直接报错,不尝试 winget 安装。
@@ -107,12 +107,12 @@ Set-StrictMode -Version Latest
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $OutputDir) { $OutputDir = Join-Path $RepoRoot 'dist' }
 
-# 装到目标机器上的文件名固定是 ldm.exe(协议注册表命令行、托盘/UI 自复制都按
+# 装到目标机器上的文件名固定是 lgdm.exe(协议注册表命令行、托盘/UI 自复制都按
 # 这个名字找);架构只体现在 bin\ 里待打包的文件名上。
-$AppExeName = 'ldm.exe'
+$AppExeName = 'lgdm.exe'
 $BinDir = Join-Path $RepoRoot 'bin'
-$IconPath = Join-Path $RepoRoot 'assets\ldm.ico'
-$WxsPath = Join-Path $RepoRoot 'installer\ldm.wxs'
+$IconPath = Join-Path $RepoRoot 'assets\lgdm.ico'
+$WxsPath = Join-Path $RepoRoot 'installer\lgdm.wxs'
 $IssPath = Join-Path $RepoRoot 'installer\installer.iss'
 
 # 不带 OSMF EULA 的最后一个 WiX 大版本;v7 起命令行会直接拒绝运行。
@@ -189,7 +189,7 @@ function Get-ArchSpec([string]$Slug) {
             Goarch  = 'arm64'
             WixArch = 'arm64'
             PE      = $PeMachineArm64
-            ExePath = (Join-Path $BinDir 'ldm-arm64.exe')
+            ExePath = (Join-Path $BinDir 'lgdm-arm64.exe')
         }
     }
     return [pscustomobject]@{
@@ -197,7 +197,7 @@ function Get-ArchSpec([string]$Slug) {
         Goarch  = 'amd64'
         WixArch = 'x64'
         PE      = $PeMachineX64
-        ExePath = (Join-Path $BinDir 'ldm-x64.exe')
+        ExePath = (Join-Path $BinDir 'lgdm-x64.exe')
     }
 }
 
@@ -504,7 +504,7 @@ wix.exe 是 v$($wix.Major)($($wix.Path)),它要求接受 OSMF EULA 才能运行,
 "@
     }
 
-    $outMsi = Join-Path $OutputDir ("ldm-setup-{0}-{1}.msi" -f $BuildVersion, $Spec.Slug)
+    $outMsi = Join-Path $OutputDir ("lgdm-setup-{0}-{1}.msi" -f $BuildVersion, $Spec.Slug)
     # -arch 决定 <Package> 的平台,-d Arch 决定打哪个二进制,两者必须一致。
     Invoke-Native $wix.Path @(
         'build', $WxsPath,
@@ -540,8 +540,8 @@ function New-ExePackage {
         Remove-Item Env:LDM_WIN_VERSION -ErrorAction SilentlyContinue
     }
 
-    # .iss 里 OutputBaseFilename = ldm-setup-<版本>-<架构>.exe。
-    return (Join-Path $OutputDir ("ldm-setup-{0}-{1}.exe" -f $BuildVersion, $Spec.Slug))
+    # .iss 里 OutputBaseFilename = lgdm-setup-<版本>-<架构>.exe。
+    return (Join-Path $OutputDir ("lgdm-setup-{0}-{1}.exe" -f $BuildVersion, $Spec.Slug))
 }
 
 # ---------------------------------------------------------------------------
