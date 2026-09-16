@@ -65,6 +65,15 @@ func RunChild() int {
 	c.SetOnShow(func() {
 		fyne.Do(func() { win.ShowFromTray() })
 	})
+	// 业务侧收到 lgom:// 转发后 → 显示主窗口并弹出「新建下载任务」对话框,
+	// URL/Name/UA/Cookies 由参数携带。onShowAddTask 跑在 IPC 读循环里,
+	// 这里 fyne.Do 把 UI 操作切回事件线程。
+	c.SetOnShowAddTask(func(p ipc.ShowAddTaskParams) {
+		fyne.Do(func() {
+			win.ShowFromTray()
+			ShowAddTaskDialogForURL(c, p)
+		})
+	})
 	// 业务侧退出 / 连接断开 → 通知 fyne 退出。LightMode 下窗口关闭
 	// 也会调用 a.Quit()，此时连接由 Close 兜底关闭。
 	c.SetOnClose(func() {

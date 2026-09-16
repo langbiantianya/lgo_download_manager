@@ -32,8 +32,17 @@ type ipcClient struct {
 	subs     []chan scheduler.Event
 	settings store.Settings
 
-	onShow  func()
-	onClose func()
+	onShow        func()
+	onClose       func()
+	onShowAddTask func(ipc.ShowAddTaskParams)
+
+	// showAddTaskQ 在 onShowAddTask 尚未注册前缓存收到的 MsgShowAddTask。
+	// 业务进程的 lgom:// 转发可能在 RunChild 还没调到 SetOnShowAddTask
+	// 时就已发送;不缓存就直接丢弃,主窗口被 ShowFromTray 拉起后却看不到
+	// 对话框。容量 1:同一会话内 URL 转发连续触发概率极低,丢一条比塞一队
+	// 陈旧 URL 更安全。
+	showAddTaskQ []ipc.ShowAddTaskParams
+	showAddTaskDrained bool
 
 	quit chan struct{}
 	once sync.Once
@@ -107,6 +116,23 @@ func (c *ipcClient) run() {
 		case ipc.MsgShow:
 			if c.onShow != nil {
 				c.onShow()
+			}
+		case ipc.MsgShowAddTask:
+			var p ipc.ShowAddTaskParams
+			if err := json.Unmarshal(msg.Data, &p); err != nil {
+				continue
+			}
+			c.pendMu.Lock()
+			hook := c.onShowAddTask
+			// hook 未注册时缓存一条;drained=true 表示 hook 之前注册过
+			// 又被清除(SetOnShowAddTask(nil)),此时不再缓存——防御性兜底,
+			// 因为正常路径下 hook 一旦注册就永驻。
+			if hook == nil && !c.showAddTaskDrained {
+				c.showAddTaskQ = append(c.showAddTaskQ[:0], p)
+			}
+			c.pendMu.Unlock()
+			if hook != nil {
+				hook(p)
 			}
 		case ipc.MsgClose:
 			c.notifyClose()
@@ -298,3 +324,21 @@ func (c *ipcClient) SetOnShow(f func()) { c.onShow = f }
 
 // SetOnClose 注册业务侧要求退出（MsgClose / 连接断开）时的回调。
 func (c *ipcClient) SetOnClose(f func()) { c.onClose = f }
+
+// SetOnShowAddTask 注册 MsgShowAddTask（业务转发 lgom:// 后弹出对话框）回调。
+// f 在 IPC 读循环里被调用,实现在 Fyne 事件线程上自行 fyne.Do。
+//
+// 注册时如果有缓存的 MsgShowAddTask（hook 还没装好时就到的消息）,全部
+// 按到达顺序补发一次——保证冷启动「业务先 send,RunChild 还没 SetOnShowAddTask」
+// 这种窗口期里的 URL 不会丢。
+func (c *ipcClient) SetOnShowAddTask(f func(ipc.ShowAddTaskParams)) {
+	c.pendMu.Lock()
+	c.onShowAddTask = f
+	pending := c.showAddTaskQ
+	c.showAddTaskQ = nil
+	c.showAddTaskDrained = true
+	c.pendMu.Unlock()
+	for _, p := range pending {
+		f(p)
+	}
+}

@@ -573,6 +573,60 @@ func (m *Manager) send(msg ipc.Message) error {
 	return ch.Send(msg)
 }
 
+// SendShowAddTask 让 UI 弹出「新建下载任务」对话框。
+//
+// 行为:
+//   - UI 已运行:立刻把参数序列化后发出,UI 端读完显示主窗口并打开对话框;
+//   - UI 未运行:Start() 拉起一个子进程后,在握手/初始化预算内等待 conn
+//     挂上,然后再 send——冷启动下 Start() 立刻返回,但 acceptLoop 的握手
+//     仍是异步的,不等待就几乎一定丢失首条消息。
+//
+// 业务进程 lgom:// URL 转发路径用它替代原先直接 Add/Start,避免误触;
+// 仅在所有路径都失败时返回 error,由调用方决定是否回退到旧行为。
+func (m *Manager) SendShowAddTask(p ipc.ShowAddTaskParams) error {
+	if !m.Running() {
+		if err := m.Start(); err != nil {
+			return fmt.Errorf("uimgr: cannot start UI for show_add_task: %w", err)
+		}
+		// 等待握手 + init 完成(conn 在 acceptLoop 中设置);握手上限是
+		// handshakeTimeout=20s,留 30s 余量足够覆盖实际路径。
+		if err := m.waitConnReady(30 * time.Second); err != nil {
+			return err
+		}
+	}
+	enc, err := ipc.Encode(p)
+	if err != nil {
+		return fmt.Errorf("uimgr: encode show_add_task: %w", err)
+	}
+	enc.Type = ipc.MsgShowAddTask
+	if err := m.send(enc); err != nil {
+		return err
+	}
+	return nil
+}
+
+// waitConnReady 阻塞直到 m.conn 非空或超时/被取消。Running() 已 true 时
+// 立即返回 nil。用于 SendShowAddTask 等「先要 UI 起来才能发消息」的场景。
+func (m *Manager) waitConnReady(timeout time.Duration) error {
+	if m.Running() {
+		return nil
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	tick := time.NewTicker(20 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		if m.Running() {
+			return nil
+		}
+		select {
+		case <-deadline.C:
+			return fmt.Errorf("uimgr: UI connection not ready within %s", timeout)
+		case <-tick.C:
+		}
+	}
+}
+
 // makeSocketPath 生成带随机后缀的 socket 路径（用户缓存目录）。
 func (m *Manager) makeSocketPath() (string, error) {
 	dir, err := os.UserCacheDir()

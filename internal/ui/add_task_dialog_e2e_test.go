@@ -20,6 +20,7 @@ import (
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
@@ -409,3 +410,214 @@ type startErr string
 func (s startErr) Error() string { return string(s) }
 
 var errStartFailed = startErr("simulated start failure")
+
+// TestShowAddTaskDialogForURL_PrefillsAndOverrides 验证 lgom:// 转发的入口
+// ShowAddTaskDialogForURL:
+//   - URL/Name 字段被预填(URL 字段对应对话框的 urlEntry,SavePath 自动
+//     推导成 <DefaultSaveDir>/<Name>);
+//   - URL 自带的 UA/Cookies 覆盖 GlobalSettings 的默认值,落到持久化的
+//     AuthData 里——这是 lgom:// 协议请求带凭据的关键路径;
+//   - 全局 GlobalSettings 在调用前后未被污染(关闭对话框后下一次点
+//     「新建任务」仍走 GlobalSettings 的 UA/Cookies)。
+func TestShowAddTaskDialogForURL_PrefillsAndOverrides(t *testing.T) {
+	a := test.NewApp()
+	defer test.NewApp()
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "lgdm.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	saveDir := filepath.Join(dir, "dl")
+	// 全局 UA/Cookies 与 URL 自带的刻意分开,用来区分覆盖路径。
+	const globalUA = "GlobalUA/1.0"
+	const globalCookies = "global=1"
+	const urlUA = "URLUA/2.0"
+	const urlCookies = "url=2"
+	if err := st.SaveSettings(store.Settings{
+		DefaultSaveDir: saveDir,
+		DefaultThreads: 2,
+		MinChunkSize:   1 << 20,
+		UserAgent:      globalUA,
+		Cookies:        globalCookies,
+	}); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	GlobalSettings, _ = st.LoadSettings()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	sc := scheduler.New(st)
+	ctx, cancel := context.WithCancel(context.Background())
+	schedulerDone := make(chan struct{})
+	defer func() {
+		cancel()
+		<-schedulerDone
+	}()
+	go func() {
+		sc.Run(ctx)
+		close(schedulerDone)
+	}()
+	svc := &localServiceAdapter{sc: sc, st: st}
+
+	params := ipc.ShowAddTaskParams{
+		URL:     srv.URL + "/president.iso",
+		Name:    "president.iso",
+		UA:      urlUA,
+		Cookies: urlCookies,
+	}
+	ShowAddTaskDialogForURL(svc, params)
+
+	wAdd := findAppWindow(a, "新建下载任务")
+	if wAdd == nil {
+		t.Fatalf("ShowAddTaskDialogForURL did not open a window")
+	}
+	content := wAdd.Content()
+	urlEntry := findNthEntry(content, 0)
+	saveEntry := findNthEntry(content, 1)
+	if urlEntry == nil || saveEntry == nil {
+		t.Fatalf("could not find entries; urlEntry=%v saveEntry=%v", urlEntry, saveEntry)
+	}
+	if urlEntry.Text != params.URL {
+		t.Fatalf("urlEntry.Text = %q, want %q", urlEntry.Text, params.URL)
+	}
+	wantSave := filepath.Join(saveDir, params.Name)
+	if saveEntry.Text != wantSave {
+		t.Fatalf("saveEntry.Text = %q, want %q", saveEntry.Text, wantSave)
+	}
+
+	confirmBtn := findButtonByText(content, "开始下载")
+	if confirmBtn == nil {
+		t.Fatalf("could not find 开始下载 button")
+	}
+	test.Tap(confirmBtn)
+
+	// 等待任务被加入 store。
+	deadline := time.Now().Add(3 * time.Second)
+	var tk *store.Task
+	for time.Now().Before(deadline) {
+		tasks, _ := st.ListTasks("", store.SortCreatedDesc)
+		if len(tasks) == 1 {
+			tk = tasks[0]
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if tk == nil {
+		t.Fatalf("task was not added")
+	}
+
+	// 关键断言:AuthData 必须是 URL 自带的 UA/Cookies,不是 GlobalSettings 的。
+	var got struct {
+		UserAgent string `json:"UserAgent"`
+		Cookies   string `json:"Cookies"`
+	}
+	if err := json.Unmarshal([]byte(tk.AuthData), &got); err != nil {
+		t.Fatalf("AuthData %q is not valid JSON: %v", tk.AuthData, err)
+	}
+	if got.UserAgent != urlUA {
+		t.Fatalf("UserAgent in AuthData = %q, want %q (URL UA must override GlobalSettings)", got.UserAgent, urlUA)
+	}
+	if got.Cookies != urlCookies {
+		t.Fatalf("Cookies in AuthData = %q, want %q (URL Cookies must override GlobalSettings)", got.Cookies, urlCookies)
+	}
+
+	// 关闭对话框后,GlobalSettings 必须恢复——下次点「新建任务」不应被污染。
+	if GlobalSettings.UserAgent != globalUA {
+		t.Fatalf("GlobalSettings.UserAgent polluted: got %q, want %q", GlobalSettings.UserAgent, globalUA)
+	}
+	if GlobalSettings.Cookies != globalCookies {
+		t.Fatalf("GlobalSettings.Cookies polluted: got %q, want %q", GlobalSettings.Cookies, globalCookies)
+	}
+}
+
+// TestShowAddTaskDialogForURL_FallsBackToGlobalWhenEmpty 验证 URL 没带
+// UA/Cookies 时,对话框应回退到 GlobalSettings——避免把空串写入 task。
+func TestShowAddTaskDialogForURL_FallsBackToGlobalWhenEmpty(t *testing.T) {
+	a := test.NewApp()
+	defer test.NewApp()
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "lgdm.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	saveDir := filepath.Join(dir, "dl")
+	const globalUA = "GlobalUA/1.0"
+	if err := st.SaveSettings(store.Settings{
+		DefaultSaveDir: saveDir,
+		DefaultThreads: 2,
+		MinChunkSize:   1 << 20,
+		UserAgent:      globalUA,
+	}); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	GlobalSettings, _ = st.LoadSettings()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	sc := scheduler.New(st)
+	ctx, cancel := context.WithCancel(context.Background())
+	schedulerDone := make(chan struct{})
+	defer func() {
+		cancel()
+		<-schedulerDone
+	}()
+	go func() {
+		sc.Run(ctx)
+		close(schedulerDone)
+	}()
+	svc := &localServiceAdapter{sc: sc, st: st}
+
+	// 仅带 URL,不带 UA/Cookies——应走 GlobalSettings。
+	ShowAddTaskDialogForURL(svc, ipc.ShowAddTaskParams{URL: srv.URL + "/x.bin"})
+
+	wAdd := findAppWindow(a, "新建下载任务")
+	if wAdd == nil {
+		t.Fatalf("ShowAddTaskDialogForURL did not open a window")
+	}
+	content := wAdd.Content()
+	urlEntry := findNthEntry(content, 0)
+	saveEntry := findNthEntry(content, 1)
+	urlEntry.SetText(srv.URL + "/x.bin")
+	saveEntry.SetText(filepath.Join(saveDir, "x.bin"))
+
+	confirmBtn := findButtonByText(content, "开始下载")
+	test.Tap(confirmBtn)
+
+	deadline := time.Now().Add(3 * time.Second)
+	var tk *store.Task
+	for time.Now().Before(deadline) {
+		tasks, _ := st.ListTasks("", store.SortCreatedDesc)
+		if len(tasks) == 1 {
+			tk = tasks[0]
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if tk == nil {
+		t.Fatalf("task was not added")
+	}
+	var got struct {
+		UserAgent string `json:"UserAgent"`
+	}
+	if err := json.Unmarshal([]byte(tk.AuthData), &got); err != nil {
+		t.Fatalf("AuthData %q is not valid JSON: %v", tk.AuthData, err)
+	}
+	if got.UserAgent != globalUA {
+		t.Fatalf("UserAgent = %q, want %q (must fall back to GlobalSettings when URL UA is empty)", got.UserAgent, globalUA)
+	}
+}

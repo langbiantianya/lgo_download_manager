@@ -70,6 +70,23 @@ type InitData struct {
 	Settings store.Settings `json:"settings"`
 }
 
+// ShowAddTaskParams 是 MsgShowAddTask 的负载。
+//
+// 业务进程收到 lgom:// URL 后,把解析出的 DownloadRequest 字段透传给 UI:
+//   - URL     目标下载链接,用于对话框的 URL 输入框与保存路径的自动推导;
+//   - Name    URL 中的可选文件名提示,非空时用于填充保存路径的文件名部分;
+//   - UA      URL 自带的 User-Agent,非空时覆盖 GlobalSettings.UserAgent;
+//   - Cookies URL 自带的 Cookie,非空时覆盖 GlobalSettings.Cookies。
+//
+// 任务提交由用户在对话框内点击「开始下载」后由 UI 端发起;业务进程
+// 不再为此 URL 自动 Add/Start,避免误触。
+type ShowAddTaskParams struct {
+	URL     string `json:"url"`
+	Name    string `json:"name,omitempty"`
+	UA      string `json:"ua,omitempty"`
+	Cookies string `json:"cookies,omitempty"`
+}
+
 // EventData 是 MsgEvent 的负载，镜像 scheduler.Event 的 JSON 表示。
 // 业务端从 scheduler.Event 转换而来；UI 端转换回 scheduler.Event。
 type EventData struct {

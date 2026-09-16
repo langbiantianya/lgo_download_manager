@@ -29,6 +29,9 @@ const (
 	MsgShow = "biz.show"
 	// MsgClose 请求 UI 进程优雅退出（托盘「退出」/业务进程关停）。
 	MsgClose = "biz.close"
+	// MsgShowAddTask 请求 UI 弹出「新建下载任务」对话框（lgom:// 转发场景）。
+	// UI 应在 Fyne 事件线程上显示主窗口并打开对话框，按 URL 参数预填。
+	MsgShowAddTask = "biz.show_add_task"
 )
 
 // 消息类型：UI → 业务。

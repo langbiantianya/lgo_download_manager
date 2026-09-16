@@ -176,44 +176,39 @@ func main() {
 	}
 	go sc.Run(ctx)
 
-	// 业务进程对 URL 转发的处理：探测 protocol、推导保存路径，
-	// 然后通过 scheduler 添加任务并启动；与 UI 子进程的 IPC
-	// 调用走的是同一条路径。
+	// UI 管理器：负责拉起/管理 Fyne UI 子进程（自我复刻）。必须先于
+	// handleDownloadURL 创建,后者把 URL 转发给 UI 弹弹对话框。
+	uim := uimgr.New(st, sc)
+	uim.SetSettings(cur)
+
+	// 业务进程对 URL 转发的处理：解析 lgom:// 参数并把预填值交给 UI 子进程
+	// 的「新建下载任务」对话框,任务提交由用户在该对话框中确认后触发;
+	// 与 UI 内点「新建任务」按钮走的是同一条 IPC + Service.AddTask/Start
+	// 路径,只在是否预填 URL/Name/UA/Cookies 上不同。
+	//
+	// --no-gui 模式下没有 UI 实例:此时回退到原先的「业务进程直接 Add+Start」,
+	// 服务/CLI 形态仍可独立工作;其它路径只要 UI 子进程拉起失败就只记录
+	// warning,由用户从托盘或重新转发 URL 触发。
 	handleDownloadURL := func(rawURL string) {
 		req, err := urllauncher.HandleURL(rawURL)
 		if err != nil {
 			logging.Printf("invalid URL: %v", err)
 			return
 		}
-		// 从 URL 推导协议：此前这里传空串，导致 scheduler.startAsync 里
-		// protocol.New 报 "no driver for kind="，任何 lgom:// 触发的下载
-		// 都会立刻变成 Failed。
-		kind, err := protocol.DetectKind(req.URL, "")
-		if err != nil {
-			logging.Printf("unsupported URL %s: %v", req.URL, err)
+		logging.Printf("queueing URL for dialog: %s", req.URL)
+
+		if *noGUI {
+			// CLI / 服务场景:业务侧直接创建并启动,无对话框可弹。
+			addAndStartFromURL(sc, cur, req)
 			return
 		}
-		logging.Printf("adding download: %s", req.URL)
-
-		auth := protocol.AuthOptions{
-			UserAgent: req.UA,
-			Cookies:   req.Cookies,
-		}
-
-		tk, err := sc.Add(scheduler.AddTaskInput{
-			URL:          req.URL,
-			SavePath:     savePathFor(cur, req.URL, req.Name),
-			Protocol:     kind,
-			Auth:         auth,
-			ChunkCount:   defaultChunks(cur.DefaultThreads),
-			MinChunkSize: cur.MinChunkSize,
-		})
-		if err != nil {
-			logging.Printf("failed to add task: %v", err)
-			return
-		}
-		if err := sc.Start(tk.ID); err != nil {
-			logging.Printf("failed to start task: %v", err)
+		if err := uim.SendShowAddTask(ipc.ShowAddTaskParams{
+			URL:     req.URL,
+			Name:    req.Name,
+			UA:      req.UA,
+			Cookies: req.Cookies,
+		}); err != nil {
+			logging.Printf("cannot show add-task dialog for %s: %v", req.URL, err)
 		}
 	}
 
@@ -229,10 +224,6 @@ func main() {
 	for _, u := range urls {
 		handleDownloadURL(u)
 	}
-
-	// UI 管理器：负责拉起/管理 Fyne UI 子进程（自我复刻）。
-	uim := uimgr.New(st, sc)
-	uim.SetSettings(cur)
 
 	// 退出信号：业务进程同时监听 SIGINT/SIGTERM 和托盘「退出」菜单。
 	// 任何一方触发都会走同一条优雅退出路径(cancel → uim.Close → tray.Stop)。
@@ -253,7 +244,9 @@ func main() {
 		},
 	})
 
-	// 默认拉起 UI(除非 -no-gui)。
+	// 默认拉起 UI(除非 -no-gui)。本进程的本地 --open-url / 位置参数
+	// URL 在 uim 起来之前就已经被上面循环处理——SendShowAddTask 内部会
+	// 等待握手,首条消息不会丢失。
 	if !*noGUI {
 		if err := uim.Start(); err != nil {
 			logging.Printf("uimgr: cannot start UI child: %v", err)
@@ -294,6 +287,44 @@ func savePathFor(s store.Settings, rawURL, name string) string {
 		}
 	}
 	return filepath.Join(saveDir, name)
+}
+
+// addAndStartFromURL 把一个 lgom:// 解析出的 DownloadRequest 直接
+// 落地到 scheduler：探测协议、构造 AddTaskInput、Add + Start。
+//
+// 仅在 --no-gui 这条路径上调用——没有 UI 可弹,业务侧独立完成所有工作;
+// 其它路径都走 uim.SendShowAddTask 让用户在对话框里确认。
+//
+// 行为/错误日志与原先 handleDownloadURL 内联实现保持一致,以便
+// --no-gui 用户得到与历史版本兼容的行为。
+func addAndStartFromURL(sc *scheduler.Scheduler, cur store.Settings, req *urllauncher.DownloadRequest) {
+	kind, err := protocol.DetectKind(req.URL, "")
+	if err != nil {
+		logging.Printf("unsupported URL %s: %v", req.URL, err)
+		return
+	}
+	logging.Printf("adding download: %s", req.URL)
+
+	auth := protocol.AuthOptions{
+		UserAgent: req.UA,
+		Cookies:   req.Cookies,
+	}
+
+	tk, err := sc.Add(scheduler.AddTaskInput{
+		URL:          req.URL,
+		SavePath:     savePathFor(cur, req.URL, req.Name),
+		Protocol:     kind,
+		Auth:         auth,
+		ChunkCount:   defaultChunks(cur.DefaultThreads),
+		MinChunkSize: cur.MinChunkSize,
+	})
+	if err != nil {
+		logging.Printf("failed to add task: %v", err)
+		return
+	}
+	if err := sc.Start(tk.ID); err != nil {
+		logging.Printf("failed to start task: %v", err)
+	}
 }
 
 // defaultConfigPath 返回默认的配置目录(SQLite 与日志都落在它里面)。

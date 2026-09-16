@@ -21,6 +21,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/ui/nativefolder"
 )
@@ -102,6 +103,43 @@ func uniqueSavePath(path string) string {
 // URL 变更时自动从路径末尾提取文件名填入保存路径，并异步请求业务进程
 // 探测文件大小进行预览（探针复用业务侧代理配置）。
 func showAddTaskDialog(parent fyne.Window, svc Service) {
+	showAddTaskDialogWithPreset(parent, svc, addTaskPreset{})
+}
+
+// addTaskPreset 描述对话框打开时的可选预填值。所有字段都可选——空值
+// 表示「保持默认/GlobalSettings」。用于:
+//
+//   - lgom:// URL 转发:从业务进程收到的 ShowAddTaskParams 转过来;
+//   - 未来:拖拽、剪贴板粘贴等本地快捷入口。
+//
+// UA / Cookies 非空时,在「开始下载」时覆盖 GlobalSettings 的对应字段
+// (URL 自带的凭据比全局默认更具体)。其它字段保持原行为不变。
+type addTaskPreset struct {
+	URL     string
+	Name    string
+	UA      string
+	Cookies string
+}
+
+// ShowAddTaskDialogForURL 由 MsgShowAddTask 回调调用:把 IPC 负载转成
+// 对话框预填值并打开。预期在 Fyne 事件线程上执行。
+//
+// URL 自带的 UA / Cookies 仅在该次提交中有效——它们由 showAddTaskDialog
+// 内部作为 taskAuth 的覆盖值传入,关闭/取消后即丢弃;再次点开「新建
+// 任务」时回到 GlobalSettings 的常规路径。
+func ShowAddTaskDialogForURL(svc Service, params ipc.ShowAddTaskParams) {
+	showAddTaskDialogWithPreset(nil, svc, addTaskPreset{
+		URL:     params.URL,
+		Name:    params.Name,
+		UA:      params.UA,
+		Cookies: params.Cookies,
+	})
+}
+
+// showAddTaskDialogWithPreset 是 showAddTaskDialog 的内部实现。
+// preset 仅在窗口首次构造时被读取,运行期间用户对 urlEntry 的修改
+// 不会被覆盖。preset.Name 仅在用户未自定义保存路径时参与文件名推导。
+func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTaskPreset) {
 	// 构建一个纵向布局、标签左对齐的表单。
 	makeRow := func(label string, w fyne.CanvasObject) *fyne.Container {
 		lbl := widget.NewLabel(label)
@@ -113,8 +151,21 @@ func showAddTaskDialog(parent fyne.Window, svc Service) {
 	urlEntry.SetPlaceHolder("https://...")
 	urlEntry.Validator = notEmptyValidator()
 
+	defaultName := "download.bin"
+	if preset.URL != "" {
+		if u, err := url.Parse(preset.URL); err == nil && u.Path != "" {
+			if base := filepath.Base(u.Path); base != "" && base != "." && base != "/" {
+				defaultName = base
+			}
+		}
+	}
+	// preset.Name 覆盖 URL 末端推导出的文件名(lgom:// 的 &name= 参数
+	// 比路径末尾更具体,例如镜像源常通过它指定真实文件名)。
+	if preset.Name != "" {
+		defaultName = preset.Name
+	}
 	savePathEntry := widget.NewEntry()
-	savePathEntry.SetText(uniqueSavePath(filepath.Join(GlobalSettings.DefaultSaveDir, "download.bin")))
+	savePathEntry.SetText(uniqueSavePath(filepath.Join(GlobalSettings.DefaultSaveDir, defaultName)))
 	// 「浏览」按钮：调用系统原生文件夹选择对话框(资源管理器 / Finder /
 	// GTK/Qt 通用 chooser),不走 fyne 自带的 dialog.ShowFolderOpen。
 	// 同步阻塞在 UI 线程上,直接在 goroutine 中执行,选择结束后用
@@ -156,7 +207,7 @@ func showAddTaskDialog(parent fyne.Window, svc Service) {
 			return
 		}
 		filename := filepath.Base(u.Path)
-		if savePathEntry.Text == "" || savePathEntry.Text == filepath.Join(GlobalSettings.DefaultSaveDir, "download.bin") {
+		if savePathEntry.Text == "" || savePathEntry.Text == filepath.Join(GlobalSettings.DefaultSaveDir, defaultName) {
 			savePathEntry.SetText(uniqueSavePath(filepath.Join(GlobalSettings.DefaultSaveDir, filename)))
 		}
 		// 异步探测（经业务进程，代理配置一致）。失败时静默清空预览。
@@ -206,9 +257,22 @@ func showAddTaskDialog(parent fyne.Window, svc Service) {
 		// 立即生效;留空也照样透传(业务进程据此把 UA 字段保留为空)。
 		// 仅设置中已存在的字段才会真正下发,避免给 URL/FTP 驱动传
 		// 与协议无关的代理/凭据导致副作用。
+		//
+		// preset 中的 UA / Cookies 是 lgom:// URL 自带的凭据
+		// (lgom://download?...&ua=...&cookies=...),优先级高于
+		// GlobalSettings——非空时直接覆盖。覆盖仅作用在本次 AddTask 上,
+		// 关闭/取消后即丢弃。
+		ua := GlobalSettings.UserAgent
+		if preset.UA != "" {
+			ua = preset.UA
+		}
+		cookies := GlobalSettings.Cookies
+		if preset.Cookies != "" {
+			cookies = preset.Cookies
+		}
 		taskAuth := protocol.AuthOptions{
-			UserAgent: GlobalSettings.UserAgent,
-			Cookies:   GlobalSettings.Cookies,
+			UserAgent: ua,
+			Cookies:   cookies,
 		}
 		tk, err := svc.AddTask(AddTaskInput{
 			URL:          url,
@@ -251,6 +315,14 @@ func showAddTaskDialog(parent fyne.Window, svc Service) {
 
 	// 让 closeWin 在所有控件构造完成后指向真实关闭逻辑。
 	closeWin = w.Close
+
+	// 预设 URL 必须在 SetContent/OnChanged 注册之后再写,否则 OnChanged
+	// 第一次回调拿到的 savePathEntry.Text 还是默认占位符,会出现「用户
+	// 没碰 URL 但保存路径被刷新」的怪异行为。同时显式触发一次 updateFromURL,
+	// 让 URL 末尾文件名 + 大小预览就位。
+	if preset.URL != "" {
+		urlEntry.SetText(preset.URL)
+	}
 
 	w.Show()
 }
