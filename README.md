@@ -280,22 +280,39 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 
 | 参数        | 默认值          | 说明                                          |
 | ----------- | --------------- | --------------------------------------------- |
-| `-db`       | 见下            | SQLite 数据库文件路径                         |
+| `-config`   | 见下            | 运行时目录（SQLite 与日志都落在它里面）       |
 | `-no-gui`   | `false`         | 启动时不打开 Fyne GUI                         |
 | `-open-url` | `""`            | 一条 `lgom://...` URL，加入队列               |
 | `-light`    | `false`         | 强制开启轻量模式（关闭主窗口时释放 widget 树） |
+| `-debug`    | `false`         | 把日志写到 stderr 而不是轮转文件（详见「日志」） |
 
-`-db` 默认值：Windows 上是
-`%LOCALAPPDATA%\lgo_download_manager\lgdm.sqlite`（绝对路径 —— 安装后的
-lgdm 会被 `lgom://` 协议从任意工作目录拉起，相对路径会因 CWD 不可写而
-开库失败，托盘实例与协议实例也会落到两份不同的库）；其它平台仍是
-相对当前工作目录的 `lgdm.sqlite`。
+`-config` 默认值：Windows 上是 `%LOCALAPPDATA%\lgo_download_manager`（绝对路径
+—— 安装后的 lgdm 会被 `lgom://` 协议从任意工作目录拉起，相对路径会因 CWD
+不可写而开库失败，托盘实例与协议实例也会落到两份不同的库）；其它平台沿用
+XDG 风格的 `~/.config/lgo_download_manager`（`$HOME` 不可用时回退到 `.`）。
+SQLite 数据库固定为 `<config>/lgdm.sqlite`。
 
-> 库文件名从 `ldm.sqlite` 改成了 `lgdm.sqlite`（安装目录名仍是
+> 库文件名从 `ldm.sqlite` 改成了 `lgdm.sqlite`（目录名仍是
 > `lgo_download_manager`）：如果本地还留着旧的 `ldm.sqlite`，程序不会去读它，
 > 需要的话手工改名即可。
 
 也支持以位置参数的形式传入 `lgom://` URL（某些桌面环境会以位置参数方式传递 URL）。
+
+## 日志
+
+所有日志由 `internal/logging` 统一封装，底层是 `log/slog`：
+
+- 默认（非 `--debug`）：写到 `<config>/lgdm.log`，按天轮转成
+  `lgdm.log.yyyymmdd`，启动时自动 prune 掉超过 7 天的历史文件。
+- `--debug`：写到 stderr，Debug 级别。
+- Windows 上二进制是 GUI 子系统构建（`-H windowsgui`），从 cmd / PowerShell
+  加 `--debug` 启动时由 `AttachParentConsole(ATTACH_PARENT_PROCESS)`
+  把进程挂回父终端，日志直接落到控制台；无父 console（资源管理器/浏览器
+  URL 协议拉起）时 attach 失败，回退到 `lgdm.log`（同样 Debug 级别），
+  保证调试信息不丢。
+
+业务进程通过环境变量 `LGDM_DEBUG=1` 把 `--debug` 透传给由它自我复刻拉起的
+UI 子进程，避免子进程的日志悄悄落到文件里。
 
 ## URL 协议
 
@@ -393,6 +410,7 @@ internal/prealloc/             # 磁盘预分配辅助
 internal/urllauncher/          # lgom:// URL 解析、单实例锁、URL 转发
                                #   （Windows 命名管道 / 其它平台 Unix socket）
 internal/settings/             # 首次运行默认值 / --light 覆盖 / 进程级代理同步
+internal/logging/              # log/slog 门面：轮转文件 / --debug stderr / Windows console 挂接
 internal/ipc/                  # 长度前缀 JSON 帧协议（业务↔UI 共用）
 internal/uimgr/                # UI 子进程生命周期与 IPC 会话管理
 internal/ui/                   # Fyne 窗口、任务列表、设置对话框、分片视图、系统托盘
