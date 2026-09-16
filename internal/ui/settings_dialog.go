@@ -17,6 +17,7 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/autostart"
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/store"
@@ -100,14 +101,14 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 		}
 	}
 
-// 代理相关控件
-proxyURLEntry := widget.NewEntry()
-proxyURLEntry.SetText(GlobalSettings.ProxyURL)
-proxyURLEntry.SetPlaceHolder("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
-proxyURLEntry.OnChanged = func(s string) {
-	GlobalSettings.ProxyURL = strings.TrimSpace(s)
-	persist()
-}
+	// 代理相关控件
+	proxyURLEntry := widget.NewEntry()
+	proxyURLEntry.SetText(GlobalSettings.ProxyURL)
+	proxyURLEntry.SetPlaceHolder("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
+	proxyURLEntry.OnChanged = func(s string) {
+		GlobalSettings.ProxyURL = strings.TrimSpace(s)
+		persist()
+	}
 
 	proxyBypassEntry := widget.NewEntry()
 	proxyBypassEntry.SetText(GlobalSettings.ProxyBypass)
@@ -220,6 +221,22 @@ proxyURLEntry.OnChanged = func(s string) {
 		GlobalSettings.AutoStart = checked
 		persist()
 	})
+
+	// 每次打开设置时重新对齐 DB 与 OS 真实状态:
+	//   - 用户可能用第三方工具(任务管理器启动标签、GNOME Tweaks、
+	//     系统设置)直接改过,DB 没跟上;
+	//   - 安装/卸载残留也可能让两者漂移。
+	// OS 状态通过 autostart.IsEnabled() 直接读 HKCU Run / XDG autostart /
+	// LaunchAgent —— 这是纯 OS 状态查询,不依赖业务进程,UI 子进程
+	// 与业务进程读到的结果一致;若与 DB 不一致,以 OS 为准更新镜像并
+	// 持久化回去(settings.Save → ApplyAutoStart 顺势确保 OS 也跟着对齐)。
+	// 查询/持久化失败只记日志,不阻塞对话框打开。
+	if enabled, err := autostart.IsEnabled(); err != nil {
+		logging.Printf("ui: query autostart state: %v", err)
+	} else if enabled != GlobalSettings.AutoStart {
+		GlobalSettings.AutoStart = enabled
+		persist()
+	}
 	autoStartCheck.SetChecked(GlobalSettings.AutoStart)
 
 	sortSelect.SetSelected(currentLabel)
