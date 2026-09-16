@@ -16,7 +16,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
 	"os"
 	"os/exec"
@@ -25,6 +24,7 @@ import (
 	"time"
 
 	"lgo_download_manager/internal/ipc"
+	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/settings"
@@ -67,7 +67,7 @@ func New(st *store.Store, sc *scheduler.Scheduler) *Manager {
 		st: st,
 		sc: sc,
 		onExit: func() {
-			log.Println("uimgr: UI session ended; business keeps running")
+			logging.Println("uimgr: UI session ended; business keeps running")
 		},
 	}
 }
@@ -109,7 +109,7 @@ func (m *Manager) Open() {
 		return
 	}
 	if err := m.Start(); err != nil {
-		log.Printf("uimgr: cannot open UI: %v", err)
+		logging.Printf("uimgr: cannot open UI: %v", err)
 	}
 }
 
@@ -178,7 +178,7 @@ func (m *Manager) Start() error {
 	// 这里只捕获局部 cmd，不再读写 m.cmd，消除与 finishSession 的竞态。
 	go func() {
 		err := cmd.Wait()
-		log.Printf("uimgr: UI child exited: %v", err)
+		logging.Printf("uimgr: UI child exited: %v", err)
 		cancel()
 	}()
 
@@ -229,7 +229,7 @@ func (m *Manager) acceptLoop(ln net.Listener, ctx context.Context, gen uint64) {
 	}
 	ch := ipc.NewConn(conn)
 	if err := m.handshake(ch); err != nil {
-		log.Printf("uimgr: handshake failed: %v", err)
+		logging.Printf("uimgr: handshake failed: %v", err)
 		ch.Close()
 		m.killChild(gen)
 		return
@@ -243,7 +243,7 @@ func (m *Manager) acceptLoop(ln net.Listener, ctx context.Context, gen uint64) {
 		err = ch.SendPayload(ipc.MsgInit, initMsg.Data)
 	}
 	if err != nil {
-		log.Printf("uimgr: send init: %v", err)
+		logging.Printf("uimgr: send init: %v", err)
 		ch.Close()
 		m.killChild(gen)
 		return

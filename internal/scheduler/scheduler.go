@@ -15,7 +15,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -23,6 +22,7 @@ import (
 	"time"
 
 	"lgo_download_manager/internal/engine"
+	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/prealloc"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/store"
@@ -433,7 +433,7 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 			tk.ChunkRanges = ranges
 			rj.dirtyMu.Unlock()
 			if err := s.st.UpdateTaskChunkRanges(tk.ID, ranges); err != nil {
-				log.Printf("scheduler: persist chunk ranges: %v", err)
+				logging.Printf("scheduler: persist chunk ranges: %v", err)
 			}
 		},
 	})
@@ -449,7 +449,7 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	tk.ChunkRanges = ranges
 	rj.dirtyMu.Unlock()
 	if err := s.st.UpdateTaskChunkRanges(tk.ID, ranges); err != nil {
-		log.Printf("scheduler: persist chunk ranges: %v", err)
+		logging.Printf("scheduler: persist chunk ranges: %v", err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 

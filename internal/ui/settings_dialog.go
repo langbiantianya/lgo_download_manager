@@ -8,7 +8,6 @@ package ui
 
 import (
 	"fmt"
-	"log"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -18,6 +17,7 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/store"
 )
@@ -36,7 +36,7 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 			return
 		}
 		if err := svc.SaveSettings(GlobalSettings); err != nil {
-			log.Printf("ui: save settings: %v", err)
+			logging.Printf("ui: save settings: %v", err)
 		}
 		if onChange != nil {
 			onChange()

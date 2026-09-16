@@ -11,10 +11,10 @@
 package settings
 
 import (
-	"log"
 	"os"
 	"path/filepath"
 
+	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/store"
 )
@@ -51,7 +51,7 @@ func Load(st *store.Store, forceLight bool) (store.Settings, error) {
 	ApplyProxy(persisted)
 	if firstRun {
 		if err := Save(st, persisted); err != nil {
-			log.Printf("settings: save first-run defaults: %v", err)
+			logging.Printf("settings: save first-run defaults: %v", err)
 		}
 	}
 	return persisted, nil

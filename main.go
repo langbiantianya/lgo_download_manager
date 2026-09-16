@@ -20,7 +20,9 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"lgo_download_manager/internal/ipc"
+	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/settings"
@@ -30,7 +32,6 @@ import (
 	"lgo_download_manager/internal/uimgr"
 	"lgo_download_manager/internal/urllauncher"
 	"lgo_download_manager/internal/version"
-	"log"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -42,18 +43,45 @@ import (
 
 const defaultDBFile = "lgdm.sqlite"
 
+// envLogDebug 跨进程传递 --debug 选择:业务进程启动时若用户指定了
+// --debug,则把该信号写进 LGDM_DEBUG,UI 子进程继承同一份配置。
+const envLogDebug = "LGDM_DEBUG"
+
 func main() {
-	log.Printf("lgdm %s", version.String())
+	configPath := flag.String("config", defaultConfigPath(), "directory for lgdm runtime files (db + logs)")
+	noGUI := flag.Bool("no-gui", false, "start without spawning the Fyne UI child")
+	openURL := flag.String("open-url", "", "download URL (lgom://... format)")
+	light := flag.Bool("light", false, "force lightweight mode (destroy UI on close)")
+	debug := flag.Bool("debug", false, "log to stderr instead of rotating file")
+	flag.Parse()
+
+	// 把 --debug 通过环境变量传给即将拉起的 UI 子进程,
+	// 让子进程日志也走 stderr,而不是悄悄落到文件里。
+	if *debug {
+		os.Setenv(envLogDebug, "1")
+	}
+
+	// UI 子进程在 spawn 时也会走到这里(被业务进程自我复刻拉起),
+	// 它没有自己的 --debug,但父进程已经把 LGDM_DEBUG 传过来。
+	childDebug := os.Getenv(envLogDebug) == "1"
+	// 日志与 db 落在同一目录:用户传 --config 时跟 --config,否则跟 defaultConfigPath()。
+	// 这样运维上 db 与 log 总在同一处,便于打包收集。
+	logDir := *configPath
+	if logDir == "" {
+		logDir = "."
+	}
+	if err := logging.Init(childDebug || *debug, logDir); err != nil {
+		fmt.Fprintf(os.Stderr, "logging init: %v\n", err)
+		os.Exit(1)
+	}
+	defer logging.Close()
+
+	logging.Printf("lgdm %s", version.String())
+
 	// 这样业务子进程即便被误调用也不会去解析业务 flag 或拉起 store。
 	if os.Getenv(ipc.EnvUIChild) == "1" {
 		os.Exit(ui.RunChild())
 	}
-
-	dbPath := flag.String("db", defaultDBPath(), "path to SQLite database")
-	noGUI := flag.Bool("no-gui", false, "start without spawning the Fyne UI child")
-	openURL := flag.String("open-url", "", "download URL (lgom://... format)")
-	light := flag.Bool("light", false, "force lightweight mode (destroy UI on close)")
-	flag.Parse()
 
 	// 收集 URL：--open-url 与位置参数两种来源都支持。
 	var urls []string
@@ -69,7 +97,7 @@ func main() {
 	// 单实例锁：第二个实例只负责把 URL 转发给已运行实例。
 	isPrimary, release, err := urllauncher.AcquireLock()
 	if err != nil {
-		log.Fatalf("urllauncher: %v", err)
+		logging.Fatalf("urllauncher: %v", err)
 	}
 	if !isPrimary {
 		if len(urls) > 0 {
@@ -77,17 +105,17 @@ func main() {
 			var failed int
 			for _, u := range urls {
 				if err := urllauncher.SendURL(u); err != nil {
-					log.Printf("failed to forward URL %q: %v", u, err)
+					logging.Printf("failed to forward URL %q: %v", u, err)
 					failed++
 				}
 			}
 			if failed > 0 {
-				log.Printf("failed to forward %d of %d URL(s) to the primary instance", failed, len(urls))
+				logging.Printf("failed to forward %d of %d URL(s) to the primary instance", failed, len(urls))
 				os.Exit(1)
 			}
-			log.Printf("forwarded %d URL(s) to primary instance", len(urls))
+			logging.Printf("forwarded %d URL(s) to primary instance", len(urls))
 		} else {
-			log.Println("another instance is already running")
+			logging.Println("another instance is already running")
 		}
 		os.Exit(0)
 	}
@@ -96,22 +124,23 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// 存储 + 设置加载。默认库落在用户级数据目录里,那里可能还不存在
-	// (首次安装后直接由 lgom:// 协议拉起时),先建目录再开库。
-	if dir := filepath.Dir(*dbPath); dir != "." && dir != "" {
+	// 拼接 db 实际路径:配置目录 + db 文件名。配置目录可能在 lgom://
+	// 协议首次拉起时还不存在(冷启动),先建目录再开库。
+	dbPath := filepath.Join(*configPath, defaultDBFile)
+	if dir := *configPath; dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
-			log.Fatalf("store: create database directory: %v", err)
+			logging.Fatalf("store: create database directory: %v", err)
 		}
 	}
-	st, err := store.Open(*dbPath)
+	st, err := store.Open(dbPath)
 	if err != nil {
-		log.Fatalf("store: %v", err)
+		logging.Fatalf("store: %v", err)
 	}
 	defer st.Close()
 
 	cur, err := settings.Load(st, *light)
 	if err != nil {
-		log.Fatalf("settings: %v", err)
+		logging.Fatalf("settings: %v", err)
 	}
 
 	// 调度器。
@@ -127,7 +156,7 @@ func main() {
 	// 没有 engine 在跑,必须在 Run 之前把它们回收成 Paused,否则 UI 会
 	// 把这些任务显示为「下载中」却永远没有进度,用户无法恢复。
 	if err := sc.ReclaimDownloadingTasks(); err != nil {
-		log.Printf("scheduler: reclaim downloading tasks: %v", err)
+		logging.Printf("scheduler: reclaim downloading tasks: %v", err)
 	}
 	go sc.Run(ctx)
 
@@ -137,7 +166,7 @@ func main() {
 	handleDownloadURL := func(rawURL string) {
 		req, err := urllauncher.HandleURL(rawURL)
 		if err != nil {
-			log.Printf("invalid URL: %v", err)
+			logging.Printf("invalid URL: %v", err)
 			return
 		}
 		// 从 URL 推导协议：此前这里传空串，导致 scheduler.startAsync 里
@@ -145,10 +174,10 @@ func main() {
 		// 都会立刻变成 Failed。
 		kind, err := protocol.DetectKind(req.URL, "")
 		if err != nil {
-			log.Printf("unsupported URL %s: %v", req.URL, err)
+			logging.Printf("unsupported URL %s: %v", req.URL, err)
 			return
 		}
-		log.Printf("adding download: %s", req.URL)
+		logging.Printf("adding download: %s", req.URL)
 
 		auth := protocol.AuthOptions{
 			UserAgent: req.UA,
@@ -164,11 +193,11 @@ func main() {
 			MinChunkSize: cur.MinChunkSize,
 		})
 		if err != nil {
-			log.Printf("failed to add task: %v", err)
+			logging.Printf("failed to add task: %v", err)
 			return
 		}
 		if err := sc.Start(tk.ID); err != nil {
-			log.Printf("failed to start task: %v", err)
+			logging.Printf("failed to start task: %v", err)
 		}
 	}
 
@@ -176,7 +205,7 @@ func main() {
 	// 投递新下载请求。
 	go func() {
 		if err := urllauncher.ListenAndServe(handleDownloadURL); err != nil {
-			log.Printf("urllauncher server error: %v", err)
+			logging.Printf("urllauncher server error: %v", err)
 		}
 	}()
 
@@ -211,11 +240,11 @@ func main() {
 	// 默认拉起 UI(除非 -no-gui)。
 	if !*noGUI {
 		if err := uim.Start(); err != nil {
-			log.Printf("uimgr: cannot start UI child: %v", err)
+			logging.Printf("uimgr: cannot start UI child: %v", err)
 		}
 	}
 	<-quit
-	log.Println("shutting down...")
+	logging.Println("shutting down...")
 	// 先停掉所有正在下载的 engine job 并落盘 Paused, 再 cancel root ctx。
 	// 顺序很重要:scheduler.Run 在 ctx.Done 上调用 flushAll, 会用
 	// rj.status(=Downloading)覆盖 store;PauseAll 在 cancel 之前跑完,
@@ -228,7 +257,7 @@ func main() {
 	pauseErr := sc.PauseAll(shutdownCtx)
 	shutdownCancel()
 	if pauseErr != nil {
-		log.Printf("scheduler: pause all timed out after 5s, forcing exit: %v", pauseErr)
+		logging.Printf("scheduler: pause all timed out after 5s, forcing exit: %v", pauseErr)
 		os.Exit(1)
 	}
 	cancel()
@@ -251,7 +280,7 @@ func savePathFor(s store.Settings, rawURL, name string) string {
 	return filepath.Join(saveDir, name)
 }
 
-// defaultDBPath 返回默认的数据库路径。
+// defaultConfigPath 返回默认的配置目录(SQLite 与日志都落在它里面)。
 //
 // Windows 上默认值必须落在用户级数据目录,不能是相对路径:安装后
 // 的 lgdm 会被 lgom:// 协议从任意工作目录拉起(资源管理器/浏览器的
@@ -259,14 +288,19 @@ func savePathFor(s store.Settings, rawURL, name string) string {
 // 开库失败;即使能写,托盘实例与协议实例的工作目录不同也会落到两份
 // 不同的库里,任务列表对不上。
 //
-// 其它平台沿用相对路径(./lgdm.sqlite),由桌面环境/安装器决定 CWD。
-func defaultDBPath() string {
+// 其它平台沿用 XDG 风格的 ~/.config/lgo_download_manager:即便 CWD
+// 是任意目录(例如 lgom:// 协议从 System32 拉起),也总能落在用户
+// 自己的可写位置上。$HOME 不可用时回退到 ./,留给桌面环境/安装器决定。
+func defaultConfigPath() string {
 	if runtime.GOOS == "windows" {
 		if dir := os.Getenv("LOCALAPPDATA"); dir != "" {
-			return filepath.Join(dir, "lgo_download_manager", defaultDBFile)
+			return filepath.Join(dir, "lgo_download_manager")
 		}
 	}
-	return defaultDBFile
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".config", "lgo_download_manager")
+	}
+	return "."
 }
 
 // defaultSaveDir 返回当前平台合适的下载目录。

@@ -7,13 +7,13 @@
 package ui
 
 import (
-	"log"
 	"os"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 
 	"lgo_download_manager/internal/ipc"
+	"lgo_download_manager/internal/logging"
 )
 
 // NewService 连接到业务进程的 socket、完成握手并返回 Service 接口。
@@ -36,19 +36,19 @@ func NewService(socketPath, token string) (Service, error) {
 // 仅在被业务进程以正确环境变量拉起时调用；直接运行会因缺少环境变量而退出。
 func RunChild() int {
 	if os.Getenv(ipc.EnvUIChild) != "1" {
-		log.Println("ui.RunChild: not a UI child process (missing env); exiting")
+		logging.Println("ui.RunChild: not a UI child process (missing env); exiting")
 		return 2
 	}
 	sock := os.Getenv(ipc.EnvUISocket)
 	tok := os.Getenv(ipc.EnvUIToken)
 	if sock == "" || tok == "" {
-		log.Println("ui.RunChild: missing socket/token env; exiting")
+		logging.Println("ui.RunChild: missing socket/token env; exiting")
 		return 2
 	}
 
 	c, _, err := dialAndHandshake(sock, tok)
 	if err != nil {
-		log.Printf("ui.RunChild: handshake failed: %v", err)
+		logging.Printf("ui.RunChild: handshake failed: %v", err)
 		return 1
 	}
 

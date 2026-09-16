@@ -12,13 +12,14 @@ package tray
 import (
 	_ "embed"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
 
 	"fyne.io/systray"
+
+	"lgo_download_manager/internal/logging"
 )
 
 // 嵌入托盘图标。各平台格式由 fyne.io/systray 的接口契约决定：
@@ -62,7 +63,7 @@ func Start(cb Callbacks) {
 		systray.SetTooltip("下载管理器")
 
 		if err := setPlatformIcon(); err != nil {
-			log.Printf("tray: set icon: %v", err)
+			logging.Printf("tray: set icon: %v", err)
 		}
 		// 模板图标只在非 Windows 使用:Windows 上 SetTemplateIcon 会退化成
 		// SetIcon(把 PNG 字节写到无扩展名临时文件),从而覆盖 setPlatformIcon
@@ -92,7 +93,7 @@ func Start(cb Callbacks) {
 	}
 
 	onExit := func() {
-		log.Println("tray: exited")
+		logging.Println("tray: exited")
 	}
 
 	systray.Run(onReady, onExit)
