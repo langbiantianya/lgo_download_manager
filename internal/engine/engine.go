@@ -12,6 +12,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"math/rand/v2"
 	"os"
 	"sync"
@@ -44,20 +46,11 @@ type Options struct {
 	// (例如当服务器不支持字节区间时,引擎回退到单个流式分片)。
 	// 该回调以新的 [start0,end0,start1,end1,...] 区间对作为参数调用。
 	OnPlanChanged func(ranges []int64)
-	Logger        Logger
+	// Logger 是 engine 内部的诊断输出通道(分片重规划/错误等);
+	// 业务侧应传 internal/logging.L() 以统一进入 lgdm 日志系统。
+	// 留空时静默,不向任何 handler 写。
+	Logger *slog.Logger
 }
-
-type Logger interface {
-	Infof(format string, args ...any)
-	Warnf(format string, args ...any)
-}
-
-var noOpLogger Logger = noOpFn{}
-
-type noOpFn struct{}
-
-func (noOpFn) Infof(string, ...any) {}
-func (noOpFn) Warnf(string, ...any) {}
 
 func (o *Options) defaults() {
 	if o.ChunkCount <= 0 {
@@ -71,6 +64,12 @@ func (o *Options) defaults() {
 	}
 }
 
+// silentLogger 是默认占位:写向 io.Discard,保证 engine 在调用方
+// 没传 Logger 时不会去申请默认 stdout。
+func silentLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
 type Job struct {
 	driver     protocol.ProtocolDriver
 	dest       *os.File
@@ -80,7 +79,7 @@ type Job struct {
 	stopped    atomic.Bool
 	mu         sync.Mutex
 	chunkCount int
-	log        Logger
+	log        *slog.Logger
 }
 
 const oneMiB = 1 << 20
@@ -100,7 +99,7 @@ type chunk struct {
 func NewJob(driver protocol.ProtocolDriver, total int64, dest *os.File, opts Options) *Job {
 	opts.defaults()
 	if opts.Logger == nil {
-		opts.Logger = noOpLogger
+		opts.Logger = silentLogger()
 	}
 	j := &Job{
 		driver:     driver,
@@ -321,7 +320,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 	}
 
 	j.mu.Lock()
-	j.log.Infof("starting download  total=%d bytes  range=%v  maxChunks=%d", j.total, useRange, j.chunkCount)
+	j.log.Info("starting download", "total", j.total, "range", useRange, "maxChunks", j.chunkCount)
 	j.mu.Unlock()
 
 	// bytesDone 是本次会话累计写入的字节；resumedBytes 是会话开始前磁盘上
@@ -490,7 +489,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		}
 		rounds++
 		if rounds > maxReplanRounds {
-			j.log.Warnf("giving up after %d replan rounds: %v", rounds-1, lastErr)
+			j.log.Warn("giving up after replan rounds", "rounds", rounds-1, "err", lastErr)
 			return lastErr
 		}
 		old := target
@@ -499,12 +498,12 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			target = 1
 		}
 		if old != target {
-			j.log.Warnf("reducing chunk concurrency %d -> %d  last error: %v", old, target, lastErr)
+			j.log.Warn("reducing chunk concurrency", "old", old, "new", target, "err", lastErr)
 			if j.opts.OnChunkCountDecreased != nil {
 				j.opts.OnChunkCountDecreased(target)
 			}
 		} else {
-			j.log.Warnf("chunk error: %v", lastErr)
+			j.log.Warn("chunk error", "err", lastErr)
 		}
 		// 回调不持锁调用：调度器会在回调里访问引擎与数据库。
 		ranges := j.replan()
@@ -555,7 +554,7 @@ func (j *Job) downloadChunk(ctx context.Context, idx int, bytesDone *atomic.Int6
 		}
 		start := atomic.LoadInt64(&c.progress)
 		if start > c.end {
-			j.log.Infof("chunk %d finished  range=%d-%d", idx, c.start, c.end)
+			j.log.Info("chunk finished", "idx", idx, "range", fmt.Sprintf("%d-%d", c.start, c.end))
 			return nil
 		}
 
@@ -575,13 +574,13 @@ func (j *Job) downloadChunk(ctx context.Context, idx int, bytesDone *atomic.Int6
 			return ctx.Err()
 		}
 		if protocol.IsTerminal(err) {
-			j.log.Warnf("chunk %d terminal error: %v", idx, err)
+			j.log.Warn("chunk terminal error", "idx", idx, "err", err)
 			return err
 		}
 		consecutiveFails++
-		j.log.Warnf("chunk %d error: %v  backing off %v  fails=%d/%d", idx, err, backoff, consecutiveFails, maxChunkRetries)
+		j.log.Warn("chunk error backing off", "idx", idx, "err", err, "backoff", backoff, "fails", consecutiveFails, "maxFails", maxChunkRetries)
 		if consecutiveFails >= maxChunkRetries {
-			j.log.Warnf("chunk %d giving up after %d consecutive failures: %v", idx, consecutiveFails, err)
+			j.log.Warn("chunk giving up after consecutive failures", "idx", idx, "fails", consecutiveFails, "err", err)
 			return err
 		}
 		wait := backoff + jitter(backoff)
@@ -645,7 +644,7 @@ func downloadFallbackWithRetry(ctx context.Context, j *Job, c *chunk, bytesDone 
 		if consecutiveFails >= maxChunkRetries {
 			return err
 		}
-		j.log.Warnf("streaming chunk error: %v  backs off %v  fails=%d/%d", err, backoff, consecutiveFails, maxChunkRetries)
+		j.log.Warn("streaming chunk error backing off", "err", err, "backoff", backoff, "fails", consecutiveFails, "maxFails", maxChunkRetries)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()

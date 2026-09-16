@@ -426,6 +426,7 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 			s.markProgress(tk.ID, p)
 		},
 		TaskID: tk.ID,
+		Logger: logging.L(),
 		OnPlanChanged: func(ranges []int64) {
 			// engine 保证在调用本回调时不持有自己的锁（见 engine.Run 契约），
 			// 因此这里可以取 dirtyMu 安全更新共享任务快照。
@@ -878,7 +879,7 @@ func (s *Scheduler) markStatusFromJob(taskID string, st store.Status, rj *runnin
 	rj.dirtyMu.Unlock()
 
 	if err := s.st.UpdateTaskProgress(taskID, downloaded, progress, st, errMsg); err != nil {
-		fmt.Fprintln(os.Stderr, "scheduler markStatusFromJob:", err)
+		logging.Printf("scheduler markStatusFromJob: %v", err)
 	}
 	if tk2, err := s.st.GetTask(taskID); err == nil {
 		s.publish(Event{Why: statusWhy(st), Task: tk2})
@@ -908,7 +909,7 @@ func (s *Scheduler) completeFromEngine(taskID string, rj *runningJob) {
 		total += v
 	}
 	if err := s.st.UpdateTaskProgress(taskID, total, progress, store.TaskStatus.Completed, ""); err != nil {
-		fmt.Fprintln(os.Stderr, "scheduler completeFromEngine:", err)
+		logging.Printf("scheduler completeFromEngine: %v", err)
 	}
 	rj.dirtyMu.Lock()
 	rj.task.ChunkProgress = progress
@@ -925,7 +926,7 @@ func (s *Scheduler) completeFromEngine(taskID string, rj *runningJob) {
 // 引擎运行期间失败走 markStatusFromJob，以便落盘引擎权威的 chunk 偏移。
 func (s *Scheduler) fail(tk *store.Task, err error) {
 	if writeErr := s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.Failed, err.Error()); writeErr != nil {
-		fmt.Fprintln(os.Stderr, "scheduler fail:", writeErr)
+		logging.Printf("scheduler fail: %v", writeErr)
 	}
 	if tk2, err := s.st.GetTask(tk.ID); err == nil {
 		s.publish(Event{Why: "failed", Task: tk2})
@@ -970,7 +971,7 @@ func (s *Scheduler) abortPrepare(taskID string, tk *store.Task) {
 	// 如果 releaseSlot 先跑,promotePending 会看到自己刚被取消的
 	// 任务还显示为 Pending,导致无限重新启动。
 	if writeErr := s.st.UpdateTaskProgress(taskID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.Paused, ""); writeErr != nil {
-		fmt.Fprintln(os.Stderr, "scheduler abortPrepare:", writeErr)
+		logging.Printf("scheduler abortPrepare: %v", writeErr)
 	}
 	s.releaseSlot(taskID)
 	if latest, err := s.st.GetTask(taskID); err == nil {
@@ -1062,7 +1063,7 @@ func (s *Scheduler) flushAll() {
 		updates = append(updates, d.update)
 	}
 	if err := s.st.UpdateTasksProgress(updates); err != nil {
-		fmt.Fprintln(os.Stderr, "flush:", err)
+		logging.Printf("flush: %v", err)
 		// 整批失败：全部标记回 dirty，下个周期重试。
 		for _, d := range dirty {
 			d.rj.dirtyMu.Lock()
