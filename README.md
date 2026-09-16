@@ -77,6 +77,46 @@ pwsh -File scripts\package.ps1          # x64 + arm64 各一份 MSI 与 EXE
 `-SkipToolInstall` 关闭自动安装；`-WixPath` / `-IsccPath` / `-CCX64` / `-CCArm64`
 可以指向已有的安装。
 
+### 准备编译环境（winget / scoop）
+
+编译只要有 Go、Git 和一个 gcc 风格的 C 编译器；打包工具（WiX / Inno Setup）
+交给 `scripts/package.ps1` 自动装即可。两条路任选一条，包名与版本按本机的
+winget / scoop 清单核对过（WiX、Inno Setup、LLVM-MinGW 是本机用 winget 装出来跑通的）。
+
+**winget**（Windows 10 1809+ 一般自带 App Installer）
+
+```powershell
+winget install --id GoLang.Go --exact --silent                       # Go 1.27
+winget install --id Git.Git --exact --silent                         # Git(版本号注入用)
+winget install --id MartinStorsjo.LLVM-MinGW.UCRT --exact --silent   # clang + mingw-w64 sysroot:x64 与 arm64 都能编
+
+# 打包工具(脚本会按需自动装,CI 预置时可以显式执行;WiX 必须锁 6.0.2,不指定会拿到 v7)
+winget install --id WiXToolset.WiXCLI --version 6.0.2 --exact --silent
+winget install --id JRSoftware.InnoSetup --exact --silent
+```
+
+**scoop**
+
+```powershell
+scoop install go git      # go 1.27 / git 2.55
+scoop install gcc         # GCC 15.2 + binutils,target = x86_64-w64-mingw32,够 x64 用
+```
+
+scoop 侧的边界（都实测过）：
+
+- `mingw`（niXman mingw-builds）也只有 x86_64 / i686，**没有 aarch64 target**；
+  arm64 要的 aarch64 sysroot 只有 LLVM-MinGW 带 —— 出 arm64 包时用上面的
+  winget 命令装它。
+- 打包工具别走 scoop：main bucket 里的 `wixtoolset` 是 **v7.0.0**（要求接受
+  OSMF EULA，本项目的脚本会明确拒绝），Inno Setup 也不在 main bucket。
+
+两条通用注意：
+
+- 新装的工具要**重开终端**才进 `PATH`。`go`/`gcc` 依赖 PATH；打包工具即使没进
+  PATH 也没关系——脚本会去 winget 的包目录里兜底查找。
+- scoop 的 shim 是 PowerShell 脚本，报「禁止运行脚本」时执行
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`（只影响当前用户）。
+
 ### 命令与参数
 
 | 参数 | 默认 | 说明 |
