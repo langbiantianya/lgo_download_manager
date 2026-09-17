@@ -152,3 +152,46 @@ func TestSendShowAddTask_NoConn_ReturnsError(t *testing.T) {
 		t.Fatalf("SendShowAddTask without conn returned nil error; expected failure")
 	}
 }
+
+// TestSetLanguage_OnLanguageChangedFires 验证 SetLanguage 在语言真的
+// 切换时回调 OnLanguageChanged 钩子,供业务侧同步刷新托盘等非 UI 通道。
+// 这是「设置里切语言 → 托盘菜单跟着切」的核心契约。
+func TestSetLanguage_OnLanguageChangedFires(t *testing.T) {
+	m := New(nil, nil)
+
+	var got []string
+	m.OnLanguageChanged(func(lang string) {
+		got = append(got, lang)
+	})
+
+	// 首次调用:curLang 空 → 任何值都算"变化"。
+	m.SetLanguage("en")
+	if len(got) != 1 || got[0] != "en" {
+		t.Fatalf("after first SetLanguage(en) hook got %v, want [en]", got)
+	}
+	// 相同语言:不触发。
+	m.SetLanguage("en")
+	if len(got) != 1 {
+		t.Fatalf("after same-lang SetLanguage hook fired %v, want no extra call", got)
+	}
+	// 切到新语言:触发一次。
+	m.SetLanguage("ja")
+	if len(got) != 2 || got[1] != "ja" {
+		t.Fatalf("after SetLanguage(ja) hook got %v, want [en ja]", got)
+	}
+}
+
+// TestSetLanguage_NoConnStillFiresHook 验证 SetLanguage 不依赖 conn:
+// UI 子进程还没起来的场景(冷启动早期),钩子仍要触发,否则托盘永远
+// 收不到语言变更通知。本测试不启动 fake conn,直接断言 hook 被调用。
+func TestSetLanguage_NoConnStillFiresHook(t *testing.T) {
+	m := New(nil, nil)
+	var fired bool
+	m.OnLanguageChanged(func(lang string) {
+		fired = true
+	})
+	m.SetLanguage("de")
+	if !fired {
+		t.Fatalf("hook not fired when no conn is attached")
+	}
+}

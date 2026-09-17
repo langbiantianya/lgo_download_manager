@@ -96,6 +96,11 @@ func TestT_PerLanguageCoveredKeys(t *testing.T) {
 		"taskRow.status.paused",
 		"addTask.start",
 		"taskList.empty",
+		// 托盘菜单与 tooltip —— 业务进程里也用,跨 6 语言都必须有覆盖。
+		"tray.menu.open",
+		"tray.menu.open.tooltip",
+		"tray.menu.quit",
+		"tray.menu.quit.tooltip",
 	}
 	Set("zh-Hans")
 	defaults := make(map[string]string, len(keys))

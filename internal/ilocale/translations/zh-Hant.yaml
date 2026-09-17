@@ -99,6 +99,13 @@ details.section.chunks: "檔案分塊詳情"
 details.ua.used: "UA: {{ .UA }}"
 details.ua.default: "UA: Wget/1.21.3 (default)"
 
+
+# 系统托盘(tray)
+tray.menu.open: "顯示視窗"
+tray.menu.open.tooltip: "顯示主視窗"
+tray.menu.quit: "退出"
+tray.menu.quit.tooltip: "退出下載管理員"
+
 time.seconds: "{{ .N }} 秒"
 time.minutes: "{{ .N }} 分鐘"
 time.hours: "{{ .N }} 小時"

@@ -99,6 +99,13 @@ details.section.chunks: "Сведения о блоках"
 details.ua.used: "UA: {{ .UA }}"
 details.ua.default: "UA: Wget/1.21.3 (default)"
 
+
+# 系统托盘(tray)
+tray.menu.open: "Открыть"
+tray.menu.open.tooltip: "Показать главное окно"
+tray.menu.quit: "Выход"
+tray.menu.quit.tooltip: "Выйти из менеджера загрузок"
+
 time.seconds: "{{ .N }} с"
 time.minutes: "{{ .N }} мин"
 time.hours: "{{ .N }} ч"

@@ -99,6 +99,13 @@ details.section.chunks: "Chunk-Details"
 details.ua.used: "UA: {{ .UA }}"
 details.ua.default: "UA: Wget/1.21.3 (default)"
 
+
+# 系统托盘(tray)
+tray.menu.open: "Öffnen"
+tray.menu.open.tooltip: "Hauptfenster anzeigen"
+tray.menu.quit: "Beenden"
+tray.menu.quit.tooltip: "Download-Manager beenden"
+
 time.seconds: "{{ .N }}s"
 time.minutes: "{{ .N }} Min."
 time.hours: "{{ .N }} Std."

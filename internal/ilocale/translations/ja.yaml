@@ -99,6 +99,13 @@ details.section.chunks: "チャンクの詳細"
 details.ua.used: "UA: {{ .UA }}"
 details.ua.default: "UA: Wget/1.21.3 (default)"
 
+
+# 系统托盘(tray)
+tray.menu.open: "ウィンドウを表示"
+tray.menu.open.tooltip: "メインウィンドウを表示"
+tray.menu.quit: "終了"
+tray.menu.quit.tooltip: "ダウンローダーを終了"
+
 time.seconds: "{{ .N }}秒"
 time.minutes: "{{ .N }}分"
 time.hours: "{{ .N }}時間"

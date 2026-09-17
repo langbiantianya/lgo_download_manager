@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
@@ -184,10 +185,18 @@ func main() {
 	// handleDownloadURL 创建,后者把 URL 转发给 UI 弹弹对话框。
 	uim := uimgr.New(st, sc)
 	uim.SetSettings(cur)
-	// 把权威 Language 同步到 uimgr:冷启动场景 InitData 会从 settings
-	// 携带 Language,这里提前把 curLang 置好,避免 UI 起来后 SetLanguage
-	// 因 curLang 与 s.Language 相等而误判"无变更"。运行中切语言由
-	// dispatch → SetLanguage 处理。
+	// 把权威 Language 应用到当前进程的 ilocale(托盘、日志等业务侧
+	// 本地化都走这里),同时注册变更 hook:UI 在「设置」里切语言时,
+	// uim.SetLanguage 会回调这里,刷新 ilocale 与托盘菜单。
+	ilocale.Set(cur.Language)
+	uim.OnLanguageChanged(func(lang string) {
+		ilocale.Set(lang)
+		tray.Reload()
+	})
+	// 同步 curLang 到 uimgr:冷启动场景 InitData 会从 settings 携带
+	// Language,这里提前置好,避免 UI 起来后 SetLanguage 因 curLang 与
+	// s.Language 相等而误判"无变更"。运行中切语言由 dispatch → SetLanguage
+	// 处理,hook 同步刷新本进程本地化界面。
 	uim.SetLanguage(cur.Language)
 
 	// 业务进程对 URL 转发的处理：解析 lgom:// 参数并把预填值交给 UI 子进程

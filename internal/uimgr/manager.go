@@ -60,6 +60,10 @@ type Manager struct {
 
 	onExit   func()     // UI 会话结束后回调（业务侧日志/状态）
 	exitOnce *sync.Once // 每个会话一个，保证 onExit 只触发一次
+
+	// onLanguageChanged 在 UI 端保存语言变更后被调用,供业务侧同步刷新
+	// 其它本地化的 UI(托盘菜单/标题等)。仅在语言真正变化时触发。
+	onLanguageChanged func(lang string)
 }
 
 // New 创建 UI 管理器。
@@ -95,12 +99,24 @@ func (m *Manager) Settings() store.Settings {
 // 变化时(用户在「设置」里切语言)发送 MsgLanguage 让 UI 立即重译;
 // 业务进程每次保存设置时都调用一次,UI 子进程还没起的场景由 InitData
 // 携带的 Language 处理,本方法对 Running()==false 直接 no-op。
+//
+// 变化时除了推 MsgLanguage,还会回调 onLanguageChanged——供业务侧
+// 同步刷新托盘等不在 UI 进程内的本地化界面。
 func (m *Manager) SetLanguage(lang string) {
 	m.mu.Lock()
 	changed := m.curLang != lang
 	m.curLang = lang
 	ch := m.conn
+	hook := m.onLanguageChanged
 	m.mu.Unlock()
+	if changed {
+		// 本地先刷新(ilocale.Set 在 main.go 的 hook 里做),再让 UI
+		// 子进程跟着刷新——两条路径独立,先后顺序对正确性没影响,
+		// 但先本地后 UI 让窗口重新可见时已经显示新语言。
+		if hook != nil {
+			hook(lang)
+		}
+	}
 	if !changed || !m.Running() || ch == nil {
 		return
 	}
@@ -115,6 +131,13 @@ func (m *Manager) SetLanguage(lang string) {
 // OnExit 注册 UI 会话结束回调。
 func (m *Manager) OnExit(f func()) {
 	m.onExit = f
+}
+
+// OnLanguageChanged 注册语言变更回调。f 在 SetLanguage 检测到实际
+// 切换时调用,lang 参数是新的 BCP-47 标签。仅供业务侧把托盘等非 Fyne
+// 通道的本地化 UI 同步刷新——UI 子进程自身的翻译走 MsgLanguage。
+func (m *Manager) OnLanguageChanged(f func(lang string)) {
+	m.onLanguageChanged = f
 }
 
 // Running 报告 UI 子进程会话是否存活。
