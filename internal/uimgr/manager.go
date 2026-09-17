@@ -47,6 +47,7 @@ type Manager struct {
 
 	mu       sync.Mutex
 	settings store.Settings
+	curLang  string // 上次推给 UI 的语言，用于 SetLanguage 判变更
 
 	uiSock string
 	token  string
@@ -88,6 +89,27 @@ func (m *Manager) Settings() store.Settings {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.settings
+}
+
+// SetLanguage 把业务进程的权威 Language 推到 UI 子进程。当 Language
+// 变化时(用户在「设置」里切语言)发送 MsgLanguage 让 UI 立即重译;
+// 业务进程每次保存设置时都调用一次,UI 子进程还没起的场景由 InitData
+// 携带的 Language 处理,本方法对 Running()==false 直接 no-op。
+func (m *Manager) SetLanguage(lang string) {
+	m.mu.Lock()
+	changed := m.curLang != lang
+	m.curLang = lang
+	ch := m.conn
+	m.mu.Unlock()
+	if !changed || !m.Running() || ch == nil {
+		return
+	}
+	enc, err := ipc.Encode(ipc.LanguageData{Language: lang})
+	if err != nil {
+		return
+	}
+	enc.Type = ipc.MsgLanguage
+	_ = ch.Send(enc)
 }
 
 // OnExit 注册 UI 会话结束回调。
@@ -434,6 +456,9 @@ func (m *Manager) dispatch(method string, raw json.RawMessage) (any, error) {
 			return nil, err
 		}
 		m.SetSettings(s)
+		// 语言单独推一份精简消息,避免每次设置保存都序列化整份 settings。
+		// SetLanguage 内部按 curLang 判变更,同语言下不产生 IPC。
+		m.SetLanguage(s.Language)
 		return struct{}{}, nil
 
 	case ipc.MethodProbe:

@@ -18,6 +18,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"lgo_download_manager/internal/autostart"
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/store"
@@ -63,18 +64,17 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 	// “MB”标签仅为装饰——在传给引擎前，该值始终乘以 1<<20。
 	chunkSizeEntry := widget.NewEntry()
 	chunkSizeEntry.SetText(fmt.Sprintf("%d", GlobalSettings.MinChunkSize/mib))
-	chunkSizeEntry.SetPlaceHolder("整数 MiB")
 	chunkSizeEntry.OnChanged = func(s string) {
 		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
 			GlobalSettings.MinChunkSize = int64(n) * mib
 			persist()
 		}
 	}
-	chunkSizeRow := container.NewBorder(nil, nil, nil, widget.NewLabel("MB"), chunkSizeEntry)
+	chunkSizeRow := container.NewBorder(nil, nil, nil, widget.NewLabel(ilocale.T("settings.label.minChunkUnit")), chunkSizeEntry)
 
 	uaEntry := widget.NewEntry()
 	uaEntry.SetText(GlobalSettings.UserAgent)
-	uaEntry.SetPlaceHolder("可选，自定义 User-Agent")
+	uaEntry.SetPlaceHolder(ilocale.T("settings.ua.placeholder"))
 	uaEntry.OnChanged = func(s string) {
 		GlobalSettings.UserAgent = s
 		persist()
@@ -82,7 +82,7 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 
 	cookiesEntry := widget.NewEntry()
 	cookiesEntry.SetText(GlobalSettings.Cookies)
-	cookiesEntry.SetPlaceHolder("可选，Cookie 字符串")
+	cookiesEntry.SetPlaceHolder(ilocale.T("settings.cookies.placeholder"))
 	cookiesEntry.OnChanged = func(s string) {
 		GlobalSettings.Cookies = s
 		persist()
@@ -93,7 +93,6 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 	// 以免 store 收到 0/负数(EffectiveMaxConcurrent 会兜底但 UX 不直观)。
 	maxConcEntry := widget.NewEntry()
 	maxConcEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveMaxConcurrent()))
-	maxConcEntry.SetPlaceHolder("正整数，默认 3")
 	maxConcEntry.OnChanged = func(s string) {
 		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
 			GlobalSettings.MaxConcurrent = n
@@ -104,7 +103,7 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 	// 代理相关控件
 	proxyURLEntry := widget.NewEntry()
 	proxyURLEntry.SetText(GlobalSettings.ProxyURL)
-	proxyURLEntry.SetPlaceHolder("例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080")
+	proxyURLEntry.SetPlaceHolder(ilocale.T("settings.proxyURL.placeholder"))
 	proxyURLEntry.OnChanged = func(s string) {
 		GlobalSettings.ProxyURL = strings.TrimSpace(s)
 		persist()
@@ -112,22 +111,22 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 
 	proxyBypassEntry := widget.NewEntry()
 	proxyBypassEntry.SetText(GlobalSettings.ProxyBypass)
-	proxyBypassEntry.SetPlaceHolder("逗号分隔，例如 example.com,*.lan")
+	proxyBypassEntry.SetPlaceHolder(ilocale.T("settings.proxyBypass.placeholder"))
 	proxyBypassEntry.OnChanged = func(s string) {
 		GlobalSettings.ProxyBypass = strings.TrimSpace(s)
 		persist()
 	}
 
-	proxyModeLabels := map[protocol.ProxyMode]string{
-		protocol.ProxyModeSystem:   "使用系统代理（默认）",
-		protocol.ProxyModeDisabled: "不使用代理（始终直连）",
-		protocol.ProxyModeManual:   "手动设置代理",
-	}
+	// 代理模式与排序选项的「显示标签」来自翻译;底层 enum 值不变。
+	// 切换语言时 buildSettingsContent 会被重建(从 buildSettingsContent
+	// 调用入口 → showSettingsPage),label ↔ enum 的双向映射每次重建
+	// 时重新生成。
+	proxyModeOpts := make([]string, 0, 3)
 	labelToProxyMode := map[string]protocol.ProxyMode{}
-	proxyModeOpts := make([]string, 0, len(proxyModeLabels))
 	for _, m := range []protocol.ProxyMode{protocol.ProxyModeSystem, protocol.ProxyModeDisabled, protocol.ProxyModeManual} {
-		proxyModeOpts = append(proxyModeOpts, proxyModeLabels[m])
-		labelToProxyMode[proxyModeLabels[m]] = m
+		lbl := proxyModeLabel(m)
+		proxyModeOpts = append(proxyModeOpts, lbl)
+		labelToProxyMode[lbl] = m
 	}
 
 	// 切换模式时仅控制代理地址/绕过列表的可见性。地址本身始终保留，
@@ -153,29 +152,25 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 	if initialMode == 0 {
 		initialMode = protocol.ProxyModeSystem
 	}
-	initialLabel := proxyModeLabels[initialMode]
-	if initialLabel == "" {
-		initialLabel = proxyModeLabels[protocol.ProxyModeSystem]
-	}
-	proxyModeSelect.SetSelected(initialLabel)
+	proxyModeSelect.SetSelected(proxyModeLabel(initialMode))
 	if initialMode != protocol.ProxyModeManual {
 		proxyURLEntry.Hide()
 		proxyBypassEntry.Hide()
 	}
 
-	ftpPassive := widget.NewCheck("启用 FTP PASV 被动模式", func(checked bool) {
+	ftpPassive := widget.NewCheck(ilocale.T("settings.ftp.pasv"), func(checked bool) {
 		GlobalSettings.FTPPassive = checked
 		persist()
 	})
 	ftpPassive.SetChecked(GlobalSettings.FTPPassive)
 
-	prealloc := widget.NewCheck("下载时磁盘预分配（连续大文件更稳定）", func(checked bool) {
+	prealloc := widget.NewCheck(ilocale.T("settings.prealloc.desc"), func(checked bool) {
 		GlobalSettings.Prealloc = checked
 		persist()
 	})
 	prealloc.SetChecked(GlobalSettings.Prealloc)
 
-	browseBtn := widget.NewButton("浏览...", func() {
+	browseBtn := widget.NewButton(ilocale.T("settings.browse"), func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
 			if err != nil || uri == nil {
 				return
@@ -185,17 +180,12 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 	})
 
 	// 任务列表排序方式（单选下拉框）
-	sortLabels := map[store.TaskSort]string{
-		store.SortCreatedDesc: "添加时间倒序（最新在前）",
-		store.SortCreatedAsc:  "添加时间正序（最老在前）",
-		store.SortNameAsc:     "文件名正序（A-Z）",
-		store.SortNameDesc:    "文件名倒序（Z-A）",
-	}
-	sortOpts := make([]string, 0, len(sortLabels))
+	sortOpts := make([]string, 0, 4)
 	labelToSort := map[string]store.TaskSort{}
 	for _, s := range store.AllTaskSorts() {
-		sortOpts = append(sortOpts, sortLabels[s])
-		labelToSort[sortLabels[s]] = s
+		lbl := sortLabel(s)
+		sortOpts = append(sortOpts, lbl)
+		labelToSort[lbl] = s
 	}
 	sortSelect := widget.NewSelect(sortOpts, func(s string) {
 		if sort, ok := labelToSort[s]; ok {
@@ -203,11 +193,9 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 			persist()
 		}
 	})
-	currentLabel := sortLabels[GlobalSettings.TaskSort]
-	if currentLabel == "" {
-		currentLabel = sortLabels[store.SortCreatedDesc]
-	}
-	lightModeCheck := widget.NewCheck("轻量模式（关闭主窗口时退出 UI 进程并释放内存）", func(checked bool) {
+	sortSelect.SetSelected(sortLabel(GlobalSettings.TaskSort))
+
+	lightModeCheck := widget.NewCheck(ilocale.T("settings.lightMode.desc"), func(checked bool) {
 		GlobalSettings.LightMode = checked
 		persist()
 	})
@@ -217,7 +205,7 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 	// 不显示主窗口,只保留调度器 + 系统托盘;用户在托盘菜单恢复 UI。
 	// UI 提交后由 settings.Save → ApplyAutoStart 在业务侧把
 	// 注册表/.desktop/LaunchAgent 调到与开关一致,失败只记日志。
-	autoStartCheck := widget.NewCheck("开机自启（静默拉起,不显示主窗口）", func(checked bool) {
+	autoStartCheck := widget.NewCheck(ilocale.T("settings.autoStart.desc"), func(checked bool) {
 		GlobalSettings.AutoStart = checked
 		persist()
 	})
@@ -239,22 +227,30 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 	}
 	autoStartCheck.SetChecked(GlobalSettings.AutoStart)
 
-	sortSelect.SetSelected(currentLabel)
+	// 语言选择:下拉显示「友好显示名」(由 ilocale.T("lang.<tag>") 给出),
+	// 选中的就是 BCP-47 tag。语言变更的传播路径:
+	//   UI select.OnChanged → 写 GlobalSettings.Language → svc.SaveSettings
+	//   → 业务侧 settings.Save → uimgr.SetLanguage → UI 子进程收 MsgLanguage
+	//   → ilocale.Set + applyLanguage(本文件 → settingsDialog 整体重建)
+	//   → 重译所有 widget。
+	langSelect := buildLanguageSelect(persist)
+
 	form := widget.NewForm(
-		widget.NewFormItem("默认保存目录", container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
-		widget.NewFormItem("默认并发线程数", threadsEntry),
-		widget.NewFormItem("同时下载任务数", maxConcEntry),
-		widget.NewFormItem("最小分块大小", chunkSizeRow),
-		widget.NewFormItem("默认 User-Agent", uaEntry),
-		widget.NewFormItem("默认 Cookie", cookiesEntry),
-		widget.NewFormItem("HTTP/HTTPS 代理模式", proxyModeSelect),
-		widget.NewFormItem("代理地址", proxyURLEntry),
-		widget.NewFormItem("代理绕过列表", proxyBypassEntry),
-		widget.NewFormItem("FTP 模式", ftpPassive),
-		widget.NewFormItem("磁盘预分配", prealloc),
-		widget.NewFormItem("轻量模式", lightModeCheck),
-		widget.NewFormItem("开机自启", autoStartCheck),
-		widget.NewFormItem("任务列表排序", sortSelect),
+		widget.NewFormItem(ilocale.T("settings.label.language"), langSelect),
+		widget.NewFormItem(ilocale.T("settings.label.autoStart"), autoStartCheck),
+		widget.NewFormItem(ilocale.T("settings.label.lightMode"), lightModeCheck),
+		widget.NewFormItem(ilocale.T("settings.label.sort"), sortSelect),
+		widget.NewFormItem(ilocale.T("settings.label.saveDir"), container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
+		widget.NewFormItem(ilocale.T("settings.label.threads"), threadsEntry),
+		widget.NewFormItem(ilocale.T("settings.label.maxConcurrent"), maxConcEntry),
+		widget.NewFormItem(ilocale.T("settings.label.minChunk"), chunkSizeRow),
+		widget.NewFormItem(ilocale.T("settings.label.ua"), uaEntry),
+		widget.NewFormItem(ilocale.T("settings.label.cookies"), cookiesEntry),
+		widget.NewFormItem(ilocale.T("settings.label.proxyMode"), proxyModeSelect),
+		widget.NewFormItem(ilocale.T("settings.label.proxyURL"), proxyURLEntry),
+		widget.NewFormItem(ilocale.T("settings.label.proxyBypass"), proxyBypassEntry),
+		widget.NewFormItem(ilocale.T("settings.label.ftp"), ftpPassive),
+		widget.NewFormItem(ilocale.T("settings.label.prealloc"), prealloc),
 	)
 
 	scroll := container.NewScroll(form)
@@ -262,10 +258,67 @@ func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
 	return scroll
 }
 
+// proxyModeLabel 返回代理模式在当前语言下的显示标签。
+func proxyModeLabel(m protocol.ProxyMode) string {
+	switch m {
+	case protocol.ProxyModeSystem:
+		return ilocale.T("settings.proxyMode.system")
+	case protocol.ProxyModeDisabled:
+		return ilocale.T("settings.proxyMode.disabled")
+	case protocol.ProxyModeManual:
+		return ilocale.T("settings.proxyMode.manual")
+	}
+	return ilocale.T("settings.proxyMode.system")
+}
+
+// sortLabel 返回任务排序方式在当前语言下的显示标签。
+func sortLabel(s store.TaskSort) string {
+	switch s {
+	case store.SortCreatedDesc:
+		return ilocale.T("settings.sort.createdDesc")
+	case store.SortCreatedAsc:
+		return ilocale.T("settings.sort.createdAsc")
+	case store.SortNameAsc:
+		return ilocale.T("settings.sort.nameAsc")
+	case store.SortNameDesc:
+		return ilocale.T("settings.sort.nameDesc")
+	}
+	return ilocale.T("settings.sort.createdDesc")
+}
+
+// buildLanguageSelect 构造「设置 → 语言」下拉框。选项按 ilocale.Supported
+// 顺序排列,显示当前语言下的友好名称(自身语言的名字,例如对日文 UI
+// 来说,英文条目显示 "English" 而不是 "英文")。变更通过 persist 写回
+// svc.SaveSettings,业务进程随后推送 MsgLanguage 触发本进程 applyLanguage。
+func buildLanguageSelect(persist func()) *widget.Select {
+	opts := make([]string, 0, len(ilocale.Supported))
+	labelToTag := map[string]string{}
+	for _, tag := range ilocale.Supported {
+		lbl := ilocale.T(ilocale.SupportedLabels[tag])
+		opts = append(opts, lbl)
+		labelToTag[lbl] = tag
+	}
+	sel := widget.NewSelect(opts, func(s string) {
+		tag, ok := labelToTag[s]
+		if !ok {
+			return
+		}
+		GlobalSettings.Language = tag
+		persist()
+	})
+	// 当前语言的标签:Normalize 后落到 Supported 中的一项,再用其自描述。
+	cur := ilocale.Normalize(GlobalSettings.Language)
+	curLbl := ilocale.T(ilocale.SupportedLabels[cur])
+	if curLbl != "" {
+		sel.SetSelected(curLbl)
+	}
+	return sel
+}
+
 // diskSpaceAt 返回 path 所在文件系统的剩余可用字节数。
 func diskSpaceAt(path string) string {
 	if path == "" {
-		return "未设置"
+		return ilocale.T("main.status.disk.unset")
 	}
 	dir := filepath.Dir(path)
 	if dir == "" {
@@ -273,9 +326,12 @@ func diskSpaceAt(path string) string {
 	}
 	free, total, err := diskUsage(dir)
 	if err != nil {
-		return fmt.Sprintf("不可用 (%v)", err)
+		return ilocale.TF("main.status.disk.error", fmt.Sprintf("不可用 (%v)", err), map[string]any{"Err": err.Error()})
 	}
-	return fmt.Sprintf("可用 %s / 总计 %s", humanBytes(free), humanBytes(total))
+	return ilocale.TF("main.status.disk.format", fmt.Sprintf("可用 %s / 总计 %s", humanBytes(free), humanBytes(total)), map[string]any{
+		"Free":  humanBytes(free),
+		"Total": humanBytes(total),
+	})
 }
 
 // humanBytes 将 n 格式化为简短的人类可读字符串。
@@ -306,14 +362,17 @@ func formatRemainingTime(secs int) string {
 		return "--"
 	}
 	if secs < 60 {
-		return fmt.Sprintf("剩 %d 秒", secs)
+		return ilocale.TF("time.seconds", fmt.Sprintf("%d 秒", secs), map[string]any{"N": secs})
 	}
 	m := secs / 60
 	s := secs % 60
 	if m < 60 {
-		return fmt.Sprintf("剩 %dm %ds", m, s)
+		// 中文/日文通常不需要精确到秒,这里直接用「分」为最小单位;
+		// 其它语言也复用「分」模板,只输出整数分即可。
+		_ = s
+		return ilocale.TF("time.minutes", fmt.Sprintf("%dm", m), map[string]any{"N": m})
 	}
 	h := m / 60
 	m = m % 60
-	return fmt.Sprintf("剩 %dh %dm", h, m)
+	return ilocale.TF("time.hoursMinutes", fmt.Sprintf("%dh %dm", h, m), map[string]any{"H": h, "M": m})
 }

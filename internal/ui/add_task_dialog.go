@@ -21,6 +21,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/ui/nativefolder"
@@ -148,7 +149,7 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 		return container.NewBorder(nil, nil, lbl, nil, w)
 	}
 	urlEntry := widget.NewEntry()
-	urlEntry.SetPlaceHolder("https://...")
+	urlEntry.SetPlaceHolder(ilocale.T("addTask.url.placeholder"))
 	urlEntry.Validator = notEmptyValidator()
 
 	defaultName := "download.bin"
@@ -170,7 +171,7 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 	// GTK/Qt 通用 chooser),不走 fyne 自带的 dialog.ShowFolderOpen。
 	// 同步阻塞在 UI 线程上,直接在 goroutine 中执行,选择结束后用
 	// fyne.Do 把结果切回 UI 线程。
-	browseBtn := widget.NewButton("浏览...", func() {
+	browseBtn := widget.NewButton(ilocale.T("addTask.browse"), func() {
 		go func() {
 			startDir := filepath.Dir(savePathEntry.Text)
 			if startDir == "" || startDir == "." {
@@ -237,12 +238,12 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 	}
 
 	formContent := container.NewVBox(
-		makeRow("下载链接 (URL)", urlEntry),
-		makeRow("文件大小", sizeLabel),
-		makeRow("保存路径", container.NewBorder(nil, nil, nil, browseBtn, savePathEntry)),
+		makeRow(ilocale.T("addTask.url.label"), urlEntry),
+		makeRow(ilocale.T("addTask.size.label"), sizeLabel),
+		makeRow(ilocale.T("addTask.savePath.label"), container.NewBorder(nil, nil, nil, browseBtn, savePathEntry)),
 	)
 
-	w := fyne.CurrentApp().NewWindow("新建下载任务")
+	w := fyne.CurrentApp().NewWindow(ilocale.T("addTask.window.title"))
 	w.Resize(fyne.NewSize(640, 260))
 	w.CenterOnScreen()
 
@@ -294,9 +295,9 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 		}
 	}
 
-	confirmBtn := widget.NewButtonWithIcon("开始下载", theme.ConfirmIcon(), startDownload)
+	confirmBtn := widget.NewButtonWithIcon(ilocale.T("addTask.start"), theme.ConfirmIcon(), startDownload)
 	confirmBtn.Importance = widget.HighImportance
-	cancelBtn := widget.NewButtonWithIcon("取消", theme.CancelIcon(), func() {
+	cancelBtn := widget.NewButtonWithIcon(ilocale.T("addTask.cancel"), theme.CancelIcon(), func() {
 		if closeWin != nil {
 			closeWin()
 		}
@@ -336,11 +337,13 @@ func notEmptyValidator() fyne.StringValidator {
 	}
 }
 
+// errEmpty 在每次 Error() 时取 ilocale 当前翻译——切语言后下一次校验
+// 失败就会用新语言的「必填」措辞显示,无需重建对话框。
 var errEmpty = errEmptyField{}
 
 type errEmptyField struct{}
 
-func (errEmptyField) Error() string { return "required" }
+func (errEmptyField) Error() string { return ilocale.T("addTask.required") }
 
 // formatSize 将字节数格式化为人类可读字符串。
 func formatSize(n int64) string {

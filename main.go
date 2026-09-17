@@ -184,6 +184,11 @@ func main() {
 	// handleDownloadURL 创建,后者把 URL 转发给 UI 弹弹对话框。
 	uim := uimgr.New(st, sc)
 	uim.SetSettings(cur)
+	// 把权威 Language 同步到 uimgr:冷启动场景 InitData 会从 settings
+	// 携带 Language,这里提前把 curLang 置好,避免 UI 起来后 SetLanguage
+	// 因 curLang 与 s.Language 相等而误判"无变更"。运行中切语言由
+	// dispatch → SetLanguage 处理。
+	uim.SetLanguage(cur.Language)
 
 	// 业务进程对 URL 转发的处理：解析 lgom:// 参数并把预填值交给 UI 子进程
 	// 的「新建下载任务」对话框,任务提交由用户在该对话框中确认后触发;

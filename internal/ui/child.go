@@ -74,6 +74,13 @@ func RunChild() int {
 			ShowAddTaskDialogForURL(c, p)
 		})
 	})
+	// 语言变更:业务进程在「设置」里切语言或首启 InitData 都走这里。
+	// ilocale.Set 已经在 ipcClient.run() 里调过,这里只负责让 UI 重译
+	// 当前可见 widget(标题/工具栏/侧边栏/状态栏/任务行/设置页)。
+	// onLanguage 跑在 IPC 读循环,切回 fyne 事件线程后再写 widget。
+	c.SetOnLanguage(func() {
+		fyne.Do(func() { win.applyLanguage() })
+	})
 	// 业务侧退出 / 连接断开 → 通知 fyne 退出。LightMode 下窗口关闭
 	// 也会调用 a.Quit()，此时连接由 Close 兜底关闭。
 	c.SetOnClose(func() {

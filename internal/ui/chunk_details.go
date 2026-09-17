@@ -21,6 +21,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/store"
 )
 
@@ -87,16 +88,17 @@ type chunkMosaic struct {
 // showChunkDetails 打开一个窗口，展示任务按分块的下载进度。
 // 每个分块被渲染为瓦片墙中的一块——参见 chunkMosaic。
 func showChunkDetails(t *store.Task, svc Service, parent fyne.Window) {
-	titleStr := fmt.Sprintf("任务详情: %s", taskName(t))
+	name := taskName(t)
+	titleStr := ilocale.TF("details.title", fmt.Sprintf("任务详情: %s", name), map[string]any{"Name": name})
 
-	urlLabel := widget.NewLabel("URL: " + t.URL)
+	urlLabel := widget.NewLabel(ilocale.TF("details.url", "URL: "+t.URL, map[string]any{"URL": t.URL}))
 	urlLabel.Wrapping = fyne.TextWrapWord
-	protoLabel := widget.NewLabel(fmt.Sprintf("协议: %s", t.Protocol))
-	pathLabel := widget.NewLabel("路径: " + t.SavePath)
-	sizeLabel := widget.NewLabel(fmt.Sprintf("总计: %s", formatBytes(t.TotalSize)))
+	protoLabel := widget.NewLabel(ilocale.TF("details.protocol", fmt.Sprintf("协议: %s", t.Protocol), map[string]any{"Protocol": t.Protocol}))
+	pathLabel := widget.NewLabel(ilocale.TF("details.path", "路径: "+t.SavePath, map[string]any{"Path": t.SavePath}))
+	sizeLabel := widget.NewLabel(ilocale.TF("details.total", fmt.Sprintf("总计: %s", formatBytes(t.TotalSize)), map[string]any{"Size": formatBytes(t.TotalSize)}))
 	uaLabel := widget.NewLabel(uaForTask(t))
-	createdAtLabel := widget.NewLabel("添加时间: " + formatTime(t.CreatedAt))
-	completedAtLabel := widget.NewLabel("下载完成时间: " + formatTime(t.CompletedAt))
+	createdAtLabel := widget.NewLabel(ilocale.TF("details.createdAt", "添加时间: "+formatTime(t.CreatedAt), map[string]any{"Time": formatTime(t.CreatedAt)}))
+	completedAtLabel := widget.NewLabel(ilocale.TF("details.completedAt", "下载完成时间: "+formatTime(t.CompletedAt), map[string]any{"Time": formatTime(t.CompletedAt)}))
 
 	mosaic := newChunkMosaic(t.ID)
 	mosaic.resizeForTotal(t.TotalSize)
@@ -113,7 +115,7 @@ func showChunkDetails(t *store.Task, svc Service, parent fyne.Window) {
 		createdAtLabel,
 		completedAtLabel,
 		widget.NewSeparator(),
-		widget.NewLabel("文件分块详情"),
+		widget.NewLabel(ilocale.T("details.section.chunks")),
 	)
 	content := container.NewVBox(header, mosaic.wrap)
 	scroll := container.NewScroll(content)
@@ -393,15 +395,15 @@ func max64(a, b int64) int64 {
 // uaForTask 返回应用于该任务下载的 User-Agent 字符串。
 func uaForTask(t *store.Task) string {
 	if t.AuthData == "" {
-		return "UA: Wget/1.21.3 (default)"
+		return ilocale.T("details.ua.default")
 	}
 	var a struct {
 		UserAgent string `json:"UserAgent"`
 	}
 	if err := json.Unmarshal([]byte(t.AuthData), &a); err == nil && a.UserAgent != "" {
-		return "UA: " + a.UserAgent
+		return ilocale.TF("details.ua.used", "UA: "+a.UserAgent, map[string]any{"UA": a.UserAgent})
 	}
-	return "UA: Wget/1.21.3 (default)"
+	return ilocale.T("details.ua.default")
 }
 
 // taskName 返回任务保存路径中的文件名部分。

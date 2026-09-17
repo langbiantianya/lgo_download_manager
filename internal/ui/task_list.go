@@ -15,6 +15,7 @@ import (
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
@@ -181,9 +182,10 @@ func (tl *taskList) build() *fyne.Container {
 	)
 	tl.list.OnSelected = func(id widget.ListItemID) { tl.list.Unselect(id) }
 
-	tl.emptyLabel = widget.NewLabel("暂无任务，点击「新建任务」开始")
+	tl.emptyLabel = widget.NewLabel("")
 	tl.emptyLabel.Alignment = fyne.TextAlignCenter
 	tl.emptyLabel.Importance = widget.LowImportance
+	tl.emptyLabel.SetText(ilocale.T("taskList.empty"))
 	tl.headerRow = tl.buildHeader()
 
 	listWithHeader := container.NewBorder(tl.headerRow, nil, nil, nil, tl.list)
@@ -193,20 +195,51 @@ func (tl *taskList) build() *fyne.Container {
 	return content
 }
 
+// applyLanguage 在语言切换时刷新 taskList 的可变字符串:表头三列、
+// 空状态标签。taskRow 自身的状态/速度/ETA 等翻译发生在 row 内的
+// refresh 路径,这里通过 resetRows 让所有可见 row 强制重渲。
+//
+// 表头 widget 被重建(原来的 headerRow 还在,但里面的 label 不再指向
+// applyLanguage 创建的引用),所以先保存然后整体替换内容。
+func (tl *taskList) applyLanguage() {
+	if tl.emptyLabel != nil {
+		tl.emptyLabel.SetText(ilocale.T("taskList.empty"))
+	}
+	if tl.headerRow != nil {
+		tl.headerRow.Objects = []fyne.CanvasObject{tl.buildHeaderRow()}
+		tl.headerRow.Refresh()
+	}
+	// 行内部文案(row 显示出来的任务名/添加时间/状态/速度/ETA)在 bind 或
+	// refresh 时才写入;applyLanguage 把 rowState 标脏,强制下一轮
+	// refresh 走完整路径覆盖所有翻译字段。
+	tl.rowMu.Lock()
+	for _, row := range tl.rowMap {
+		row.st.valid = false
+	}
+	tl.rowMu.Unlock()
+	tl.refresh()
+}
+
 // buildHeader 在列表行上方渲染列标题。
 func (tl *taskList) buildHeader() *fyne.Container {
+	return container.NewVBox(
+		tl.buildHeaderRow(),
+		widget.NewSeparator(),
+	)
+}
+
+// buildHeaderRow 渲染表头的标题行(不含底部分隔线),供 buildHeader 与
+// applyLanguage 共用——后者在重建时只换这一行,保留外层 VBox 不变。
+func (tl *taskList) buildHeaderRow() fyne.CanvasObject {
 	mkHdr := func(text string, w float32) fyne.CanvasObject {
 		l := widget.NewLabelWithStyle(text, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 		return container.NewGridWrap(fyne.NewSize(w, 28), l)
 	}
-	name := mkHdr("任务", 320)
-	size := widget.NewLabelWithStyle("大小", fyne.TextAlignTrailing, fyne.TextStyle{Bold: true})
-	status := widget.NewLabelWithStyle("状态", fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	name := mkHdr(ilocale.T("taskList.header.name"), 320)
+	size := widget.NewLabelWithStyle(ilocale.T("taskList.header.size"), fyne.TextAlignTrailing, fyne.TextStyle{Bold: true})
+	status := widget.NewLabelWithStyle(ilocale.T("taskList.header.status"), fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
 	row := container.NewBorder(nil, nil, nil, container.NewHBox(size, status), name)
-	return container.NewVBox(
-		row,
-		widget.NewSeparator(),
-	)
+	return row
 }
 
 // bindRow 在 rowMap 中以 taskID 注册 row。

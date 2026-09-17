@@ -17,6 +17,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
@@ -254,7 +255,7 @@ func (r *taskRow) effectiveStatus(t *store.Task) (store.Status, bool) {
 // 以及下载中才显示的速度与剩余时间。每个值都先与上次渲染值比较。
 func (r *taskRow) refreshProgress(t *store.Task, eff store.Status) {
 	r.setText(r.name, &r.st.name, displayName(t))
-	r.setText(r.createdAtLbl, &r.st.createdAt, "添加于: "+formatTime(t.CreatedAt))
+	r.setText(r.createdAtLbl, &r.st.createdAt, ilocale.T("taskRow.createdAt.prefix")+formatTime(t.CreatedAt))
 	r.setText(r.size, &r.st.size, formatBytes(t.TotalSize))
 
 	pct := 0.0
@@ -291,11 +292,11 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool) {
 	switch eff {
 	case store.TaskStatus.Pending:
 		if preparing {
-			r.statusLbl.SetText("准备中")
+			r.statusLbl.SetText(ilocale.T("taskRow.status.preparing"))
 			r.setVis(r.pauseBtn, showPause, true)
 			r.setVis(r.startBtn, showStart, false)
 		} else {
-			r.statusLbl.SetText("等待中")
+			r.statusLbl.SetText(ilocale.T("taskRow.status.pending"))
 			r.startBtn.SetIcon(theme.MediaPlayIcon())
 			r.startBtn.Importance = widget.LowImportance
 			r.setVis(r.pauseBtn, showPause, false)
@@ -304,13 +305,13 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool) {
 		r.setVis(r.openFolderBtn, showFolder, false)
 		r.setVis(r.openFileBtn, showFile, false)
 	case store.TaskStatus.Downloading:
-		r.statusLbl.SetText("下载中")
+		r.statusLbl.SetText(ilocale.T("taskRow.status.downloading"))
 		r.setVis(r.startBtn, showStart, false)
 		r.setVis(r.pauseBtn, showPause, true)
 		r.setVis(r.openFolderBtn, showFolder, false)
 		r.setVis(r.openFileBtn, showFile, false)
 	case store.TaskStatus.Paused:
-		r.statusLbl.SetText("已暂停")
+		r.statusLbl.SetText(ilocale.T("taskRow.status.paused"))
 		r.startBtn.SetIcon(theme.MediaPlayIcon())
 		r.startBtn.Importance = widget.LowImportance
 		r.setVis(r.startBtn, showStart, true)
@@ -318,13 +319,13 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool) {
 		r.setVis(r.openFolderBtn, showFolder, false)
 		r.setVis(r.openFileBtn, showFile, false)
 	case store.TaskStatus.Completed:
-		r.statusLbl.SetText("已完成")
+		r.statusLbl.SetText(ilocale.T("taskRow.status.completed"))
 		r.setVis(r.pauseBtn, showPause, false)
 		r.setVis(r.startBtn, showStart, false)
 		r.setVis(r.openFolderBtn, showFolder, true)
 		r.setVis(r.openFileBtn, showFile, true)
 	case store.TaskStatus.FileLost:
-		r.statusLbl.SetText("文件丢失")
+		r.statusLbl.SetText(ilocale.T("taskRow.status.filelost"))
 		r.startBtn.SetIcon(theme.DownloadIcon())
 		r.startBtn.Importance = widget.HighImportance
 		r.setVis(r.startBtn, showStart, true)
@@ -332,7 +333,7 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool) {
 		r.setVis(r.openFolderBtn, showFolder, false)
 		r.setVis(r.openFileBtn, showFile, false)
 	case store.TaskStatus.Failed:
-		r.statusLbl.SetText("失败")
+		r.statusLbl.SetText(ilocale.T("taskRow.status.failed"))
 		r.startBtn.SetIcon(theme.MediaReplayIcon())
 		r.startBtn.Importance = widget.LowImportance
 		r.setVis(r.startBtn, showStart, true)
@@ -401,7 +402,7 @@ func formatTime(t time.Time) string {
 // formatBytes 使用二进制单位后缀格式化 n。
 func formatBytes(n int64) string {
 	if n <= 0 {
-		return "未知大小"
+		return ilocale.T("taskRow.size.unknown")
 	}
 	const (
 		KB = 1 << 10
@@ -424,9 +425,11 @@ func formatBytes(n int64) string {
 }
 
 // formatBPS 以字节/秒为单位格式化速度。
+// 单位后缀 "/s" 与 formatBytes 数值部分都跟着当前语言;
+// 完整字符串里只有数值部分会变,所以这里把单位做进模板而非拼字符串。
 func formatBPS(bps float64) string {
 	if bps <= 0 {
-		return "--"
+		return ilocale.T("taskRow.speed.none")
 	}
 	return formatBytes(int64(bps)) + "/s"
 }
@@ -434,11 +437,11 @@ func formatBPS(bps float64) string {
 // etaText 估算正在运行任务的剩余时间。
 func etaText(t *store.Task, bps float64) string {
 	if bps <= 0 || t.TotalSize <= 0 {
-		return "ETA --"
+		return ilocale.T("taskRow.eta.unknown")
 	}
 	remaining := t.TotalSize - t.Downloaded
 	if remaining <= 0 {
-		return "ETA 0 秒"
+		return ilocale.T("taskRow.eta.done")
 	}
 	secs := int(float64(remaining) / bps)
 	if secs < 0 {

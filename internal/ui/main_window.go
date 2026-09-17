@@ -23,6 +23,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/store"
 )
 
@@ -40,6 +41,20 @@ type MainWindow struct {
 	filter    binding.String
 	taskList  *taskList
 	statusBar *statusBar
+
+	// 可翻译 widget 引用,语言切换时由 applyLanguage 重新写入。
+	winTitle       string
+	tbNew          *widget.Button
+	tbPauseAll     *widget.Button
+	tbResumeAll    *widget.Button
+	tbSettings     *widget.Button
+	searchEntry    *widget.Entry
+	sidebarHeader  *widget.Label
+	sidebarRadios  *widget.RadioGroup
+	diskLabel      *widget.Label
+
+	// settingsHeaderTitle 在设置页切换时即时翻译(不像其它 widget 持久持有)。
+	settingsPageOpen bool
 
 	unsub func()
 
@@ -63,14 +78,17 @@ func NewMainWindow(a fyne.App, svc Service) *MainWindow {
 	}
 	m.taskList = newTaskList(svc, m.filter)
 	m.statusBar = newStatusBar()
+	m.diskLabel = m.statusBar.diskLabel // 供 applyLanguage 找到标签引用
 	m.buildMainUI()
+	m.applyLanguage() // 首启把当前 ilocale.Current 应用到所有持久 widget
 	m.subscribe()
 	m.statusBar.refreshDiskSpace()
 	m.startDiskTicker()
 	return m
 }
 func (m *MainWindow) buildMainUI() {
-	m.win = m.app.NewWindow("下载管理器")
+	m.win = m.app.NewWindow("")
+	m.winTitle = "" // applyLanguage 写入
 	m.content = container.NewBorder(
 		m.buildToolbar(),
 		m.statusBar.container(),
@@ -84,8 +102,54 @@ func (m *MainWindow) buildMainUI() {
 	m.win.SetCloseIntercept(m.onCloseRequested)
 }
 
+// applyLanguage 把 ilocale.Current 对应的语言应用到所有持久持有的
+// widget(title/工具栏/侧边栏/状态栏标签)。由 NewMainWindow 首启调用,
+// 以及 MsgLanguage 回调触发。必须在 Fyne 事件线程上调用(write widget)。
+func (m *MainWindow) applyLanguage() {
+	if m.win != nil {
+		title := ilocale.T("main.window.title")
+		if title != m.winTitle {
+			m.winTitle = title
+			m.win.SetTitle(title)
+		}
+	}
+	if m.tbNew != nil {
+		m.tbNew.SetText(ilocale.T("main.toolbar.new"))
+		m.tbPauseAll.SetText(ilocale.T("main.toolbar.pauseAll"))
+		m.tbResumeAll.SetText(ilocale.T("main.toolbar.resumeAll"))
+		m.tbSettings.SetText(ilocale.T("main.toolbar.settings"))
+	}
+	if m.searchEntry != nil {
+		m.searchEntry.SetPlaceHolder(ilocale.T("main.toolbar.searchPlaceholder"))
+	}
+	if m.sidebarHeader != nil {
+		m.sidebarHeader.SetText(ilocale.T("main.sidebar.header"))
+	}
+	if m.sidebarRadios != nil {
+		// 选项标签与选中项都跟着语言走;保留当前选中的 filter 值不变。
+		cur, _ := m.filter.Get()
+		m.sidebarRadios.Options = m.sidebarOptions()
+		m.sidebarRadios.SetSelected(m.sidebarLabel(cur))
+		m.sidebarRadios.Refresh()
+	}
+	if m.diskLabel != nil {
+		m.diskLabel.SetText(ilocale.T("main.status.disk.detecting"))
+	}
+	// 任务列表头/列、空状态、行状态 —— 通过 list/taskRow 暴露的 hook 通知。
+	if m.taskList != nil {
+		m.taskList.applyLanguage()
+	}
+	// 状态栏磁盘信息:上一次快照的状态文案需要重写一次。
+	m.statusBar.refreshDiskSpace()
+	// 设置页若正打开,标题与所有表单项即时重译。
+	if m.settingsPageOpen {
+		m.showSettingsPage()
+	}
+}
+
 // showSettingsPage 将主内容切换到设置页面。
 func (m *MainWindow) showSettingsPage() {
+	m.settingsPageOpen = true
 	m.win.SetContent(container.NewBorder(
 		m.buildSettingsHeader(),
 		nil, nil, nil,
@@ -95,6 +159,7 @@ func (m *MainWindow) showSettingsPage() {
 
 // showMainPage 将主内容切换回主视图。
 func (m *MainWindow) showMainPage() {
+	m.settingsPageOpen = false
 	m.win.SetContent(m.content)
 }
 
@@ -103,8 +168,9 @@ func (m *MainWindow) buildSettingsHeader() fyne.CanvasObject {
 	backBtn := widget.NewButtonWithIcon("", theme.NavigateBackIcon(), func() {
 		m.showMainPage()
 	})
-	title := widget.NewLabel("设置")
+	title := widget.NewLabel("")
 	title.TextStyle.Bold = true
+	title.SetText(ilocale.T("settings.header.title"))
 	return container.NewBorder(nil, nil, backBtn, nil, container.NewHBox(title, layout.NewSpacer()))
 }
 
@@ -116,10 +182,10 @@ func (m *MainWindow) buildSettingsContent() fyne.CanvasObject {
 
 // buildToolbar 排列操作按钮、搜索框以及设置快捷按钮。
 func (m *MainWindow) buildToolbar() fyne.CanvasObject {
-	newBtn := widget.NewButtonWithIcon("新建任务", theme.ContentAddIcon(), func() {
+	newBtn := widget.NewButtonWithIcon("", theme.ContentAddIcon(), func() {
 		showAddTaskDialog(m.win, m.svc)
 	})
-	pauseAllBtn := widget.NewButtonWithIcon("暂停全部", theme.MediaPauseIcon(), func() {
+	pauseAllBtn := widget.NewButtonWithIcon("", theme.MediaPauseIcon(), func() {
 		// 不再按 Status 过滤:Start 已经预留 slot 但 engine 还没接管的
 		// 「准备中」任务,scheduler.Pause 也能通过 prepareCancel 立刻中止;
 		// 对已经不在运行的任务 Pause 会返回 error,这里忽略即可。
@@ -130,7 +196,7 @@ func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 			_ = m.svc.Pause(tk.ID)
 		}
 	})
-	resumeAllBtn := widget.NewButtonWithIcon("恢复全部", theme.MediaPlayIcon(), func() {
+	resumeAllBtn := widget.NewButtonWithIcon("", theme.MediaPlayIcon(), func() {
 		down := store.TaskStatus.Downloading
 		for _, tk := range m.taskList.allTasks() {
 			if tk.Status == store.TaskStatus.Paused || tk.Status == store.TaskStatus.Failed {
@@ -139,13 +205,18 @@ func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 			}
 		}
 	})
-	settingsBtn := widget.NewButtonWithIcon("设置", theme.SettingsIcon(), func() {
+	settingsBtn := widget.NewButtonWithIcon("", theme.SettingsIcon(), func() {
 		m.showSettingsPage()
 	})
 
 	searchEntry := widget.NewEntry()
-	searchEntry.SetPlaceHolder("搜索 URL 或保存路径…")
 	searchEntry.OnChanged = func(s string) { m.taskList.setSearch(s) }
+
+	m.tbNew = newBtn
+	m.tbPauseAll = pauseAllBtn
+	m.tbResumeAll = resumeAllBtn
+	m.tbSettings = settingsBtn
+	m.searchEntry = searchEntry
 
 	left := container.NewHBox(newBtn, pauseAllBtn, resumeAllBtn)
 	return container.NewBorder(
@@ -168,38 +239,28 @@ func (m *MainWindow) buildMainSplit() *container.Split {
 }
 
 // buildSidebar 渲染筛选单选按钮组。
+//
+// filter 与选项 label 的对应关系通过 sidebarFilterToLabel / sidebarLabelToFilter
+// 维护——选项的 label 在 applyLanguage 里整体替换,但底层 filter 值
+// （"all"/"downloading"/...）不变,selected 项也保持稳定。
 func (m *MainWindow) buildSidebar() fyne.CanvasObject {
-	type filterDef struct {
-		label     string
-		filterVal string
-	}
-	filters := []filterDef{
-		{"全部", "all"},
-		{"下载中", "downloading"},
-		{"已暂停", "paused"},
-		{"已完成", "completed"},
-		{"失败", "failed"},
-		{"文件丢失", "filelost"},
-	}
-	labelToFilter := map[string]string{}
-	for _, f := range filters {
-		labelToFilter[f.label] = f.filterVal
-	}
+	header := widget.NewLabelWithStyle("", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	m.sidebarHeader = header
+
 	radios := widget.NewRadioGroup([]string{}, func(s string) {
-		_ = m.filter.Set(labelToFilter[s])
+		fv := m.sidebarLabelToFilter(s)
+		if fv == "" {
+			return
+		}
+		_ = m.filter.Set(fv)
 		// 状态过滤改变后必须刷新列表，否则 List 的 Length 不会重新求值。
 		m.taskList.refresh()
 	})
-	labels := make([]string, len(filters))
-	for i, f := range filters {
-		labels[i] = f.label
-	}
-	radios.Options = labels
 	radios.Required = true
-	radios.SetSelected("全部")
-	_ = m.filter.Set("all")
 	radios.Horizontal = false
-	header := widget.NewLabelWithStyle("任务筛选", fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	m.sidebarRadios = radios
+	radios.SetSelected(m.sidebarLabel("all"))
+	_ = m.filter.Set("all")
 
 	return container.NewBorder(
 		container.NewVBox(header, widget.NewSeparator()),
@@ -207,6 +268,46 @@ func (m *MainWindow) buildSidebar() fyne.CanvasObject {
 		nil, nil,
 		radios,
 	)
+}
+
+// sidebarOptions 返回侧边栏筛选选项的当前语言标签,顺序固定。
+func (m *MainWindow) sidebarOptions() []string {
+	filters := []string{"all", "downloading", "paused", "completed", "failed", "filelost"}
+	out := make([]string, len(filters))
+	for i, f := range filters {
+		out[i] = m.sidebarLabel(f)
+	}
+	return out
+}
+
+// sidebarLabel 把 filter 值翻译成当前语言的显示标签。
+func (m *MainWindow) sidebarLabel(filterVal string) string {
+	switch filterVal {
+	case "all":
+		return ilocale.T("main.filter.all")
+	case "downloading":
+		return ilocale.T("main.filter.downloading")
+	case "paused":
+		return ilocale.T("main.filter.paused")
+	case "completed":
+		return ilocale.T("main.filter.completed")
+	case "failed":
+		return ilocale.T("main.filter.failed")
+	case "filelost":
+		return ilocale.T("main.filter.filelost")
+	}
+	return filterVal
+}
+
+// sidebarLabelToFilter 是 sidebarLabel 的反向:由当前语言的 label 找
+// 回 filter 值。filter 值集合固定(6 个),所以 label→filter 也是稳定的。
+func (m *MainWindow) sidebarLabelToFilter(label string) string {
+	for _, fv := range []string{"all", "downloading", "paused", "completed", "failed", "filelost"} {
+		if m.sidebarLabel(fv) == label {
+			return fv
+		}
+	}
+	return ""
 }
 
 // Show 显示主窗口。
@@ -376,8 +477,9 @@ type statusBar struct {
 }
 
 func newStatusBar() *statusBar {
-	diskLabel := widget.NewLabel("磁盘空间: 检测中...")
+	diskLabel := widget.NewLabel("")
 	diskLabel.SizeName = theme.SizeNameCaptionText
+	diskLabel.SetText(ilocale.T("main.status.disk.detecting"))
 
 	return &statusBar{
 		diskBar:   newDiskBar(),
@@ -394,21 +496,24 @@ func (sb *statusBar) container() fyne.CanvasObject {
 }
 func (sb *statusBar) setDiskSpace(free, total int64) {
 	if total == 0 {
-		sb.diskLabel.SetText("磁盘空间: 不可用")
+		sb.diskLabel.SetText(ilocale.T("main.status.disk.unavailable"))
 		sb.diskBar.setProgress(0)
 		return
 	}
 	frac := 1.0 - float64(free)/float64(total)
 	sb.diskBar.setProgress(frac)
-	sb.diskLabel.SetText(fmt.Sprintf("磁盘空间: 可用 %s / 总计 %s",
-		humanBytes(free), humanBytes(total)))
+	sb.diskLabel.SetText(ilocale.TF("main.status.disk.format", fmt.Sprintf("磁盘空间: 可用 %s / 总计 %s", humanBytes(free), humanBytes(total)), map[string]any{
+		"Free": humanBytes(free),
+		"Total": humanBytes(total),
+	}))
 }
 
 // refreshDiskSpace 根据 GlobalSettings.DefaultSaveDir 更新磁盘空间显示。
 func (sb *statusBar) refreshDiskSpace() {
 	dir := GlobalSettings.DefaultSaveDir
 	if dir == "" {
-		sb.setDiskSpace(0, 0)
+		sb.diskLabel.SetText(ilocale.T("main.status.disk.unset"))
+		sb.diskBar.setProgress(0)
 		return
 	}
 	d := filepath.Dir(dir)
@@ -417,7 +522,10 @@ func (sb *statusBar) refreshDiskSpace() {
 	}
 	free, total, err := diskUsage(d)
 	if err != nil {
-		sb.setDiskSpace(0, 0)
+		sb.diskLabel.SetText(ilocale.TF("main.status.disk.error", fmt.Sprintf("不可用 (%v)", err), map[string]any{
+			"Err": err.Error(),
+		}))
+		sb.diskBar.setProgress(0)
 		return
 	}
 	sb.setDiskSpace(free, total)

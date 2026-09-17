@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
@@ -35,6 +36,7 @@ type ipcClient struct {
 	onShow        func()
 	onClose       func()
 	onShowAddTask func(ipc.ShowAddTaskParams)
+	onLanguage    func() // 收到 MsgInit/MsgLanguage 时调用,负责 UI 重译
 
 	// showAddTaskQ 在 onShowAddTask 尚未注册前缓存收到的 MsgShowAddTask。
 	// 业务进程的 lgom:// 转发可能在 RunChild 还没调到 SetOnShowAddTask
@@ -141,6 +143,24 @@ func (c *ipcClient) run() {
 			var init ipc.InitData
 			if err := json.Unmarshal(msg.Data, &init); err == nil {
 				c.setSettings(init.Settings)
+				// InitData 已经携带权威 Language,这里同步到 ilocale。
+				// onLanguage 由 RunChild 在 NewMainWindow 之前/之后注册:
+				// - 若 NewMainWindow 已经构造,applyLanguage 会跑;
+				// - 若还没有,onLanguage 为 nil,RunChild 在 NewMainWindow
+				//   完成后会基于 ilocale.Current 立即跑一次 applyLanguage,
+				//   不需要额外通知。
+				ilocale.Set(init.Settings.Language)
+				if c.onLanguage != nil {
+					c.onLanguage() // 调用方自行切到 fyne 事件线程
+				}
+			}
+		case ipc.MsgLanguage:
+			var ld ipc.LanguageData
+			if err := json.Unmarshal(msg.Data, &ld); err == nil {
+				ilocale.Set(ld.Language)
+				if c.onLanguage != nil {
+					c.onLanguage() // 调用方自行切到 fyne 事件线程
+				}
 			}
 		}
 	}
@@ -341,4 +361,13 @@ func (c *ipcClient) SetOnShowAddTask(f func(ipc.ShowAddTaskParams)) {
 	for _, p := range pending {
 		f(p)
 	}
+}
+
+// SetOnLanguage 注册「语言变更」回调:在收到 MsgInit/MsgLanguage 时被调用,
+// 用于让 UI 重译所有 widget。回调跑在 IPC 读循环里,实现在 Fyne 事件
+// 线程上自行 fyne.Do。
+func (c *ipcClient) SetOnLanguage(f func()) {
+	c.pendMu.Lock()
+	c.onLanguage = f
+	c.pendMu.Unlock()
 }

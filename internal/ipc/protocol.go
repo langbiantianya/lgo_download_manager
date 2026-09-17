@@ -32,7 +32,16 @@ const (
 	// MsgShowAddTask 请求 UI 弹出「新建下载任务」对话框（lgom:// 转发场景）。
 	// UI 应在 Fyne 事件线程上显示主窗口并打开对话框，按 URL 参数预填。
 	MsgShowAddTask = "biz.show_add_task"
+	// MsgLanguage 通知 UI 当前权威语言已变更(用户在「设置」里切语言)。
+	// UI 必须重新翻译所有可见 widget 并重建依赖字符串的容器。InitData
+	// 已经在握手时携带了首启语言,本消息用于「运行中切换」。
+	MsgLanguage = "biz.language"
 )
+
+// LanguageData 是 MsgLanguage 的负载。
+type LanguageData struct {
+	Language string `json:"language"` // BCP-47 标签,必定是 Supported 之一
+}
 
 // 消息类型：UI → 业务。
 const (

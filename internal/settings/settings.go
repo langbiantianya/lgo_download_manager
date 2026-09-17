@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 
 	"lgo_download_manager/internal/autostart"
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/store"
@@ -49,6 +50,18 @@ func Load(st *store.Store, forceLight bool) (store.Settings, error) {
 	}
 	if forceLight {
 		persisted.LightMode = true
+	}
+	// Language 兜底:
+	//   - 持久化值非空 → Normalize 折叠一次,无效标签 → 默认 zh-Hans;
+	//   - 持久化值为空 → 用 OS 语言作为偏好(走 jeandeaual/go-locale);
+	//   - OS 语言读不到 / 不在 Supported → 落到默认 zh-Hans。
+	// Normalize 还会顺手把过期/未知标签替换成默认值,旧用户升级后不会
+	// 因 db 里残留的非法值而崩溃。首次运行也会在这里赋值并落盘,见下方
+	// firstRun 分支的 Save。
+	if persisted.Language == "" {
+		persisted.Language = ilocale.SystemLanguage()
+	} else {
+		persisted.Language = ilocale.Normalize(persisted.Language)
 	}
 	ApplyProxy(persisted)
 	if firstRun {
