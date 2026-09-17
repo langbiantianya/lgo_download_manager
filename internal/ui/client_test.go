@@ -16,6 +16,7 @@ import (
 
 	"fyne.io/fyne/v2/test"
 
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/store"
 )
@@ -216,4 +217,101 @@ func TestIpcClient_ShowAddTaskDirectDispatch(t *testing.T) {
 		t.Fatalf("direct-dispatch hook not called within 1s")
 	}
 	client.Close()
+}
+
+// newHandshakedClientWithLang 是 newHandshakedClient 的变体:把 InitData
+// 的 Language 字段强制设为指定值,用于验证握手阶段就把权威语言应用到
+// ilocale——这是修复「用户在设置里选了英文,每次开窗却显示中文」的
+// 回归测试。
+func newHandshakedClientWithLang(t *testing.T, lang string) (*ipcClient, net.Conn) {
+	t.Helper()
+	socketPath := filepath.Join(t.TempDir(), "ipc.sock")
+	_ = os.Remove(socketPath)
+	ln, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("Listen unix: %v", err)
+	}
+
+	type acceptResult struct {
+		c   net.Conn
+		err error
+	}
+	acceptCh := make(chan acceptResult, 1)
+	go func() {
+		c, err := ln.Accept()
+		acceptCh <- acceptResult{c: c, err: err}
+	}()
+
+	srvCh := make(chan net.Conn, 1)
+	go func() {
+		a := <-acceptCh
+		if a.err != nil {
+			srvCh <- nil
+			return
+		}
+		srv := ipc.NewConn(a.c)
+		if _, err := srv.Recv(); err != nil { // 等 Hello
+			srvCh <- nil
+			return
+		}
+		initMsg, err := ipc.Encode(ipc.InitData{
+			Settings: store.Settings{DefaultSaveDir: "/tmp", Language: lang},
+		})
+		if err != nil {
+			srvCh <- nil
+			return
+		}
+		initMsg.Type = ipc.MsgInit
+		if err := srv.Send(initMsg); err != nil {
+			srvCh <- nil
+			return
+		}
+		srvCh <- a.c
+	}()
+
+	client, _, err := dialAndHandshake(socketPath, "tok")
+	if err != nil {
+		_ = ln.Close()
+		_ = os.Remove(socketPath)
+		t.Fatalf("dialAndHandshake: %v", err)
+	}
+	srvConn := <-srvCh
+	_ = ln.Close()
+	_ = os.Remove(socketPath)
+	if srvConn == nil {
+		client.Close()
+		t.Fatalf("biz-side handshake failed")
+	}
+	_ = test.NewApp()
+	return client, srvConn
+}
+
+// TestHandshake_AppliesAuthoritativeLanguage 回归测试:dialAndHandshake
+// 同步消费 MsgInit 时,必须立即把 InitData.Language 应用到 ilocale。
+//
+// 之前的 bug 是只在 run() 的 MsgInit case 里调 ilocale.Set,但业务侧
+// acceptLoop 只发一次 MsgInit,run() 在下一轮 Recv 上永久阻塞,导致
+// 语言永远停在默认 zh-Hans——用户在「设置」里选的语言不生效,UI 每次
+// 开窗都被拉回中文。本测试在 run() 尚未启动时校验语言已应用。
+func TestHandshake_AppliesAuthoritativeLanguage(t *testing.T) {
+	// Reset 到一个未支持的语言,确保 handshake 之后真的被切到 en,
+	// 而不是沿用初始状态。
+	ilocale.Set("zh-Hans")
+	defer ilocale.Set(ilocale.DefaultLanguage)
+
+	client, _ := newHandshakedClientWithLang(t, "en")
+	defer client.Close()
+	// 此时 c.run() 尚未启动;但 ilocale 必须已是英文。
+	if got := ilocale.Current(); got != "en" {
+		t.Fatalf("ilocale.Current() = %q after handshake, want %q (language must be applied synchronously)", got, "en")
+	}
+	// 同时验证翻译也跟着切换——dialAndHandshake 之前的代码路径在
+	// NewMainWindow 里会读 ilocale.T 拉标题/工具栏等,这些字符串
+	// 必须已经是英文版本。
+	if got := ilocale.T("main.window.title"); got == "" || got == "main.window.title" {
+		t.Fatalf("T('main.window.title') = %q, want non-empty English translation", got)
+	}
+	if got := ilocale.T("main.toolbar.new"); got == "新建任务" {
+		t.Fatalf("T('main.toolbar.new') still zh-Hans %q after handshake with lang=en", got)
+	}
 }

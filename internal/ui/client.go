@@ -90,6 +90,14 @@ func dialAndHandshake(socket, token string) (*ipcClient, store.Settings, error) 
 		return nil, store.Settings{}, fmt.Errorf("decode init: %w", err)
 	}
 	c.settings = init.Settings
+	// 同步应用权威语言到 ilocale:握手阶段在 c.run() 启动前就消费了
+	// MsgInit,此时 NewMainWindow 尚未构造,onLanguage 还没注册;若
+	// 把 ilocale 推迟到 run() 的 case ipc.MsgInit 分支,业务侧
+	// acceptLoop 只发一次 MsgInit,run() 会卡在下一轮 Recv 上,
+	// 永远不会触发语言切换,UI 一直停在默认 zh-Hans。
+	// 这里同步落一次——MsgInit 是一次性快照,运行中切语言由
+	// uimgr.SetLanguage → MsgLanguage 路径承担,仍走 run() 分支。
+	ilocale.Set(init.Settings.Language)
 	return c, init.Settings, nil
 }
 
