@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/store"
 )
 
@@ -129,5 +130,92 @@ func TestAutoStart_PersistedRoundTrip(t *testing.T) {
 	}
 	if !got.AutoStart {
 		t.Errorf("AutoStart = %v, want true (user explicitly toggled it on)", got.AutoStart)
+	}
+}
+
+// TestLoad_Language_PersistedWinsOverSystem 验证用户在设置里显式选过的
+// 语言在后续启动时被尊重,不再被系统语言覆盖。这是 i18n 选型契约的核心:
+// 用户显式偏好优先于 OS 推断,否则每次系统语言变化都会让 UI 跟着跳。
+func TestLoad_Language_PersistedWinsOverSystem(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	// 模拟一次首启,触发默认值落盘。
+	if _, err := Load(st, false); err != nil {
+		t.Fatalf("first Load: %v", err)
+	}
+	// 随后用户在「设置 → 语言」里选了日语,保存。
+	if err := st.SaveSettings(store.Settings{
+		DefaultSaveDir: t.TempDir(), // firstRun=false
+		Language:       "ja",
+	}); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	// 再次启动:即便 OS 是英文(测试运行环境可能也是英文),Load 仍然
+	// 返回 ja——持久化值优先。
+	got, err := Load(st, false)
+	if err != nil {
+		t.Fatalf("second Load: %v", err)
+	}
+	if got.Language != "ja" {
+		t.Errorf("Language = %q, want %q (persisted value must win over OS detection)", got.Language, "ja")
+	}
+}
+
+// TestLoad_Language_UnsetFallsBackToSystem 验证 DB 里 Language 为空时
+// 走 SystemLanguage():用户没显式选过,就猜一个最像的;OS 标签若不在
+// Supported 范围内,落到默认 zh-Hans。
+func TestLoad_Language_UnsetFallsBackToSystem(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	got, err := Load(st, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// OS 语言探测的具体结果由测试机决定,但必须落在 Supported 里。
+	want := ilocale.Normalize(ilocale.SystemLanguage())
+	if got.Language != want {
+		t.Errorf("Language = %q, want %q (SystemLanguage normalization)", got.Language, want)
+	}
+}
+
+// TestLoad_Language_InvalidPersistedNormalized 验证持久化的无效标签
+// (例如旧版本残留的脏值,或用户从外部修改了 db)会被归一化到 Supported
+// 中的一项,而不是以原始字符串进入 UI 流程——后者会让 ilocale.NewLocalizer
+// 报错或返回空字符串。
+func TestLoad_Language_InvalidPersistedNormalized(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	if _, err := Load(st, false); err != nil {
+		t.Fatalf("first Load: %v", err)
+	}
+	if err := st.SaveSettings(store.Settings{
+		DefaultSaveDir: t.TempDir(),
+		Language:       "totally-invalid-tag", // 不在 Supported 也不在 BCP-47
+	}); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	got, err := Load(st, false)
+	if err != nil {
+		t.Fatalf("second Load: %v", err)
+	}
+	if got.Language != ilocale.DefaultLanguage {
+		t.Errorf("Language = %q, want default %q (invalid persisted value must normalize)", got.Language, ilocale.DefaultLanguage)
 	}
 }
