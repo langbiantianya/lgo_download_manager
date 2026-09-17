@@ -56,6 +56,14 @@ type MainWindow struct {
 	// settingsHeaderTitle 在设置页切换时即时翻译(不像其它 widget 持久持有)。
 	settingsPageOpen bool
 
+	// suppressPersist 用于在重建设置页期间屏蔽其内 OnChanged 触发的
+	// persist/SaveSettings。设置页重建(applyLanguage 调用 showSettingsPage
+	// 或 buildSettingsContent)会重新构造 select/entry,SetSelected 与
+	// SetText 的回调可能在我们刚收到 SetLanguage 的瞬间再次写回 SaveSettings,
+	// 业务侧 dispatch → SetLanguage → MsgLanguage → applyLanguage 形成
+	// 无限循环直到 UI 进程 panic。这里在重建期间统一 short-circuit。
+	suppressPersist bool
+
 	unsub func()
 
 	// diskTicker 周期性刷新状态栏的磁盘空间；关闭 diskDone 即退出该循环。
@@ -142,8 +150,14 @@ func (m *MainWindow) applyLanguage() {
 	// 状态栏磁盘信息:上一次快照的状态文案需要重写一次。
 	m.statusBar.refreshDiskSpace()
 	// 设置页若正打开,标题与所有表单项即时重译。
+	// suppressPersist 必须夹住重建:buildSettingsContent 会重新构造
+	// select/entry,SetSelected/SetText 的回调会触发 persist,若不挡
+	// 住就会把刚切完的语言再写回一次,业务侧 dispatch → SetLanguage →
+	// MsgLanguage → applyLanguage 形成无限循环,直到 UI 进程 panic。
 	if m.settingsPageOpen {
+		m.suppressPersist = true
 		m.showSettingsPage()
+		m.suppressPersist = false
 	}
 }
 
@@ -177,7 +191,10 @@ func (m *MainWindow) buildSettingsHeader() fyne.CanvasObject {
 // buildSettingsContent 返回设置表单内容。onChange 在任意设置项变更后触发，
 // 用于刷新任务列表（例如排序方式改变后）。
 func (m *MainWindow) buildSettingsContent() fyne.CanvasObject {
-	return buildSettingsContent(m.svc, func() { m.taskList.refresh() })
+	return buildSettingsContent(m.svc, func() { m.taskList.refresh() }, func() bool {
+		// applyLanguage 重建设置页期间为 true,屏蔽 persist 防止无限循环。
+		return m.suppressPersist
+	})
 }
 
 // buildToolbar 排列操作按钮、搜索框以及设置快捷按钮。

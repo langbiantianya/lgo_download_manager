@@ -32,6 +32,12 @@ type taskList struct {
 	headerRow  *fyne.Container
 	emptyLabel *widget.Label
 
+	// 表头三列标签引用:applyLanguage 就地 SetText 重译,不重建 widget
+	// (重建会丢掉 buildHeader 里的分隔线,也带来无谓的重排)。
+	headerName   *widget.Label
+	headerSize   *widget.Label
+	headerStatus *widget.Label
+
 	// rowMap 将 taskID 映射到活动的 taskRow，以便 O(1) 地派发事件。
 	rowMu  sync.Mutex
 	rowMap map[string]*taskRow
@@ -195,23 +201,21 @@ func (tl *taskList) build() *fyne.Container {
 	return content
 }
 
-// applyLanguage 在语言切换时刷新 taskList 的可变字符串:表头三列、
-// 空状态标签。taskRow 自身的状态/速度/ETA 等翻译发生在 row 内的
-// refresh 路径,这里通过 resetRows 让所有可见 row 强制重渲。
+// applyLanguage 在语言切换时刷新 taskList 的可变字符串:表头三列与
+// 空状态标签。表头标签持有引用后直接 SetText——不重建 widget,
+// 避免额外的布局/重绘,也避免误删 buildHeader 里的分隔线。
 //
-// 表头 widget 被重建(原来的 headerRow 还在,但里面的 label 不再指向
-// applyLanguage 创建的引用),所以先保存然后整体替换内容。
+// taskRow 自身的状态/速度/ETA 等文案在 bind/refresh 时写入;这里把
+// rowState 标脏,强制下一轮 refresh 走完整路径覆盖所有翻译字段。
 func (tl *taskList) applyLanguage() {
 	if tl.emptyLabel != nil {
 		tl.emptyLabel.SetText(ilocale.T("taskList.empty"))
 	}
-	if tl.headerRow != nil {
-		tl.headerRow.Objects = []fyne.CanvasObject{tl.buildHeaderRow()}
-		tl.headerRow.Refresh()
+	if tl.headerName != nil {
+		tl.headerName.SetText(ilocale.T("taskList.header.name"))
+		tl.headerSize.SetText(ilocale.T("taskList.header.size"))
+		tl.headerStatus.SetText(ilocale.T("taskList.header.status"))
 	}
-	// 行内部文案(row 显示出来的任务名/添加时间/状态/速度/ETA)在 bind 或
-	// refresh 时才写入;applyLanguage 把 rowState 标脏,强制下一轮
-	// refresh 走完整路径覆盖所有翻译字段。
 	tl.rowMu.Lock()
 	for _, row := range tl.rowMap {
 		row.st.valid = false
@@ -228,17 +232,15 @@ func (tl *taskList) buildHeader() *fyne.Container {
 	)
 }
 
-// buildHeaderRow 渲染表头的标题行(不含底部分隔线),供 buildHeader 与
-// applyLanguage 共用——后者在重建时只换这一行,保留外层 VBox 不变。
+// buildHeaderRow 渲染表头的标题行(不含底部分隔线),同时把三个标签
+// 存进 taskList,供 applyLanguage 就地改名。
 func (tl *taskList) buildHeaderRow() fyne.CanvasObject {
-	mkHdr := func(text string, w float32) fyne.CanvasObject {
-		l := widget.NewLabelWithStyle(text, fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
-		return container.NewGridWrap(fyne.NewSize(w, 28), l)
-	}
-	name := mkHdr(ilocale.T("taskList.header.name"), 320)
-	size := widget.NewLabelWithStyle(ilocale.T("taskList.header.size"), fyne.TextAlignTrailing, fyne.TextStyle{Bold: true})
-	status := widget.NewLabelWithStyle(ilocale.T("taskList.header.status"), fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
-	row := container.NewBorder(nil, nil, nil, container.NewHBox(size, status), name)
+	nameLbl := widget.NewLabelWithStyle(ilocale.T("taskList.header.name"), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
+	sizeLbl := widget.NewLabelWithStyle(ilocale.T("taskList.header.size"), fyne.TextAlignTrailing, fyne.TextStyle{Bold: true})
+	statusLbl := widget.NewLabelWithStyle(ilocale.T("taskList.header.status"), fyne.TextAlignCenter, fyne.TextStyle{Bold: true})
+	tl.headerName, tl.headerSize, tl.headerStatus = nameLbl, sizeLbl, statusLbl
+	name := container.NewGridWrap(fyne.NewSize(320, 28), nameLbl)
+	row := container.NewBorder(nil, nil, nil, container.NewHBox(sizeLbl, statusLbl), name)
 	return row
 }
 

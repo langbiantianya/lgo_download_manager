@@ -32,17 +32,33 @@ const mib = int64(1 << 20)
 // 都同步保存，因此两者保持一致。
 var GlobalSettings store.Settings
 
-func buildSettingsContent(svc Service, onChange func()) fyne.CanvasObject {
+// settingsPersist 把 GlobalSettings 写回 svc,触发刷新回调。可选的
+// suppressPersist 在重建设置页期间返回 true,会让 persist 提前返回,
+// 防止切语言后的 OnChanged 链把 SaveSettings 反复推回业务侧造成
+// 无限循环。svc/onChange/suppressPersist 任一为 nil 时对应分支跳过,
+// 老调用方可以继续用 nil 调用。
+func settingsPersist(svc Service, onChange func(), suppressPersist func() bool) {
+	// applyLanguage 重建设置页期间,widget 重建(SetSelected/SetText)
+	// 会触发 OnChanged 并再次写回 SaveSettings——这会让业务侧 dispatch
+	// 再次推送 MsgLanguage,UI 又收到一条「切语言」,再次重建,无限循环。
+	// suppressPersist 在重建窗口内返回 true,这里 short-circuit。
+	if suppressPersist != nil && suppressPersist() {
+		return
+	}
+	if svc == nil {
+		return
+	}
+	if err := svc.SaveSettings(GlobalSettings); err != nil {
+		logging.Printf("ui: save settings: %v", err)
+	}
+	if onChange != nil {
+		onChange()
+	}
+}
+
+func buildSettingsContent(svc Service, onChange func(), suppressPersist func() bool) fyne.CanvasObject {
 	persist := func() {
-		if svc == nil {
-			return
-		}
-		if err := svc.SaveSettings(GlobalSettings); err != nil {
-			logging.Printf("ui: save settings: %v", err)
-		}
-		if onChange != nil {
-			onChange()
-		}
+		settingsPersist(svc, onChange, suppressPersist)
 	}
 	dirEntry := widget.NewEntry()
 	dirEntry.SetText(GlobalSettings.DefaultSaveDir)
