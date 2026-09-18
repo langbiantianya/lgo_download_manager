@@ -626,7 +626,7 @@ function New-MsiPackage([string]$BuildVersion, [string]$NumericVersion) {
         throw @"
 wix.exe 是 v$($wix.Major)($($wix.Path)),它的二进制发布物要求在遵守 OSMF EULA 的前提下
 使用,本项目不引入该依赖。请改用 WiX v$MaxFreeWixMajor 及以下 —— 删掉那个安装,
-脚本会自动取 v$WixCliVersion:
+脚本会自动取 v${WixCliVersion} 版:
 
     $WixCliMsiUrl
 
