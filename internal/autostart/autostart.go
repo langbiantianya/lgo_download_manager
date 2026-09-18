@@ -19,6 +19,10 @@
 //     (缺省 $XDG_CONFIG_HOME 时回退到 ~/.config)。Type=Application +
 //     X-GNOME-Autostart-enabled=true,GNOME/KDE/XFCE 等遵循 Freedesktop
 //     自启动规范的桌面环境都会拉起。
+//     Flatpak 安装是例外:入口文件固定写在宿主 ~/.config/autostart
+//     (沙箱里的 $XDG_CONFIG_HOME 指向应用私有目录),Exec 写成
+//     "flatpak run <app-id> --autostart" 才能让宿主重新进入沙箱拉起
+//     应用;沙箱与宿主路径的差异见 autostart_linux.go。
 //   - macOS:~/Library/LaunchAgents/org.langbiantianya.LGDM.plist,
 //     Label=org.langbiantianya.LGDM,ProgramArguments 带 --autostart;
 //     RunAtLoad=true。launchd 登录后由 per-user agent 域拉起。
