@@ -283,7 +283,8 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 | 安装报 `1633 这个处理器类型不支持该安装程序包` | 装了架构不符的包（如把 arm64 包往 x64 上装）；换对应架构的产物 |
 | `build constraints exclude all Go files ... go-gl/gl/v3.1/gles2` | cgo 被关掉了（交叉编译时的默认行为）；用脚本编译或手工设 `CGO_ENABLED=1` |
 | `go: CC environment variable is relative; must be absolute path` | `CC` 给了 `/c/...` 形式；改成 `C:\...` |
-| `找不到 aarch64 的 C 交叉编译器` | 装工具链：`winget install --id MartinStorsjo.LLVM-MinGW.UCRT --exact --silent`，或 `-CCArm64` 指定 |
+| `gcc_arm64.S: Error: no such instruction: 'stp x29,x30,[sp,'`（一堆 `stp`/`ldp`/`blr` 报错） | 用的 C 编译器不是 aarch64 目标 —— 这是 **x86 汇编器在读 AArch64 汇编**。`windows-11-arm` 镜像的 PATH 上带着 x64 的 mingw `gcc.exe`，直接拿它配 `GOARCH=arm64` 就会这样。脚本现在用 `-dumpmachine` 校验每个候选编译器，目标不符的会跳过（并打印原因），改用 LLVM-MinGW 的 `aarch64-w64-mingw32-clang` |
+| `-CC 指向的编译器不是 <arch> 目标` | 显式传的 `-CC` / 编译器本身目标不符；错误信息里带 `-dumpmachine` 的实际输出 |
 | `winget 安装 ... 返回 -1978335189` | winget 认为已装其它版本；脚本会继续查找已安装的工具，找不到再按提示手动装 |
 | 编辑 `scripts/package.ps1` 后 Windows PowerShell 5.1 报语法错误 | 脚本含中文，必须存成 **UTF-8 with BOM**（PS 7 不敏感，PS 5.1 会按 ANSI 读） |
 

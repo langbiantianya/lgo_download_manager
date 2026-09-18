@@ -172,13 +172,16 @@ if ($slug -eq 'arm64') {
     $wixArch = 'arm64'
     $peMachine = $PeMachineArm64
     $exePath = Join-Path $BinDir 'lgdm-arm64.exe'
-    $mingwClangName = 'aarch64-w64-mingw32-clang.exe'
+    # 宿主(arm64)的 mingw 目标三元组前缀;确认过的目标架构由它写死在名字里。
+    $mingwPrefix = 'aarch64-w64-mingw32'
+    $ccArchPattern = 'aarch64'
 } else {
     $goarch = 'amd64'
     $wixArch = 'x64'
     $peMachine = $PeMachineX64
     $exePath = Join-Path $BinDir 'lgdm-x64.exe'
-    $mingwClangName = 'x86_64-w64-mingw32-clang.exe'
+    $mingwPrefix = 'x86_64-w64-mingw32'
+    $ccArchPattern = 'x86_64|amd64'
 }
 
 # 读 PE 头的 Machine 字段。防的是「-SkipBuild 复用了另一个架构的 bin 文件」——
@@ -292,31 +295,79 @@ function Find-PrefixedMingwCC([string[]]$Names) {
     return $null
 }
 
-# 解析宿主 C 编译器。返回绝对路径,或 $null 表示交给 Go 用自己的默认 CC。
-# 这里找的都是「宿主架构」的编译器(含 LLVM-MinGW 的宿主 triplet),不涉及交叉。
+# 编译器声称的目标三元组(gcc 与 clang 都支持 -dumpmachine),取不到返回 $null。
+function Get-CCTriple([string]$CCPath) {
+    try {
+        $out = & $CCPath -dumpmachine 2>$null
+        if ($LASTEXITCODE -ne 0) { return $null }
+        $first = ($out | Select-Object -First 1)
+        if (-not $first) { return $null }
+        return ([string]$first).Trim()
+    } catch {
+        return $null
+    }
+}
+
+# 这个编译器编出来的东西是不是目标架构的。
+#
+# 必须查,不能只看有没有 gcc.exe:GitHub 的 windows-11-arm 镜像 PATH 上带着
+# x64 的 mingw gcc,拿它配 GOARCH=arm64 会在汇编 runtime/cgo 的 gcc_arm64.S
+# 时炸(下面这些错误就是 x86 汇编器看到 AArch64 指令):
+#   gcc_arm64.S:30: Error: no such instruction: `stp x29,x30,[sp,'
+#   gcc_arm64.S:56: Error: no such instruction: `blr x20'
+# 名字带目标三元组的(-CC 或 aarch64-w64-mingw32-clang.exe)按名字判断就已经
+# 确定;不带前缀的必须问编译器自己。
+function Test-CCMatchesArch([string]$CCPath, [string]$Name) {
+    $triple = Get-CCTriple $CCPath
+    if ($triple) { return ($triple -match $ccArchPattern) }
+    # -dumpmachine 跑不起来:只有文件名自带正确三元组时才认。
+    return ($Name -match [regex]::Escape($mingwPrefix))
+}
+
+# 解析宿主 C 编译器,返回绝对路径。这里找的都是**宿主架构**的编译器
+# (含 LLVM-MinGW 的宿主 triplet)—— 本脚本不做交叉编译,拿错目标的编译器不会
+# 报「架构不对」,而是先在 cgo 的汇编写死,所以每个候选都要验目标。
 function Resolve-CC {
     if ($CC) {
         if (-not (Test-Path -LiteralPath $CC)) { throw "指向的 C 编译器不存在: $CC" }
-        return (Resolve-Path -LiteralPath $CC).Path
+        $resolved = (Resolve-Path -LiteralPath $CC).Path
+        if (-not (Test-CCMatchesArch $resolved (Split-Path -Leaf $resolved))) {
+            throw ("-CC 指向的编译器不是 ${slug} 目标: {0}(-dumpmachine: {1});期望 {2}" -f `
+                $resolved, (Get-CCTriple $resolved), $ccArchPattern)
+        }
+        return $resolved
     }
 
-    foreach ($name in @('gcc.exe', 'clang.exe', $mingwClangName)) {
+    # 名字带三元组的优先:它们的目标由名字确定,不依赖 PATH 上碰巧是什么。
+    $prefixed = @("$mingwPrefix-clang.exe", "$mingwPrefix-gcc.exe")
+    $plain = @('gcc.exe', 'clang.exe')
+
+    foreach ($name in ($prefixed + $plain)) {
         $cmd = Get-Command $name -ErrorAction SilentlyContinue
-        if ($cmd) { return $cmd.Source }
+        if (-not $cmd) { continue }
+        if (Test-CCMatchesArch $cmd.Source $name) { return $cmd.Source }
+        Write-Note ("跳过 {0}:目标不是 {1}(-dumpmachine: {2})" -f `
+            $name, $slug, (Get-CCTriple $cmd.Source))
     }
-    $found = Find-PrefixedMingwCC @($mingwClangName, 'clang.exe')
-    if ($found) { return $found }
 
-    # 宿主 x64 上 Go 的默认 CC 就是 gcc;没有就走 winget 装 LLVM-MinGW。
+    $found = Find-PrefixedMingwCC $prefixed
+    if ($found -and (Test-CCMatchesArch $found (Split-Path -Leaf $found))) { return $found }
+
+    # PATH 上没有能用的宿主编译器,就用 winget 装 LLVM-MinGW:它四架构都发,
+    # arm64 机器上装到的是 aarch64 那份,自带 aarch64-w64-mingw32-clang.exe。
     Write-Step "安装 C 工具链(LLVM-MinGW:$MingwWingetId)"
     Install-WingetPackage $MingwWingetId $null
-    $found = Find-PrefixedMingwCC @($mingwClangName, 'clang.exe')
-    if ($found) { return $found }
+    $found = Find-PrefixedMingwCC $prefixed
+    if ($found -and (Test-CCMatchesArch $found (Split-Path -Leaf $found))) { return $found }
 
     throw @"
-找不到 ${slug} 的 C 编译器(Fyne 的 GL 绑定是 cgo,没有 C 工具链编不过)。
+找不到 ${slug} 目标的 C 编译器(Fyne 的 GL 绑定是 cgo,没有 C 工具链编不过;
+      装了目标不符的编译器更糟 —— 会在汇编 gcc_${goarch}.S 时才失败)。
+请装 LLVM-MinGW(同时含 x86_64 与 aarch64):
+
     winget install --id $MingwWingetId --exact --silent
-或用 -CC 指向已有编译器。
+
+或用 -CC 指向已有的 ${slug} 编译器。
 "@
 }
 
