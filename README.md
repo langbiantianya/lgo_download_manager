@@ -85,36 +85,43 @@ pwsh -File scripts\package.ps1          # x64 + arm64 各一份 MSI 与 EXE
 | Windows 10/11（x64 打包机） | 脚本是 PowerShell，Windows PowerShell 5.1 与 PowerShell 7+ 都可用 |
 | Go | 版本见 `go.mod` |
 | C 工具链 | Fyne 在 Windows 上是 CGO + GLFW/OpenGL，必须有一个 **gcc 风格命令行** 的 C 编译器（GCC 或 clang），见「C 工具链与架构」 |
-| 打包工具 | WiX CLI（MSI）、Inno Setup 6（EXE）；缺失时脚本用 winget 自动安装 |
+| 打包工具 | WiX CLI（MSI）、Inno Setup 6（EXE）；缺失时脚本自动获取 |
 
-脚本会自动安装的 winget 包：
+脚本自动获取的工具（**不依赖 winget**）：
 
-| 工具 | winget 包 | 用途 |
+| 工具 | 来源 | 用途 |
 | --- | --- | --- |
-| WiX Toolset CLI | `WiXToolset.WiXCLI`（脚本选「主版本 ≤ 6 的最高版本」） | 编译 `installer/lgdm.wxs` → MSI |
-| Inno Setup 6 | `JRSoftware.InnoSetup` | 编译 `installer/installer.iss` → EXE |
-| LLVM-MinGW (UCRT) | `MartinStorsjo.LLVM-MinGW.UCRT` | arm64 的 C 交叉工具链（同时含 x64 target） |
+| WiX Toolset CLI | 官方 MSI `wix-cli-x64.msi`（锁 v6.0.2），用 `msiexec /a` 解到 `<repo>\.tools\wix`，校验 SHA256 | 编译 `installer/lgdm.wxs` → MSI |
+| LLVM-MinGW (UCRT) | 官方 release zip（`llvm-mingw-<release>-ucrt-<aarch64\|x86_64>.zip`），解到 `<repo>\.tools`，校验 SHA256 | 宿主缺可用的 GCC/clang 时的 C 工具链 |
+| Inno Setup 6 | 已装则直接用；开发机上缺了才用 winget 装 | 编译 `installer/installer.iss` → EXE |
 
-`-SkipToolInstall` 关闭自动安装；`-WixPath` / `-IsccPath` / `-CCX64` / `-CCArm64`
-可以指向已有的安装。
+`-SkipToolInstall` 关闭自动获取；`-WixPath` / `-IsccPath` / `-CC` 可以指向已有的安装。
 
-这三个包的 winget 清单里**只有部分架构的安装包**，脚本因此在安装时显式指定架构
-（否则 arm64 机器上要靠 winget 的架构回退，容易直接报「找不到适用的安装程序」）：
+**为什么不用 winget 取工具**：
 
-| 包 | 清单里有的架构 | 脚本传入 |
-| --- | --- | --- |
-| `WiXToolset.WiXCLI` | 只有 **x64**（`wix-cli-x64.msi`；v6.0.2 与 v7.0.0 的 release 资产都没有 arm64） | `--architecture x64` |
-| `JRSoftware.InnoSetup` | 只有 **x86**（`innosetup-<版本>.exe`，机器级/用户级两条都是 x86） | `--architecture x86` |
-| `MartinStorsjo.LLVM-MinGW.UCRT` | x86 / x64 / arm / **arm64** 全有 | 不指定（按宿主架构自动选） |
+1. CI 的 `windows-11-arm` 镜像**根本没带 winget**（实测 `Get-Command winget.exe` 拿不到），
+   而同一个镜像预装了 Inno Setup 6.7.1，所以只有 WiX 与 C 工具链要现取。
+2. winget 清单里的版本号与上游发布标签**不总是一致**：WiX 在清单里是四段
+   （`6.0.2.0`），发布标签是三段（`v6.0.2`），按清单号写死会报
+   `No version found matching: 6.0.2`。
+   改为固定 URL 取上游发布物后，版本号只有一处来源（发布标签），不会再对不上。
 
-wix.exe / ISCC.exe 跑在模拟层不影响产物架构：MSI 的目标架构由 `wix build -arch`
-决定、安装包的架构由 `installer.iss` 的架构标识决定，都与这两个工具自身的架构无关。
+下载物都校验 SHA256 后才使用（哈希取自 winget 清单，与它指向的是同一个 release）。
+
+**架构注意**：WiX 的 MSI 只有 x64（上游 v6/v7 都只发 `wix-cli-x64.msi`），
+arm64 上它跑在 x64 模拟层 —— 这不影响产物：MSI 的目标架构由 `wix build -arch`
+决定，与 `wix.exe` 自身架构无关。同理 ISCC.exe 的架构也不影响 `installer.iss`
+里声明的包架构。
+
+LLVM-MinGW 的 zip 按宿主架构取（aarch64 那份约 181 MB），解出来的工具名自带
+三元组（`aarch64-w64-mingw32-clang.exe`），不会像 PATH 上碰巧存在的 x64
+`gcc.exe` 那样用错目标。
 
 ### 准备编译环境（winget / scoop）
 
 编译只要有 Go、Git 和一个 gcc 风格的 C 编译器；打包工具（WiX / Inno Setup）
-交给 `scripts/package.ps1` 自动装即可。两条路任选一条，包名与版本按本机的
-winget / scoop 清单核对过（WiX、Inno Setup、LLVM-MinGW 是本机用 winget 装出来跑通的）。
+交给 `scripts/package.ps1` 自动获取即可（WiX 按固定 URL 取官方 MSI，
+Inno Setup 走 winget），不必手工预置。
 
 **winget**（Windows 10 1809+ 一般自带 App Installer）
 
@@ -123,10 +130,9 @@ winget install --id GoLang.Go --exact --silent                       # Go 1.27
 winget install --id Git.Git --exact --silent                         # Git(版本号注入用)
 winget install --id MartinStorsjo.LLVM-MinGW.UCRT --exact --silent   # clang + mingw-w64 sysroot:x64 与 arm64 都能编
 
-# 打包工具(脚本会按需自动装,CI 预置时可以显式执行)
-# WiX 版本号在 winget 清单里是**四段**(6.0.2.0),不是发布标签的三段(v6.0.2):
-# 写 --version 6.0.2 会报 "No version found matching"。也别不指定版本,最新是 v7,
-# 其二进制发布物要求在遵守 OSMF EULA 的前提下使用。脚本会自己查可用的最高 v6。
+# 打包工具:脚本会按需自动获取,这里只是显式预置的写法。
+# WiX 也可以完全不用 winget:scripts/package_native.ps1 直接取官方 MSI(锁 v6.0.2),
+# 见「Windows 打包」的「脚本自动获取的工具」。
 winget install --id WiXToolset.WiXCLI --version 6.0.2.0 --exact --silent --architecture x64
 winget install --id JRSoftware.InnoSetup --exact --silent
 ```
@@ -141,8 +147,8 @@ scoop install gcc         # GCC 15.2 + binutils,target = x86_64-w64-mingw32,够 
 scoop 侧的边界（都实测过）：
 
 - `mingw`（niXman mingw-builds）也只有 x86_64 / i686，**没有 aarch64 target**；
-  arm64 要的 aarch64 sysroot 只有 LLVM-MinGW 带 —— 出 arm64 包时用上面的
-  winget 命令装它。
+  arm64 要的 aarch64 工具链只有 LLVM-MinGW 带 —— 用上面的 winget 命令装它，
+  或让脚本自己下官方 zip（`scripts/package_native.ps1` 就是这么做的）。
 - 打包工具别走 scoop：main bucket 里的 `wixtoolset` 是 **v7.0.0**（要求接受
   OSMF EULA，本项目的脚本会明确拒绝），Inno Setup 也不在 main bucket。
 
@@ -278,7 +284,9 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 | 现象 | 原因 / 处理 |
 | --- | --- |
 | `error WIX7015: You must accept the Open Source Maintenance Fee (OSMF) EULA` | PATH 上的 `wix.exe` 是 v7；`winget install --id WiXToolset.WiXCLI --version 6.0.2.0 --exact --silent --architecture x64` 或 `-WixPath` 指向 v6 |
-| `No version found matching: 6.0.2` | WiX 在 winget 清单里的版本号是四段（`6.0.2.0`），发布标签才是三段（`v6.0.2`）；写三段永远匹配不到。脚本现在按「主版本 ≤ 6 的最高版本」自动查，不再写死补丁号 |
+| `No version found matching: 6.0.2` | WiX 在 winget 清单里的版本号是四段（`6.0.2.0`），发布标签才是三段（`v6.0.2`）；写三段永远匹配不到。`scripts/package_native.ps1` 已改为按固定 URL 取官方 MSI，不再碰 winget；`scripts/package.ps1` 仍走 winget，它会自己查「主版本 ≤ 6 的最高版本」 |
+| `缺少 Win...且系统里没有 winget` / `Get-Command winget.exe` 拿不到 | `windows-11-arm` 的 runner 镜像不带 winget。`scripts/package_native.ps1` 取 WiX 与 LLVM-MinGW 已不依赖 winget；Inno Setup 在该镜像里是预装的。若手工指定了 `-SkipToolInstall`，用 `-WixPath` / `-IsccPath` / `-CC` 指路径 |
+| 下载校验失败 `下载校验失败: <url> 期望 SHA256 ...` | 上游 release 资产被替换或 URL 指错。哈希取自 winget 清单，正常情况下与上游一致；确认 URL 后用实际哈希更新脚本里的常量 |
 | `error WIX0103: Cannot find the File file ...\bin\lgdm-<arch>.exe` | 该架构的二进制还没编（`-SkipBuild` 时最容易遇到）；去掉 `-SkipBuild` 或先编译 |
 | 安装报 `1633 这个处理器类型不支持该安装程序包` | 装了架构不符的包（如把 arm64 包往 x64 上装）；换对应架构的产物 |
 | `build constraints exclude all Go files ... go-gl/gl/v3.1/gles2` | cgo 被关掉了（交叉编译时的默认行为）；用脚本编译或手工设 `CGO_ENABLED=1` |
@@ -452,6 +460,21 @@ CI 用 `sudo flatpak remote-add` / `sudo flatpak install` 把 runtime 与 SDK �
 
 `flathub` 远程用 `dl.flathub.org` 的**未过滤** URL：发行版自带的可能是过滤过的
 （Fedora 就是），拿不到 arm64 的 ref。
+
+### Windows arm64 job 的镜像没有 winget
+
+`windows-11-arm` 的镜像**不带 winget**（`Get-Command winget.exe` 拿不到），
+`windows-latest` 带。因此 `scripts/package_native.ps1` 取工具**不依赖 winget**：
+WiX 与 LLVM-MinGW 都按固定 URL 下上游发布物（校验 SHA256），只有 Inno Setup
+仍然走 winget（两个镜像都预装了它，CI 里根本不会走到那一步）。
+
+镜像里现成的（据 actions/runner-images 的 `Windows11-Arm64-Readme.md`）：
+Inno Setup 6.7.1、LLVM 22.1.8、MSYS2、.NET SDK 6–10、Chocolatey 2.7.4。
+注意其中那个 LLVM 是 **MSVC 目标的 clang**（`aarch64-pc-windows-msvc`），
+脚本会跳过它并改用 LLVM-MinGW —— MSVC ABI 拿不到 mingw 的头/库，也不认
+`-l`/`-L`。
+
+代价：arm64 job 每次要下约 181 MB 的 LLVM-MinGW zip（没有做 CI 缓存）。
 
 ### 已验证 / 已知限制
 

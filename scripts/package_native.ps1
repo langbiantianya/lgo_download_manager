@@ -18,12 +18,17 @@
       - 架构仍然显式传入并在运行时校验:runner 被贴错标签(或本地想在 x64 上
         执行 -Arch arm64)会立刻报错,而不是安静地出一个跑不起来的包。
 
-    依赖(缺失时用 winget 安装,-SkipToolInstall 可关闭):
-      - MSI: WiX Toolset CLI 6.x(v7 起要求接受 OSMF EULA,本项目不引入)
-      - EXE: Inno Setup 6
+    依赖(缺失时自动获取,-SkipToolInstall 可关闭):
+      - MSI: WiX Toolset CLI 6.x —— 按固定 URL 取官方 MSI 并用管理安装解出
+        wix.exe(v7 起二进制发布物要求在遵守 OSMF EULA 的前提下使用,本项目不引入)。
+      - EXE: Inno Setup 6 —— CI 的 windows-latest / windows-11-arm 镜像都预装了,
+        开发机上缺了才用 winget 装。
       - C 编译器:cgo 需要 gcc 风格命令行(GCC 或 clang;**MSVC 的 cl.exe 不可用**,
-        Go 从未支持 MSVC)。宿主缺 GCC 时脚本会装 LLVM-MinGW,它自带的
-        <triplet>-clang 在**同架构**宿主上跑就是原生编译,不是交叉编译。
+        Go 从未支持 MSVC)。宿主缺可用的 GCC/clang 时脚本会取 LLVM-MinGW 的
+        官方 release zip(aarch64 / x86_64 两份),它自带的 <triplet>-clang 在
+        **同架构**宿主上跑就是原生编译,不是交叉编译。
+      获取工具**不依赖 winget**:CI 的 windows-11-arm 镜像没有 winget,而且
+      winget 清单里的版本号与上游发布标签并不总是一致。
 
 .PARAMETER Arch
     目标架构,必须与当前宿主架构一致:x64 / arm64(也接受 amd64 / aarch64)。
@@ -45,7 +50,7 @@
     跳过 go build,直接使用已有的 bin\lgdm-<arch>.exe(仍校验 PE 架构)。
 
 .PARAMETER SkipToolInstall
-    工具缺失时直接报错,不尝试 winget 安装。
+    工具缺失时直接报错,不尝试自动获取(下载 / winget)。
 
 .PARAMETER WixPath
     显式指定 wix.exe。
@@ -95,13 +100,30 @@ $IssPath = Join-Path $RepoRoot 'installer\installer.iss'
 # 不带 OSMF EULA 的最后一个 WiX 大版本;v7 起二进制发布物要求在遵守 OSMF EULA
 # 的前提下使用(见 wixtoolset/wix v7.0.0 release notes),本项目不引入该依赖。
 $MaxFreeWixMajor = 6
-$WixWingetId = 'WiXToolset.WiXCLI'
-# winget 清单里的版本号是**四段**(6.0.2.0),不是 WiX 自己发布标签里的三段
-# (v6.0.2);写三段会得到 "No version found matching: 6.0.2"。
-# 这里只作为查不到可用版本时的兜底,正常路径见 Get-WixWingetVersion。
-$WixWingetFallbackVersion = '6.0.2.0'
+
+# 工具获取**不依赖 winget**。两个原因:
+#   1. CI 的 windows-11-arm 镜像根本没带 winget(实测 Get-Command winget.exe 找不到);
+#   2. winget 清单里的版本号与上游发布标签不总是一致 —— WiX 在清单里是四段
+#      (6.0.2.0),发布标签是三段(v6.0.2),写错就报 "No version found matching"。
+# 所以按固定 URL 取上游发布物并校验 SHA256(哈希取自 winget 清单,与它指向的是
+# 同一个 release)。找不到本地安装时才下载。
+#
+# WiX CLI MSI 只有 x64(上游 v6/v7 都只发 wix-cli-x64.msi);arm64 上走 x64 模拟层,
+# 不影响产物 —— MSI 的目标架构由 `wix build -arch` 决定,与 wix.exe 自身架构无关。
+$WixCliVersion = '6.0.2'
+$WixCliMsiUrl = "https://github.com/wixtoolset/wix/releases/download/v$WixCliVersion/wix-cli-x64.msi"
+$WixCliMsiSha256 = 'A8A5CC7443353CEF3AB900C60CD7A3A5EE601746319D104AC7B12AD0CED2345C'
+
+# LLVM-MinGW:release 标签 + 各架构 zip 的哈希。zip 内目录名与工具名都带
+# 架构三元组(aarch64-w64-mingw32-clang.exe),不会拿错目标。
+$LlmMingwRelease = '20260616'
+$LlmMingwSha256 = @{
+    aarch64 = '312593669435BD0BFC1A43AC3FBA23C8B27E0610BADE88B2738E5A01702A99BA'
+    x86_64  = 'B9B68A4D276E16FA25802AABA458E4638F64B3884C290AACCDC2D87083B6CA35'
+}
+
+# Inno Setup 只在开发机上需要装(CI 的两个 Windows 镜像都预装了 6.7.1)。
 $InnoWingetId = 'JRSoftware.InnoSetup'
-$MingwWingetId = 'MartinStorsjo.LLVM-MinGW.UCRT'
 
 $PeMachineX64 = 0x8664
 $PeMachineArm64 = 0xAA64
@@ -216,21 +238,104 @@ function Assert-PEMachine {
 # C 工具链:cgo 需要 gcc 风格命令行(GCC 或 clang;MSVC 的 cl.exe 不可用)
 # ---------------------------------------------------------------------------
 
+# 下载 + SHA256 校验。PS 5.1 的默认安全协议可能是 TLS 1.0,GitHub 只收 TLS 1.2+。
+function Get-RemoteFile([string]$Url, [string]$OutFile, [string]$Sha256) {
+    try {
+        [Net.ServicePointManager]::SecurityProtocol =
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { }
+
+    Write-Note "下载 $Url"
+    $wc = New-Object System.Net.WebClient
+    try { $wc.DownloadFile($Url, $OutFile) } finally { $wc.Dispose() }
+
+    if ($Sha256) {
+        $actual = (Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash
+        if ($actual -ne $Sha256.ToUpperInvariant()) {
+            Remove-Item -LiteralPath $OutFile -Force -ErrorAction SilentlyContinue
+            throw "下载校验失败: $Url`n  期望 SHA256 $Sha256`n  实际 SHA256 $actual"
+        }
+    }
+}
+
+# 取 WiX CLI,返回 wix.exe 的路径,失败返回 $null。
+#
+# 固定版本的官方 MSI + 管理安装(msiexec /a)把文件摊到 <repo>\.tools\wix:
+# 不写系统状态、不碰 PATH、不需要 winget。MSI 内部的目录层级不写死,
+# 摊完直接递归找 wix.exe。
+function Install-WixCli {
+    if ($SkipToolInstall) { throw "缺少 WiX CLI,且指定了 -SkipToolInstall。" }
+
+    $dest = Join-Path $RepoRoot '.tools\wix'
+    if (Test-Path -LiteralPath $dest) {
+        $cached = Get-ChildItem -LiteralPath $dest -Recurse -Filter 'wix.exe' -File -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+        if ($cached) { return $cached.FullName }
+    }
+
+    New-Item -ItemType Directory -Path $dest -Force | Out-Null
+    $msi = Join-Path $dest 'wix-cli-x64.msi'
+    Get-RemoteFile $WixCliMsiUrl $msi $WixCliMsiSha256
+
+    # /a = 管理安装:只把文件摊到 TARGETDIR,不装进系统(也不需要额外权限)。
+    # msiexec 会把活交给子进程,必须 -Wait 等它跑完。
+    $cmdline = '/a "{0}" /qn TARGETDIR="{1}"' -f $msi, $dest
+    Write-Note "msiexec $cmdline"
+    $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $cmdline -Wait -PassThru
+    if ($proc.ExitCode -ne 0) {
+        throw ("msiexec 解包 WiX CLI 失败,退出码 {0};来源 {1}" -f $proc.ExitCode, $WixCliMsiUrl)
+    }
+    Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
+
+    $exe = Get-ChildItem -LiteralPath $dest -Recurse -Filter 'wix.exe' -File -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $exe) { return $null }
+    return $exe.FullName
+}
+
+# 取宿主架构的 LLVM-MinGW,返回可用的编译器路径,失败返回 $null。
+#
+# 直接下官方 release zip(与 winget 清单指向同一个 release)解到 <repo>\.tools。
+# 不必担心选错目标:zip 内目录名与工具名都带架构三元组。
+function Install-LlmMingw([string[]]$Names) {
+    if ($SkipToolInstall) { return $null }
+
+    $distroArch = ($mingwPrefix -split '-')[0]          # aarch64 / x86_64
+    $dest = Join-Path $RepoRoot '.tools'
+    $root = Join-Path $dest "llvm-mingw-$LlmMingwRelease-ucrt-$distroArch"
+
+    if (-not (Test-Path -LiteralPath $root)) {
+        New-Item -ItemType Directory -Path $dest -Force | Out-Null
+        $zip = Join-Path $dest "llvm-mingw-$LlmMingwRelease-ucrt-$distroArch.zip"
+        $url = "https://github.com/mstorsjo/llvm-mingw/releases/download/$LlmMingwRelease/llvm-mingw-$LlmMingwRelease-ucrt-$distroArch.zip"
+        Get-RemoteFile $url $zip $LlmMingwSha256[$distroArch]
+        Expand-Archive -LiteralPath $zip -DestinationPath $dest -Force
+        Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue
+    }
+
+    foreach ($name in $Names) {
+        $candidate = Join-Path $root "bin\$name"
+        if ((Test-Path -LiteralPath $candidate) -and (Test-CCMatchesArch $candidate $name)) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+# 只在 Inno Setup 上用到 winget:CI 的两个 Windows 镜像都预装了它(6.7.1),
+# Find-Iscc 直接命中,这条路径只在开发机上跑到。
 function Install-WingetPackage([string]$Id, [string]$RequiredVersion, [string]$Architecture) {
     if ($SkipToolInstall) {
-        throw "缺少 $Id,且指定了 -SkipToolInstall(不会尝试 winget 安装)。"
+        throw "缺少 $Id,且指定了 -SkipToolInstall(不会尝试安装)。"
     }
     $wg = Get-Command 'winget.exe' -ErrorAction SilentlyContinue
     if (-not $wg) {
-        throw "缺少 $Id,且系统里没有 winget;请手动安装后重试。"
+        throw "缺少 $Id,系统里也没有 winget(CI 的 windows-11-arm 镜像就没带 winget)。
+      请手动安装,或用显式路径参数指给脚本(-IsccPath / -WixPath / -CC)。"
     }
     $wingetArgs = @('install', '--id', $Id, '--exact', '--silent',
         '--accept-package-agreements', '--accept-source-agreements')
     if ($RequiredVersion) { $wingetArgs += @('--version', $RequiredVersion) }
-    # WiX CLI 的 winget 清单只有 x64 安装包(v6.0.2 与 v7.0.0 的 release 资产
-    # 都只有 wix-cli-x64.msi)。arm64 机器上不显式指定架构,winget 会找不到
-    # 匹配本机的安装包而失败。wix.exe 走 x64 模拟层不影响产物架构 ——
-    # MSI 的目标架构由 `wix build -arch` 决定,与 wix.exe 自身的架构无关。
     if ($Architecture) { $wingetArgs += @('--architecture', $Architecture) }
     Write-Note ("winget {0}" -f ($wingetArgs -join ' '))
     & $wg.Source @wingetArgs | Out-Host
@@ -239,40 +344,6 @@ function Install-WingetPackage([string]$Id, [string]$RequiredVersion, [string]$A
         # 会重新查找,找不到才报错。
         Write-Warning ("winget 安装 {0} 返回 {1};继续查找已安装的工具。" -f $Id, $LASTEXITCODE)
     }
-}
-
-# 要装的 WiX CLI winget 版本:主版本 <= $MaxFreeWixMajor 的最高版本。
-#
-# 为什么不写死:winget 清单里的版本号是四段(6.0.2.0 / 6.0.1.0),而 WiX 发布
-# 标签是三段(v6.0.2),写死三段会得到 "No version found matching"(CI 实测踩到)。
-# 为什么不用最新:最新是 7.0.0.0,它的二进制发布物要求在遵守 OSMF EULA 的前提下
-# 使用。限制的是**主版本**,所以这里按主版本筛,而不是钉死某个补丁号。
-# 查询失败(无 winget / 源不可用)时退回 $WixWingetFallbackVersion。
-function Get-WixWingetVersion {
-    if ($SkipToolInstall) { return $WixWingetFallbackVersion }
-
-    $wg = Get-Command 'winget.exe' -ErrorAction SilentlyContinue
-    if (-not $wg) { return $WixWingetFallbackVersion }
-
-    $out = @()
-    try {
-        $out = & $wg.Source @('show', '--id', $WixWingetId, '--exact',
-            '--accept-source-agreements', '--versions') 2>$null
-        if ($LASTEXITCODE -ne 0) { return $WixWingetFallbackVersion }
-    } catch {
-        return $WixWingetFallbackVersion
-    }
-
-    $versions = @()
-    foreach ($line in $out) {
-        # 只认纯版本号行,跳过 "Found WiX CLI [...]" / "Version" / "-----" 等噪声。
-        $t = ([string]$line).Trim()
-        if ($t -match '^(\d+)(\.\d+)*$' -and [int]$Matches[1] -le $MaxFreeWixMajor) {
-            try { $versions += [version]$t } catch { }
-        }
-    }
-    if ($versions.Count -eq 0) { return $WixWingetFallbackVersion }
-    return (($versions | Sort-Object -Descending | Select-Object -First 1).ToString())
 }
 
 # winget 的 LLVM-MinGW 解到 %LOCALAPPDATA%\Microsoft\WinGet\Packages\ 下,
@@ -369,21 +440,18 @@ function Resolve-CC {
     $found = Find-PrefixedMingwCC $prefixed
     if ($found -and (Test-CCMatchesArch $found (Split-Path -Leaf $found))) { return $found }
 
-    # PATH 上没有能用的宿主编译器,就用 winget 装 LLVM-MinGW:它四架构都发,
-    # arm64 机器上装到的是 aarch64 那份,自带 aarch64-w64-mingw32-clang.exe。
-    Write-Step "安装 C 工具链(LLVM-MinGW:$MingwWingetId)"
-    Install-WingetPackage $MingwWingetId $null
-    $found = Find-PrefixedMingwCC $prefixed
-    if ($found -and (Test-CCMatchesArch $found (Split-Path -Leaf $found))) { return $found }
+    # PATH 上没有能用的宿主编译器:下 LLVM-MinGW 的官方 release zip
+    # (不依赖 winget —— CI 的 windows-11-arm 镜像没有 winget)。
+    Write-Step "获取 C 工具链(LLVM-MinGW $LlmMingwRelease,$mingwPrefix)"
+    $found = Install-LlmMingw $prefixed
+    if ($found) { return $found }
 
     throw @"
 找不到 ${slug} 目标的 C 编译器(Fyne 的 GL 绑定是 cgo,没有 C 工具链编不过;
       装了目标不符的编译器更糟 —— 会在汇编 gcc_${goarch}.S 时才失败)。
-请装 LLVM-MinGW(同时含 x86_64 与 aarch64):
+可以用 -CC 指向已有的 ${slug} 编译器,或手动装 LLVM-MinGW(同时含 x86_64 与 aarch64):
 
-    winget install --id $MingwWingetId --exact --silent
-
-或用 -CC 指向已有的 ${slug} 编译器。
+    https://github.com/mstorsjo/llvm-mingw/releases
 "@
 }
 
@@ -547,20 +615,20 @@ function Find-Iscc {
 function New-MsiPackage([string]$BuildVersion, [string]$NumericVersion) {
     $wix = Find-Wix
     if (-not $wix) {
-        $wixVersion = Get-WixWingetVersion
-        Write-Step "安装 WiX Toolset CLI($WixWingetId $wixVersion)"
-        Install-WingetPackage $WixWingetId $wixVersion 'x64'
-        $wix = Find-Wix
+        Write-Step "获取 WiX Toolset CLI v$WixCliVersion"
+        $wixExe = Install-WixCli
+        if ($wixExe) { $wix = @{ Path = $wixExe; Major = 0 } }
     }
     if (-not $wix) {
-        throw "找不到 wix.exe。请安装 WiX Toolset CLI($WixWingetId)或用 -WixPath 指定。"
+        throw "找不到 wix.exe,也没能装上 WiX CLI v$WixCliVersion($WixCliMsiUrl)。请用 -WixPath 指定。"
     }
     if ($wix.Major -gt $MaxFreeWixMajor) {
         throw @"
 wix.exe 是 v$($wix.Major)($($wix.Path)),它的二进制发布物要求在遵守 OSMF EULA 的前提下
-使用,本项目不引入该依赖。请改用 WiX v$MaxFreeWixMajor 及以下:
+使用,本项目不引入该依赖。请改用 WiX v$MaxFreeWixMajor 及以下 —— 删掉那个安装,
+脚本会自动取 v$WixCliVersion:
 
-    winget install --id $WixWingetId --version $WixWingetFallbackVersion --exact --silent --architecture x64
+    $WixCliMsiUrl
 
 或用 -WixPath 指向已有的 v$MaxFreeWixMajor 及以下 wix.exe。
 "@
