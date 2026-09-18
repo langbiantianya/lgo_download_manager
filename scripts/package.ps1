@@ -115,10 +115,14 @@ $IconPath = Join-Path $RepoRoot 'assets\lgdm.ico'
 $WxsPath = Join-Path $RepoRoot 'installer\lgdm.wxs'
 $IssPath = Join-Path $RepoRoot 'installer\installer.iss'
 
-# 不带 OSMF EULA 的最后一个 WiX 大版本;v7 起命令行会直接拒绝运行。
+# 不带 OSMF EULA 的最后一个 WiX 大版本;v7 起二进制发布物要求在遵守 OSMF EULA
+# 的前提下使用(见 wixtoolset/wix v7.0.0 release notes),本项目不引入该依赖。
 $MaxFreeWixMajor = 6
 $WixWingetId = 'WiXToolset.WiXCLI'
-$WixWingetVersion = '6.0.2'
+# winget 清单里的版本号是**四段**(6.0.2.0),不是 WiX 自己发布标签里的三段
+# (v6.0.2);写三段会得到 "No version found matching: 6.0.2"。
+# 这里只作为查不到可用版本时的兜底,正常路径见 Get-WixWingetVersion。
+$WixWingetFallbackVersion = '6.0.2.0'
 $InnoWingetId = 'JRSoftware.InnoSetup'
 # clang + mingw-w64 sysroot,同时提供 x86_64 与 aarch64 target。
 $MingwWingetId = 'MartinStorsjo.LLVM-MinGW.UCRT'
@@ -460,7 +464,7 @@ function Find-Iscc {
     return $null
 }
 
-function Install-WingetPackage([string]$Id, [string]$RequiredVersion) {
+function Install-WingetPackage([string]$Id, [string]$RequiredVersion, [string]$Architecture) {
     if ($SkipToolInstall) {
         throw "缺少 $Id,且指定了 -SkipToolInstall(不会尝试 winget 安装)。"
     }
@@ -472,6 +476,11 @@ function Install-WingetPackage([string]$Id, [string]$RequiredVersion) {
     $wingetArgs = @('install', '--id', $Id, '--exact', '--silent',
         '--accept-package-agreements', '--accept-source-agreements')
     if ($RequiredVersion) { $wingetArgs += @('--version', $RequiredVersion) }
+    # WiX CLI 的 winget 清单只有 x64 安装包(v6.0.2 与 v7.0.0 的 release 资产
+    # 都只有 wix-cli-x64.msi)。arm64 机器上不显式指定架构,winget 会找不到
+    # 匹配本机的安装包而失败。wix.exe 走 x64 模拟层不影响产物架构 ——
+    # MSI 的目标架构由 `wix build -arch` 决定,与 wix.exe 自身的架构无关。
+    if ($Architecture) { $wingetArgs += @('--architecture', $Architecture) }
     Write-Note ("winget {0}" -f ($wingetArgs -join ' '))
     & $wg.Source @wingetArgs | Out-Host
     if ($LASTEXITCODE -ne 0) {
@@ -479,6 +488,40 @@ function Install-WingetPackage([string]$Id, [string]$RequiredVersion) {
         # 这不代表工具不可用:调用方随后会重新查找,找不到才报错。
         Write-Warning ("winget 安装 {0} 返回 {1};继续查找已安装的工具。" -f $Id, $LASTEXITCODE)
     }
+}
+
+# 要装的 WiX CLI winget 版本:主版本 <= $MaxFreeWixMajor 的最高版本。
+#
+# 为什么不写死:winget 清单里的版本号是四段(6.0.2.0 / 6.0.1.0),而 WiX 发布
+# 标签是三段(v6.0.2),写死三段会得到 "No version found matching"(CI 实测踩到)。
+# 为什么不用最新:最新是 7.0.0.0,它的二进制发布物要求在遵守 OSMF EULA 的前提下
+# 使用。限制的是**主版本**,所以这里按主版本筛,而不是钉死某个补丁号。
+# 查询失败(无 winget / 源不可用)时退回 $WixWingetFallbackVersion。
+function Get-WixWingetVersion {
+    if ($SkipToolInstall) { return $WixWingetFallbackVersion }
+
+    $wg = Get-Command 'winget.exe' -ErrorAction SilentlyContinue
+    if (-not $wg) { return $WixWingetFallbackVersion }
+
+    $out = @()
+    try {
+        $out = & $wg.Source @('show', '--id', $WixWingetId, '--exact',
+            '--accept-source-agreements', '--versions') 2>$null
+        if ($LASTEXITCODE -ne 0) { return $WixWingetFallbackVersion }
+    } catch {
+        return $WixWingetFallbackVersion
+    }
+
+    $versions = @()
+    foreach ($line in $out) {
+        # 只认纯版本号行,跳过 "Found WiX CLI [...]" / "Version" / "-----" 等噪声。
+        $t = ([string]$line).Trim()
+        if ($t -match '^(\d+)(\.\d+)*$' -and [int]$Matches[1] -le $MaxFreeWixMajor) {
+            try { $versions += [version]$t } catch { }
+        }
+    }
+    if ($versions.Count -eq 0) { return $WixWingetFallbackVersion }
+    return (($versions | Sort-Object -Descending | Select-Object -First 1).ToString())
 }
 
 # ---------------------------------------------------------------------------
@@ -490,8 +533,9 @@ function New-MsiPackage {
 
     $wix = Find-Wix
     if (-not $wix) {
-        Write-Step "安装 WiX Toolset CLI($WixWingetId $WixWingetVersion)"
-        Install-WingetPackage $WixWingetId $WixWingetVersion
+        $wixVersion = Get-WixWingetVersion
+        Write-Step "安装 WiX Toolset CLI($WixWingetId $wixVersion)"
+        Install-WingetPackage $WixWingetId $wixVersion 'x64'
         $wix = Find-Wix
     }
     if (-not $wix) {
@@ -499,10 +543,10 @@ function New-MsiPackage {
     }
     if ($wix.Major -gt $MaxFreeWixMajor) {
         throw @"
-wix.exe 是 v$($wix.Major)($($wix.Path)),它要求接受 OSMF EULA 才能运行,本项目不引入该依赖。
-请改用 WiX v$MaxFreeWixMajor 及以下:
+wix.exe 是 v$($wix.Major)($($wix.Path)),它的二进制发布物要求在遵守 OSMF EULA 的前提下
+使用,本项目不引入该依赖。请改用 WiX v$MaxFreeWixMajor 及以下:
 
-    winget install --id $WixWingetId --version $WixWingetVersion --exact --silent
+    winget install --id $WixWingetId --version $WixWingetFallbackVersion --exact --silent --architecture x64
 
 或用 -WixPath 指向已有的 v$MaxFreeWixMajor 及以下 wix.exe。
 "@
@@ -526,7 +570,9 @@ function New-ExePackage {
     $iscc = Find-Iscc
     if (-not $iscc) {
         Write-Step "安装 Inno Setup($InnoWingetId)"
-        Install-WingetPackage $InnoWingetId $null
+        # Inno Setup 的 winget 清单只有 x86 安装包(innosetup-<版本>.exe,机器级/用户级
+        # 两条都是 x86);显式指定,免得 arm64 机器上依赖 winget 的架构回退。
+        Install-WingetPackage $InnoWingetId $null 'x86'
         $iscc = Find-Iscc
     }
     if (-not $iscc) {

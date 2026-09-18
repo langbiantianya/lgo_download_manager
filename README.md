@@ -91,12 +91,24 @@ pwsh -File scripts\package.ps1          # x64 + arm64 各一份 MSI 与 EXE
 
 | 工具 | winget 包 | 用途 |
 | --- | --- | --- |
-| WiX Toolset CLI | `WiXToolset.WiXCLI`（脚本固定 `6.0.2`） | 编译 `installer/lgdm.wxs` → MSI |
+| WiX Toolset CLI | `WiXToolset.WiXCLI`（脚本选「主版本 ≤ 6 的最高版本」） | 编译 `installer/lgdm.wxs` → MSI |
 | Inno Setup 6 | `JRSoftware.InnoSetup` | 编译 `installer/installer.iss` → EXE |
 | LLVM-MinGW (UCRT) | `MartinStorsjo.LLVM-MinGW.UCRT` | arm64 的 C 交叉工具链（同时含 x64 target） |
 
 `-SkipToolInstall` 关闭自动安装；`-WixPath` / `-IsccPath` / `-CCX64` / `-CCArm64`
 可以指向已有的安装。
+
+这三个包的 winget 清单里**只有部分架构的安装包**，脚本因此在安装时显式指定架构
+（否则 arm64 机器上要靠 winget 的架构回退，容易直接报「找不到适用的安装程序」）：
+
+| 包 | 清单里有的架构 | 脚本传入 |
+| --- | --- | --- |
+| `WiXToolset.WiXCLI` | 只有 **x64**（`wix-cli-x64.msi`；v6.0.2 与 v7.0.0 的 release 资产都没有 arm64） | `--architecture x64` |
+| `JRSoftware.InnoSetup` | 只有 **x86**（`innosetup-<版本>.exe`，机器级/用户级两条都是 x86） | `--architecture x86` |
+| `MartinStorsjo.LLVM-MinGW.UCRT` | x86 / x64 / arm / **arm64** 全有 | 不指定（按宿主架构自动选） |
+
+wix.exe / ISCC.exe 跑在模拟层不影响产物架构：MSI 的目标架构由 `wix build -arch`
+决定、安装包的架构由 `installer.iss` 的架构标识决定，都与这两个工具自身的架构无关。
 
 ### 准备编译环境（winget / scoop）
 
@@ -111,8 +123,11 @@ winget install --id GoLang.Go --exact --silent                       # Go 1.27
 winget install --id Git.Git --exact --silent                         # Git(版本号注入用)
 winget install --id MartinStorsjo.LLVM-MinGW.UCRT --exact --silent   # clang + mingw-w64 sysroot:x64 与 arm64 都能编
 
-# 打包工具(脚本会按需自动装,CI 预置时可以显式执行;WiX 必须锁 6.0.2,不指定会拿到 v7)
-winget install --id WiXToolset.WiXCLI --version 6.0.2 --exact --silent
+# 打包工具(脚本会按需自动装,CI 预置时可以显式执行)
+# WiX 版本号在 winget 清单里是**四段**(6.0.2.0),不是发布标签的三段(v6.0.2):
+# 写 --version 6.0.2 会报 "No version found matching"。也别不指定版本,最新是 v7,
+# 其二进制发布物要求在遵守 OSMF EULA 的前提下使用。脚本会自己查可用的最高 v6。
+winget install --id WiXToolset.WiXCLI --version 6.0.2.0 --exact --silent --architecture x64
 winget install --id JRSoftware.InnoSetup --exact --silent
 ```
 
@@ -262,7 +277,8 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| `error WIX7015: You must accept the Open Source Maintenance Fee (OSMF) EULA` | PATH 上的 `wix.exe` 是 v7；`winget install --id WiXToolset.WiXCLI --version 6.0.2 --exact --silent` 或 `-WixPath` 指向 v6 |
+| `error WIX7015: You must accept the Open Source Maintenance Fee (OSMF) EULA` | PATH 上的 `wix.exe` 是 v7；`winget install --id WiXToolset.WiXCLI --version 6.0.2.0 --exact --silent --architecture x64` 或 `-WixPath` 指向 v6 |
+| `No version found matching: 6.0.2` | WiX 在 winget 清单里的版本号是四段（`6.0.2.0`），发布标签才是三段（`v6.0.2`）；写三段永远匹配不到。脚本现在按「主版本 ≤ 6 的最高版本」自动查，不再写死补丁号 |
 | `error WIX0103: Cannot find the File file ...\bin\lgdm-<arch>.exe` | 该架构的二进制还没编（`-SkipBuild` 时最容易遇到）；去掉 `-SkipBuild` 或先编译 |
 | 安装报 `1633 这个处理器类型不支持该安装程序包` | 装了架构不符的包（如把 arm64 包往 x64 上装）；换对应架构的产物 |
 | `build constraints exclude all Go files ... go-gl/gl/v3.1/gles2` | cgo 被关掉了（交叉编译时的默认行为）；用脚本编译或手工设 `CGO_ENABLED=1` |
