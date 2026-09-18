@@ -91,7 +91,7 @@ pwsh -File scripts\package.ps1          # x64 + arm64 各一份 MSI 与 EXE
 
 | 工具 | 来源 | 用途 |
 | --- | --- | --- |
-| WiX Toolset CLI | 官方 MSI `wix-cli-x64.msi`（锁 v6.0.2），用 `msiexec /a` 解到 `<repo>\.tools\wix`，校验 SHA256 | 编译 `installer/lgdm.wxs` → MSI |
+| WiX Toolset CLI | 官方 .NET 工具包（`dotnet tool install --global wix --version 6.0.2`）→ `%USERPROFILE%\.dotnet\tools\wix.exe` | 编译 `installer/lgdm.wxs` → MSI |
 | LLVM-MinGW (UCRT) | 官方 release zip（`llvm-mingw-<release>-ucrt-<aarch64\|x86_64>.zip`），解到 `<repo>\.tools`，校验 SHA256 | 宿主缺可用的 GCC/clang 时的 C 工具链 |
 | Inno Setup 6 | 已装则直接用；开发机上缺了才用 winget 装 | 编译 `installer/installer.iss` → EXE |
 
@@ -104,18 +104,16 @@ pwsh -File scripts\package.ps1          # x64 + arm64 各一份 MSI 与 EXE
 2. winget 清单里的版本号与上游发布标签**不总是一致**：WiX 在清单里是四段
    （`6.0.2.0`），发布标签是三段（`v6.0.2`），按清单号写死会报
    `No version found matching: 6.0.2`。
-   改为固定 URL 取上游发布物后，版本号只有一处来源（发布标签），不会再对不上。
 
-下载物都校验 SHA256 后才使用（哈希取自 winget 清单，与它指向的是同一个 release）。
+**为什么 WiX 不用官方 MSI**：`wix-cli-x64.msi` 只有 x64，而且
+`msiexec /a`（管理安装解包）在 CI 上直接以 **1603** 失败（x64 与 arm64 两个 job
+都实测过）。NuGet 上的 `wix` 工具包是 **RID 无关**的（`tools/net6.0/any/`，
+已核对包内容），arm64 上原样能跑，版本号还与发布标签一致，所以走 `dotnet tool`。
 
-**架构注意**：WiX 的 MSI 只有 x64（上游 v6/v7 都只发 `wix-cli-x64.msi`），
-arm64 上它跑在 x64 模拟层 —— 这不影响产物：MSI 的目标架构由 `wix build -arch`
-决定，与 `wix.exe` 自身架构无关。同理 ISCC.exe 的架构也不影响 `installer.iss`
-里声明的包架构。
-
-LLVM-MinGW 的 zip 按宿主架构取（aarch64 那份约 181 MB），解出来的工具名自带
-三元组（`aarch64-w64-mingw32-clang.exe`），不会像 PATH 上碰巧存在的 x64
-`gcc.exe` 那样用错目标。
+**架构注意**：C 工具链按宿主架构取 LLVM-MinGW 的 zip（aarch64 那份约 181 MB），
+解出来的工具名自带三元组（`aarch64-w64-mingw32-clang.exe`），不会像 PATH 上
+碰巧存在的 x64 `gcc.exe` 那样用错目标。`wix.exe` 自身的架构不影响产物 ——
+MSI 的目标架构由 `wix build -arch` 决定。
 
 ### 准备编译环境（winget / scoop）
 
@@ -283,9 +281,11 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| `error WIX7015: You must accept the Open Source Maintenance Fee (OSMF) EULA` | PATH 上的 `wix.exe` 是 v7；`winget install --id WiXToolset.WiXCLI --version 6.0.2.0 --exact --silent --architecture x64` 或 `-WixPath` 指向 v6 |
-| `No version found matching: 6.0.2` | WiX 在 winget 清单里的版本号是四段（`6.0.2.0`），发布标签才是三段（`v6.0.2`）；写三段永远匹配不到。`scripts/package_native.ps1` 已改为按固定 URL 取官方 MSI，不再碰 winget；`scripts/package.ps1` 仍走 winget，它会自己查「主版本 ≤ 6 的最高版本」 |
-| `缺少 Win...且系统里没有 winget` / `Get-Command winget.exe` 拿不到 | `windows-11-arm` 的 runner 镜像不带 winget。`scripts/package_native.ps1` 取 WiX 与 LLVM-MinGW 已不依赖 winget；Inno Setup 在该镜像里是预装的。若手工指定了 `-SkipToolInstall`，用 `-WixPath` / `-IsccPath` / `-CC` 指路径 |
+| `error WIX7015: You must accept the Open Source Maintenance Fee (OSMF) EULA` | PATH 上的 `wix.exe` 是 v7；装回 v6：`dotnet tool uninstall --global wix` 然后 `dotnet tool install --global wix --version 6.0.2`，或用 `-WixPath` 指向 v6 |
+| `No version found matching: 6.0.2` | WiX 在 winget 清单里的版本号是四段（`6.0.2.0`），发布标签才是三段（`v6.0.2`）；写三段永远匹配不到。`scripts/package_native.ps1` 已改为走官方 .NET 工具包（版本号与发布标签一致），不再碰 winget；`scripts/package.ps1` 仍走 winget，它会自己查「主版本 ≤ 6 的最高版本」 |
+| `msiexec 解包 WiX CLI 失败,退出码 1603` | `wix-cli-x64.msi` 的管理安装（`msiexec /a`）在 CI 上就是会 1603（x64 与 arm64 都实测过）。改走 `dotnet tool install --global wix --version 6.0.2`（`package_native.ps1` 现在就是这么做的） |
+| `缺少 Win...且系统里没有 winget` / `Get-Command winget.exe` 拿不到 | `windows-11-arm` 的 runner 镜像不带 winget。`scripts/package_native.ps1` 取 WiX（dotnet tool）与 LLVM-MinGW（下 zip）已不依赖 winget；Inno Setup 在该镜像里是预装的。若手工指定了 `-SkipToolInstall`，用 `-WixPath` / `-IsccPath` / `-CC` 指路径 |
+| `找不到 wix.exe,也没有 dotnet` | 装 .NET SDK（<https://dotnet.microsoft.com/download>），或用 `-WixPath` 指向已有的 `wix.exe` |
 | 下载校验失败 `下载校验失败: <url> 期望 SHA256 ...` | 上游 release 资产被替换或 URL 指错。哈希取自 winget 清单，正常情况下与上游一致；确认 URL 后用实际哈希更新脚本里的常量 |
 | `error WIX0103: Cannot find the File file ...\bin\lgdm-<arch>.exe` | 该架构的二进制还没编（`-SkipBuild` 时最容易遇到）；去掉 `-SkipBuild` 或先编译 |
 | 安装报 `1633 这个处理器类型不支持该安装程序包` | 装了架构不符的包（如把 arm64 包往 x64 上装）；换对应架构的产物 |
@@ -465,7 +465,8 @@ CI 用 `sudo flatpak remote-add` / `sudo flatpak install` 把 runtime 与 SDK �
 
 `windows-11-arm` 的镜像**不带 winget**（`Get-Command winget.exe` 拿不到），
 `windows-latest` 带。因此 `scripts/package_native.ps1` 取工具**不依赖 winget**：
-WiX 与 LLVM-MinGW 都按固定 URL 下上游发布物（校验 SHA256），只有 Inno Setup
+WiX 走官方 .NET 工具包（`dotnet tool install --global wix`，NuGet 包 RID 无关，
+arm64 上原样能跑），LLVM-MinGW 下官方 release zip 并校验 SHA256；只有 Inno Setup
 仍然走 winget（两个镜像都预装了它，CI 里根本不会走到那一步）。
 
 镜像里现成的（据 actions/runner-images 的 `Windows11-Arm64-Readme.md`）：

@@ -19,8 +19,9 @@
         执行 -Arch arm64)会立刻报错,而不是安静地出一个跑不起来的包。
 
     依赖(缺失时自动获取,-SkipToolInstall 可关闭):
-      - MSI: WiX Toolset CLI 6.x —— 按固定 URL 取官方 MSI 并用管理安装解出
-        wix.exe(v7 起二进制发布物要求在遵守 OSMF EULA 的前提下使用,本项目不引入)。
+      - MSI: WiX Toolset CLI 6.x —— 用官方 .NET 工具包(`dotnet tool install
+        --global wix --version 6.0.2`)。v7 起二进制发布物要求在遵守 OSMF EULA
+        的前提下使用,本项目不引入。
       - EXE: Inno Setup 6 —— CI 的 windows-latest / windows-11-arm 镜像都预装了,
         开发机上缺了才用 winget 装。
       - C 编译器:cgo 需要 gcc 风格命令行(GCC 或 clang;**MSVC 的 cl.exe 不可用**,
@@ -96,23 +97,22 @@ $BinDir = Join-Path $RepoRoot 'bin'
 $IconPath = Join-Path $RepoRoot 'assets\lgdm.ico'
 $WxsPath = Join-Path $RepoRoot 'installer\lgdm.wxs'
 $IssPath = Join-Path $RepoRoot 'installer\installer.iss'
+# dotnet tool --global 的安装目录(WiX CLI 装在这里)。
+$DotnetToolsDir = Join-Path $env:USERPROFILE '.dotnet\tools'
 
 # 不带 OSMF EULA 的最后一个 WiX 大版本;v7 起二进制发布物要求在遵守 OSMF EULA
 # 的前提下使用(见 wixtoolset/wix v7.0.0 release notes),本项目不引入该依赖。
 $MaxFreeWixMajor = 6
 
-# 工具获取**不依赖 winget**。两个原因:
-#   1. CI 的 windows-11-arm 镜像根本没带 winget(实测 Get-Command winget.exe 找不到);
-#   2. winget 清单里的版本号与上游发布标签不总是一致 —— WiX 在清单里是四段
-#      (6.0.2.0),发布标签是三段(v6.0.2),写错就报 "No version found matching"。
-# 所以按固定 URL 取上游发布物并校验 SHA256(哈希取自 winget 清单,与它指向的是
-# 同一个 release)。找不到本地安装时才下载。
+# 工具获取**不依赖 winget**:CI 的 windows-11-arm 镜像根本没带 winget
+# (实测 Get-Command winget.exe 找不到),而且 winget 清单里的版本号与上游发布
+# 标签不总是一致(WiX 在清单里是四段 6.0.2.0,发布标签是三段 v6.0.2)。
 #
-# WiX CLI MSI 只有 x64(上游 v6/v7 都只发 wix-cli-x64.msi);arm64 上走 x64 模拟层,
-# 不影响产物 —— MSI 的目标架构由 `wix build -arch` 决定,与 wix.exe 自身架构无关。
-$WixCliVersion = '6.0.2'
-$WixCliMsiUrl = "https://github.com/wixtoolset/wix/releases/download/v$WixCliVersion/wix-cli-x64.msi"
-$WixCliMsiSha256 = 'A8A5CC7443353CEF3AB900C60CD7A3A5EE601746319D104AC7B12AD0CED2345C'
+# WiX CLI 走官方 .NET 工具包(NuGet 上的 wix):版本号与发布标签一致,包本身
+# RID 无关(tools/net6.0/any/),arm64 上原样能跑,dotnet 在 CI 两个 Windows
+# 镜像里都有(.NET SDK 6-10)。
+# 不用它的 MSI:那个只有 x64,而且 msiexec /a 在 CI 上直接以 1603 失败(实测)。
+$WixToolVersion = '6.0.2'
 
 # LLVM-MinGW:release 标签 + 各架构 zip 的哈希。zip 内目录名与工具名都带
 # 架构三元组(aarch64-w64-mingw32-clang.exe),不会拿错目标。
@@ -260,37 +260,35 @@ function Get-RemoteFile([string]$Url, [string]$OutFile, [string]$Sha256) {
 
 # 取 WiX CLI,返回 wix.exe 的路径,失败返回 $null。
 #
-# 固定版本的官方 MSI + 管理安装(msiexec /a)把文件摊到 <repo>\.tools\wix:
-# 不写系统状态、不碰 PATH、不需要 winget。MSI 内部的目录层级不写死,
-# 摊完直接递归找 wix.exe。
+# 用官方 .NET 工具包装:`dotnet tool install --global wix --version <v>`,
+# 装出来的壳在 %USERPROFILE%\.dotnet\tools\wix.exe。
+# 选它而不是官方 MSI 的原因见文件头的注释(MSI 只有 x64,且 msiexec /a
+# 在 CI 上以 1603 失败)。
 function Install-WixCli {
+    $exe = Join-Path $DotnetToolsDir 'wix.exe'
+    if (Test-Path -LiteralPath $exe) { return $exe }
+
     if ($SkipToolInstall) { throw "缺少 WiX CLI,且指定了 -SkipToolInstall。" }
 
-    $dest = Join-Path $RepoRoot '.tools\wix'
-    if (Test-Path -LiteralPath $dest) {
-        $cached = Get-ChildItem -LiteralPath $dest -Recurse -Filter 'wix.exe' -File -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-        if ($cached) { return $cached.FullName }
+    $dotnet = Get-Command 'dotnet.exe' -ErrorAction SilentlyContinue
+    if (-not $dotnet) {
+        throw @"
+找不到 wix.exe,也没有 dotnet,装不了 WiX CLI($WixToolVersion)。
+请装 .NET SDK,或用 -WixPath 指向已有的 wix.exe:
+
+    https://dotnet.microsoft.com/download
+"@
     }
 
-    New-Item -ItemType Directory -Path $dest -Force | Out-Null
-    $msi = Join-Path $dest 'wix-cli-x64.msi'
-    Get-RemoteFile $WixCliMsiUrl $msi $WixCliMsiSha256
-
-    # /a = 管理安装:只把文件摊到 TARGETDIR,不装进系统(也不需要额外权限)。
-    # msiexec 会把活交给子进程,必须 -Wait 等它跑完。
-    $cmdline = '/a "{0}" /qn TARGETDIR="{1}"' -f $msi, $dest
-    Write-Note "msiexec $cmdline"
-    $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $cmdline -Wait -PassThru
-    if ($proc.ExitCode -ne 0) {
-        throw ("msiexec 解包 WiX CLI 失败,退出码 {0};来源 {1}" -f $proc.ExitCode, $WixCliMsiUrl)
+    Write-Note ("dotnet tool install --global wix --version {0}" -f $WixToolVersion)
+    & $dotnet.Source @('tool', 'install', '--global', 'wix', '--version', $WixToolVersion) | Out-Host
+    if ($LASTEXITCODE -ne 0) {
+        # 已经装过同版本时 dotnet 会返回非 0("already installed"),不代表不可用。
+        Write-Warning ("dotnet tool install 返回 {0};继续查找已安装的 wix.exe。" -f $LASTEXITCODE)
     }
-    Remove-Item -LiteralPath $msi -Force -ErrorAction SilentlyContinue
 
-    $exe = Get-ChildItem -LiteralPath $dest -Recurse -Filter 'wix.exe' -File -ErrorAction SilentlyContinue |
-        Select-Object -First 1
-    if (-not $exe) { return $null }
-    return $exe.FullName
+    if (-not (Test-Path -LiteralPath $exe)) { return $null }
+    return $exe
 }
 
 # 取宿主架构的 LLVM-MinGW,返回可用的编译器路径,失败返回 $null。
@@ -553,7 +551,7 @@ function Get-WixMajor([string]$WixExe) {
     return 0
 }
 
-# 查找 wix.exe:显式指定 → PATH → Program Files\WiX Toolset v*。
+# 查找 wix.exe:显式指定 → PATH → dotnet tool 目录 → Program Files\WiX Toolset v*。
 function Find-Wix {
     if ($WixPath) {
         if (-not (Test-Path -LiteralPath $WixPath)) { throw "-WixPath 指向的文件不存在: $WixPath" }
@@ -562,6 +560,12 @@ function Find-Wix {
 
     $cmd = Get-Command 'wix.exe' -ErrorAction SilentlyContinue
     if ($cmd) { return @{ Path = $cmd.Source; Major = (Get-WixMajor $cmd.Source) } }
+
+    # 本脚本用 dotnet tool 装的 WiX CLI 就在这里。
+    $toolExe = Join-Path $DotnetToolsDir 'wix.exe'
+    if (Test-Path -LiteralPath $toolExe) {
+        return @{ Path = $toolExe; Major = (Get-WixMajor $toolExe) }
+    }
 
     $found = @()
     foreach ($root in @(${env:ProgramFiles}, ${env:ProgramFiles(x86)})) {
@@ -615,20 +619,20 @@ function Find-Iscc {
 function New-MsiPackage([string]$BuildVersion, [string]$NumericVersion) {
     $wix = Find-Wix
     if (-not $wix) {
-        Write-Step "获取 WiX Toolset CLI v$WixCliVersion"
+        Write-Step "获取 WiX Toolset CLI v$WixToolVersion"
         $wixExe = Install-WixCli
-        if ($wixExe) { $wix = @{ Path = $wixExe; Major = 0 } }
+        if ($wixExe) { $wix = @{ Path = $wixExe; Major = (Get-WixMajor $wixExe) } }
     }
     if (-not $wix) {
-        throw "找不到 wix.exe,也没能装上 WiX CLI v$WixCliVersion($WixCliMsiUrl)。请用 -WixPath 指定。"
+        throw "找不到 wix.exe,也没能装上 WiX CLI v$WixToolVersion。请用 -WixPath 指定。"
     }
     if ($wix.Major -gt $MaxFreeWixMajor) {
         throw @"
 wix.exe 是 v$($wix.Major)($($wix.Path)),它的二进制发布物要求在遵守 OSMF EULA 的前提下
-使用,本项目不引入该依赖。请改用 WiX v$MaxFreeWixMajor 及以下 —— 删掉那个安装,
-脚本会自动取 v${WixCliVersion} 版:
+使用,本项目不引入该依赖。请换回 v${WixToolVersion}:
 
-    $WixCliMsiUrl
+    dotnet tool uninstall --global wix
+    dotnet tool install --global wix --version $WixToolVersion
 
 或用 -WixPath 指向已有的 v$MaxFreeWixMajor 及以下 wix.exe。
 "@
