@@ -367,7 +367,8 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
   `Exec=flatpak run org.langbiantianya.LGDM --autostart` + `X-Flatpak=`；关闭 → 被删除。
   aarch64 那份是在 qemu 下跑的（启动/退出各几秒）。
 - `lgom://` 由 Flatpak 导出给宿主，导出的 `.desktop` 里 Exec 被改写成
-  `flatpak run … --open-url @@u %u @@`。
+  `flatpak run … @@u %u @@`（`%u` 作为位置参数直接传给主进程；不要写成
+  `--open-url %u`，否则图标点击空 URL 时 `--open-url` 拿不到值会立即退出）。
 - 架构守卫：`--skip-build` 传入架构不符的二进制（伪造的 aarch64 ELF）会被直接拒绝，
   不会打进包里。
 
@@ -453,7 +454,7 @@ UI 子进程，避免子进程的日志悄悄落到文件里。
 只有 `url` 是必填项。URL 由操作系统交给新启动的进程：Windows 安装包注册的命令行是
 `"<install>\lgdm.exe" "%1"`；Linux 由 `.desktop` 的 `MimeType=x-scheme-handler/lgom`
 注册，Flatpak 版由 Flatpak 把同一份 `.desktop` 导出给宿主（导出的 Exec 会被改写成
-`flatpak run … --open-url @@u %u @@`）。没有实例在运行时，这个进程就是主实例，
+`flatpak run … @@u %u @@`，`%u` 作为位置参数直接传给主进程）。没有实例在运行时，这个进程就是主实例，
 自己把 URL 入队并下载；已有实例在运行时，新进程通过命名管道（Windows）/
 Unix socket（其它平台）把 URL 转发给主实例后退出，转发失败（例如主实例刚好在退出）
 以非零状态结束并打印原因。
