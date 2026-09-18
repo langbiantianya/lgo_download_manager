@@ -11,12 +11,11 @@ on:
 permissions:
   contents: write   # 上传 release 资产
 
-# 拆成两个独立 job:
-#   - x86_64: ubuntu-24.04(原生 amd64)——flatpak-builder 直接产 x86_64 flatpak
-#   - aarch64: ubuntu-24.04-arm(原生 arm64,GitHub 2025 GA)——产 aarch64 flatpak
-# 不再走 qemu-user-static + gcc-aarch64-linux-gnu 的交叉编译路径;每个 job
-# 在原生架构上跑,SDK 的 qemu 模拟器 / binfmt_misc 都不需要。
-# 见 scripts/build_flatpak.sh 的 can_run_arch(原生架构直接 return 0)。
+# 两个独立 job,各自在原生架构 runner 上跑 scripts/build_flatpak_native.sh:
+#   - x86_64:  ubuntu-24.04(原生 amd64)
+#   - aarch64: ubuntu-24.04-arm(原生 arm64)
+# 脚本要求 --arch 与宿主架构一致;不装 qemu-user-static,也不需要
+# gcc-aarch64-linux-gnu 之类的交叉工具链 —— 原生构建用宿主 gcc。
 
 jobs:
   flatpak-x86_64:
@@ -34,6 +33,9 @@ jobs:
           go-version: '1.26.6'
           cache: true
 
+      # 只装原生构建需要的东西:flatpak / flatpak-builder / 宿主 gcc。
+      # (脚本会把 flatpak SDK 当 sysroot,GL/X11/wayland 的头与库都在里面,
+      # 不需要额外的 -devel 包。)
       - name: install flatpak toolchain
         run: |
           set -euo pipefail
@@ -41,21 +43,23 @@ jobs:
           sudo apt-get install -y \
             flatpak \
             flatpak-builder \
+            build-essential \
             pkg-config
 
-      - name: register flathub
-        # 脚本会用 `flatpak install --arch=x86_64 flathub` 装 gnome SDK 50。
-        # Ubuntu 自带的 flathub 是过滤过的(只本机架构),改用未过滤的远程
-        # (dl.flathub.org),保证 x86_64 与 aarch64 ref 都能拿到。
+      - name: install runtime and SDK
+        # 脚本要求目标架构的 SDK/runtime 已就绪;用未过滤的 flathub 远程
+        # (dl.flathub.org)保证 ref 齐全,发行版自带的可能是过滤过的。
         run: |
           set -euo pipefail
           flatpak remote-add --if-not-exists flathub \
             https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install -y --noninteractive flathub \
+            org.gnome.Sdk//50 org.gnome.Platform//50
 
       - name: build flatpak x86_64
         run: |
           set -euo pipefail
-          ./scripts/build_flatpak.sh --arch=x86_64
+          ./scripts/build_flatpak_native.sh --arch=x86_64
 
       - name: upload artifact
         uses: actions/upload-artifact@v4
@@ -87,18 +91,21 @@ jobs:
           sudo apt-get install -y \
             flatpak \
             flatpak-builder \
+            build-essential \
             pkg-config
 
-      - name: register flathub
+      - name: install runtime and SDK
         run: |
           set -euo pipefail
           flatpak remote-add --if-not-exists flathub \
             https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install -y --noninteractive flathub \
+            org.gnome.Sdk//50 org.gnome.Platform//50
 
       - name: build flatpak aarch64
         run: |
           set -euo pipefail
-          ./scripts/build_flatpak.sh --arch=aarch64
+          ./scripts/build_flatpak_native.sh --arch=aarch64
 
       - name: upload artifact
         uses: actions/upload-artifact@v4

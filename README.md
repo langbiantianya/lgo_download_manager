@@ -30,6 +30,7 @@
 - 各平台都有安装包，都是「一条命令编译 + 出包」：Windows 用 `scripts/package.ps1`
   出 MSI / EXE（x64 + arm64），Linux 用 `scripts/build_flatpak.sh` 出 Flatpak 单文件包
   （x86_64 + aarch64）；后者在同一份包上支持 `lgom://` 与开机自启。
+  CI（GitHub Actions）在原生 x64 / arm64 runner 上按架构分别出包，见「持续集成」。
 
 ## 构建
 
@@ -59,8 +60,9 @@ Linux 上要**安装包**（Flatpak 单文件包，默认出 x86_64 + aarch64）
 ### 版本元数据
 
 `internal/version` 包提供 `Version` / `Commit` / `Date` 三个变量，默认
-是开发期占位符；两个打包脚本（Windows 的 `scripts/package.ps1`、Linux 的
-`scripts/build_flatpak.sh`）都用 `-ldflags -X` 在链接期把它们覆盖成
+是开发期占位符；打包脚本（Windows 的 `scripts/package.ps1` /
+`scripts/package_native.ps1`，Linux 的 `scripts/build_flatpak.sh` /
+`scripts/build_flatpak_native.sh`）都用 `-ldflags -X` 在链接期把它们覆盖成
 `git describe` / `git rev-parse --short HEAD` / `date -u` 的真实结果
 （手工 `go build` 同样可以加 `-ldflags`）。启动时 `lgdm` 会在日志中打印
 一行 `lgdm <version> (commit <c>, built <d>)`。
@@ -72,6 +74,9 @@ Linux 上要**安装包**（Flatpak 单文件包，默认出 x86_64 + aarch64）
 ```powershell
 pwsh -File scripts\package.ps1          # x64 + arm64 各一份 MSI 与 EXE
 ```
+
+只要出**本机架构**的包（CI 的用法）用 `scripts/package_native.ps1 -Arch <x64|arm64>`：
+`-Arch` 必须与宿主 CPU 一致（不一致直接报错），不做交叉编译，因此不需要交叉工具链。
 
 ### 环境要求
 
@@ -276,6 +281,9 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 ./scripts/build_flatpak.sh --install          # 出包后把本机架构那份装进用户安装
 ```
 
+只要出**本机架构**的包（CI 的用法）用 `scripts/build_flatpak_native.sh --arch=<x86_64|aarch64>`：
+它不做交叉编译，不需要 qemu / 交叉编译器，`--arch` 与宿主架构不符时在预检阶段直接报错。
+
 ### 环境要求
 
 | 依赖 | 说明 |
@@ -371,6 +379,9 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
   `--open-url %u`，否则图标点击空 URL 时 `--open-url` 拿不到值会立即退出）。
 - 架构守卫：`--skip-build` 传入架构不符的二进制（伪造的 aarch64 ELF）会被直接拒绝，
   不会打进包里。
+- `./scripts/build_flatpak_native.sh --arch=x86_64`（原生构建，不装 qemu、不用交叉
+  编译器）同样一条命令出包，产物 11 MB；`--arch` 与宿主架构不符时在预检阶段直接
+  拒绝（实测在 x86_64 上传 `--arch=aarch64` 立即报错退出）。
 
 限制：
 
@@ -380,6 +391,43 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
 - **aarch64 在 x86_64 上出包需要 qemu**（构建环境要求，与产物无关）：沙箱里的
   `install` / appstream compose 等步骤跑在 qemu 下；在原生 aarch64 机器上不需要 qemu，
   也不需要交叉编译器（`arch == 本机架构` 时脚本走本机 gcc）。
+
+## 持续集成（GitHub Actions）
+
+`.github/workflows/` 下两个工作流，按**架构拆成独立 job**，每个 job 在**原生架构**
+的 runner 上跑对应的原生打包脚本（不做交叉编译）：
+
+| 工作流 | job | runner | 脚本 | 产物 |
+| --- | --- | --- | --- | --- |
+| `windows.yml` | `windows-x64` | `windows-latest` | `scripts/package_native.ps1 -Arch x64` | `dist/lgdm-setup-<版本>-x64.{msi,exe}` |
+| `windows.yml` | `windows-arm64` | `windows-11-arm` | `scripts/package_native.ps1 -Arch arm64` | `dist/lgdm-setup-<版本>-arm64.{msi,exe}` |
+| `linux.yml` | `flatpak-x86_64` | `ubuntu-24.04` | `scripts/build_flatpak_native.sh --arch=x86_64` | `dist/lgdm-<版本>-x86_64.flatpak` |
+| `linux.yml` | `flatpak-aarch64` | `ubuntu-24.04-arm` | `scripts/build_flatpak_native.sh --arch=aarch64` | `dist/lgdm-<版本>-aarch64.flatpak` |
+
+触发：push 到 `master`、`v*` tag、PR、手动 `workflow_dispatch`。每个 job 把产物作为
+artifact 上传（保留 30 天）；**只有 `v*` tag** 会触发 `release` job，把四个 artifact
+汇总发到 GitHub Release（`generate_release_notes`）。
+
+### 原生脚本与交叉脚本的分工
+
+| | `scripts/package.ps1` / `build_flatpak.sh` | `scripts/package_native.ps1` / `build_flatpak_native.sh` |
+| --- | --- | --- |
+| 目标架构 | 一次可出多个，可交叉 | 只出宿主架构，`-Arch` / `--arch` 必须与宿主一致 |
+| 工具链 | 交叉编译器（LLVM-MinGW 的 `<triplet>-clang`、`gcc-aarch64-linux-gnu`） | 宿主 gcc / clang |
+| Linux 额外依赖 | 跨架构时需 `qemu-user-static` | 无 |
+| 架构校验 | 有 | 有（不一致时在预检阶段直接报错） |
+
+两者的 SDK sysroot 层相同：**Flatpak 的原生构建同样需要把目标 runtime 的 SDK 当
+sysroot**（见 `prepare_toolchain`），因为二进制必须链接它要运行的那个 runtime 的
+libc/GL/X11，而不是宿主的同名库。
+
+### 已验证 / 已知限制
+
+- `ubuntu-24.04-arm`、`windows-11-arm` 这两个 arm64 runner **只在公开仓库可用**；
+  仓库转私有后 arm64 两个 job 会直接失败，需要重新改回「x64 runner + 交叉编译」。
+- `windows-11-arm` 上的 arm64 job 未在 CI 实测过（本地没有 Windows 环境）；
+  Windows 两条 job 的首次运行就是它的第一次真实验证。
+- Linux 的 `flatpak-x86_64` job 与本地 `--arch=x86_64` 走的是同一条脚本路径，已实测。
 
 ## 运行
 
@@ -588,8 +636,11 @@ internal/ui/                   # Fyne 窗口、任务列表、设置对话框、
 internal/tray/                 # fyne.io/systray 业务进程常驻托盘
 assets/                        # 图标（安装包快捷方式 / lgom:// DefaultIcon 都用它）
 installer/                     # lgdm.wxs（WiX MSI）、installer.iss（Inno Setup EXE）
-scripts/package.ps1            # 打包入口：编译 + 出 MSI / EXE 安装包
-scripts/build_flatpak.sh       # 打包入口：编译 + 出 Flatpak 安装包
+scripts/package.ps1            # 打包入口：编译 + 出 MSI / EXE 安装包（可交叉）
+scripts/package_native.ps1     # 同上，但只出宿主架构的包（CI 用，不做交叉编译）
+scripts/build_flatpak.sh       # 打包入口：编译 + 出 Flatpak 安装包（可交叉）
+scripts/build_flatpak_native.sh # 同上，但只出宿主架构的包（CI 用，不做交叉编译）
+.github/workflows/             # CI：windows.yml / linux.yml，按架构分 job 出包
 org.langbiantianya.LGDM.yml    # Flatpak manifest（app id / runtime / 权限 / 模块）
 flatpak/                       # Flatpak 用的 AppStream metainfo
 ```

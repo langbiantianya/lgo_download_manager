@@ -11,11 +11,11 @@ on:
 permissions:
   contents: write   # 上传 release 资产
 
-# 拆成两个独立 job:
-#   - x64:   windows-latest(原生 amd64)——脚本默认就会用本机 GCC 走 cgo
-#   - arm64: windows-11-arm(原生 arm64,仅公开仓库可用)——脚本也走本机工具链
-# 不再靠 LLVM-MinGW 交叉编译;每个 job 在原生架构上跑,GOARCH 与 CPU 一致,
-# Go 默认开 cgo,fyne 的 GL 绑定直接走本机 GCC,免去 sysroot 切换。
+# 两个独立 job,各自在原生架构 runner 上跑 scripts/package_native.ps1:
+#   - x64:   windows-latest(原生 amd64)
+#   - arm64: windows-11-arm(原生 arm64,仅公开仓库可用)
+# 脚本要求 -Arch 与宿主 CPU 一致 —— runner 贴错标签会立刻报错,而不是安静地
+# 出一个架构不符的包。不走交叉编译,因此没有 LLVM-MinGW target 选择。
 
 jobs:
   windows-x64:
@@ -33,18 +33,18 @@ jobs:
           go-version: '1.26.6'
           cache: true
 
-      # 脚本依赖(winget 一次性拉齐):
-      #   - WiX Toolset CLI 6.0.2     (出 MSI)
-      #   - Inno Setup 6              (出 EXE)
-      # 默认让脚本自动装;SkipToolInstall 不传,确保缺啥装啥。
-      # C 编译器:windows-latest 自带 mingw-w64 GCC,脚本里 Get-Command gcc.exe
-      # 会直接拿到,不需要 LLVM-MinGW。
+      # 打包依赖(脚本缺啥用 winget 装啥,不传 -SkipToolInstall):
+      #   - WiX Toolset CLI 6.x  (MSI)
+      #   - Inno Setup 6         (EXE)
+      # C 编译器:windows runner 自带 mingw-w64 GCC,脚本按 gcc → clang →
+      # LLVM-MinGW 的顺序解析宿主编译器。
 
       - name: package x64 (MSI + EXE)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          pwsh -NoProfile -File scripts/package.ps1 -Format both -Arch x64
+          pwsh -NoProfile -File scripts/package_native.ps1 `
+            -Arch x64 -Format both
 
       - name: upload artifact
         uses: actions/upload-artifact@v4
@@ -58,7 +58,7 @@ jobs:
 
   windows-arm64:
     name: windows arm64
-    runs-on: windows-11-arm   # 仅公开仓库可用;原生 ARM64,无需交叉编译
+    runs-on: windows-11-arm   # 仅公开仓库可用
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -71,15 +71,16 @@ jobs:
           go-version: '1.26.6'
           cache: true
 
-      # windows-11-arm 自带 arm64 mingw GCC(脚本优先 Get-Command gcc.exe);
-      # 若本机 gcc 缺失,脚本里 Resolve-CC 会自动 winget 装 LLVM-MinGW
-      # 作为后备(同一个工具链同时带 x86_64 / aarch64 target)。
+      # 与 x64 同一个脚本,只是 -Arch 不同:GOARCH=arm64 在 arm64 宿主上,
+      # cgo 直接用宿主 C 编译器(缺 GCC 时脚本会装 LLVM-MinGW,其自带的
+      # aarch64-w64-mingw32-clang 在同架构宿主上跑仍是原生编译)。
 
       - name: package arm64 (MSI + EXE)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          pwsh -NoProfile -File scripts/package.ps1 -Format both -Arch arm64
+          pwsh -NoProfile -File scripts/package_native.ps1 `
+            -Arch arm64 -Format both
 
       - name: upload artifact
         uses: actions/upload-artifact@v4
