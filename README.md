@@ -421,6 +421,20 @@ artifact 上传（保留 30 天）；**只有 `v*` tag** 会触发 `release` job
 sysroot**（见 `prepare_toolchain`），因为二进制必须链接它要运行的那个 runtime 的
 libc/GL/X11，而不是宿主的同名库。
 
+### Linux job 的 SDK 必须装在**系统**安装里
+
+CI 用 `sudo flatpak remote-add` / `sudo flatpak install` 把 runtime 与 SDK 装进系统安装
+（`/var/lib/flatpak`），**不要**改成 `--user`：
+
+- 普通用户没有 `ConfigureRemote` 权限，不带 `sudo` 的 `flatpak remote-add` 会直接报
+  `error: Flatpak system operation ConfigureRemote not allowed for user`（CI 第一次跑就是这么挂的）；
+- 脚本内部的 `flatpak info` 与 `flatpak-builder` 都**不带** `--user`，默认按系统安装解析
+  （`flatpak-builder --system` 是默认值）；SDK 若装在用户安装里，这两处都会找不到。
+  要支持用户安装得同时给 `flatpak info` / `flatpak-builder` 加 `--user`，属于另一处改动。
+
+`flathub` 远程用 `dl.flathub.org` 的**未过滤** URL：发行版自带的可能是过滤过的
+（Fedora 就是），拿不到 arm64 的 ref。
+
 ### 已验证 / 已知限制
 
 - `ubuntu-24.04-arm`、`windows-11-arm` 这两个 arm64 runner **只在公开仓库可用**；
