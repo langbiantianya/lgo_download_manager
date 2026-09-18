@@ -1,0 +1,116 @@
+# Flatpak manifest for lgo_download_manager (LGDM).
+#
+# 打包(编二进制 + 出可安装的单文件包):
+#   ./scripts/build_flatpak.sh
+#
+# 手工构建 / 直接装进用户安装:
+#   flatpak-builder --user --install --force-clean build-dir org.langbiantianya.LGDM.yml
+#
+# Runtime 选 GNOME 50:Fyne 走 EGL/GLFW 渲染,原生 Wayland 与 X11
+# (XWayland 兜底)会话都能跑。
+#
+# 应用 ID 必须与 manifest 文件名、.desktop 文件名、AppStream metainfo
+# 文件名保持一致(flatpak-builder 与桌面环境都按 ID 做匹配),并与
+# conf/lgo_download_manager.desktop 的 Icon= 一致;改 ID 等于换一个应用,
+# 已安装的用户需要重装。
+#
+# URL scheme: lgom://download?url=<encoded>[&name=<encoded>[&ua=<encoded>
+#             [&headers=<encoded>[&cookies=<encoded>]]]]
+# 经 .desktop 的 MimeType=x-scheme-handler/lgom 注册;Flatpak 导出后宿主
+# 点链接会把 URL 转给本应用。运行中的主实例通过 Unix socket 接收转发
+# (urllauncher 把 socket 放在 ~/.local/share/lgo_download_manager),
+# 因此需要 --filesystem=home 之类的家目录访问。
+#
+# 构建策略:
+#   - 二进制在宿主机上按目标架构编好(沙箱内未必连得上 module proxy),
+#     本 manifest 只负责把它装进 /app/bin;scripts/build_flatpak.sh
+#     会先跑 go build 再调 flatpak-builder。
+#   - 二进制与架构绑定,所以用 only-arches 按目标架构各取一份:一次
+#     flatpak-builder --arch=X 只会装进 X 的那份,缺文件时直接报错,
+#     不会把别的架构的二进制打进包里。
+#   - 每个 module 的 sources 都用 type: file 精确取需要的文件,不整目录
+#     拷贝:仓库里还有 .git 与几十 MB 的构建产物,拷进构建目录又慢又脏。
+
+id: org.langbiantianya.LGDM
+branch: stable
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: lgo_download_manager
+
+finish-args:
+  # --- 网络访问(HTTP/HTTPS/FTP/WebDAV 下载) ---
+  - --share=network
+  - --share=ipc
+  # --- 显示:Fyne 的 GL 渲染,Wayland 优先、X11 回退 ---
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # --- D-Bus 会话总线(托盘 StatusNotifier) ---
+  - --socket=session-bus
+  # --- 用户文件系统:下载目标由用户自选,可能在任意挂载点 ---
+  - --filesystem=xdg-download
+  - --filesystem=home
+  - --filesystem=host
+  # 沙箱里的 /tmp 是 flatpak 建的私有 tmpfs,--filesystem=host 不会覆盖它:
+  # 不显式授权 /tmp 的话,用户把下载目录填成 /tmp 时文件只存在于沙箱内,
+  # 应用退出就没了。授权的是宿主 /tmp(host 的子集,不额外扩大可见范围)。
+  - --filesystem=/tmp
+  # --- 开机自启:宿主 ~/.config/autostart ---
+  # 沙箱内的 $XDG_CONFIG_HOME 是应用私有目录,自启项必须落在宿主目录才能
+  # 被桌面环境读到;这条授权把它映射进沙箱,internal/autostart 据此写入
+  # "flatpak run org.langbiantianya.LGDM --autostart"。
+  - --filesystem=xdg-config/autostart
+  # 运行期文件(socket + 单实例锁)都在家目录下的
+  # ~/.local/share/lgo_download_manager(见 internal/urllauncher),
+  # UI 子进程的 socket 在系统临时目录,都由 home / host 覆盖;
+  # 不需要额外授权 $XDG_RUNTIME_DIR(flatpak 里它本身也是应用私有的)。
+
+modules:
+  # ---------------------------------------------------------------
+  # 应用二进制:scripts/build_flatpak.sh 在宿主机上按目标架构
+  # go build 出 bin/lgo_download_manager-<arch>,这里只把它装进 /app/bin。
+  # only-arches 保证每个架构只取自己那一份(dest-filename 统一成
+  # 装进沙箱后的名字,两条 build-commands 因此完全一致)。
+  # ---------------------------------------------------------------
+  - name: lgdm
+    buildsystem: simple
+    only-arches: [x86_64]
+    build-commands:
+      - install -Dm755 lgo_download_manager /app/bin/lgo_download_manager
+    sources:
+      - type: file
+        path: bin/lgo_download_manager-x86_64
+        dest-filename: lgo_download_manager
+
+  - name: lgdm
+    buildsystem: simple
+    only-arches: [aarch64]
+    build-commands:
+      - install -Dm755 lgo_download_manager /app/bin/lgo_download_manager
+    sources:
+      - type: file
+        path: bin/lgo_download_manager-aarch64
+        dest-filename: lgo_download_manager
+
+  # ---------------------------------------------------------------
+  # 桌面集成:.desktop / AppStream metainfo / 图标。
+  # .desktop 里的 MimeType=x-scheme-handler/lgom 注册 lgom:// 协议,
+  # 安装时必须叫 <app-id>.desktop,否则 Flatpak 不导出。
+  # 图标用 internal/tray/assets/tray.png(64x64,与应用图标同一份美术),
+  # 按 hicolor 规范放进与像素尺寸一致的 64x64 目录,不做放大。
+  # ---------------------------------------------------------------
+  - name: lgdm-desktop
+    buildsystem: simple
+    build-commands:
+      - install -Dm644 lgo_download_manager.desktop /app/share/applications/org.langbiantianya.LGDM.desktop
+      - install -Dm644 org.langbiantianya.LGDM.metainfo.xml /app/share/metainfo/org.langbiantianya.LGDM.metainfo.xml
+      - install -Dm644 org.langbiantianya.LGDM.png /app/share/icons/hicolor/64x64/apps/org.langbiantianya.LGDM.png
+    sources:
+      - type: file
+        path: conf/lgo_download_manager.desktop
+      - type: file
+        path: flatpak/org.langbiantianya.LGDM.metainfo.xml
+      - type: file
+        path: internal/tray/assets/tray.png
+        dest-filename: org.langbiantianya.LGDM.png

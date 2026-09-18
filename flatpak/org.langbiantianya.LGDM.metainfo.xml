@@ -1,0 +1,83 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream 元数据(Flatpak 安装包用)。
+
+  文件名必须等于 <id>.metainfo.xml,且 id 与 Flatpak 应用 ID、.desktop
+  文件名一致,否则桌面环境/软件中心认不出来。
+
+  metadata_license 只覆盖本文件(机器可读元数据)本身,不改变应用代码的
+  许可:AppStream 与 Flathub 都要求元数据用宽松许可,应用本体仍是
+  MPL-2.0(见 project_license)。
+-->
+<component type="desktop-application">
+  <id>org.langbiantianya.LGDM</id>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MPL-2.0</project_license>
+
+  <name>LGo Download Manager</name>
+  <name xml:lang="zh-Hans">下载管理器</name>
+  <summary>Multi-protocol download manager with a native desktop UI</summary>
+  <summary xml:lang="zh-Hans">多协议下载管理器</summary>
+
+  <description>
+    <p>
+      LGo Download Manager (lgdm) is a download manager for HTTP, HTTPS, FTP
+      and WebDAV that splits each download into byte ranges and fetches them
+      concurrently, so a single connection's throughput is no longer the ceiling.
+    </p>
+    <p xml:lang="zh-Hans">
+      下载管理器(lgdm)支持 HTTP / HTTPS / FTP / WebDAV,把每个任务切成
+      字节区间并发下载,不再受单连接速度限制。
+    </p>
+    <ul>
+      <li>Resumable downloads: pausing and restarting continues from the bytes already fetched.</li>
+      <li>Per-task tuning: concurrency, chunk size, User-Agent, cookies, FTP mode, proxy.</li>
+      <li>Live progress per chunk, plus speed and ETA for every task.</li>
+      <li>System proxy detection, or a manual proxy with a bypass list.</li>
+      <li>Tasks and settings are persisted locally in SQLite.</li>
+      <li>Resident system tray: closing the window keeps downloads running.</li>
+      <li>Optional silent auto-start at login.</li>
+      <li>Browser hand-off through the lgom:// URL scheme.</li>
+      <li>Interface available in Chinese (Simplified and Traditional), English, Japanese, German and Russian.</li>
+    </ul>
+  </description>
+
+  <launchable type="desktop-id">org.langbiantianya.LGDM.desktop</launchable>
+
+  <provides>
+    <binary>lgo_download_manager</binary>
+    <mediatype>x-scheme-handler/lgom</mediatype>
+  </provides>
+
+  <categories>
+    <category>Network</category>
+    <category>FileTransfer</category>
+  </categories>
+
+  <keywords>
+    <keyword>download</keyword>
+    <keyword>http</keyword>
+    <keyword>ftp</keyword>
+    <keyword>webdav</keyword>
+    <keyword>resume</keyword>
+    <keyword>segmented</keyword>
+  </keywords>
+
+  <url type="homepage">https://github.com/langbiantianya/lgo_download_manager</url>
+  <url type="bugtracker">https://github.com/langbiantianya/lgo_download_manager/issues</url>
+
+  <developer id="org.langbiantianya">
+    <name>langbiantianya</name>
+  </developer>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.0.1" date="2026-09-16">
+      <description>
+        <p>First tagged release: concurrent byte-range downloads over HTTP, HTTPS, FTP and WebDAV, SQLite-persisted task list, system tray, lgom:// URL protocol, and login auto-start.</p>
+      </description>
+    </release>
+  </releases>
+</component>

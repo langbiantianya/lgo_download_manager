@@ -4,6 +4,8 @@ lgo_download_manager
 lgo_download_manager.exe
 bin/
 dist/
+# 手工跑 flatpak-builder 时建在仓库根的状态/缓存目录(脚本用 --state-dir 放进 dist/)
+.flatpak-builder/
 .tools/
 lgdm.sqlite
 lgdm.sqlite-shm

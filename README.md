@@ -19,7 +19,7 @@
   不使用代理（始终直连）、手动设置代理（自定义 URL + 绕过列表）。
   自动按平台检测：Linux (GNOME `gsettings` / KDE `kioslaverc` / `/etc/environment`)、
   macOS (`scutil --proxy`)、Windows (WinINET 注册表)。
-- `lgom://download?url=...&name=...&ua=...&headers=...&cookies=...` URL 协议 — Windows 安装包会把它注册成桌面协议处理程序（`HKCU\Software\Classes\lgom`）：浏览器里的链接直接拉起 lgdm 并开始下载；lgdm 已在运行时，新进程把 URL 转发给主实例（Windows 命名管道 / 其它平台 Unix socket）后退出。
+- `lgom://download?url=...&name=...&ua=...&headers=...&cookies=...` URL 协议 — 安装包会把它注册成桌面协议处理程序（Windows：`HKCU\Software\Classes\lgom`；Linux / Flatpak：`.desktop` 里的 `MimeType=x-scheme-handler/lgom`）：浏览器里的链接直接拉起 lgdm 并开始下载；lgdm 已在运行时，新进程把 URL 转发给主实例（Windows 命名管道 / 其它平台 Unix socket）后退出。
 - 任务列表与配置持久化到 SQLite（`lgdm.sqlite`）。
 - GUI 中实时显示进度、每个分片的速度条、下载速率与剩余时间（ETA）。
 - 系统托盘常驻业务进程：菜单提供「显示窗口」与「退出」，托盘 Quit 与 SIGINT/SIGTERM 等价，触发同一条优雅退出路径。
@@ -27,12 +27,15 @@
 - 正常退出前会调用 `PauseAll` 把所有运行中的 job 暂停并落盘；上限 5s，超时直接 `os.Exit(1)` 兜底结束进程。
 - 异步任务提交：`Start` 立即返回，HTTP 探测在后台 goroutine 中执行，
   UI 线程不会被不可达 URL 阻塞。
+- 各平台都有安装包，都是「一条命令编译 + 出包」：Windows 用 `scripts/package.ps1`
+  出 MSI / EXE（x64 + arm64），Linux 用 `scripts/build_flatpak.sh` 出 Flatpak 单文件包
+  （x86_64 + aarch64）；后者在同一份包上支持 `lgom://` 与开机自启。
 
 ## 构建
 
 ```sh
 go build -o bin/lgdm.exe .        # Windows,本机架构(手工调试用;打包脚本统一产出 bin\lgdm-<arch>.exe)
-go build -o bin/lgdm .            # Linux / macOS
+go build -o bin/lgdm .            # Linux / macOS(手工调试用;Flatpak 脚本产出 bin/lgo_download_manager-<架构>)
 ```
 
 Windows 上**正式发布**的二进制是 GUI 子系统构建（`go build -ldflags "-H windowsgui"`），
@@ -47,11 +50,18 @@ Windows 上要**安装包**（MSI / EXE，x64 与 arm64）用打包脚本，细�
 pwsh -File scripts\package.ps1
 ```
 
+Linux 上要**安装包**（Flatpak 单文件包，默认出 x86_64 + aarch64）用构建脚本，细节见「Linux 打包（Flatpak 安装包）」：
+
+```sh
+./scripts/build_flatpak.sh
+```
+
 ### 版本元数据
 
 `internal/version` 包提供 `Version` / `Commit` / `Date` 三个变量，默认
-是开发期占位符；`scripts/package.ps1` 通过 `-ldflags -X` 在链接期把它们
-覆盖成 `git describe` / `git rev-parse --short HEAD` / `date -u` 的真实结果
+是开发期占位符；两个打包脚本（Windows 的 `scripts/package.ps1`、Linux 的
+`scripts/build_flatpak.sh`）都用 `-ldflags -X` 在链接期把它们覆盖成
+`git describe` / `git rev-parse --short HEAD` / `date -u` 的真实结果
 （手工 `go build` 同样可以加 `-ldflags`）。启动时 `lgdm` 会在日志中打印
 一行 `lgdm <version> (commit <c>, built <d>)`。
 
@@ -256,6 +266,120 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 | `winget 安装 ... 返回 -1978335189` | winget 认为已装其它版本；脚本会继续查找已安装的工具，找不到再按提示手动装 |
 | 编辑 `scripts/package.ps1` 后 Windows PowerShell 5.1 报语法错误 | 脚本含中文，必须存成 **UTF-8 with BOM**（PS 7 不敏感，PS 5.1 会按 ANSI 读） |
 
+## Linux 打包（Flatpak 安装包）
+
+一条命令完成「按架构编二进制 + 出 Flatpak 安装包」，默认出 **x86_64 与 aarch64** 两份：
+
+```sh
+./scripts/build_flatpak.sh                    # x86_64 + aarch64，各一份 .flatpak
+./scripts/build_flatpak.sh --arch=x86_64      # 只出本机架构
+./scripts/build_flatpak.sh --install          # 出包后把本机架构那份装进用户安装
+```
+
+### 环境要求
+
+| 依赖 | 说明 |
+| --- | --- |
+| `flatpak` / `flatpak-builder` | 出包与安装；本机用的是 Flatpak 1.18 + flatpak-builder 1.4 |
+| Go + C 工具链 | 二进制在**宿主机**上按目标架构编（沙箱内未必连得上 Go module proxy）；Fyne 是 cgo |
+| 每个架构的 SDK/runtime | `flatpak install --user --arch=<架构> flathub org.gnome.Sdk//50 org.gnome.Platform//50`；缺失时脚本会直接打出这条命令。发行版自带的 flathub 若是过滤过的（Fedora 就是），非本机架构的 ref 要另加未过滤远端，见「排错」 |
+| 跨架构出包 | ① 本机能执行目标架构的构建步骤：`sudo dnf install -y qemu-user-static`（注册 binfmt 后本机即可跑 aarch64 的构建命令；注意 `flatpak --supported-arches` 是静态列表，装了 qemu 也不会变）② 目标架构的 C 交叉编译器：`sudo dnf install -y gcc-aarch64-linux-gnu`，或用 `--cc-aarch64=<路径>` 指定 |
+
+**不需要**在本机装目标架构的 X11/GL/wayland 开发包：编译时用**目标架构的 flatpak SDK**
+当 sysroot（生成在 `dist/flatpak/<架构>/sysroot`），那里正好是与运行时配套的完整开发环境
+（头文件、库、pkg-config、glibc 全在），链接出来的产物与它要运行的 runtime ABI 一致。
+
+### 命令与参数
+
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| `--arch` | `x86_64,aarch64` | 逗号分隔；接受 `amd64`/`x64`、`arm64`/`aarch64` 别名 |
+| `--version` | `git describe --tags --always --dirty` | 写进二进制 `internal/version` 与安装包文件名 |
+| `--skip-build` | 关 | 复用已有的 `bin/lgo_download_manager-<架构>`（仍会校验 ELF 架构） |
+| `--install` | 关 | 出包后 `flatpak install --user <文件>`（只装本机架构那份） |
+| `--cc-x86_64` / `--cc-aarch64` | 自动查找 | 显式指定该架构的 C 编译器（如 `/usr/bin/aarch64-linux-gnu-gcc`） |
+
+### 产物
+
+```
+dist/lgdm-<版本>-x86_64.flatpak         # 单文件安装包:flatpak install --user <文件>
+dist/lgdm-<版本>-aarch64.flatpak
+bin/lgo_download_manager-<架构>          # 打进包里的二进制(打包输入)
+dist/flatpak/<架构>/build-dir/           # flatpak-builder 构建目录
+dist/flatpak/<架构>/repo/                # 导出仓库（build-bundle 的输入）
+dist/flatpak/<架构>/state/               # flatpak-builder 缓存（删掉只是下次变慢）
+dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向本架构 SDK)
+```
+
+- 每个架构单独一份包：Flatpak bundle 与架构绑定，不能合并。
+- manifest 里用一个 `only-arches` 的 module per 架构装对应的二进制，一次
+  `flatpak-builder --arch=X` 只会把 X 的那份装进包；缺文件会直接报错，不会串架。
+- 二进制与 `dist/`、`bin/` 一样在 `.gitignore` 里；manifest 的每个 module 都用
+  `type: file` 精确取文件，不整目录拷贝仓库。
+- 装/卸：`flatpak install --user dist/lgdm-<版本>-<架构>.flatpak` /
+  `flatpak uninstall --user org.langbiantianya.LGDM`。
+
+### 沙箱内的行为差异
+
+- **开机自启**：见「开机自启」——写的是 `flatpak run org.langbiantianya.LGDM
+  --autostart`，入口落在宿主 `~/.config/autostart/`。
+- **配置与数据库**：`--filesystem=home` 让沙箱内看到的就是宿主家目录，因此
+  `~/.config/lgo_download_manager`（SQLite + 日志）和 `~/.local/share/lgo_download_manager`
+  （单实例锁 + URL 转发 socket）与自编译版本共用一份，两者同时启动也只有一个实例。
+- **lgom:// 协议**：`.desktop` 的 `MimeType=x-scheme-handler/lgom` 由 Flatpak 导出
+  给宿主，浏览器点链接时转给运行中的实例。
+- **托盘**：走 `--socket=session-bus`；GNOME 需要 AppIndicator 扩展才会显示托盘图标。
+- **路径**：`home` / `host` 授权让沙箱直接看到宿主文件系统，但沙箱里的 `/tmp` 是
+  Flatpak 自己挂的私有 tmpfs（`--filesystem=host` 不会覆盖它），所以 manifest 里
+  额外授权了 `--filesystem=/tmp`——否则把下载目录填成 `/tmp` 时文件只活在沙箱内，
+  应用一退出就没了。
+
+### 排错
+
+| 现象 | 原因 / 处理 |
+| --- | --- |
+| `本机无法执行 aarch64 的构建步骤` | 缺模拟器：`sudo dnf install -y qemu-user-static`（判据是 `/proc/sys/fs/binfmt_misc/qemu-aarch64` 存在且 enabled） |
+| `缺少 aarch64 的构建依赖 runtime/org.gnome.Sdk/aarch64/50` | 按脚本打印的命令装：`flatpak install --user --arch=aarch64 flathub org.gnome.Sdk//50 org.gnome.Platform//50` |
+| 装 aarch64 ref 报 `未发现用于"flathub"的远程引用` | 发行版自带的 flathub 是**过滤过**的（Fedora 就是），只提供本机架构的 ref：`flatpak remote-add --user --if-not-exists flathub-all https://dl.flathub.org/repo/flathub.flatpakrepo`，再用 `--arch=aarch64 flathub-all` 装 |
+| `找不到 aarch64 的 C 交叉编译器` | `sudo dnf install -y gcc-aarch64-linux-gnu`，或 `--cc-aarch64=/usr/bin/aarch64-linux-gnu-gcc` |
+| `bin/lgo_download_manager-aarch64 的架构是 …，与目标 aarch64 不符` | `--skip-build` 复用了别的架构的二进制；删掉重编或换成匹配的二进制 |
+| `create: 'lgo_download_manager' not found` / `install: cannot stat` | 打包输入不存在：先跑脚本（不要加 `--skip-build`）把 `bin/lgo_download_manager-<架构>` 编出来 |
+| 编译报 `bits/wordsize.h: 没有那个文件或目录` | sysroot 视图没建全（`dist/flatpak/<架构>/sysroot` 被删或 SDK 变了）；重跑脚本会重建 |
+| 编译报 `ld: 找不到 -latomic_asneeded` / 一串 `undefined reference`（libxcb、libXext、libffi…） | sysroot 视图少了 Fedora gcc 注入的 `-l*_asneeded` 脚本或缺 `-rpath-link`；脚本已处理，出现说明 SDK 布局变了，重跑脚本重建 sysroot |
+| appstream 校验报错 | `flatpak/org.langbiantianya.LGDM.metainfo.xml` 改坏了；单独校验：`appstreamcli validate --no-net <文件>` |
+
+### 已验证 / 已知限制
+
+本机（Fedora 44 / Flatpak 1.18.2 / flatpak-builder 1.4.10 / GNOME 50 runtime /
+`qemu-user-static` + `gcc-aarch64-linux-gnu`）实测：
+
+- `./scripts/build_flatpak.sh`（默认两个架构）一条命令出两份包：用目标架构的 flatpak SDK
+  当 sysroot 编二进制 → `flatpak-builder --arch=<架构>` → `build-bundle`，产出
+  `dist/lgdm-<版本>-x86_64.flatpak`（11 MB）与 `…-aarch64.flatpak`（9.7 MB）；
+  AppStream compose 与 `desktop-file-validate` 都不报错。缓存齐了之后一次跑完约 30 秒。
+- 编译用的头文件、glibc、X11/GL/wayland 库全部来自目标架构的 SDK（与运行时同源）：
+  aarch64 产物在沙箱里 `ldd` 解析到 `/usr/lib/aarch64-linux-gnu/*`、`uname -m` 为 `aarch64`。
+- `flatpak install --user <文件>`（脚本的 `--install`）装进用户安装：两份不同架构的 ref
+  可以并存于同一个用户安装，`flatpak run` 默认跑本机架构、`flatpak run --arch=aarch64 …`
+  跑另一份（本机实测两份都在，默认得 x86_64、加 `--arch=aarch64` 得 aarch64）。
+- **两个架构都实测过**沙箱内的开机自启：开关打开 → 宿主
+  `~/.config/autostart/lgo_download_manager.desktop` 出现
+  `Exec=flatpak run org.langbiantianya.LGDM --autostart` + `X-Flatpak=`；关闭 → 被删除。
+  aarch64 那份是在 qemu 下跑的（启动/退出各几秒）。
+- `lgom://` 由 Flatpak 导出给宿主，导出的 `.desktop` 里 Exec 被改写成
+  `flatpak run … --open-url @@u %u @@`。
+- 架构守卫：`--skip-build` 传入架构不符的二进制（伪造的 aarch64 ELF）会被直接拒绝，
+  不会打进包里。
+
+限制：
+
+- **托盘图标依赖桌面环境**：GNOME 需要 AppIndicator 扩展才能看到托盘菜单。
+- **未签名**：产物是单文件 bundle（`flatpak install <文件>` 直接装），没有仓库
+  签名/OSTree remote 那套发布流程。
+- **aarch64 在 x86_64 上出包需要 qemu**（构建环境要求，与产物无关）：沙箱里的
+  `install` / appstream compose 等步骤跑在 qemu 下；在原生 aarch64 机器上不需要 qemu，
+  也不需要交叉编译器（`arch == 本机架构` 时脚本走本机 gcc）。
+
 ## 运行
 
 带 GUI 运行：
@@ -276,6 +400,13 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 ./lgdm --light
 ```
 
+装了 Flatpak 包的话（见「Linux 打包（Flatpak 安装包）」）：
+
+```sh
+flatpak run org.langbiantianya.LGDM                 # 跑已安装的那份(默认本机架构)
+flatpak run --arch=aarch64 org.langbiantianya.LGDM  # 已装了 aarch64 那份时指定它
+```
+
 ## 命令行参数
 
 | 参数        | 默认值          | 说明                                          |
@@ -285,7 +416,7 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 | `-open-url` | `""`            | 一条 `lgom://...` URL，加入队列               |
 | `-light`    | `false`         | 强制开启轻量模式（关闭主窗口时释放 widget 树） |
 | `-debug`    | `false`         | 把日志写到 stderr 而不是轮转文件（详见「日志」） |
-| `-autostart`| `false`         | 由 OS 登录启动项触发:静默拉起(只保留调度器 + 托盘,不显示主窗口) |
+| `-autostart`| `false`         | 由 OS 登录启动项触发:静默拉起(只保留调度器 + 托盘,不显示主窗口)。Flatpak 安装下由注册项里的 `flatpak run … --autostart` 触发 |
 
 `-config` 默认值：Windows 上是 `%LOCALAPPDATA%\lgo_download_manager`（绝对路径
 —— 安装后的 lgdm 会被 `lgom://` 协议从任意工作目录拉起，相对路径会因 CWD
@@ -319,11 +450,13 @@ UI 子进程，避免子进程的日志悄悄落到文件里。
 
 `lgom://download?url=<encoded>[&name=<encoded>[&ua=<encoded>[&headers=<encoded>[&cookies=<encoded>]]]]`
 
-只有 `url` 是必填项。URL 由操作系统交给新启动的 `lgdm.exe`（Windows 安装包
-注册的命令行是 `"<install>\lgdm.exe" "%1"`）：没有实例在运行时，这个进程就是
-主实例，自己把 URL 入队并下载；已有实例在运行时，新进程通过命名管道
-（Windows）/ Unix socket（其它平台）把 URL 转发给主实例后退出，转发失败
-（例如主实例刚好在退出）以非零状态结束并打印原因。
+只有 `url` 是必填项。URL 由操作系统交给新启动的进程：Windows 安装包注册的命令行是
+`"<install>\lgdm.exe" "%1"`；Linux 由 `.desktop` 的 `MimeType=x-scheme-handler/lgom`
+注册，Flatpak 版由 Flatpak 把同一份 `.desktop` 导出给宿主（导出的 Exec 会被改写成
+`flatpak run … --open-url @@u %u @@`）。没有实例在运行时，这个进程就是主实例，
+自己把 URL 入队并下载；已有实例在运行时，新进程通过命名管道（Windows）/
+Unix socket（其它平台）把 URL 转发给主实例后退出，转发失败（例如主实例刚好在退出）
+以非零状态结束并打印原因。
 
 ## 代理
 
@@ -350,10 +483,18 @@ PAC / WPAD 自动配置脚本不在支持范围内。
 | ------ | ------------------------------------------------------------------------- | --------- |
 | Windows | `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`（无需管理员权限）  | `"<exe>" --autostart` |
 | Linux  | `$XDG_CONFIG_HOME/autostart/lgo_download_manager.desktop`（缺省 `~/.config`） | `Exec=<exe> --autostart` + `X-GNOME-Autostart-enabled=true` |
+| Linux（Flatpak） | 宿主 `~/.config/autostart/lgo_download_manager.desktop`          | `Exec=flatpak run org.langbiantianya.LGDM --autostart` + `X-Flatpak=org.langbiantianya.LGDM` |
 | macOS  | `~/Library/LaunchAgents/org.langbiantianya.LGDM.plist`                    | `ProgramArguments` 数组形式，`RunAtLoad=true`、`ProcessType=Background` |
 
 `--autostart` 由各平台注册项附加，业务进程读到后跳过 `uim.Start()`，
 保留调度器 + 托盘常驻。Windows / Linux / macOS 三平台行为对齐。
+
+Flatpak 是 Linux 上的例外：沙箱里的 `/app/bin/lgo_download_manager` 在宿主上
+并不存在，注册项必须写成 `flatpak run <app-id> --autostart` 由宿主重新进入
+沙箱拉起应用，应用 ID 取自运行时注入的 `FLATPAK_ID`；入口文件也必须落在宿主
+`~/.config/autostart`（沙箱里的 `$XDG_CONFIG_HOME` 是应用私有目录
+`~/.var/app/<app-id>/config`，写在那里等于没注册）。宿主目录由 manifest 的
+`finish-args: --filesystem=xdg-config/autostart` 映射进沙箱。
 
 启动时 `settings.ReconcileAutoStart` 会把持久化的开关与操作系统真实状态
 调和：用户在第三方工具（任务管理器「启动」标签、GNOME Tweaks、系统设置）
@@ -438,7 +579,7 @@ internal/prealloc/             # 磁盘预分配辅助
 internal/urllauncher/          # lgom:// URL 解析、单实例锁、URL 转发
                                #   （Windows 命名管道 / 其它平台 Unix socket）
 internal/settings/             # 首次运行默认值 / --light 覆盖 / 进程级代理同步 / 开机自启调和
-internal/autostart/            # 跨平台开机自启：HKCU Run / XDG autostart / LaunchAgent
+internal/autostart/            # 跨平台开机自启：HKCU Run / XDG autostart / LaunchAgent（含 Flatpak）
 internal/logging/              # log/slog 门面：轮转文件 / --debug stderr / Windows console 挂接
 internal/ipc/                  # 长度前缀 JSON 帧协议（业务↔UI 共用）
 internal/uimgr/                # UI 子进程生命周期与 IPC 会话管理
@@ -447,6 +588,9 @@ internal/tray/                 # fyne.io/systray 业务进程常驻托盘
 assets/                        # 图标（安装包快捷方式 / lgom:// DefaultIcon 都用它）
 installer/                     # lgdm.wxs（WiX MSI）、installer.iss（Inno Setup EXE）
 scripts/package.ps1            # 打包入口：编译 + 出 MSI / EXE 安装包
+scripts/build_flatpak.sh       # 打包入口：编译 + 出 Flatpak 安装包
+org.langbiantianya.LGDM.yml    # Flatpak manifest（app id / runtime / 权限 / 模块）
+flatpak/                       # Flatpak 用的 AppStream metainfo
 ```
 
 ### IPC 协议（业务 ↔ UI 子进程）
