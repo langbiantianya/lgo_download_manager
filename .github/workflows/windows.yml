@@ -11,28 +11,16 @@ on:
 permissions:
   contents: write   # 上传 release 资产
 
-jobs:
-  package:
-    name: package (${{ matrix.arch }})
-    # x64 跑 windows-latest,arm64 跑 windows-11-arm(仅公开仓库可用);
-    # 脚本走 cgo + LLVM-MinGW 交叉编译,但 winget / WiX / Inno Setup 都按
-    # Windows 平台路径解析,跨 GOARCH 在 arm64 runner 上等价于「原生 GOARCH
-    # + winget 拉同包」——两个 runner 都能稳定跑同一条脚本。
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [x64, arm64]
-        include:
-          - arch: x64
-            runs-on: windows-latest
-            artifact_prefix: lgdm-windows-x64
-            ext: x64
-          - arch: arm64
-            runs-on: windows-11-arm
-            artifact_prefix: lgdm-windows-arm64
-            ext: arm64
-    runs-on: ${{ matrix.runs-on }}
+# 拆成两个独立 job:
+#   - x64:   windows-latest(原生 amd64)——脚本默认就会用本机 GCC 走 cgo
+#   - arm64: windows-11-arm(原生 arm64,仅公开仓库可用)——脚本也走本机工具链
+# 不再靠 LLVM-MinGW 交叉编译;每个 job 在原生架构上跑,GOARCH 与 CPU 一致,
+# Go 默认开 cgo,fyne 的 GL 绑定直接走本机 GCC,免去 sysroot 切换。
 
+jobs:
+  windows-x64:
+    name: windows x64
+    runs-on: windows-latest
     steps:
       - name: checkout
         uses: actions/checkout@v4
@@ -48,34 +36,64 @@ jobs:
       # 脚本依赖(winget 一次性拉齐):
       #   - WiX Toolset CLI 6.0.2     (出 MSI)
       #   - Inno Setup 6              (出 EXE)
-      #   - LLVM-MinGW UCRT           (x64 / arm64 cgo;同一个工具链包同时带
-      #                                x86_64 与 aarch64 target)
       # 默认让脚本自动装;SkipToolInstall 不传,确保缺啥装啥。
+      # C 编译器:windows-latest 自带 mingw-w64 GCC,脚本里 Get-Command gcc.exe
+      # 会直接拿到,不需要 LLVM-MinGW。
 
-      - name: package (MSI + EXE)
+      - name: package x64 (MSI + EXE)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          pwsh -NoProfile -File scripts/package.ps1 `
-            -Format both -Arch ${{ matrix.arch }}
-
-      - name: list dist
-        shell: pwsh
-        run: Get-ChildItem dist/ | Format-Table Name, Length
+          pwsh -NoProfile -File scripts/package.ps1 -Format both -Arch x64
 
       - name: upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_prefix }}
+          name: lgdm-windows-x64
           path: |
-            dist/lgdm-setup-*-${{ matrix.ext }}.msi
-            dist/lgdm-setup-*-${{ matrix.ext }}.exe
+            dist/lgdm-setup-*-x64.msi
+            dist/lgdm-setup-*-x64.exe
+          if-no-files-found: error
+          retention-days: 30
+
+  windows-arm64:
+    name: windows arm64
+    runs-on: windows-11-arm   # 仅公开仓库可用;原生 ARM64,无需交叉编译
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.6'
+          cache: true
+
+      # windows-11-arm 自带 arm64 mingw GCC(脚本优先 Get-Command gcc.exe);
+      # 若本机 gcc 缺失,脚本里 Resolve-CC 会自动 winget 装 LLVM-MinGW
+      # 作为后备(同一个工具链同时带 x86_64 / aarch64 target)。
+
+      - name: package arm64 (MSI + EXE)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File scripts/package.ps1 -Format both -Arch arm64
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lgdm-windows-arm64
+          path: |
+            dist/lgdm-setup-*-arm64.msi
+            dist/lgdm-setup-*-arm64.exe
           if-no-files-found: error
           retention-days: 30
 
   release:
     name: release
-    needs: [package]
+    needs: [windows-x64, windows-arm64]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
