@@ -260,6 +260,18 @@ function Find-PrefixedMingwCC([string[]]$Names) {
     return $null
 }
 
+# 交给 Go 的 CC 值。
+#
+# Go 用 str.SplitQuotedFields 解析 CC,按空白切词,所以路径带空格时必须加引号,
+# 否则它只拿到第一段,报:
+#   cgo: C compiler "C:\\Program" not found: exec: "C:\\Program": executable file not found
+# 本脚本的 Find-PrefixedMingwCC 就会去 Program Files\llvm-mingw 下找,
+# -CCX64 / -CCArm64 也可能传进来带空格的路径。
+function Format-CCForGo([string]$CCPath) {
+    if ($CCPath -match '\s') { return '"' + $CCPath + '"' }
+    return $CCPath
+}
+
 # 解析某个架构的 CC。返回编译器的绝对路径,或 $null 表示交给 Go 用自己的默认 CC。
 # 找不到 arm64 工具链时会先尝试 winget 安装 LLVM-MinGW。
 function Resolve-CC([string]$Slug) {
@@ -373,7 +385,7 @@ function Invoke-Build([pscustomobject]$Spec, [string]$CC) {
     # 交叉编译(GOARCH != 主机架构)时 Go 默认把 cgo 关掉,而 Fyne 的 GL 绑定
     # 只有 cgo 实现,关掉就是 "build constraints exclude all Go files"。
     $env:CGO_ENABLED = '1'
-    if ($CC) { $env:CC = $CC }
+    if ($CC) { $env:CC = (Format-CCForGo $CC) }
     try {
         Invoke-Native 'go' @('build', '-trimpath', '-ldflags', $ldflags, '-o', $Spec.ExePath, '.') $RepoRoot
     } finally {

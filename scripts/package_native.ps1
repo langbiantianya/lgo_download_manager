@@ -174,14 +174,19 @@ if ($slug -eq 'arm64') {
     $exePath = Join-Path $BinDir 'lgdm-arm64.exe'
     # 宿主(arm64)的 mingw 目标三元组前缀;确认过的目标架构由它写死在名字里。
     $mingwPrefix = 'aarch64-w64-mingw32'
-    $ccArchPattern = 'aarch64'
+    # 必须是 mingw-w64 / GNU 目标的编译器:Fyne 的 cgo 依赖走 gcc 风格命令行,
+    # Windows 上 MSVC 目标的 clang(LLVM 官方 Windows 版不带 -target 时默认就是
+    # x86_64-pc-windows-msvc / aarch64-pc-windows-msvc)拿不到 mingw 的头与库,
+    # 也不认 -l/-L 那套链接参数,选中它只会在链接阶段失败。只按架构匹配的话
+    # 它会混进来,所以这里连 ABI 一起限死。
+    $ccArchPattern = '^aarch64.*(mingw|gnu)'
 } else {
     $goarch = 'amd64'
     $wixArch = 'x64'
     $peMachine = $PeMachineX64
     $exePath = Join-Path $BinDir 'lgdm-x64.exe'
     $mingwPrefix = 'x86_64-w64-mingw32'
-    $ccArchPattern = 'x86_64|amd64'
+    $ccArchPattern = '^(x86_64|amd64).*(mingw|gnu)'
 }
 
 # 读 PE 头的 Machine 字段。防的是「-SkipBuild 复用了另一个架构的 bin 文件」——
@@ -324,6 +329,17 @@ function Test-CCMatchesArch([string]$CCPath, [string]$Name) {
     return ($Name -match [regex]::Escape($mingwPrefix))
 }
 
+# 交给 Go 的 CC 值。
+#
+# Go 用 str.SplitQuotedFields 解析 CC,按空白切词,所以路径带空格时必须加引号,
+# 否则它只拿到第一段,报:
+#   cgo: C compiler "C:\\Program" not found: exec: "C:\\Program": executable file not found
+# (Program Files 下的 LLVM/MinGW、以及 -CC 传进来的带空格路径都会踩到。)
+function Format-CCForGo([string]$CCPath) {
+    if ($CCPath -match '\s') { return '"' + $CCPath + '"' }
+    return $CCPath
+}
+
 # 解析宿主 C 编译器,返回绝对路径。这里找的都是**宿主架构**的编译器
 # (含 LLVM-MinGW 的宿主 triplet)—— 本脚本不做交叉编译,拿错目标的编译器不会
 # 报「架构不对」,而是先在 cgo 的汇编写死,所以每个候选都要验目标。
@@ -438,7 +454,7 @@ function Invoke-Build($CCPath) {
     $env:GOOS = 'windows'
     $env:GOARCH = $goarch
     $env:CGO_ENABLED = '1'
-    if ($CCPath) { $env:CC = $CCPath }
+    if ($CCPath) { $env:CC = (Format-CCForGo $CCPath) }
     try {
         Invoke-Native 'go' @('build', '-trimpath', '-ldflags', $ldflags, '-o', $exePath, '.') $RepoRoot
     } finally {
