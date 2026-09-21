@@ -4,6 +4,7 @@
 	"version": "1.0.0",
 	"description": "__MSG_extensionDescription__",
 	"default_locale": "en",
+	"minimum_chrome_version": "102",
 	"permissions": ["downloads", "storage", "tabs", "webRequest"],
 	"host_permissions": ["<all_urls>"],
 	"background": {
