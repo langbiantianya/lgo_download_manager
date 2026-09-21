@@ -28,21 +28,36 @@ globalThis.chrome.downloads.onCreated.addListener(async (downloadItem) => {
 	await browser.downloads.cancel(downloadItem.id).catch(() => {});
 	await browser.downloads.erase({ id: downloadItem.id }).catch(() => {});
 
-	await warmHeaderCache(downloadItem.url);
-	const headers = await getHeaders(downloadItem.url);
+	// The hand-off can fail (no protocol handler registered, tab creation
+	// refused). Record what happened instead of aborting silently, so the
+	// popup's recent list reflects reality.
+	try {
+		await warmHeaderCache(downloadItem.url);
+		const headers = await getHeaders(downloadItem.url);
 
-	const metadata = normalizeMetadata(
-		downloadItem.url,
-		downloadItem.filename || undefined,
-		headers ?? {},
-		FALLBACK_UA
-	);
+		const metadata = normalizeMetadata(
+			downloadItem.url,
+			downloadItem.filename || undefined,
+			headers ?? {},
+			FALLBACK_UA
+		);
 
-	const lgomUrl = buildLgomUrl(metadata, config.maxUrlLength);
-	await triggerProtocol(lgomUrl);
+		const lgomUrl = buildLgomUrl(metadata, config.maxUrlLength);
+		await triggerProtocol(lgomUrl);
 
-	await recordRecent(downloadItem.url, metadata.name, true, 'forwarded');
+		await recordRecent(downloadItem.url, metadata.name, true, 'forwarded');
+	} catch (error) {
+		await recordRecent(downloadItem.url, downloadItem.filename, false, describeError(error));
+	}
 });
+
+/**
+ * @param {unknown} error
+ * @returns {string}
+ */
+function describeError(error) {
+	return `failed: ${String(/** @type {{message?: string}} */ (error)?.message ?? error)}`;
+}
 
 /**
  * @param {string} url

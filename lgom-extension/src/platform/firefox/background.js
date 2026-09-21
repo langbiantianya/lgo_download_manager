@@ -34,24 +34,45 @@ browser.downloads.onCreated.addListener(async (downloadItem) => {
 	await browser.downloads.cancel(downloadItem.id).catch(() => {});
 	await browser.downloads.erase({ id: downloadItem.id }).catch(() => {});
 
-	await warmHeaderCache(downloadItem.url);
-	const headers = await getCachedHeaders(downloadItem.url);
+	// The hand-off can fail (no protocol handler registered, tab creation
+	// refused). Record what happened instead of aborting silently, so the
+	// popup's recent list reflects reality.
+	try {
+		await warmHeaderCache(downloadItem.url);
+		const headers = await getCachedHeaders(downloadItem.url);
 
-	const metadata = normalizeMetadata(
-		downloadItem.url,
-		downloadItem.filename || undefined,
-		headers ?? {},
-		FALLBACK_UA
-	);
+		const metadata = normalizeMetadata(
+			downloadItem.url,
+			downloadItem.filename || undefined,
+			headers ?? {},
+			FALLBACK_UA
+		);
 
-	const lgomUrl = buildLgomUrl(metadata, config.maxUrlLength);
-	await triggerProtocol(lgomUrl);
+		const lgomUrl = buildLgomUrl(metadata, config.maxUrlLength);
+		await triggerProtocol(lgomUrl);
 
-	await appendRecent({
-		url: downloadItem.url,
-		name: metadata.name,
-		ok: true,
-		reason: 'forwarded',
-		timestamp: Date.now()
-	});
+		await appendRecent({
+			url: downloadItem.url,
+			name: metadata.name,
+			ok: true,
+			reason: 'forwarded',
+			timestamp: Date.now()
+		});
+	} catch (error) {
+		await appendRecent({
+			url: downloadItem.url,
+			name: downloadItem.filename,
+			ok: false,
+			reason: describeError(error),
+			timestamp: Date.now()
+		});
+	}
 });
+
+/**
+ * @param {unknown} error
+ * @returns {string}
+ */
+function describeError(error) {
+	return `failed: ${String(/** @type {{message?: string}} */ (error)?.message ?? error)}`;
+}
