@@ -1,8 +1,4 @@
-import {
-	HEADER_CACHE_KEY,
-	HEADER_CACHE_LIMIT,
-	HEADER_CACHE_TTL
-} from '$lib/constants.js';
+import { HEADER_CACHE_KEY, HEADER_CACHE_LIMIT, HEADER_CACHE_TTL } from '$lib/constants.js';
 import { browser } from '$lib/platform-api.js';
 
 /** @type {Map<string, { at: number, headers: Record<string, string | string[]> }>} */

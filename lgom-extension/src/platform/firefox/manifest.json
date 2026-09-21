@@ -4,24 +4,19 @@
 	"version": "1.0.0",
 	"description": "__MSG_extensionDescription__",
 	"default_locale": "en",
-	"permissions": [
-		"downloads",
-		"storage",
-		"tabs",
-		"webRequest",
-		"scripting"
-	],
-	"host_permissions": [
-		"<all_urls>"
-	],
+	"permissions": ["downloads", "storage", "tabs", "webRequest", "scripting"],
+	"host_permissions": ["<all_urls>"],
 	"background": {
-		"service_worker": "background.js",
+		"scripts": ["background.js"],
 		"type": "module"
 	},
 	"browser_specific_settings": {
 		"gecko": {
 			"id": "lgom-download-manager@langbiantianya",
-			"strict_min_version": "120.0"
+			"strict_min_version": "140.0",
+			"data_collection_permissions": {
+				"required": ["none"]
+			}
 		}
 	},
 	"action": {
