@@ -1,0 +1,8 @@
+{
+	"extensionName": {
+		"message": "LGOM 下载管理器"
+	},
+	"extensionDescription": {
+		"message": "拦截浏览器下载并转发到 LGOM 桌面客户端。"
+	}
+}

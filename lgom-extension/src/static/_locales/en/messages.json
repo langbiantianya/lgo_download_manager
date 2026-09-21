@@ -1,0 +1,8 @@
+{
+	"extensionName": {
+		"message": "LGOM Download Manager"
+	},
+	"extensionDescription": {
+		"message": "Intercepts browser downloads and forwards them to the LGOM desktop client."
+	}
+}
