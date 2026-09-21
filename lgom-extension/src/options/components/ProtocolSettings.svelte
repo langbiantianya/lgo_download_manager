@@ -1,6 +1,7 @@
 <script>
 	import { getConfig, setConfig } from '$lib/storage.js';
 	import { DEFAULT_CONFIG } from '$lib/constants.js';
+	import { i18nGetMessage } from '$lib/platform-api.js';
 
 	let enabled = $state(DEFAULT_CONFIG.enabled);
 	let maxUrlLength = $state(DEFAULT_CONFIG.maxUrlLength);
@@ -26,16 +27,16 @@
 </script>
 
 <section class="flex flex-col gap-3 rounded bg-neutral-800 p-4 text-sm">
-	<h2 class="font-medium">protocol</h2>
+	<h2 class="font-medium">{i18nGetMessage('protocol')}</h2>
 
 	<label class="flex items-center gap-2">
 		<input type="checkbox" bind:checked={enabled} class="h-4 w-4 accent-green-500" />
-		<span>intercept downloads and forward to LGOM</span>
+		<span>{i18nGetMessage('interceptDownloadsLabel')}</span>
 	</label>
 
 	<label class="flex flex-col gap-1">
 		<span class="text-xs text-neutral-400">
-			maximum URL length forwarded (core params only above this)
+			{i18nGetMessage('maxUrlLengthLabel')}
 		</span>
 		<input
 			type="number"
@@ -51,14 +52,14 @@
 			onclick={save}
 			class="rounded bg-green-600 px-3 py-1 text-sm font-medium hover:bg-green-500"
 		>
-			save
+			{i18nGetMessage('save')}
 		</button>
 		{#if saved}
-			<span class="text-xs text-green-400">saved</span>
+			<span class="text-xs text-green-400">{i18nGetMessage('saved')}</span>
 		{/if}
 	</div>
 
 	<p class="text-xs text-neutral-500">
-		downloads are handed off through <code class="text-neutral-400">lgom://download?url=…</code>
+		{i18nGetMessage('handoffDescription', ['lgom://download?url=…'])}
 	</p>
 </section>

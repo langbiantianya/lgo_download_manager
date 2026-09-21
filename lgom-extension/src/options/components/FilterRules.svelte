@@ -1,8 +1,15 @@
 <script>
 	import { getConfig, setConfig } from '$lib/storage.js';
 	import { DEFAULT_CONFIG } from '$lib/constants.js';
+	import { i18nGetMessage } from '$lib/platform-api.js';
 
-	const MODES = ['all', 'whitelist', 'blacklist'];
+	const MODES = /** @type {const} */ (['all', 'whitelist', 'blacklist']);
+
+	const MODE_KEYS = {
+		all: 'modeAll',
+		whitelist: 'modeWhitelist',
+		blacklist: 'modeBlacklist'
+	};
 
 	let mode = $state(
 		/** @type {import('$lib/types.js').InterceptConfig['mode']} */ (DEFAULT_CONFIG.mode)
@@ -38,10 +45,10 @@
 </script>
 
 <section class="flex flex-col gap-3 rounded bg-neutral-800 p-4 text-sm">
-	<h2 class="font-medium">filter rules</h2>
+	<h2 class="font-medium">{i18nGetMessage('filterRules')}</h2>
 
 	<fieldset class="flex flex-col gap-1">
-		<legend class="text-xs text-neutral-400">mode</legend>
+		<legend class="text-xs text-neutral-400">{i18nGetMessage('mode')}</legend>
 		{#each MODES as option (option)}
 			<label class="flex items-center gap-2">
 				<input
@@ -53,7 +60,7 @@
 						(mode = /** @type {import('$lib/types.js').InterceptConfig['mode']} */ (option))}
 					class="h-4 w-4 accent-green-500"
 				/>
-				<span>{option}</span>
+				<span>{i18nGetMessage(MODE_KEYS[option])}</span>
 			</label>
 		{/each}
 	</fieldset>
@@ -64,19 +71,19 @@
 				<input
 					bind:value={draft}
 					onkeydown={(event) => event.key === 'Enter' && addPattern()}
-					placeholder="regex or substring"
+					placeholder={i18nGetMessage('patternPlaceholder')}
 					class="flex-1 rounded bg-neutral-700 px-2 py-1 text-sm"
 				/>
 				<button
 					onclick={addPattern}
 					class="rounded bg-neutral-600 px-3 py-1 text-sm hover:bg-neutral-500"
 				>
-					add
+					{i18nGetMessage('add')}
 				</button>
 			</div>
 
 			{#if patterns.length === 0}
-				<p class="text-xs text-neutral-500">no patterns</p>
+				<p class="text-xs text-neutral-500">{i18nGetMessage('noPatterns')}</p>
 			{:else}
 				<ul class="flex flex-col gap-1">
 					{#each patterns as pattern, index (pattern + index)}
@@ -86,7 +93,7 @@
 								onclick={() => removePattern(index)}
 								class="text-xs text-red-400 hover:text-red-300"
 							>
-								remove
+								{i18nGetMessage('remove')}
 							</button>
 						</li>
 					{/each}
@@ -100,10 +107,10 @@
 			onclick={save}
 			class="rounded bg-green-600 px-3 py-1 text-sm font-medium hover:bg-green-500"
 		>
-			save
+			{i18nGetMessage('save')}
 		</button>
 		{#if saved}
-			<span class="text-xs text-green-400">saved</span>
+			<span class="text-xs text-green-400">{i18nGetMessage('saved')}</span>
 		{/if}
 	</div>
 </section>

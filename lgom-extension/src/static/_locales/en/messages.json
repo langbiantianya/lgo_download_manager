@@ -4,5 +4,110 @@
 	},
 	"extensionDescription": {
 		"message": "Intercepts browser downloads and forwards them to the LGOM desktop client."
+	},
+	"loading": {
+		"message": "loading…"
+	},
+	"status": {
+		"message": "status"
+	},
+	"active": {
+		"message": "active"
+	},
+	"paused": {
+		"message": "paused"
+	},
+	"mode": {
+		"message": "mode"
+	},
+	"patterns": {
+		"message": "patterns"
+	},
+	"urlBudget": {
+		"message": "url budget"
+	},
+	"recent": {
+		"message": "recent"
+	},
+	"noInterceptionsYet": {
+		"message": "no interceptions yet"
+	},
+	"sent": {
+		"message": "sent"
+	},
+	"skipped": {
+		"message": "skipped"
+	},
+	"protocol": {
+		"message": "protocol"
+	},
+	"interceptDownloadsLabel": {
+		"message": "intercept downloads and forward to LGOM"
+	},
+	"maxUrlLengthLabel": {
+		"message": "maximum URL length forwarded (core params only above this)"
+	},
+	"save": {
+		"message": "save"
+	},
+	"saved": {
+		"message": "saved"
+	},
+	"handoffDescription": {
+		"message": "downloads are handed off through $URL$",
+		"placeholders": {
+			"url": {
+				"content": "$1",
+				"example": "lgom://download?url=…"
+			}
+		}
+	},
+	"filterRules": {
+		"message": "filter rules"
+	},
+	"modeAll": {
+		"message": "all"
+	},
+	"modeWhitelist": {
+		"message": "whitelist"
+	},
+	"modeBlacklist": {
+		"message": "blacklist"
+	},
+	"patternPlaceholder": {
+		"message": "regex or substring"
+	},
+	"add": {
+		"message": "add"
+	},
+	"remove": {
+		"message": "remove"
+	},
+	"noPatterns": {
+		"message": "no patterns"
+	},
+	"about": {
+		"message": "about"
+	},
+	"aboutDescription": {
+		"message": "forwards intercepted downloads to the LGOM desktop client via the $PROTOCOL$ protocol.",
+		"placeholders": {
+			"protocol": {
+				"content": "$1",
+				"example": "lgom://"
+			}
+		}
+	},
+	"platform": {
+		"message": "platform"
+	},
+	"default": {
+		"message": "default"
+	},
+	"ipcFrameLimit": {
+		"message": "ipc frame limit"
+	},
+	"clearInterceptionLog": {
+		"message": "clear interception log"
 	}
 }

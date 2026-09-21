@@ -1,5 +1,6 @@
 <script>
 	import { getConfig, setConfig } from '$lib/storage.js';
+	import { i18nGetMessage } from '$lib/platform-api.js';
 
 	let enabled = $state(true);
 	let saving = $state(false);
@@ -23,7 +24,7 @@
 
 <section class="rounded bg-neutral-800 p-3">
 	<label class="flex items-center justify-between gap-2 text-xs">
-		<span>intercept downloads</span>
+		<span>{i18nGetMessage('interceptDownloadsLabel')}</span>
 		<input
 			type="checkbox"
 			checked={enabled}

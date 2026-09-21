@@ -4,5 +4,110 @@
 	},
 	"extensionDescription": {
 		"message": "拦截浏览器下载并转发到 LGOM 桌面客户端。"
+	},
+	"loading": {
+		"message": "加载中…"
+	},
+	"status": {
+		"message": "状态"
+	},
+	"active": {
+		"message": "运行中"
+	},
+	"paused": {
+		"message": "已暂停"
+	},
+	"mode": {
+		"message": "模式"
+	},
+	"patterns": {
+		"message": "规则"
+	},
+	"urlBudget": {
+		"message": "URL 预算"
+	},
+	"recent": {
+		"message": "最近"
+	},
+	"noInterceptionsYet": {
+		"message": "暂无拦截记录"
+	},
+	"sent": {
+		"message": "已发送"
+	},
+	"skipped": {
+		"message": "已跳过"
+	},
+	"protocol": {
+		"message": "协议"
+	},
+	"interceptDownloadsLabel": {
+		"message": "拦截下载并转发到 LGOM"
+	},
+	"maxUrlLengthLabel": {
+		"message": "最大转发 URL 长度（仅核心参数超出此值时生效）"
+	},
+	"save": {
+		"message": "保存"
+	},
+	"saved": {
+		"message": "已保存"
+	},
+	"handoffDescription": {
+		"message": "下载通过 $URL$ 协议转发",
+		"placeholders": {
+			"url": {
+				"content": "$1",
+				"example": "lgom://download?url=…"
+			}
+		}
+	},
+	"filterRules": {
+		"message": "过滤规则"
+	},
+	"modeAll": {
+		"message": "全部"
+	},
+	"modeWhitelist": {
+		"message": "白名单"
+	},
+	"modeBlacklist": {
+		"message": "黑名单"
+	},
+	"patternPlaceholder": {
+		"message": "正则或子串"
+	},
+	"add": {
+		"message": "添加"
+	},
+	"remove": {
+		"message": "移除"
+	},
+	"noPatterns": {
+		"message": "暂无规则"
+	},
+	"about": {
+		"message": "关于"
+	},
+	"aboutDescription": {
+		"message": "将拦截的下载转发至 LGOM 桌面客户端，协议：$PROTOCOL$。",
+		"placeholders": {
+			"protocol": {
+				"content": "$1",
+				"example": "lgom://"
+			}
+		}
+	},
+	"platform": {
+		"message": "平台"
+	},
+	"default": {
+		"message": "默认"
+	},
+	"ipcFrameLimit": {
+		"message": "IPC 帧限制"
+	},
+	"clearInterceptionLog": {
+		"message": "清除拦截日志"
 	}
 }

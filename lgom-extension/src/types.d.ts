@@ -30,6 +30,9 @@ interface WebExtensionTab {
 }
 
 interface WebExtensionApi {
+	i18n: {
+		getMessage(messageName: string, substitutions?: string | string[]): string;
+	};
 	runtime: {
 		getManifest(): { manifest_version?: number };
 		getBrowserInfo?(): Promise<{ name: string; vendor: string }>;
