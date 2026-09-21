@@ -1,5 +1,4 @@
 import {
-	DOWNLOAD_HINT,
 	HEADER_CACHE_KEY,
 	HEADER_CACHE_LIMIT,
 	HEADER_CACHE_TTL
@@ -26,8 +25,6 @@ export function registerHeaderListener() {
  * @param {import('$lib/types.js').HeaderEvent} details
  */
 function onBeforeSendHeaders(details) {
-	if (!DOWNLOAD_HINT.test(details.url)) return;
-
 	const now = Date.now();
 	memory.set(details.url, { at: now, headers: toHeaderRecord(details.requestHeaders) });
 	if (memory.size > HEADER_CACHE_LIMIT) {
