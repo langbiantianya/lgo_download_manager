@@ -39,7 +39,8 @@ for (const entry of ['popup', 'options']) {
 	cpSync(join(STAGE, css), join(OUT, `${entry}.css`));
 }
 
-cpSync(join(ROOT, `src/platform/${PLATFORM}`), join(OUT, 'platform'), { recursive: true });
+// The platform directory contributes only its manifest; its sources are
+// already bundled into background.js by the entries above.
 cpSync(join(ROOT, `src/platform/${PLATFORM}/manifest.json`), join(OUT, 'manifest.json'));
 cpSync(join(ROOT, `src/popup/index.html`), join(OUT, 'popup.html'));
 cpSync(join(ROOT, `src/options/index.html`), join(OUT, 'options.html'));

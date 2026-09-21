@@ -47,9 +47,6 @@ export const HEADER_CACHE_KEY = 'lgom_header_cache';
 /** Filename fallback when nothing better is known. */
 export const UNKNOWN_FILENAME = 'unknown';
 
-/** Heuristic pre-filter for URLs worth caching headers for. */
-export const DOWNLOAD_HINT = /\.(zip|rar|7z|tar|gz|mp4|mkv|avi|pdf|exe|dmg|iso|apk|deb|rpm)(\?|$)/i;
-
 /** How long the protocol tab stays open before being removed (ms). */
 export const PROTOCOL_TAB_TIMEOUT = 1000;
 
