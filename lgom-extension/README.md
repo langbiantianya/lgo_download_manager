@@ -1,218 +1,205 @@
-# LGOM browser extension
+# LGOM 浏览器扩展
 
-Intercepts browser downloads and hands them to the LGOM desktop client
-(`lgo_download_manager`) through the `lgom://` URL scheme.
+拦截浏览器下载请求，通过 `lgom://` URL 协议将任务移交给 LGOM 桌面客户端
+（`lgo_download_manager`）。
 
-One codebase, two platform bundles: shared logic in `src/lib`, per-browser
-manifests, background scripts and protocol triggers in `src/platform/<target>`,
-and a Svelte 5 popup + options surface in `src/popup` / `src/options`.
+一套代码库，两个平台包：共享逻辑位于 `src/lib`，各浏览器独占的
+manifest、后台脚本和协议触发器位于 `src/platform/<target>`，
+Svelte 5 弹窗和选项页面位于 `src/popup` / `src/options`。
 
-## Requirements
+## 系统要求
 
-| Host                          | Manifest | Background context       |
-| ----------------------------- | -------- | ------------------------ |
-| Chrome / Chromium / Edge 102+ | MV3      | ES module service worker |
-| Firefox 140+                  | MV3      | ES module event page     |
+| 主机                              | Manifest | 后台上下文                    |
+| --------------------------------- | -------- | ----------------------------- |
+| Chrome / Chromium / Edge 102+     | MV3      | ES 模块 Service Worker        |
+| Firefox 140+                      | MV3      | ES 模块事件页面               |
 
-The Chrome floor is set by `chrome.storage.session` (102+) for the header-cache
-mirror, and is enforced by `minimum_chrome_version` in that manifest.
+Chrome 版本下限由 `chrome.storage.session`（102+）的请求头缓存镜像功能决定，
+通过该 manifest 中的 `minimum_chrome_version` 强制执行。
 
-Firefox does not implement MV3 service workers, so its background has to be
-declared as an event page (`background.scripts`) instead of
-`background.service_worker`; declaring the latter makes Firefox refuse to
-install with _"background.service_worker is currently disabled. Add
-background.scripts."_ Firefox's `strict_min_version` is 140.0 because that is
-the version that introduced `data_collection_permissions`, which is mandatory
-for new add-ons.
+Firefox 未实现 MV3 Service Worker，因此其后台必须声明为事件页面
+（`background.scripts`），而非 `background.service_worker`；后者会导致 Firefox
+拒绝安装并报错"background.service_worker 目前已禁用，请添加 background.scripts"。
+Firefox 的 `strict_min_version` 为 140.0，因为该版本引入了新扩展必需的
+`data_collection_permissions`。
 
-Both hosts load the background bundle as an **ES module**. Vite emits it with
-`import ... from "./chunks/..."` statements, which a classic background script
-cannot execute — silently killing the extension. Keep `"type": "module"` in
-both manifests in sync with the bundler output.
+两个主机都将后台 bundle 加载为 **ES 模块**。Vite 输出包含
+`import ... from "./chunks/..."` 语句的代码，经典后台脚本无法执行——会静默终止扩展。
+请确保两个 manifest 中的 `"type": "module"` 与打包器输出保持同步。
 
-## Build
+## 构建
 
 ```sh
 npm install
-npm run build:all        # -> build/chrome/ and build/firefox/
+npm run build:all        # -> build/chrome/ 和 build/firefox/
 ```
 
-| Script                  | Effect                               |
-| ----------------------- | ------------------------------------ |
-| `npm run build:chrome`  | Chrome bundle into `build/chrome/`   |
-| `npm run build:firefox` | Firefox bundle into `build/firefox/` |
-| `npm run build:all`     | Both                                 |
-| `npm run dev`           | Rebuild the Chrome bundle on change  |
-| `npm run dev:firefox`   | Same, for Firefox                    |
-| `npm run check`         | `svelte-check` over `jsconfig.json`  |
-| `npm run lint`          | `prettier --check` + `eslint`        |
-| `npm run format`        | `prettier --write`                   |
+| 脚本                   | 效果                                |
+| ---------------------- | ----------------------------------- |
+| `npm run build:chrome`  | Chrome 包输出至 `build/chrome/`     |
+| `npm run build:firefox` | Firefox 包输出至 `build/firefox/`   |
+| `npm run build:all`     | 同时构建两者                         |
+| `npm run dev`           | 监听文件变更自动重新构建 Chrome 包   |
+| `npm run dev:firefox`   | 同上，针对 Firefox                  |
+| `npm run check`         | `svelte-check`（基于 `jsconfig.json`）|
+| `npm run lint`          | `prettier --check` + `eslint`       |
+| `npm run format`        | `prettier --write`                  |
 
-Each build stages Vite output in a temp directory and assembles the extension
-root, so the two platform trees never mix. Result:
+每次构建会将 Vite 输出先暂存到临时目录，再组装成扩展根目录，
+确保两个平台的文件互不污染。产物结构：
 
 ```
 build/<platform>/
   manifest.json      # src/platform/<platform>/manifest.json
-  background.js      # bundled background entry
-  chunks/            # shared chunks statically imported by the entries
+  background.js      # 打包后的后台入口
+  chunks/            # 入口静态导入的共享代码块
   popup.html|css|js  # src/popup
   options.html|css|js
   icons/             # src/static/icons
   _locales/          # src/static/_locales
 ```
 
-## Loading
+## 加载扩展
 
 ```sh
 npm run build:chrome
 
-# Chromium-family browsers (see the caveat below)
+# Chromium 系列浏览器（见下方注意事项）
 chrome  --load-extension="$PWD/build/chrome"
-# or: chrome://extensions -> enable Developer mode -> Load unpacked -> build/chrome
+# 或：chrome://extensions -> 启用开发者模式 -> 加载已解压的扩展 -> build/chrome
 ```
 
 ```sh
 npm run build:firefox
-# about:debugging#/runtime/this-firefox -> Load Temporary Add-on -> build/firefox/manifest.json
+# about:debugging#/runtime/this-firefox -> 临时加载附加组件 -> build/firefox/manifest.json
 ```
 
-Branded Google Chrome ≥ 137 ignores `--load-extension` (the command line flag is
-only honoured by Chromium and Chrome for Testing builds). Load unpacked through
-`chrome://extensions`, or drive a Chromium-family build such as
-`/usr/bin/microsoft-edge --load-extension=...` for scripted testing.
+品牌版 Google Chrome ≥ 137 会忽略 `--load-extension`（此命令行参数仅 Chromium
+和 Chrome for Testing 构建版本支持）。请通过 `chrome://extensions` 加载，
+或使用 Chromium 系列构建（如 `/usr/bin/microsoft-edge --load-extension=...`）
+进行脚本化测试。
 
-The unpacked Chrome extension ID is derived from the directory path, so moving
-`build/chrome` changes the ID. Pin it with a `key` in the Chrome manifest before
-anything starts whitelisting that ID (for example a future native messaging
-host manifest).
+未打包的 Chrome 扩展 ID 由目录路径决定，移动 `build/chrome` 会改变 ID。
+在扩展 ID 被加入白名单（如未来的原生消息主机 manifest）之前，
+请在 Chrome manifest 中使用 `key` 固定 ID。
 
-## How interception works
+## 拦截原理
 
-1. `webRequest.onBeforeSendHeaders` (observe-only, no `blocking`) caches the
-   request headers per URL in an in-memory `Map`, mirrored into
-   `storage.session` behind a 250 ms debounce. Both hosts evict the background
-   context when idle, so the in-memory map alone is not enough; Chrome only
-   grants `Cookie`/`User-Agent` visibility with the `extraHeaders` opt-in.
-2. `downloads.onCreated` fires. If interception is disabled or the URL does not
-   match the active filter mode, nothing is touched.
-3. The download is cancelled and erased.
-4. The cached headers are turned into metadata (`normalizeMetadata`), and
-   `buildLgomUrl` produces the hand-off URL.
-5. `triggerProtocol` opens an inactive tab on the `lgom://` URL and removes the
-   tab after 1 s. Firefox additionally injects a hidden iframe as a fallback,
-   because it can refuse top-level navigation to an unknown external scheme.
-6. The outcome is appended to the recent-interception log (newest first, last
-   50 entries) — including hand-off failures, so the popup never reports
-   "no interceptions yet" for a download that was actually intercepted and then
-   failed to forward.
+1. `webRequest.onBeforeSendHeaders`（仅观察，不阻塞）将每个 URL 的请求头
+   缓存到内存 `Map`，并以 250 ms 防抖写入 `storage.session` 镜像。
+   两个主机都会在空闲时清除后台上下文，因此仅靠内存 Map 不够；
+   Chrome 需要 `extraHeaders` 才能获取 `Cookie`/`User-Agent`。
+2. `downloads.onCreated` 事件触发。如拦截已禁用或 URL 不匹配当前过滤模式，
+   则不处理。
+3. 下载任务被取消并擦除。
+4. 缓存的请求头经 `normalizeMetadata` 转为元数据，`buildLgomUrl` 生成交接 URL。
+5. `triggerProtocol` 打开一个指向 `lgom://` URL 的后台标签页，1 秒后移除。
+   Firefox 还会注入一个隐藏 iframe 作为备选方案，因为它可能拒绝向未知外部
+   协议发起顶层导航。
+6. 结果追加到最近拦截日志（最新优先，最多 50 条）——包括交接失败，
+   这样弹窗不会在下载已被拦截但转发失败的情况下显示"尚无拦截记录"。
 
-## Hand-off URL contract
+## 交接 URL 协议
 
 ```
-lgom://download?url=<encoded>[&name=<encoded>[&ua=<encoded>][&headers=<encoded>&cookies=<encoded>]]
+lgom://download?url=<编码>[&name=<编码>[&ua=<编码>][&headers=<编码>&cookies=<编码>]]
 ```
 
-`headers` is a `Name: value` line list; hop-by-hop and host-bound headers
-(`host`, `connection`, `content-length`, `accept-encoding`, `transfer-encoding`,
-`te`, `trailer`, `upgrade`) are stripped. When the fully encoded URL would
-exceed `maxUrlLength`, it degrades to the core params (`url`, `name`, `ua`) so
-the hand-off stays inside the LGOM IPC frame limit (`MAX_FRAME_LEN`, 64 KiB).
+`headers` 为 `Name: value` 逐行列表；逐跳和主机绑定头
+（`host`、`connection`、`content-length`、`accept-encoding`、`transfer-encoding`、
+`te`、`trailer`、`upgrade`）会被剥离。当完整编码后的 URL 超过 `maxUrlLength` 时，
+降级为仅含核心参数（`url`、`name`、`ua`），以保证交接 URL 保持在
+LGOM IPC 帧限制内（`MAX_FRAME_LEN`，64 KiB）。
 
-### The browser confirmation prompt
+### 浏览器确认提示
 
-Handing off via `lgom://` is an **external protocol launch**, which the browser
-gates behind a confirmation dialog ("Open LGOM?"). That dialog cannot be
-suppressed from extension code — it is browser security policy, not an
-extension behaviour. One-time opt-outs:
+通过 `lgom://` 交接属于**外部协议启动**，浏览器会在确认对话框
+（"打开 LGOM？"）后放行。该对话框无法在扩展代码中 suppress——
+这是浏览器安全策略，而非扩展行为。一次性解除方法：
 
-- **Chrome:** tick _Always allow … to open links of this type_ in the dialog.
-  Administrators can pre-allow with the `AutoLaunchProtocolsFromOrigins`
-  policy.
-- **Firefox:** set `network.protocol-handler.warn-external.lgom` to `false` in
-  `about:config`.
+- **Chrome：** 在对话框中勾选"始终允许……打开此类链接"。
+  管理员可通过 `AutoLaunchProtocolsFromOrigins` 策略预批准。
+- **Firefox：** 在 `about:config` 中将
+  `network.protocol-handler.warn-external.lgom` 设为 `false`。
 
-Removing the prompt entirely requires a channel the browser does not gate —
-`runtime.sendNativeMessage` with a native messaging host installed by the
-desktop app, or a loopback HTTP bridge. Neither is implemented yet.
+完全移除提示需要一个浏览器不设卡的通道——`runtime.sendNativeMessage`
+（需桌面应用安装原生消息主机）或回环 HTTP 桥接。两者均未实现。
 
-## Configuration
+## 配置
 
-Settings live on the options page (`chrome://extensions` → Details → Extension
-options; `about:addons` → Preferences).
+设置项位于选项页（`chrome://extensions` → 详情 → 扩展选项；
+`about:addons` → 偏好设置）。
 
-| Field          | Default | Notes                                                      |
-| -------------- | ------- | ---------------------------------------------------------- |
-| `enabled`      | `true`  | Master switch; when off no download is touched             |
-| `mode`         | `all`   | `all` \| `whitelist` \| `blacklist`                        |
-| `patterns`     | `[]`    | Regexes; an invalid pattern degrades to substring matching |
-| `maxUrlLength` | `2000`  | Clamped to 200–8000 on save                                |
+| 字段           | 默认值  | 说明                                        |
+| -------------- | ------- | ------------------------------------------- |
+| `enabled`      | `true`  | 主开关；关闭时不处理任何下载                |
+| `mode`         | `all`   | `all` \| `whitelist` \| `blacklist`        |
+| `patterns`     | `[]`    | 正则表达式；无效模式降级为子字符串匹配      |
+| `maxUrlLength` | `2000`  | 保存时限制在 200–8000 范围内                 |
 
-Filter semantics: `all` intercepts everything; `whitelist` intercepts only
-matching URLs; `blacklist` intercepts everything except matches.
+过滤语义：`all` 拦截所有；`whitelist` 仅拦截匹配的 URL；`blacklist`
+拦截除匹配项外的所有。
 
-Storage keys: `lgom_config` (`storage.local`), `lgom_recent`
-(`storage.local`), `lgom_header_cache` (`storage.session`).
+存储键：`lgom_config`（`storage.local`）、`lgom_recent`
+（`storage.local`）、`lgom_header_cache`（`storage.session`）。
 
-## Permissions
+## 权限
 
-| Permission                 | Why                                            |
-| -------------------------- | ---------------------------------------------- |
-| `downloads`                | `onCreated` plus `cancel` / `erase`            |
-| `webRequest`               | observe request headers for the hand-off       |
-| `storage`                  | config, recent log, header-cache mirror        |
-| `tabs`                     | open the hand-off tab and remove it            |
-| `scripting` (Firefox only) | hidden-iframe fallback for the protocol launch |
-| `<all_urls>`               | intercept downloads from any origin            |
+| 权限                    | 用途                                      |
+| ----------------------- | ----------------------------------------- |
+| `downloads`             | `onCreated` 及 `cancel` / `erase`         |
+| `webRequest`            | 观察请求头以供交接                         |
+| `storage`               | 配置、最近日志、请求头缓存镜像             |
+| `tabs`                  | 打开并移除交接标签页                       |
+| `scripting`（仅 Firefox）| 协议启动的隐藏 iframe 备选方案            |
+| `<all_urls>`            | 拦截任意来源的下载                         |
 
-Permissions are declared per platform: Chrome omits `scripting` because it has
-no iframe fallback, and neither manifest requests `webRequestBlocking` since
-requests are only observed.
+权限按平台声明：Chrome 不含 `scripting`（因为没有 iframe 备选方案）；
+两个 manifest 均未请求 `webRequestBlocking`（因为只观察请求）。
 
-## Localisation
+## 国际化
 
-UI strings live in `src/static/_locales/<locale>/messages.json` and are read
-through `i18nGetMessage()` (`src/lib/platform-api.js`), which wraps
-`browser.i18n.getMessage` and falls back to the key when the API is absent.
-`en` is `default_locale`; `zh_CN` is complete. To add a locale, copy
-`_locales/en` under the new tag and translate the values — the manifest's
-`__MSG_extensionName__` / `__MSG_extensionDescription__` placeholders resolve
-from the same file.
+界面字符串位于 `src/static/_locales/<locale>/messages.json`，
+通过 `i18nGetMessage()`（`src/lib/platform-api.js`）读取，该函数封装了
+`browser.i18n.getMessage`，在 API 缺失时回退为键本身。
+`en` 是 `default_locale`；`zh_CN` 已完整翻译。添加新语言时，
+将 `_locales/en` 复制到新语言标签目录下并翻译各条目的 values
+——manifest 中的 `__MSG_extensionName__` / `__MSG_extensionDescription__`
+占位符也从同一文件解析。
 
-## Layout
+## 目录结构
 
-| Path                      | Contents                                                                   |
-| ------------------------- | -------------------------------------------------------------------------- |
-| `src/lib/constants.js`    | protocol, storage keys, cache tuning, defaults                             |
-| `src/lib/types.js`        | JSDoc typedefs (no runtime exports)                                        |
-| `src/lib/platform-api.js` | `browser`/`chrome` handle, `i18nGetMessage`, platform name                 |
-| `src/lib/url-builder.js`  | header serialisation, `buildLgomUrl`                                       |
-| `src/lib/metadata.js`     | `normalizeMetadata`, `shouldIntercept`                                     |
-| `src/lib/storage.js`      | config load/save                                                           |
-| `src/lib/recent.js`       | recent-interception log                                                    |
-| `src/platform/chrome/`    | MV3 manifest, module service worker, header cache, protocol trigger        |
-| `src/platform/firefox/`   | MV3 manifest, event page, header cache, protocol trigger + iframe fallback |
-| `src/popup/`              | toolbar popup (status, master toggle, recent list)                         |
-| `src/options/`            | options page (protocol, filter rules, about)                               |
-| `src/static/`             | icons and `_locales` copied verbatim into the build                        |
-| `src/types.d.ts`          | ambient `chrome`/`browser` declarations (no `@types/chrome`)               |
-| `src/routes/layout.css`   | the Tailwind v4 entry imported by both UI surfaces                         |
+| 路径                          | 内容                                                    |
+| ----------------------------- | ------------------------------------------------------- |
+| `src/lib/constants.js`        | 协议、存储键、缓存调优、默认值                          |
+| `src/lib/types.js`            | JSDoc typedef（无运行时导出）                           |
+| `src/lib/platform-api.js`     | `browser`/`chrome` 处理、`i18nGetMessage`、平台名称     |
+| `src/lib/url-builder.js`       | 请求头序列化、`buildLgomUrl`                            |
+| `src/lib/metadata.js`         | `normalizeMetadata`、`shouldIntercept`                   |
+| `src/lib/storage.js`          | 配置加载/保存                                          |
+| `src/lib/recent.js`           | 最近拦截日志                                           |
+| `src/platform/chrome/`        | MV3 manifest、模块 Service Worker、请求头缓存、协议触发器|
+| `src/platform/firefox/`       | MV3 manifest、事件页面、请求头缓存、协议触发器 + iframe 备选|
+| `src/popup/`                  | 工具栏弹窗（状态、主开关、最近列表）                     |
+| `src/options/`                | 选项页（协议、过滤规则、关于）                          |
+| `src/static/`                 | 图标和 `_locales` 直接复制到构建输出                    |
+| `src/types.d.ts`              | 环境 `chrome`/`browser` 声明（不使用 `@types/chrome`） |
+| `src/routes/layout.css`       | Tailwind v4 入口，被两个 UI 界面导入                   |
 
-The project is JavaScript with JSDoc types, not TypeScript; `jsconfig.json` has
-`checkJs` enabled and `svelte-check` is the type gate.
+项目使用 JavaScript + JSDoc 类型注解，而非 TypeScript；`jsconfig.json`
+启用了 `checkJs`，`svelte-check` 是类型检查关卡。
 
-## Verifying a build
+## 验证构建
 
 ```sh
 npm run check && npm run lint
 ```
 
-For runtime checks, load the built extension and drive it through the DevTools
-protocol — the background script's storage is the easiest signal:
+运行时检查：加载构建好的扩展，通过 DevTools 协议驱动，后台脚本的存储是最易观测的信号：
 
 ```js
-// in the service worker context
+// 在 Service Worker 上下文中
 await chrome.downloads.download({ url: 'https://example.com/file.zip' });
-await chrome.downloads.search({}); // [] once the interception cancelled + erased it
+await chrome.downloads.search({}); // 拦截取消擦除后为空 []
 await chrome.storage.local.get('lgom_recent'); // [{ ok: true, reason: 'forwarded' }]
 ```
