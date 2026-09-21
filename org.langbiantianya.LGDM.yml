@@ -33,9 +33,9 @@
 
 id: org.langbiantianya.LGDM
 branch: stable
-runtime: org.gnome.Platform
-runtime-version: '50'
-sdk: org.gnome.Sdk
+runtime: org.freedesktop.Platform
+runtime-version: '26.08'
+sdk: org.freedesktop.Sdk
 command: lgo_download_manager
 
 finish-args:
