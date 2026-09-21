@@ -30,7 +30,8 @@
 - 各平台都有安装包，都是「一条命令编译 + 出包」：Windows 用 `scripts/package.ps1`
   出 MSI / EXE（x64 + arm64），Linux 用 `scripts/build_flatpak.sh` 出 Flatpak 单文件包
   （x86_64 + aarch64）；后者在同一份包上支持 `lgom://` 与开机自启。
-  CI（GitHub Actions）在原生 x64 / arm64 runner 上按架构分别出包，见「持续集成」。
+  CI（GitHub Actions）在原生 x64 / arm64 runner 上按架构分别出包，见「持续集成」；
+  浏览器扩展 `lgom-extension/` 由 `extension.yml` 出 zip / crx / xpi。
 
 ## 构建
 
@@ -420,8 +421,9 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
 
 ## 持续集成（GitHub Actions）
 
-`.github/workflows/` 下两个工作流，按**架构拆成独立 job**，每个 job 在**原生架构**
-的 runner 上跑对应的原生打包脚本（不做交叉编译）：
+`.github/workflows/` 下三个工作流：`windows.yml` / `linux.yml` 出桌面端安装包，
+按**架构拆成独立 job**，每个 job 在**原生架构**的 runner 上跑对应的原生打包脚本
+（不做交叉编译）；`extension.yml` 出浏览器扩展包（独立 JS 工具链，与 Go 构建无关）。
 
 | 工作流 | job | runner | 脚本 | 产物 |
 | --- | --- | --- | --- | --- |
@@ -429,10 +431,14 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
 | `windows.yml` | `windows-arm64` | `windows-11-arm` | `scripts/package_native.ps1 -Arch arm64` | `dist/lgdm-setup-<版本>-arm64.{msi,exe}` |
 | `linux.yml` | `flatpak-x86_64` | `ubuntu-24.04` | `scripts/build_flatpak_native.sh --arch=x86_64` | `dist/lgdm-<版本>-x86_64.flatpak` |
 | `linux.yml` | `flatpak-aarch64` | `ubuntu-24.04-arm` | `scripts/build_flatpak_native.sh --arch=aarch64` | `dist/lgdm-<版本>-aarch64.flatpak` |
+| `extension.yml` | `extension-chrome` | `ubuntu-latest` | `npm run package:chrome` | `lgom-extension/dist/lgom-extension-chrome-<版本>.{zip,crx}` |
+| `extension.yml` | `extension-firefox` | `ubuntu-latest` | `npm run package:firefox` | `lgom-extension/dist/lgom-extension-firefox-<版本>.{zip,xpi}` |
 
 触发：push 到 `master`、`v*` tag、PR、手动 `workflow_dispatch`。每个 job 把产物作为
-artifact 上传（保留 30 天）；**只有 `v*` tag** 会触发 `release` job，把四个 artifact
-汇总发到 GitHub Release（`generate_release_notes`）。
+artifact 上传（保留 30 天）；**只有 `v*` tag** 会触发 `release` job，把所有 artifact
+汇总发到 GitHub Release（`generate_release_notes`）。扩展包的版本号取 tag 去掉 `v`，
+`CHROME_EXTENSION_KEY` / `AMO_API_KEY` / `AMO_API_SECRET` 三个 secret 的语义见
+`lgom-extension/README.md` 的「持续集成」。
 
 ### 原生脚本与交叉脚本的分工
 
@@ -696,7 +702,8 @@ scripts/package.ps1            # 打包入口：编译 + 出 MSI / EXE 安装包
 scripts/package_native.ps1     # 同上，但只出宿主架构的包（CI 用，不做交叉编译）
 scripts/build_flatpak.sh       # 打包入口：编译 + 出 Flatpak 安装包（可交叉）
 scripts/build_flatpak_native.sh # 同上，但只出宿主架构的包（CI 用，不做交叉编译）
-.github/workflows/             # CI：windows.yml / linux.yml，按架构分 job 出包
+.github/workflows/             # CI：windows.yml / linux.yml / extension.yml，按架构或平台分 job 出包
+lgom-extension/                # 浏览器扩展（Chrome / Firefox，MV3）：独立 npm 工具链，见其 README
 org.langbiantianya.LGDM.yml    # Flatpak manifest（app id / runtime / 权限 / 模块）
 flatpak/                       # Flatpak 用的 AppStream metainfo
 ```

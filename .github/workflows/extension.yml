@@ -1,0 +1,159 @@
+name: extension
+
+on:
+  push:
+    branches: [master]
+    tags:    ['v*']
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # 上传 release 资产
+
+# lgom-extension 是独立的 JS 工具链(与 Go 二进制无关),单独一个工作流:
+#   - chrome:  zip(Web Store 上传 / 解压后加载)+ crx(签名过的单文件包)
+#   - firefox: zip(AMO 上传)+ xpi(安装用;v* tag 且配了 AMO secret 时由 AMO 签名)
+# 版本号:tag 推 v1.2.3 用 1.2.3,其余情况用 manifest 里的版本。
+
+jobs:
+  extension-chrome:
+    name: extension chrome
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lgom-extension
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      # crx3 要求 Node >= 22,而 lgom-extension/.npmrc 里 engine-strict=true:
+      # Node 版本低了 npm ci 直接失败。
+      - name: setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: lgom-extension/package-lock.json
+
+      - name: install deps
+        run: npm ci
+
+      - name: resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(node -p "require('./src/platform/chrome/manifest.json').version")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: build + package (zip + crx)
+        env:
+          CHROME_EXTENSION_KEY: ${{ secrets.CHROME_EXTENSION_KEY }}
+        run: |
+          set -euo pipefail
+          npm run build:chrome
+          key_args=()
+          if [[ -n "${CHROME_EXTENSION_KEY}" ]]; then
+            # CRX 的扩展 ID 由私钥决定:私钥放进 secret,各版本的包才是同一个扩展
+            # (否则升级会被 Chrome 当成另一个扩展)。没配 secret 时脚本自己在
+            # dist/ 下生成一把,ID 每次构建都变。
+            mkdir -p dist
+            printf '%s\n' "${CHROME_EXTENSION_KEY%$'\n'}" > dist/chrome.pem
+            key_args=(--key=dist/chrome.pem)
+          fi
+          node scripts/package.mjs chrome \
+            --version="${{ steps.version.outputs.value }}" "${key_args[@]}"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lgdm-extension-chrome
+          path: |
+            lgom-extension/dist/lgom-extension-chrome-*.zip
+            lgom-extension/dist/lgom-extension-chrome-*.crx
+          if-no-files-found: error
+          retention-days: 30
+
+  extension-firefox:
+    name: extension firefox
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lgom-extension
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: lgom-extension/package-lock.json
+
+      - name: install deps
+        run: npm ci
+
+      - name: resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo "value=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(node -p "require('./src/platform/firefox/manifest.json').version")" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: build + package (zip + xpi)
+        env:
+          AMO_API_KEY: ${{ secrets.AMO_API_KEY }}
+          AMO_API_SECRET: ${{ secrets.AMO_API_SECRET }}
+        run: |
+          set -euo pipefail
+          npm run build:firefox
+          sign_args=()
+          # AMO 按版本号去重,同一版本只能签名一次 —— 只在 v* tag 上提交,
+          # master 推送和 PR 只出未签名 xpi(安装需要 Developer Edition / Nightly)。
+          if [[ -n "${AMO_API_KEY}" && -n "${AMO_API_SECRET}" && "${GITHUB_REF}" == refs/tags/v* ]]; then
+            echo '提交 AMO 签名(channel=unlisted)'
+            sign_args=(--sign)
+          else
+            echo '跳过 AMO 签名:没配 AMO_API_KEY / AMO_API_SECRET,或本次不是 v* tag 推送'
+          fi
+          node scripts/package.mjs firefox \
+            --version="${{ steps.version.outputs.value }}" "${sign_args[@]}"
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lgdm-extension-firefox
+          path: |
+            lgom-extension/dist/lgom-extension-firefox-*.zip
+            lgom-extension/dist/lgom-extension-firefox-*.xpi
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: release
+    needs: [extension-chrome, extension-firefox]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: publish to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/lgdm-extension-chrome/*.zip
+            artifacts/lgdm-extension-chrome/*.crx
+            artifacts/lgdm-extension-firefox/*.zip
+            artifacts/lgdm-extension-firefox/*.xpi
+          generate_release_notes: true
+          fail_on_unmatched_files: true
