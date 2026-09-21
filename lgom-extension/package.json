@@ -10,6 +10,9 @@
 		"build:chrome": "node scripts/build.mjs chrome",
 		"build:firefox": "node scripts/build.mjs firefox",
 		"build:all": "node scripts/build.mjs chrome && node scripts/build.mjs firefox",
+		"package:chrome": "node scripts/package.mjs chrome",
+		"package:firefox": "node scripts/package.mjs firefox",
+		"package:all": "node scripts/package.mjs chrome && node scripts/package.mjs firefox",
 		"preview": "vite preview",
 		"check": "node -e \"try{require('fs').statSync('svelte.config.js');require('child_process').execSync('svelte-kit sync',{stdio:'inherit'})}catch(e){}\" && svelte-check --tsconfig ./jsconfig.json",
 		"check:watch": "node -e \"try{require('fs').statSync('svelte.config.js');require('child_process').execSync('svelte-kit sync',{stdio:'inherit'})}catch(e){}\" && svelte-check --tsconfig ./jsconfig.json --watch",
@@ -23,6 +26,7 @@
 		"@sveltejs/vite-plugin-svelte": "^7.1.2",
 		"@tailwindcss/vite": "^4.3.0",
 		"@types/node": "^24",
+		"crx3": "^2.0.0",
 		"eslint": "^10.4.1",
 		"eslint-config-prettier": "^10.1.8",
 		"eslint-plugin-svelte": "^3.19.0",
@@ -34,6 +38,7 @@
 		"svelte-check": "^4.6.0",
 		"tailwindcss": "^4.3.0",
 		"typescript": "^6.0.3",
-		"vite": "^8.0.16"
+		"vite": "^8.0.16",
+		"web-ext": "^10.6.0"
 	}
 }

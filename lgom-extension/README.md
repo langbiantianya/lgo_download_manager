@@ -9,10 +9,10 @@ Svelte 5 弹窗和选项页面位于 `src/popup` / `src/options`。
 
 ## 系统要求
 
-| 主机                              | Manifest | 后台上下文                    |
-| --------------------------------- | -------- | ----------------------------- |
-| Chrome / Chromium / Edge 102+     | MV3      | ES 模块 Service Worker        |
-| Firefox 140+                      | MV3      | ES 模块事件页面               |
+| 主机                          | Manifest | 后台上下文             |
+| ----------------------------- | -------- | ---------------------- |
+| Chrome / Chromium / Edge 102+ | MV3      | ES 模块 Service Worker |
+| Firefox 140+                  | MV3      | ES 模块事件页面        |
 
 Chrome 版本下限由 `chrome.storage.session`（102+）的请求头缓存镜像功能决定，
 通过该 manifest 中的 `minimum_chrome_version` 强制执行。
@@ -34,16 +34,19 @@ npm install
 npm run build:all        # -> build/chrome/ 和 build/firefox/
 ```
 
-| 脚本                   | 效果                                |
-| ---------------------- | ----------------------------------- |
-| `npm run build:chrome`  | Chrome 包输出至 `build/chrome/`     |
-| `npm run build:firefox` | Firefox 包输出至 `build/firefox/`   |
-| `npm run build:all`     | 同时构建两者                         |
-| `npm run dev`           | 监听文件变更自动重新构建 Chrome 包   |
-| `npm run dev:firefox`   | 同上，针对 Firefox                  |
-| `npm run check`         | `svelte-check`（基于 `jsconfig.json`）|
-| `npm run lint`          | `prettier --check` + `eslint`       |
-| `npm run format`        | `prettier --write`                  |
+| 脚本                      | 效果                                    |
+| ------------------------- | --------------------------------------- |
+| `npm run build:chrome`    | Chrome 包输出至 `build/chrome/`         |
+| `npm run build:firefox`   | Firefox 包输出至 `build/firefox/`       |
+| `npm run build:all`       | 同时构建两者                            |
+| `npm run package:chrome`  | Chrome 成品输出至 `dist/`（zip + crx）  |
+| `npm run package:firefox` | Firefox 成品输出至 `dist/`（zip + xpi） |
+| `npm run package:all`     | 两个平台都出成品                        |
+| `npm run dev`             | 监听文件变更自动重新构建 Chrome 包      |
+| `npm run dev:firefox`     | 同上，针对 Firefox                      |
+| `npm run check`           | `svelte-check`（基于 `jsconfig.json`）  |
+| `npm run lint`            | `prettier --check` + `eslint`           |
+| `npm run format`          | `prettier --write`                      |
 
 每次构建会将 Vite 输出先暂存到临时目录，再组装成扩展根目录，
 确保两个平台的文件互不污染。产物结构：
@@ -59,7 +62,45 @@ build/<platform>/
   _locales/          # src/static/_locales
 ```
 
+## 打包（可直接安装的扩展包）
+
+```sh
+npm install
+npm run build:all
+npm run package:all      # -> dist/
+```
+
+`scripts/package.mjs` 只搬运 `build/<platform>/`，不重新编译；先跑对应的
+`build:<platform>`（或 `build:all`）再打包。产物：
+
+| 文件                                | 用途                                                                                                                                                      |
+| ----------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lgom-extension-chrome-<版本>.zip`  | Chrome 应用商店上传；解压后用「加载已解压的扩展」加载                                                                                                     |
+| `lgom-extension-chrome-<版本>.crx`  | 签名过的单文件包：Chromium 系开发者模式下拖进 `chrome://extensions` 直接安装                                                                              |
+| `lgom-extension-firefox-<版本>.zip` | AMO 上传                                                                                                                                                  |
+| `lgom-extension-firefox-<版本>.xpi` | 安装：未签名时只有 Developer Edition / Nightly（`xpinstall.signatures.required=false`）或 `about:debugging` 临时加载能装；AMO 签名后 release 版可直接安装 |
+
+选项：
+
+| 选项               | 说明                                                                                                                            |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------------- |
+| `--version=X.Y.Z`  | 覆盖产物版本，并改写构建目录里的 `manifest.json`（1~4 段数字）。CI 用 tag 版本                                                  |
+| `--key=<file.pem>` | CRX 签名私钥。**扩展 ID 由这把私钥决定**：不给就在 `dist/` 下新生成一把，ID 每次打包都变，升级会被浏览器当成另一个扩展          |
+| `--sign`           | 把 Firefox 包提交 AMO 签名（`--channel=unlisted`），需要 `AMO_API_KEY` / `AMO_API_SECRET`；AMO 按版本号去重，同一版本只能签一次 |
+
 ## 加载扩展
+
+```sh
+npm run build:all
+npm run package:all
+
+# Chrome / Chromium：开发者模式 -> 把 dist/lgom-extension-chrome-<版本>.crx 拖进 chrome://extensions
+#                    （品牌版 Chrome 从本地文件装 crx 受策略限制，此时用 zip 解压后「加载已解压的扩展」）
+# Firefox：直接打开 dist/lgom-extension-firefox-<版本>.xpi
+#          未签名时仅 Developer Edition / Nightly 能装，见「打包」
+```
+
+调试用未打包目录：
 
 ```sh
 npm run build:chrome
@@ -130,12 +171,12 @@ LGOM IPC 帧限制内（`MAX_FRAME_LEN`，64 KiB）。
 设置项位于选项页（`chrome://extensions` → 详情 → 扩展选项；
 `about:addons` → 偏好设置）。
 
-| 字段           | 默认值  | 说明                                        |
-| -------------- | ------- | ------------------------------------------- |
-| `enabled`      | `true`  | 主开关；关闭时不处理任何下载                |
-| `mode`         | `all`   | `all` \| `whitelist` \| `blacklist`        |
-| `patterns`     | `[]`    | 正则表达式；无效模式降级为子字符串匹配      |
-| `maxUrlLength` | `2000`  | 保存时限制在 200–8000 范围内                 |
+| 字段           | 默认值 | 说明                                   |
+| -------------- | ------ | -------------------------------------- |
+| `enabled`      | `true` | 主开关；关闭时不处理任何下载           |
+| `mode`         | `all`  | `all` \| `whitelist` \| `blacklist`    |
+| `patterns`     | `[]`   | 正则表达式；无效模式降级为子字符串匹配 |
+| `maxUrlLength` | `2000` | 保存时限制在 200–8000 范围内           |
 
 过滤语义：`all` 拦截所有；`whitelist` 仅拦截匹配的 URL；`blacklist`
 拦截除匹配项外的所有。
@@ -145,14 +186,14 @@ LGOM IPC 帧限制内（`MAX_FRAME_LEN`，64 KiB）。
 
 ## 权限
 
-| 权限                    | 用途                                      |
-| ----------------------- | ----------------------------------------- |
-| `downloads`             | `onCreated` 及 `cancel` / `erase`         |
-| `webRequest`            | 观察请求头以供交接                         |
-| `storage`               | 配置、最近日志、请求头缓存镜像             |
-| `tabs`                  | 打开并移除交接标签页                       |
-| `scripting`（仅 Firefox）| 协议启动的隐藏 iframe 备选方案            |
-| `<all_urls>`            | 拦截任意来源的下载                         |
+| 权限                      | 用途                              |
+| ------------------------- | --------------------------------- |
+| `downloads`               | `onCreated` 及 `cancel` / `erase` |
+| `webRequest`              | 观察请求头以供交接                |
+| `storage`                 | 配置、最近日志、请求头缓存镜像    |
+| `tabs`                    | 打开并移除交接标签页              |
+| `scripting`（仅 Firefox） | 协议启动的隐藏 iframe 备选方案    |
+| `<all_urls>`              | 拦截任意来源的下载                |
 
 权限按平台声明：Chrome 不含 `scripting`（因为没有 iframe 备选方案）；
 两个 manifest 均未请求 `webRequestBlocking`（因为只观察请求）。
@@ -169,22 +210,24 @@ LGOM IPC 帧限制内（`MAX_FRAME_LEN`，64 KiB）。
 
 ## 目录结构
 
-| 路径                          | 内容                                                    |
-| ----------------------------- | ------------------------------------------------------- |
-| `src/lib/constants.js`        | 协议、存储键、缓存调优、默认值                          |
-| `src/lib/types.js`            | JSDoc typedef（无运行时导出）                           |
-| `src/lib/platform-api.js`     | `browser`/`chrome` 处理、`i18nGetMessage`、平台名称     |
-| `src/lib/url-builder.js`       | 请求头序列化、`buildLgomUrl`                            |
-| `src/lib/metadata.js`         | `normalizeMetadata`、`shouldIntercept`                   |
-| `src/lib/storage.js`          | 配置加载/保存                                          |
-| `src/lib/recent.js`           | 最近拦截日志                                           |
-| `src/platform/chrome/`        | MV3 manifest、模块 Service Worker、请求头缓存、协议触发器|
-| `src/platform/firefox/`       | MV3 manifest、事件页面、请求头缓存、协议触发器 + iframe 备选|
-| `src/popup/`                  | 工具栏弹窗（状态、主开关、最近列表）                     |
-| `src/options/`                | 选项页（协议、过滤规则、关于）                          |
-| `src/static/`                 | 图标和 `_locales` 直接复制到构建输出                    |
-| `src/types.d.ts`              | 环境 `chrome`/`browser` 声明（不使用 `@types/chrome`） |
-| `src/routes/layout.css`       | Tailwind v4 入口，被两个 UI 界面导入                   |
+| 路径                      | 内容                                                               |
+| ------------------------- | ------------------------------------------------------------------ |
+| `src/lib/constants.js`    | 协议、存储键、缓存调优、默认值                                     |
+| `src/lib/types.js`        | JSDoc typedef（无运行时导出）                                      |
+| `src/lib/platform-api.js` | `browser`/`chrome` 处理、`i18nGetMessage`、平台名称                |
+| `src/lib/url-builder.js`  | 请求头序列化、`buildLgomUrl`                                       |
+| `src/lib/metadata.js`     | `normalizeMetadata`、`shouldIntercept`                             |
+| `src/lib/storage.js`      | 配置加载/保存                                                      |
+| `src/lib/recent.js`       | 最近拦截日志                                                       |
+| `src/platform/chrome/`    | MV3 manifest、模块 Service Worker、请求头缓存、协议触发器          |
+| `src/platform/firefox/`   | MV3 manifest、事件页面、请求头缓存、协议触发器 + iframe 备选       |
+| `src/popup/`              | 工具栏弹窗（状态、主开关、最近列表）                               |
+| `src/options/`            | 选项页（协议、过滤规则、关于）                                     |
+| `src/static/`             | 图标和 `_locales` 直接复制到构建输出                               |
+| `src/types.d.ts`          | 环境 `chrome`/`browser` 声明（不使用 `@types/chrome`）             |
+| `src/routes/layout.css`   | Tailwind v4 入口，被两个 UI 界面导入                               |
+| `scripts/build.mjs`       | 构建入口：把 Vite 产物组装成 `build/<platform>/`                   |
+| `scripts/package.mjs`     | 打包入口：把 `build/<platform>/` 打成 `dist/` 里的 zip / crx / xpi |
 
 项目使用 JavaScript + JSDoc 类型注解，而非 TypeScript；`jsconfig.json`
 启用了 `checkJs`，`svelte-check` 是类型检查关卡。
@@ -195,6 +238,20 @@ LGOM IPC 帧限制内（`MAX_FRAME_LEN`，64 KiB）。
 npm run check && npm run lint
 ```
 
+打包产物也能装进真实浏览器验证：`web-ext` 走的是浏览器原生的临时加载通道，
+Firefox 侧会打印 `Installed ... as a temporary add-on`。
+
+```sh
+npm run build:all
+npx web-ext run -s build/firefox -f firefox                     # Firefox
+npx web-ext run -s build/chrome -t chromium \                   # Chromium 系二进制
+  --chromium-binary=/usr/bin/chromium
+```
+
+品牌版 Chrome ≥ 137 不接受 `--load-extension`，脚本化加载要走 CDP
+`Extensions.loadUnpacked`（需要 `--remote-debugging-pipe`）；手动验证则在
+`chrome://extensions` 里「加载已解压的扩展」指向解压后的 zip。
+
 运行时检查：加载构建好的扩展，通过 DevTools 协议驱动，后台脚本的存储是最易观测的信号：
 
 ```js
@@ -203,3 +260,15 @@ await chrome.downloads.download({ url: 'https://example.com/file.zip' });
 await chrome.downloads.search({}); // 拦截取消擦除后为空 []
 await chrome.storage.local.get('lgom_recent'); // [{ ok: true, reason: 'forwarded' }]
 ```
+
+## 持续集成
+
+`.github/workflows/extension.yml` 在 push / PR / `v*` tag 上跑
+`npm ci` + `build:<platform>` + `package:<platform>`，产物作为 artifact 上传
+（保留 30 天）；`v*` tag 上把 zip / crx / xpi 一并附到 GitHub Release。
+版本号用 tag 去掉 `v`（`v1.2.3` → `1.2.3`），非 tag 推送用 manifest 里的版本。
+
+| secret                           | 用途                                                                                               |
+| -------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `CHROME_EXTENSION_KEY`           | CRX 签名私钥（PEM）。不配则每次构建新生成一把，扩展 ID 每次都变                                    |
+| `AMO_API_KEY` / `AMO_API_SECRET` | AMO 的 JWT issuer / secret。配了之后 `v*` tag 的 Firefox 包自动提交 AMO 签名（`channel=unlisted`） |
