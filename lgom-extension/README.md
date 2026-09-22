@@ -134,9 +134,14 @@ npm run build:firefox
    则不处理。
 3. 下载任务被取消并擦除。
 4. 缓存的请求头经 `normalizeMetadata` 转为元数据，`buildLgomUrl` 生成交接 URL。
-5. `triggerProtocol` 打开一个指向 `lgom://` URL 的后台标签页，1 秒后移除。
-   Firefox 还会注入一个隐藏 iframe 作为备选方案，因为它可能拒绝向未知外部
-   协议发起顶层导航。
+5. `triggerProtocol` 打开一个指向 `lgom://` URL 的后台标签页，由浏览器接管，
+   每次下载只触发一次：
+   - **Chrome** 把"打开 LGOM？"确认对话框挂在该标签页的 WebContents 上，
+     提前关闭标签页等于放弃这次交接（用户看不到提示，客户端也不会被拉起）。
+     因此该标签页不再定时移除——Chrome 在外部处理器成功拉起后自行关闭它；
+     用户取消对话框时标签页会留空，自行关闭即可。
+   - **Firefox** 的确认提示属于浏览器窗口而非标签页，标签页在完成导航交接后
+     即可移除（1 秒）。
 6. 结果追加到最近拦截日志（最新优先，最多 50 条）——包括交接失败，
    这样弹窗不会在下载已被拦截但转发失败的情况下显示"尚无拦截记录"。
 
@@ -158,8 +163,10 @@ LGOM IPC 帧限制内（`MAX_FRAME_LEN`，64 KiB）。
 （"打开 LGOM？"）后放行。该对话框无法在扩展代码中 suppress——
 这是浏览器安全策略，而非扩展行为。一次性解除方法：
 
-- **Chrome：** 在对话框中勾选"始终允许……打开此类链接"。
-  管理员可通过 `AutoLaunchProtocolsFromOrigins` 策略预批准。
+- **Chrome：** 若对话框提供"始终允许……打开此类链接"复选框（仅当发起方是可
+  信来源时才会出现），勾选后同一来源 + 协议的后续交接不再提示。管理员可通过
+  `AutoLaunchProtocolsFromOrigins` 策略预批准。取消对话框不会转发本次下载，
+  交接标签页会留成空标签页，关掉即可。
 - **Firefox：** 在 `about:config` 中将
   `network.protocol-handler.warn-external.lgom` 设为 `false`。
 
@@ -186,17 +193,16 @@ LGOM IPC 帧限制内（`MAX_FRAME_LEN`，64 KiB）。
 
 ## 权限
 
-| 权限                      | 用途                              |
-| ------------------------- | --------------------------------- |
-| `downloads`               | `onCreated` 及 `cancel` / `erase` |
-| `webRequest`              | 观察请求头以供交接                |
-| `storage`                 | 配置、最近日志、请求头缓存镜像    |
-| `tabs`                    | 打开并移除交接标签页              |
-| `scripting`（仅 Firefox） | 协议启动的隐藏 iframe 备选方案    |
-| `<all_urls>`              | 拦截任意来源的下载                |
+| 权限         | 用途                              |
+| ------------ | --------------------------------- |
+| `downloads`  | `onCreated` 及 `cancel` / `erase` |
+| `webRequest` | 观察请求头以供交接                |
+| `storage`    | 配置、最近日志、请求头缓存镜像    |
+| `tabs`       | 打开并移除交接标签页              |
+| `<all_urls>` | 拦截任意来源的下载                |
 
-权限按平台声明：Chrome 不含 `scripting`（因为没有 iframe 备选方案）；
-两个 manifest 均未请求 `webRequestBlocking`（因为只观察请求）。
+两个 manifest 声明同一组权限：协议交接统一走标签页导航，不需要 `scripting`；
+均未请求 `webRequestBlocking`（因为只观察请求）。
 
 ## 国际化
 
@@ -220,7 +226,7 @@ LGOM IPC 帧限制内（`MAX_FRAME_LEN`，64 KiB）。
 | `src/lib/storage.js`      | 配置加载/保存                                                      |
 | `src/lib/recent.js`       | 最近拦截日志                                                       |
 | `src/platform/chrome/`    | MV3 manifest、模块 Service Worker、请求头缓存、协议触发器          |
-| `src/platform/firefox/`   | MV3 manifest、事件页面、请求头缓存、协议触发器 + iframe 备选       |
+| `src/platform/firefox/`   | MV3 manifest、事件页面、请求头缓存、协议触发器                     |
 | `src/popup/`              | 工具栏弹窗（状态、主开关、最近列表）                               |
 | `src/options/`            | 选项页（协议、过滤规则、关于）                                     |
 | `src/static/`             | 图标和 `_locales` 直接复制到构建输出                               |

@@ -47,7 +47,9 @@ export const HEADER_CACHE_KEY = 'lgom_header_cache';
 /** Filename fallback when nothing better is known. */
 export const UNKNOWN_FILENAME = 'unknown';
 
-/** How long the protocol tab stays open before being removed (ms). */
+/** How long the Firefox hand-off tab stays open before being removed (ms).
+ * Firefox's "launch application?" prompt belongs to the browser window, not to
+ * the tab, so the tab is disposable once the navigation has been handed off. */
 export const PROTOCOL_TAB_TIMEOUT = 1000;
 
 /** URL size ceiling accepted by the LGOM IPC forwarder. */

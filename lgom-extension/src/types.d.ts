@@ -62,13 +62,6 @@ interface WebExtensionApi {
 		query(properties: { active?: boolean; currentWindow?: boolean }): Promise<WebExtensionTab[]>;
 		remove(id: number): Promise<void>;
 	};
-	scripting: {
-		executeScript(options: {
-			target: { tabId: number };
-			func: (url: string) => void;
-			args: string[];
-		}): Promise<unknown[]>;
-	};
 }
 
 interface WebExtensionStorageArea {
