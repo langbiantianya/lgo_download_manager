@@ -142,6 +142,19 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      # 原生消息主机装不进扩展包(manifest 必须由本地程序写入),也不能由扩展
+      # 自己安装,所以跟扩展包一起发出去,用户解包后跑 install.sh。
+      - name: pack native messaging host
+        working-directory: lgom-extension
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          mkdir -p dist
+          tar -czf "dist/lgom-native-host-${version}.tar.gz" native-host
+
       - name: download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -155,5 +168,6 @@ jobs:
             artifacts/lgdm-extension-chrome/*.crx
             artifacts/lgdm-extension-firefox/*.zip
             artifacts/lgdm-extension-firefox/*.xpi
+            lgom-extension/dist/lgom-native-host-*.tar.gz
           generate_release_notes: true
           fail_on_unmatched_files: true

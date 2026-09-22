@@ -31,7 +31,9 @@
   出 MSI / EXE（x64 + arm64），Linux 用 `scripts/build_flatpak.sh` 出 Flatpak 单文件包
   （x86_64 + aarch64）；后者在同一份包上支持 `lgom://` 与开机自启。
   CI（GitHub Actions）在原生 x64 / arm64 runner 上按架构分别出包，见「持续集成」；
-  浏览器扩展 `lgom-extension/` 由 `extension.yml` 出 zip / crx / xpi。
+  浏览器扩展 `lgom-extension/` 由 `extension.yml` 出 zip / crx / xpi，
+  以及配套的原生消息主机 `lgom-native-host-<版本>.tar.gz`
+  （Chrome 静默交接用，需要用户本地执行 `native-host/install.sh`，见扩展 README）。
 
 ## 构建
 
@@ -433,6 +435,7 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
 | `linux.yml` | `flatpak-aarch64` | `ubuntu-24.04-arm` | `scripts/build_flatpak_native.sh --arch=aarch64` | `dist/lgdm-<版本>-aarch64.flatpak` |
 | `extension.yml` | `extension-chrome` | `ubuntu-latest` | `npm run package:chrome` | `lgom-extension/dist/lgom-extension-chrome-<版本>.{zip,crx}` |
 | `extension.yml` | `extension-firefox` | `ubuntu-latest` | `npm run package:firefox` | `lgom-extension/dist/lgom-extension-firefox-<版本>.{zip,xpi}` |
+| `extension.yml` | `release` | `ubuntu-latest` | `tar native-host/` (v* tag) | `lgom-extension/dist/lgom-native-host-<版本>.tar.gz` |
 
 触发：push 到 `master`、`v*` tag、PR、手动 `workflow_dispatch`。每个 job 把产物作为
 artifact 上传（保留 30 天）；**只有 `v*` tag** 会触发 `release` job，把所有 artifact
@@ -704,6 +707,7 @@ scripts/build_flatpak.sh       # 打包入口：编译 + 出 Flatpak 安装包�
 scripts/build_flatpak_native.sh # 同上，但只出宿主架构的包（CI 用，不做交叉编译）
 .github/workflows/             # CI：windows.yml / linux.yml / extension.yml，按架构或平台分 job 出包
 lgom-extension/                # 浏览器扩展（Chrome / Firefox，MV3）：独立 npm 工具链，见其 README
+lgom-extension/native-host/    # 原生消息主机（POSIX sh）：让 Chrome 不弹确认框、不开标签页地交接下载
 org.langbiantianya.LGDM.yml    # Flatpak manifest（app id / runtime / 权限 / 模块）
 flatpak/                       # Flatpak 用的 AppStream metainfo
 ```
