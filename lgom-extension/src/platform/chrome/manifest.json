@@ -5,7 +5,7 @@
 	"description": "__MSG_extensionDescription__",
 	"default_locale": "en",
 	"minimum_chrome_version": "102",
-	"permissions": ["downloads", "storage", "tabs", "webRequest"],
+	"permissions": ["downloads", "nativeMessaging", "storage", "tabs", "webRequest"],
 	"host_permissions": ["<all_urls>"],
 	"background": {
 		"service_worker": "background.js",

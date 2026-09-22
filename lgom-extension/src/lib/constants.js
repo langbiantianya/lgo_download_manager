@@ -6,6 +6,18 @@ export const LGOM_SCHEME = 'lgom';
 /** Host part of the download route. */
 export const LGOM_HOST = 'download';
 
+/**
+ * Native messaging host name registered by `native-host/install.sh`.
+ *
+ * Deliberately platform-independent: the host is looked up by name inside the
+ * browser's own user-level manifest directory, so the extension never has to
+ * know which browser (or profile) is talking to it.
+ */
+export const NATIVE_HOST_NAME = 'org.langbiantianya.lgom';
+
+/** Extension page kept open as the Chrome fallback hand-off tab. */
+export const HANDOFF_PAGE = 'handoff.html';
+
 /** storage.local key holding the persisted InterceptConfig. */
 export const CONFIG_STORAGE_KEY = 'lgom_config';
 
@@ -51,6 +63,12 @@ export const UNKNOWN_FILENAME = 'unknown';
  * Firefox's "launch application?" prompt belongs to the browser window, not to
  * the tab, so the tab is disposable once the navigation has been handed off. */
 export const PROTOCOL_TAB_TIMEOUT = 1000;
+
+/** How long the Chrome fallback waits for the hand-off page to load (ms).
+ * Chrome discards a tab that has nothing committed when its only pending
+ * navigation turns into an external protocol launch, so the first hand-off
+ * must not navigate before the page has committed. */
+export const HANDOFF_TAB_LOAD_TIMEOUT = 3000;
 
 /** URL size ceiling accepted by the LGOM IPC forwarder. */
 export const MAX_FRAME_LEN = 64 * 1024;

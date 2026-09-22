@@ -11,14 +11,16 @@ import { browser } from '$lib/platform-api.js';
  * been handed off, so it is removed again.
  *
  * @param {string} url
- * @returns {Promise<void>}
+ * @returns {Promise<import('$lib/types.js').HandoffChannel>}
  */
 export async function triggerProtocol(url) {
 	const tab = await browser.tabs.create({ url, active: false });
-	if (tab.id === undefined) return;
+	if (tab.id === undefined) return 'tab';
 
 	const tabId = tab.id;
 	setTimeout(() => {
 		browser.tabs.remove(tabId).catch(() => {});
 	}, PROTOCOL_TAB_TIMEOUT);
+
+	return 'tab';
 }

@@ -1,24 +1,31 @@
+import { sendToNativeHost } from './native-host.js';
+import { handOffViaTab } from './handoff-tab.js';
+
 /**
  * Hand the generated URL to the OS.
  *
- * Chrome resolves `lgom://` from a normal navigation, but an unapproved scheme
- * first turns that navigation into an "Open LGOM?" confirmation dialog that
- * belongs to the new tab's WebContents. Destroying the tab answers nothing and
- * drops the launch outright, so the tab is deliberately left alone: Chrome
- * closes it on its own once the external handler has been launched.
+ * Preferred channel is the native messaging host: `runtime.sendNativeMessage`
+ * spawns the locally installed bridge, which starts (or forwards to) the LGOM
+ * client. Chrome shows no confirmation for it, and no tab is involved.
  *
- * A tab whose dialog the user dismissed stays behind, because an unanswered
- * dialog and a dismissed one look identical from the extension side, and a
- * batch download may legitimately leave several prompts queued at once. The
- * tab is left for the user to close rather than swept.
- *
- * `active: false` keeps the user's focus where it was; Chrome presents the
- * dialog through the browser window and activates the tab itself when an
- * answer is needed.
+ * The host is optional — a machine that never ran `native-host/install.sh`
+ * still has to work — so a failed attempt falls through to the external
+ * protocol channel (`lgom://`), which the browser gates behind its own
+ * "Open LGOM?" dialog. Missing hosts are the normal case for un-bridged
+ * installs and stay silent; a registered-but-unusable host is reported, since
+ * that is an install error the user can fix.
  *
  * @param {string} url
- * @returns {Promise<void>}
+ * @returns {Promise<import('$lib/types.js').HandoffChannel>}
  */
 export async function triggerProtocol(url) {
-	await globalThis.chrome.tabs.create({ url, active: false });
+	const native = await sendToNativeHost(url);
+	if (native.ok) return 'native';
+
+	if (native.kind !== 'missing') {
+		console.warn(`native hand-off failed (${native.kind}): ${native.error}; using lgom:// tab`);
+	}
+
+	await handOffViaTab(url);
+	return 'tab';
 }

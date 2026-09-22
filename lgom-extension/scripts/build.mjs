@@ -23,7 +23,7 @@ execFileSync('npx', ['vite', 'build', '--outDir', STAGE, '--emptyOutDir'], {
 });
 
 // Move the platform's own artifacts out of the staging directory.
-for (const name of ['popup.js', 'options.js', 'background.js']) {
+for (const name of ['popup.js', 'options.js', 'handoff.js', 'background.js']) {
 	moveIfExists(join(STAGE, name), join(OUT, name));
 }
 moveIfExists(join(STAGE, 'chunks'), join(OUT, 'chunks'));
@@ -33,7 +33,7 @@ moveIfExists(join(STAGE, 'chunks'), join(OUT, 'chunks'));
 const emittedCss = readdirSync(STAGE).filter(
 	(file) => file.endsWith('.css') && statSync(join(STAGE, file)).isFile()
 );
-for (const entry of ['popup', 'options']) {
+for (const entry of ['popup', 'options', 'handoff']) {
 	const css = emittedCss[0];
 	if (css === undefined) continue;
 	cpSync(join(STAGE, css), join(OUT, `${entry}.css`));
@@ -44,6 +44,7 @@ for (const entry of ['popup', 'options']) {
 cpSync(join(ROOT, `src/platform/${PLATFORM}/manifest.json`), join(OUT, 'manifest.json'));
 cpSync(join(ROOT, `src/popup/index.html`), join(OUT, 'popup.html'));
 cpSync(join(ROOT, `src/options/index.html`), join(OUT, 'options.html'));
+cpSync(join(ROOT, `src/handoff/index.html`), join(OUT, 'handoff.html'));
 cpSync(join(ROOT, 'src/static'), OUT, { recursive: true });
 
 // Remove the vite-emitted artifacts; everything the platform needs has been

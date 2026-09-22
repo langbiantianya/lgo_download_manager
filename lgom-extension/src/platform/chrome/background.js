@@ -43,9 +43,17 @@ globalThis.chrome.downloads.onCreated.addListener(async (downloadItem) => {
 		);
 
 		const lgomUrl = buildLgomUrl(metadata, config.maxUrlLength);
-		await triggerProtocol(lgomUrl);
+		const channel = await triggerProtocol(lgomUrl);
 
-		await recordRecent(downloadItem.url, metadata.name, true, 'forwarded');
+		// `forwarded-tab` means the native messaging host was unavailable and the
+		// browser's own confirmation dialog was used instead; the popup shows
+		// both as a successful hand-off, the reason is for diagnostics.
+		await recordRecent(
+			downloadItem.url,
+			metadata.name,
+			true,
+			channel === 'native' ? 'forwarded' : 'forwarded-tab'
+		);
 	} catch (error) {
 		await recordRecent(downloadItem.url, downloadItem.filename, false, describeError(error));
 	}

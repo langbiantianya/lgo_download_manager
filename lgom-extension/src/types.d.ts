@@ -27,6 +27,13 @@ interface WebExtensionDownloadItem {
 interface WebExtensionTab {
 	id?: number;
 	url?: string;
+	pendingUrl?: string;
+	status?: string;
+}
+
+interface WebExtensionTabChange {
+	status?: string;
+	url?: string;
 }
 
 interface WebExtensionApi {
@@ -36,6 +43,13 @@ interface WebExtensionApi {
 	runtime: {
 		getManifest(): { manifest_version?: number };
 		getBrowserInfo?(): Promise<{ name: string; vendor: string }>;
+		/** Extension-relative path → absolute `chrome-extension://` URL. */
+		getURL(path: string): string;
+		/**
+		 * Send one message to a native messaging host and resolve with its
+		 * reply. Rejects when the host is missing, forbidden, or died.
+		 */
+		sendNativeMessage(host: string, message: unknown): Promise<unknown>;
 	};
 	downloads: {
 		onCreated: {
@@ -59,8 +73,18 @@ interface WebExtensionApi {
 	};
 	tabs: {
 		create(properties: { url: string; active?: boolean }): Promise<WebExtensionTab>;
-		query(properties: { active?: boolean; currentWindow?: boolean }): Promise<WebExtensionTab[]>;
+		get(id: number): Promise<WebExtensionTab>;
+		query(properties: {
+			active?: boolean;
+			currentWindow?: boolean;
+			url?: string;
+		}): Promise<WebExtensionTab[]>;
+		update(id: number, properties: { url?: string; active?: boolean }): Promise<WebExtensionTab>;
 		remove(id: number): Promise<void>;
+		onUpdated: {
+			addListener(listener: (tabId: number, changeInfo: WebExtensionTabChange) => void): void;
+			removeListener(listener: (tabId: number, changeInfo: WebExtensionTabChange) => void): void;
+		};
 	};
 }
 

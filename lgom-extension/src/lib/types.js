@@ -18,9 +18,19 @@
  */
 
 /**
+ * How a hand-off reached the desktop client.
+ *
+ * - `native`: through the native messaging host (no tab, no confirmation).
+ * - `tab`:   by navigating an extension tab to `lgom://`, which the browser
+ *            gates behind its own confirmation dialog.
+ *
+ * @typedef {'native' | 'tab'} HandoffChannel
+ */
+
+/**
  * @typedef {object} PlatformBridge
  * @property {() => string} getPlatformName
- * @property {(url: string) => Promise<void>} triggerProtocol
+ * @property {(url: string) => Promise<HandoffChannel>} triggerProtocol
  * @property {() => Promise<string>} getActiveTabUrl
  */
 

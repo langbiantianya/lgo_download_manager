@@ -26,6 +26,7 @@ export default defineConfig({
 			input: {
 				popup: join(ROOT, 'src/popup/main.js'),
 				options: join(ROOT, 'src/options/main.js'),
+				handoff: join(ROOT, 'src/handoff/main.js'),
 				background: join(ROOT, `src/platform/${PLATFORM}/background.js`)
 			},
 			output: {

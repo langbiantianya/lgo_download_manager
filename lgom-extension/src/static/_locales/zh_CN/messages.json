@@ -62,6 +62,12 @@
 			}
 		}
 	},
+	"handoffPageTitle": {
+		"message": "LGOM 转发标签页"
+	},
+	"handoffPageHint": {
+		"message": "原生消息主机未安装时，下载经由这个标签页转发给 LGOM。让它留在后台即可；关掉后扩展会在下次需要时重新打开。"
+	},
 	"filterRules": {
 		"message": "过滤规则"
 	},
