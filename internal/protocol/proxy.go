@@ -181,6 +181,22 @@ func systemProxyFunc() func(*http.Request) (*url.URL, error) {
 		return systemProxyCall(req)
 	}
 }
+
+// HTTPProxyFunc 返回一个可直接赋给 http.Transport.Proxy 或
+// torrent.ClientConfig.HTTPProxy 的代理解析函数,依据包级代理配置
+// (settings.ApplyProxy 写入)决定 tracker / HTTP 请求是否走代理。
+//
+// 与驱动内部使用的 proxyFunc 语义完全一致(含 bypass 列表与系统代理
+// 探测),使 BitTorrent 的 tracker 公告、webseed、元数据 HTTP 抓取
+// 与分片下载共用同一套代理设置。proxyFunc 返回 nil 时(理论上仅出现在
+// 未识别的模式分支)回退到 http.ProxyFromEnvironment。
+func HTTPProxyFunc() func(*http.Request) (*url.URL, error) {
+	fn := proxyFunc(AuthOptions{})
+	if fn == nil {
+		return http.ProxyFromEnvironment
+	}
+	return fn
+}
 var (
 	systemProxyOnce  sync.Once
 	systemProxyCache *url.URL

@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"lgo_download_manager/internal/bittorrent"
 	"lgo_download_manager/internal/engine"
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/prealloc"
@@ -50,6 +51,20 @@ type Scheduler struct {
 	// wg.Wait() 确保每个 job 都已落盘 Paused 后再返回,避免"已 cancel 但
 	// DB 仍是 Downloading"的窗口。
 	wg sync.WaitGroup
+
+	// ---- BitTorrent ----
+
+	// btMu 保护 bt(共享的 BT 客户端管理器)与 btCfg(最近一次设置)。
+	// 客户端懒创建:没有 BT 任务时不占用端口、不建 DHT 路由表。
+	btMu  sync.Mutex
+	bt    *bittorrent.Manager
+	btCfg bittorrent.Config
+
+	// seedsMu 保护 btSeeds:「已下载完成但按设置继续做种」的任务句柄。
+	// 这些任务已经 Completed、不占并发槽位,但客户端仍在为它们上传,
+	// 直到任务被删除或程序退出(见 bittorrent.go)。
+	seedsMu sync.Mutex
+	btSeeds map[string]*bittorrent.Handle
 
 	// 事件订阅者(GUI)。筛选逻辑在消费侧完成。
 	Subs []chan Event
@@ -134,6 +149,14 @@ func New(s *store.Store) *Scheduler {
 		st:            s,
 		jobs:          map[string]*runningJob{},
 		maxConcurrent: store.DefaultMaxConcurrent,
+		btSeeds:       map[string]*bittorrent.Handle{},
+		// BT 客户端的首启默认配置:随机端口、DHT/PEX 开启、不限速、
+		// 完成后不做种。main/uimgr 会用持久化设置覆盖它。
+		btCfg: bittorrent.Config{
+			MaxPeersPerTorrent: store.DefaultBTMaxPeers,
+			EnableDHT:          true,
+			EnablePEX:          true,
+		},
 	}
 }
 
@@ -249,6 +272,9 @@ func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 // 由于探测在后台 goroutine 中进行,调用方可以在 UI 线程上安全地调用 Start:
 // 不可达的服务器或超大的文件预分配都不会阻塞 UI。
 func (s *Scheduler) Start(taskID string) error {
+	// 该任务若正在做种,先停止它:同一 infohash 在客户端里只能存在一个
+	// Torrent,重复添加会被判定为 ErrAlreadyAdded。
+	s.dropSeed(taskID)
 	// 先读任务（SQLite 查询 + JSON 解码）再取锁：不能持 s.mu 做 I/O，
 	// 否则忙时（busy_timeout 最长 5s）整个调度器都会被卡住。
 	tk0, err := s.st.GetTask(taskID)
@@ -342,6 +368,15 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		if detected, derr := protocol.DetectKind(tk.URL, ""); derr == nil {
 			kind = detected
 		}
+	}
+	// BitTorrent 不走 ProtocolDriver/engine:
+	// 它由 bittorrent.Manager 直接驱动(种子元数据、peer、文件落盘都由
+	// 客户端负责),scheduler 只做生命周期与进度采样。startBittorrent 返回
+	// true 表示 session 已交给它的新 goroutine 收尾;返回 false(槽位已被
+	// Pause/Delete 摘掉)时仍由本函数的 defer 关闭 session。
+	if kind == protocol.ProtoBT {
+		handedOver = s.startBittorrent(taskID, tk, rj, prepareCtx)
+		return
 	}
 	driver, err := protocol.New(tk.URL, kind, protocol.Auth{AuthOptions: auth})
 	if err != nil {
@@ -645,9 +680,9 @@ func (s *Scheduler) Cancel(taskID string) error {
 	if err != nil {
 		return err
 	}
-	if tk.SavePath != "" {
-		_ = os.Remove(tk.SavePath)
-	}
+	// 先停做种(BT 任务完成后可能仍在为其它 peer 上传)。
+	s.dropSeed(taskID)
+	removeTaskData(tk)
 	if err := s.markStatus(tk.ID, store.TaskStatus.Failed); err != nil {
 		return err
 	}
@@ -669,8 +704,9 @@ func (s *Scheduler) Delete(taskID string) error {
 		cancelWait()
 	}
 	tk, err := s.st.GetTask(taskID)
-	if err == nil && tk != nil && tk.SavePath != "" {
-		_ = os.Remove(tk.SavePath)
+	if err == nil && tk != nil {
+		s.dropSeed(taskID)
+		removeTaskData(tk)
 	}
 	if err := s.st.DeleteTask(taskID); err != nil {
 		return err
@@ -715,6 +751,9 @@ func (s *Scheduler) ValidateFileExistence() {
 			if err := s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.FileLost, "文件已丢失"); err != nil {
 				continue
 			}
+			// 数据不在磁盘上了,做种也就失去意义(否则会一直为不存在的
+			// 文件保持种子)。放在状态落盘之后,避免与引擎收尾竞争。
+			s.dropSeed(tk.ID)
 			tk.Status = store.TaskStatus.FileLost
 			s.publish(Event{Why: "updated", Task: tk})
 		}
@@ -1036,10 +1075,20 @@ func (s *Scheduler) flushAll() {
 		}
 		p := rj.lastSnapshot
 		status := rj.status
+		// BT 任务没有 engine 分片快照(下面 cs 为 nil),分片进度直接来自
+		// 任务快照(每个种子文件一块),必须在持锁期间取出来,否则会被
+		// 下面的 chunkProgressFrom(nil) 覆盖成空数组。
+		var taskProgress []int64
+		if rj.job == nil {
+			taskProgress = append([]int64(nil), rj.task.ChunkProgress...)
+		}
 		rj.dirty = false
 		rj.dirtyMu.Unlock()
 
 		progress := chunkProgressFrom(cs)
+		if taskProgress != nil {
+			progress = taskProgress
+		}
 		if progress == nil {
 			progress = []int64{}
 		}

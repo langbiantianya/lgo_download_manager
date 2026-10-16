@@ -20,9 +20,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"lgo_download_manager/internal/bittorrent"
 	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
@@ -86,6 +88,9 @@ func (m *Manager) SetSettings(s store.Settings) {
 	// 下次保存就会触发 promotePending——可能提升之前因超出限额而
 	// 排队的 Pending 任务。
 	m.sc.SetMaxConcurrent(s.EffectiveMaxConcurrent())
+	// BitTorrent 设置同步:限速立即生效,端口/DHT/PEX 等在客户端可安全
+	// 重建时生效(见 scheduler.SetBittorrentConfig)。
+	m.sc.SetBittorrentConfig(scheduler.BittorrentConfigFrom(s))
 }
 
 // Settings 返回当前权威设置的副本。
@@ -506,6 +511,12 @@ func (m *Manager) probe(raw string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	// BitTorrent:.torrent 种子文件可以解析出精确体积;磁力链接在没有
+	// peer 之前拿不到元数据,这里直接返回「未知」(0, nil),让对话框
+	// 不显示体积而不是弹一个错误。
+	if kind == protocol.ProtoBT {
+		return m.probeBittorrent(raw)
+	}
 	s := m.Settings()
 	driver, err := protocol.New(raw, kind, protocol.Auth{AuthOptions: protocol.AuthOptions{
 		UserAgent:   s.UserAgent,
@@ -526,6 +537,27 @@ func (m *Manager) probe(raw string) (int64, error) {
 		return 0, err
 	}
 	return caps.TotalSize, nil
+}
+
+// probeBittorrent 解析 .torrent 种子文件的总体积。磁力链接缺元数据,
+// 返回 0(体积未知)。任何取种子的失败都当作「未知」而不是错误——
+// 体积预览不该拦住用户添加任务。
+func (m *Manager) probeBittorrent(raw string) (int64, error) {
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "magnet:") {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		data, err := bittorrent.FetchTorrentFile(ctx, raw, protocol.HTTPProxyFunc())
+		if err != nil {
+			logging.Printf("uimgr: probe torrent file: %v", err)
+			return 0, nil
+		}
+		if _, total, perr := bittorrent.TorrentFileInfo(data); perr == nil {
+			return total, nil
+		} else {
+			logging.Printf("uimgr: parse torrent file: %v", perr)
+		}
+	}
+	return 0, nil
 }
 
 // forwardEvents 把 scheduler 事件转换成 EventData 推给 UI。

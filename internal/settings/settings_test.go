@@ -34,6 +34,94 @@ func TestLoad_FirstRunDefaults(t *testing.T) {
 	}
 }
 
+// TestLoad_BittorrentDefaults 锁定 BT 的首次运行默认值:端口随机、不限速、
+// DHT/PEX 开启(磁力链接没有 tracker 时几乎只能靠它们找 peer)、
+// 下载完成后不做种。这些值会随首次运行一起落盘。
+func TestLoad_BittorrentDefaults(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	got, err := Load(st, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got.BTPort != 0 {
+		t.Errorf("BTPort = %d, want 0 (random port)", got.BTPort)
+	}
+	if got.EffectiveBTMaxPeers() != store.DefaultBTMaxPeers {
+		t.Errorf("EffectiveBTMaxPeers = %d, want %d", got.EffectiveBTMaxPeers(), store.DefaultBTMaxPeers)
+	}
+	if got.BTDownloadLimitKiB != 0 || got.BTUploadLimitKiB != 0 {
+		t.Errorf("limits = %d/%d, want 0/0 (unlimited)", got.BTDownloadLimitKiB, got.BTUploadLimitKiB)
+	}
+	if !got.BTDHT {
+		t.Error("BTDHT default = false, want true (magnet links need DHT)")
+	}
+	if !got.BTPEX {
+		t.Error("BTPEX default = false, want true")
+	}
+	if got.BTSeeding {
+		t.Error("BTSeeding default = true, want false (do not upload after completion by default)")
+	}
+
+	// 再次加载必须从库里读回同一份默认值(首启落盘过一次)。
+	again, err := Load(st, false)
+	if err != nil {
+		t.Fatalf("Load (second): %v", err)
+	}
+	if !again.BTDHT || !again.BTPEX || again.BTSeeding {
+		t.Errorf("persisted BT flags = %v/%v/%v, want true/true/false", again.BTDHT, again.BTPEX, again.BTSeeding)
+	}
+}
+
+// TestLoad_BittorrentPersistedWins 验证用户改过的 BT 设置不会被默认值
+// 覆盖:关掉 DHT/PEX、开启做种、设端口与限速后重新加载必须原样返回。
+func TestLoad_BittorrentPersistedWins(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	cur, err := Load(st, false)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	cur.BTPort = 51413
+	cur.BTMaxPeers = 30
+	cur.BTDownloadLimitKiB = 4096
+	cur.BTUploadLimitKiB = 256
+	cur.BTDHT = false
+	cur.BTPEX = false
+	cur.BTSeeding = true
+	cur.BTTrackers = "udp://tracker.example.com:6969/announce"
+	if err := Save(st, cur); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+
+	got, err := Load(st, false)
+	if err != nil {
+		t.Fatalf("Load (after save): %v", err)
+	}
+	if got.BTPort != 51413 || got.BTMaxPeers != 30 {
+		t.Errorf("BTPort/BTMaxPeers = %d/%d, want 51413/30", got.BTPort, got.BTMaxPeers)
+	}
+	if got.BTDownloadLimitKiB != 4096 || got.BTUploadLimitKiB != 256 {
+		t.Errorf("limits = %d/%d, want 4096/256", got.BTDownloadLimitKiB, got.BTUploadLimitKiB)
+	}
+	if got.BTDHT || got.BTPEX || !got.BTSeeding {
+		t.Errorf("BT flags = %v/%v/%v, want false/false/true", got.BTDHT, got.BTPEX, got.BTSeeding)
+	}
+	if got.BTTrackers != "udp://tracker.example.com:6969/announce" {
+		t.Errorf("BTTrackers = %q", got.BTTrackers)
+	}
+}
+
 // TestLoad_ForceLightOverridesDefault 验证 --light flag 强制开启 LightMode。
 func TestLoad_ForceLightOverridesDefault(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "state.db")

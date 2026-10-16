@@ -24,6 +24,7 @@ import (
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/protocol"
+	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/ui/nativefolder"
 )
 
@@ -167,6 +168,10 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 	}
 	savePathEntry := widget.NewEntry()
 	savePathEntry.SetText(uniqueSavePath(filepath.Join(GlobalSettings.DefaultSaveDir, defaultName)))
+	// 保存路径的标签会随 URL 形态切换:普通任务是「保存路径」(单个文件),
+	// BT 任务是「保存目录」(种子的全部文件都落在该目录之下)。
+	savePathLabel := widget.NewLabel(ilocale.T("addTask.savePath.label"))
+	savePathLabel.TextStyle.Bold = true
 	// 「浏览」按钮：调用系统原生文件夹选择对话框(资源管理器 / Finder /
 	// GTK/Qt 通用 chooser),不走 fyne 自带的 dialog.ShowFolderOpen。
 	// 同步阻塞在 UI 线程上,直接在 goroutine 中执行,选择结束后用
@@ -196,21 +201,48 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 	sizeLabel.Alignment = fyne.TextAlignTrailing
 	sizeLabel.TextStyle.Italic = true
 
+	// BT 任务的保存路径语义与普通任务不同(目录而非文件),用一行灰色
+	// 说明在 URL 是磁力链接/种子文件时提示用户。默认隐藏。
+	btHint := widget.NewLabel(ilocale.T("addTask.bt.hint"))
+	btHint.TextStyle.Italic = true
+	btHint.Wrapping = fyne.TextWrapWord
+	btHint.Hide()
+
 	// 关闭窗口的工具函数——确认和取消两条路径共用，避免重复 SetOnClosed 链。
 	var closeWin func()
 	var startDownload func()
 
+	// autoSavePath 记录「对话框自动推导出来的保存路径」。用户一旦手动改过,
+	// 后续 URL 变化不再覆盖用户输入——这既保住了人工选择,也让 BT/BT 之间
+	// 的 URL 切换能自然刷新默认目录名。
+	autoSavePath := filepath.Join(GlobalSettings.DefaultSaveDir, defaultName)
+
 	// 从 URL 提取文件名并更新保存路径，同时异步探测文件大小
 	updateFromURL := func(rawURL string) {
-		u, err := url.Parse(rawURL)
-		if err != nil || u.Path == "" {
-			sizeLabel.SetText("")
-			return
+		nextDefault := filepath.Join(GlobalSettings.DefaultSaveDir, defaultName)
+		if protocol.IsBitTorrent(rawURL) {
+			// BT 任务的保存路径是「任务目录」:磁力链接用 dn 参数
+			// (没有则 infohash 前缀),.torrent 用去掉后缀的文件名。
+			savePathLabel.SetText(ilocale.T("addTask.saveDir.label"))
+			btHint.Show()
+			dirName := scheduler.BittorrentDefaultDir(rawURL)
+			if dirName == "" {
+				dirName = "bt-task"
+			}
+			nextDefault = filepath.Join(GlobalSettings.DefaultSaveDir, dirName)
+		} else {
+			savePathLabel.SetText(ilocale.T("addTask.savePath.label"))
+			btHint.Hide()
+			if u, err := url.Parse(rawURL); err == nil && u.Path != "" {
+				nextDefault = filepath.Join(GlobalSettings.DefaultSaveDir, filepath.Base(u.Path))
+			}
 		}
-		filename := filepath.Base(u.Path)
-		if savePathEntry.Text == "" || savePathEntry.Text == filepath.Join(GlobalSettings.DefaultSaveDir, defaultName) {
-			savePathEntry.SetText(uniqueSavePath(filepath.Join(GlobalSettings.DefaultSaveDir, filename)))
+		// 只在「用户没改过推导值」时刷新保存路径:否则手动选择会被 URL
+		// 的每次键入覆盖掉。
+		if savePathEntry.Text == "" || savePathEntry.Text == autoSavePath {
+			savePathEntry.SetText(uniqueSavePath(nextDefault))
 		}
+		autoSavePath = nextDefault
 		// 异步探测（经业务进程，代理配置一致）。失败时静默清空预览。
 		go func() {
 			size, perr := svc.Probe(rawURL)
@@ -240,7 +272,8 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 	formContent := container.NewVBox(
 		makeRow(ilocale.T("addTask.url.label"), urlEntry),
 		makeRow(ilocale.T("addTask.size.label"), sizeLabel),
-		makeRow(ilocale.T("addTask.savePath.label"), container.NewBorder(nil, nil, nil, browseBtn, savePathEntry)),
+		container.NewBorder(nil, nil, savePathLabel, browseBtn, savePathEntry),
+		btHint,
 	)
 
 	w := fyne.CurrentApp().NewWindow(ilocale.T("addTask.window.title"))
@@ -275,9 +308,13 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 			UserAgent: ua,
 			Cookies:   cookies,
 		}
+		// 协议由对话框显式给出(magnet:/.torrent → BT),业务进程据此
+		// 走 BT 引擎;识别失败时留空,由业务进程按 URL 兜底判定。
+		kind, _ := protocol.DetectKind(url, "")
 		tk, err := svc.AddTask(AddTaskInput{
 			URL:          url,
 			SavePath:     savePath,
+			Protocol:     kind,
 			ChunkCount:   GlobalSettings.DefaultThreads,
 			MinChunkSize: GlobalSettings.MinChunkSize,
 			Auth:         taskAuth,

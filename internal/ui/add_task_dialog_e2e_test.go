@@ -42,10 +42,16 @@ func (l *localServiceAdapter) Subscribe() (<-chan scheduler.Event, func()) {
 }
 
 func (l *localServiceAdapter) AddTask(in AddTaskInput) (*store.Task, error) {
+	// 与生产实现(ipcClient.AddTask)保持一致:协议由调用方显式给出;
+	// 留空时按历史行为落到 HTTP,等价于「由业务进程按 URL 兜底识别」。
+	kind := in.Protocol
+	if kind == "" {
+		kind = protocol.ProtoHTTP
+	}
 	return l.sc.Add(scheduler.AddTaskInput{
 		URL:          in.URL,
 		SavePath:     in.SavePath,
-		Protocol:     protocol.ProtoHTTP,
+		Protocol:     kind,
 		Auth:         in.Auth,
 		ChunkCount:   in.ChunkCount,
 		MinChunkSize: in.MinChunkSize,

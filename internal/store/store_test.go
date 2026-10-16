@@ -331,3 +331,167 @@ func TestSettingsRoundtrip(t *testing.T) {
 		t.Fatalf("MaxConcurrent: got %d want %d", got.MaxConcurrent, want.MaxConcurrent)
 	}
 }
+
+// TestSettingsBittorrentRoundtrip 覆盖 BT 设置列的往返:新增列在旧库上
+// 由迁移补齐缺省值(DHT/PEX 开、端口随机、不限速),写入后再读必须原样
+// 返回——「设置」页的每个开关都依赖这条路径。
+func TestSettingsBittorrentRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// 全新库上 LoadSettings 返回零值行——业务默认值由 settings.Load 的
+	// 首次运行分支套用(见 internal/settings)。这里只锁住「0 表示未配置」
+	// 这一约定,以及 EffectiveBTMaxPeers 的兜底。
+	got, err := s.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BTPort != 0 || got.BTMaxPeers != 0 {
+		t.Errorf("default BTPort/BTMaxPeers = %d/%d, want 0/0", got.BTPort, got.BTMaxPeers)
+	}
+	if got.BTDownloadLimitKiB != 0 || got.BTUploadLimitKiB != 0 {
+		t.Errorf("default limits = %d/%d, want 0/0", got.BTDownloadLimitKiB, got.BTUploadLimitKiB)
+	}
+	if got.EffectiveBTMaxPeers() != DefaultBTMaxPeers {
+		t.Errorf("EffectiveBTMaxPeers() = %d, want %d", got.EffectiveBTMaxPeers(), DefaultBTMaxPeers)
+	}
+	// 列级缺省值必须对「迁移后已存在的行」同样生效:老库升级上来时,
+	// settings 行早就存在,只有 ALTER 的 DEFAULT 能给它补上 DHT/PEX 开启。
+	var dht, pex int
+	if err := s.db.QueryRow(`SELECT bt_dht, bt_pex FROM settings WHERE id=1`).Scan(&dht, &pex); err != nil {
+		t.Fatal(err)
+	}
+	if dht != 1 || pex != 1 {
+		t.Errorf("migrated column defaults = dht %d / pex %d, want 1/1", dht, pex)
+	}
+
+	want := got
+	want.BTPort = 51413
+	want.BTMaxPeers = 64
+	want.BTDownloadLimitKiB = 2048
+	want.BTUploadLimitKiB = 128
+	want.BTDHT = false
+	want.BTPEX = false
+	want.BTSeeding = true
+	want.BTTrackers = "udp://tracker.example.com:6969/announce\nhttp://t.example.org/announce"
+	if err := s.SaveSettings(want); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s2.Close()
+	got, err = s2.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BTPort != want.BTPort || got.BTMaxPeers != want.BTMaxPeers {
+		t.Errorf("BTPort/BTMaxPeers = %d/%d, want %d/%d", got.BTPort, got.BTMaxPeers, want.BTPort, want.BTMaxPeers)
+	}
+	if got.BTDownloadLimitKiB != want.BTDownloadLimitKiB || got.BTUploadLimitKiB != want.BTUploadLimitKiB {
+		t.Errorf("limits = %d/%d, want %d/%d", got.BTDownloadLimitKiB, got.BTUploadLimitKiB,
+			want.BTDownloadLimitKiB, want.BTUploadLimitKiB)
+	}
+	if got.BTDHT != want.BTDHT || got.BTPEX != want.BTPEX || got.BTSeeding != want.BTSeeding {
+		t.Errorf("bt flags = %v/%v/%v, want %v/%v/%v",
+			got.BTDHT, got.BTPEX, got.BTSeeding, want.BTDHT, want.BTPEX, want.BTSeeding)
+	}
+	if got.BTTrackers != want.BTTrackers {
+		t.Errorf("BTTrackers = %q, want %q", got.BTTrackers, want.BTTrackers)
+	}
+}
+
+// TestTorrentMetainfoCache 覆盖 BT 元数据缓存表:写入后可读、重复写入
+// 覆盖、删除任务时一并清理(否则 bt_metainfo 会留下永不回收的孤儿行)。
+func TestTorrentMetainfoCache(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// 未缓存时返回 (nil, nil),调用方据此回退到磁力链接。
+	if got, err := s.LoadTorrentMetainfo("t1"); err != nil || got != nil {
+		t.Fatalf("LoadTorrentMetainfo(empty) = %v, %v; want nil, nil", got, err)
+	}
+	info := []byte("d4:infodё-fake-info-bytes")
+	if err := s.SaveTorrentMetainfo("t1", info); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LoadTorrentMetainfo("t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(info) {
+		t.Fatalf("cached info = %q, want %q", got, info)
+	}
+	// 覆盖写。
+	if err := s.SaveTorrentMetainfo("t1", []byte("second")); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = s.LoadTorrentMetainfo("t1"); string(got) != "second" {
+		t.Fatalf("cached info after overwrite = %q, want second", got)
+	}
+	// 空字节视为「没有元数据」,不写库。
+	if err := s.SaveTorrentMetainfo("t2", nil); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = s.LoadTorrentMetainfo("t2"); got != nil {
+		t.Fatalf("empty info should not be cached, got %q", got)
+	}
+
+	// 删除任务必须级联清掉缓存。
+	tk := &Task{ID: "t1", URL: "magnet:?xt=urn:btih:x", SavePath: dir, Protocol: "BT",
+		Status: TaskStatus.Pending}
+	if err := s.CreateTask(tk); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveTorrentMetainfo("t1", info); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteTask("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ = s.LoadTorrentMetainfo("t1"); got != nil {
+		t.Fatalf("metainfo survived task deletion: %q", got)
+	}
+}
+
+// TestTaskBTFileRoundtrip 覆盖 BT 单文件任务的相对路径列:它决定 UI 的
+// 「打开文件」按钮指向哪个文件。
+func TestTaskBTFileRoundtrip(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	tk := &Task{ID: "bt1", URL: "magnet:?xt=urn:btih:y", SavePath: filepath.Join(dir, "task"),
+		Protocol: "BT", Status: TaskStatus.Pending, BTFile: "ubuntu.iso"}
+	if err := s.CreateTask(tk); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetTask("bt1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BTFile != "ubuntu.iso" {
+		t.Fatalf("BTFile = %q, want ubuntu.iso", got.BTFile)
+	}
+	if err := s.UpdateTaskBTFile("bt1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = s.GetTask("bt1"); err != nil {
+		t.Fatal(err)
+	}
+	if got.BTFile != "" {
+		t.Fatalf("BTFile after clear = %q, want empty", got.BTFile)
+	}
+}

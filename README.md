@@ -1,7 +1,8 @@
 # lgdm — 本地下载管理器
 
 单文件可执行程序的下载管理器，提供 Fyne GUI、持久化的 SQLite 状态、
-并发的分片下载，以及用于浏览器接力的两条交接通道（本地端口 / `lgom://` URL 协议）。
+并发的分片下载、BitTorrent（磁力链接 / `.torrent`），以及用于浏览器接力的
+两条交接通道（本地端口 / `lgom://` URL 协议）。
 
 业务进程与 UI 子进程通过 Unix socket + 长度前缀 JSON 帧通信：业务进程
 持有 SQLite 与 scheduler、UI 子进程是单独的 Fyne 进程；托盘常驻业务进程，
@@ -11,6 +12,11 @@
 
 - 基于 Range 的并发下载（HTTP、HTTPS、FTP、WebDAV）。
 - 支持断点续传：暂停/恢复后会从已下载的字节偏移处继续，已完成的分片不会重新下载。
+- BitTorrent 下载：`magnet:` 磁力链接与 `.torrent` 种子（本地路径或 HTTP 链接），
+  底层用 [anacrolix/torrent](https://github.com/anacrolix/torrent)；DHT / PEX /
+  tracker、全局限速、做种开关、随机或固定监听端口；进度按「每个种子文件一块」
+  展示；磁力链接的元数据会缓存进库，之后离线也能续传；详见
+  「[BitTorrent 下载](#bittorrent-下载)」。
 - 任务级参数设置（URL、保存路径、并发数、分片大小、UA、Cookies、FTP 模式、代理）。
 - 并发任务数量上限：可在「设置」里配置同时下载的最大任务数（默认 3）。超出限额
   的新任务保持 `Pending`（UI 显示为「等待中」），按 FIFO 顺序在有 slot 释放时自动启动；
@@ -604,6 +610,9 @@ suppress），但它同时把 lgdm 冷启动起来。通道 1 的短板是要求
 「新建下载任务」对话框由用户确认；`--no-gui` / `--autostart` 形态则直接
 Add + Start（服务/CLI 语义不变）。
 
+`url` 同样接受磁力链接与 `.torrent` 链接（正文是 JSON，不需要 URL 编码），
+因此扩展/脚本可以把 BT 任务一并交接给 lgdm。
+
 只监听回环地址、不监听 `0.0.0.0`/`::`。`POST /download` 必须带
 `X-LGOM-Client` 头（逼普通网页先走预检），且带 `Origin` 时必须是扩展来源
 （`chrome-extension://` / `moz-extension://` / Edge 的 `extension://` /
@@ -627,6 +636,11 @@ Add + Start（服务/CLI 语义不变）。
 Unix socket（其它平台）把 URL 转发给主实例后退出，转发失败（例如主实例刚好在退出）
 以非零状态结束并打印原因。
 
+`url` 不限协议：`https://…`、`ftp://…`、`webdav://…` 之外，`magnet:?xt=urn:btih:…`
+（需 URL 编码后放进查询串,例如 `lgom://download?url=magnet%3A%3Fxt%3Durn%3Abtih%3A…`）
+与 `.torrent` 链接同样会被识别成 BitTorrent 任务，落到「新建任务」对话框
+（`--no-gui` / `--autostart` 下则直接 Add + Start）。
+
 ## 代理
 
 设置对话框的 **HTTP/HTTPS 代理模式** 提供三个选项：
@@ -639,6 +653,10 @@ Unix socket（其它平台）把 URL 转发给主实例后退出，转发失败�
   （逗号分隔主机名，glob 模式 `*.lan`、`192.168.*`）。
 
 PAC / WPAD 自动配置脚本不在支持范围内。
+
+BitTorrent 任务的 tracker 公告、webseed 与 `.torrent` 文件的 HTTP 抓取
+同样走这套设置（`internal/protocol.HTTPProxyFunc`）；BT 的 peer 连接不是
+HTTP，因此不受这里的代理影响。
 
 ## 开机自启
 
@@ -693,8 +711,92 @@ macOS 上 `ProcessType=Background` 标记为后台进程，不进入前台应用
 | Proxy bypass        | ""               | 手动模式下的绕过列表（逗号分隔）           |
 | Light mode          | true             | 关闭主窗口时释放 widget 树                 |
 | Auto start          | false            | 操作系统登录后是否静默自启（详见「开机自启」） |
+| BT listen port      | 0（随机）        | BT 客户端监听端口（TCP/uTP）；0 = 随机分配 |
+| BT download limit   | 0（不限）        | BT 客户端全局限速（KiB/s），0 = 不限速     |
+| BT upload limit     | 0（不限）        | BT 客户端全局上传限速（KiB/s）             |
+| BT max connections  | 50               | 单个种子的最大已连接 peer 数               |
+| DHT                 | true             | 启用 DHT（磁力链接没有 tracker 时靠它找 peer） |
+| PEX                 | true             | 启用节点交换（与 peer 交换可用节点）       |
+| BT seeding          | false            | 下载完成后继续做种（上传给其它 peer）      |
+| Extra trackers      | ""               | 附加 tracker（每行一个），追加到每个 BT 任务 |
 
 每次修改都会立即持久化。
+
+## BitTorrent 下载
+
+BT 任务与 HTTP 分片任务共用任务列表、状态机、并发上限与排序，但底层走
+`internal/bittorrent`（封装 anacrolix/torrent）：进程内共享一个 BT 客户端
+（一个监听端口、一份 DHT 路由表、一份连接池），每个任务只持有自己的种子句柄
+与独立的任务目录。BT 客户端是**懒创建**的——没有 BT 任务时不监听端口、
+不建 DHT 路由表。
+
+### 怎么加任务
+
+把下面任意一种填进「新建任务」的 URL 一栏（也可以经
+`lgom://download?url=<encoded>` 或浏览器扩展的本地端口通道转发过来），
+协议按 URL 形态自动识别：
+
+| URL 形态 | 处理方式 |
+| -------- | -------- |
+| `magnet:?xt=urn:btih:…&dn=…` | 从 DHT / tracker / peer 抓取元数据后下载 |
+| `https://…/foo.torrent[?query]` | 先用 HTTP（走代理设置）取种子文件，再下载内容 |
+| `/path/to/foo.torrent`、`file:///path/foo.torrent` | 直接读本地种子文件 |
+
+文件大小预览：`.torrent` 能解析出精确的总体积；磁力链接在拿到元数据前
+无法预知体积，对话框保持「未知大小」而不是报错，任务会以「下载中 + 未知大小」
+的状态等待 peer 提供元数据（期间每 30s 在日志里记一条 `waiting for metadata`，
+便于区分「网络/端口不通」与「卡死」）。
+
+### 保存路径 = 任务目录
+
+BT 任务的保存路径是一个**目录**（不是单个文件），默认按磁力链接的 `dn`
+参数（没有则用 infohash 前缀）或种子文件名建目录。种子内容落在
+`<任务目录>/<种子名>/…` 之下（单文件种子就是 `<任务目录>/<文件名>`）。
+
+- 未完成的文件带 `.part` 后缀，某个文件下载完成后由客户端重命名为正式文件名；
+- 「打开文件夹」打开任务目录；「打开文件」在单文件种子下直接打开那个文件，
+  多文件种子则打开任务目录；
+- **删除任务会连同任务目录一起删除**（含未完成的 `.part` 数据）。
+
+### 断点续传与恢复
+
+暂停任务会摘除种子（断开所有 peer）；恢复时重新添加同一个种子，已完成的文件
+与 `.part` 里的数据都会被识别，只补缺失的部分。磁力链接在首次抓到元数据后会把
+info 字典缓存进 `lgdm.sqlite` 的 `bt_metainfo` 表，因此后续恢复不必再依赖
+DHT/tracker（离线、tracker 全挂也能续传）。进程异常退出后的冷启动回收
+（`ReclaimDownloadingTasks`）对 BT 任务同样生效。
+
+### 做种
+
+默认「下载完成后不再上传」：任务完成即断开连接、释放并发槽位。开启
+「BT seeding」后，任务完成后继续上传，此时任务状态已是「已完成」、不再占用
+并发上限；删除任务或退出程序时停止做种。
+
+### 代理、端口与连通性
+
+- tracker 公告、webseed、种子文件的 HTTP 抓取都走「代理模式」里的同一套设置
+  （System / Disabled / Manual + 绕过列表）；BT 的 peer 连接不是 HTTP，
+  因此不受 HTTP 代理影响；
+- 监听端口默认随机（`0`）。要接受入站连接（提升速度）得填一个固定端口并在
+  路由器上做映射——lgdm **不会**自动改路由器配置（不启用 UPnP/NAT-PMP）；
+- DHT / PEX 默认开启：磁力链接没有 tracker 时几乎完全依赖它们找 peer。
+
+### 与 HTTP 任务共用的部分
+
+- 进度、速度、ETA、状态筛选、排序、搜索、并发上限与 FIFO 排队；
+- 「任务详情」的分块马赛克与分片视图：BT 任务按「每个种子文件一块」渲染，
+  一块对应一个文件（区间按文件在种子内的偏移拼接）；
+- 设置改动：限速立刻生效；监听端口 / DHT / PEX / 连接数上限这类客户端
+  构造期参数在没有 BT 任务运行时立即重建客户端生效，否则延后到最后一个
+  BT 任务结束（做种中的任务也算「在运行」）。
+
+### 依赖说明
+
+BT 支持引入 `github.com/anacrolix/torrent`。它是纯 Go 实现，但存储层在
+CGO 开启时会编入一个 cgo 版 SQLite（用于分片完成状态，与 lgdm 自己用的
+`modernc.org/sqlite` 无关）。本项目的正式构建本来就需要 CGO（Fyne 的
+GL/GLFW 绑定），所以不额外增加构建依赖；纯 `CGO_ENABLED=0` 的构建本来就
+无法产出 GUI 二进制。
 
 ## 任务状态字段
 
@@ -705,9 +807,15 @@ macOS 上 `ProcessType=Background` 标记为后台进程，不进入前台应用
 | Total / downloaded | 是         | 累计字节计数                                         |
 | Status            | 是         | `Pending` / `Downloading` / `Paused` / `Completed` / `Failed` / `FileLost` |
 | Error message     | 是         | 失败原因                                               |
+| bt_file           | 是         | BT 单文件任务的文件相对路径（UI 的「打开文件」用它定位） |
 
 `FileLost` 由周期性文件存在性检查（`uimgr.validate`）与重连触发的检查维护——
 目标文件被人为删除后任务会被标记为 `FileLost`，UI 提供「重置 + 重启」入口。
+BT 任务的 `SavePath` 是任务目录，检查的是该目录是否存在。
+
+BT 任务的种子元数据（info 字典）存在 `bt_metainfo` 表（`task_id` → `info` BLOB），
+与 `tasks` 分表：它变长且可能很大，而 `tasks` 行会在每次进度事件里被序列化后
+推给 UI，不能塞进任务结构体。删除任务时同一把锁内级联清理。
 
 ## 进程架构
 
@@ -740,11 +848,14 @@ macOS 上 `ProcessType=Background` 标记为后台进程，不进入前台应用
 
 ```
 main.go                        # 命令行参数、单实例锁、本地端口服务 + URL 协议处理、退出信号
-internal/store/                # SQLite 持久化（任务、设置、分片状态）
+internal/store/                # SQLite 持久化（任务、设置、分片状态、BT 元数据缓存）
 internal/protocol/             # HTTP、HTTPS、FTP、WebDAV 驱动 + 代理 + 系统代理探测
   └── sysproxy/                #   跨平台系统代理检测（linux/darwin/windows/other）
+internal/bittorrent/           # BitTorrent 客户端封装（anacrolix/torrent）：共享客户端、
+                               #   种子添加/元数据缓存恢复、限速、按任务的存储目录
 internal/engine/               # 分片规划、Range 下载、重试
 internal/scheduler/            # 单任务生命周期、状态事件、进度刷盘、异步 Start
+                               #   （HTTP 分片与 BT 两条下载路径的编排）
 internal/prealloc/             # 磁盘预分配辅助
 internal/urllauncher/          # lgom:// URL 解析、单实例锁、URL 转发
                                #   （Windows 命名管道 / 其它平台 Unix socket）
@@ -794,6 +905,10 @@ flatpak/                       # Flatpak 用的 AppStream metainfo
 `svc.AddTask` → `svc.Start`（二者都经 IPC 落到业务进程），成功后关闭
 对话框。AddTask / Start 任一返回错误时弹错误对话框，保留窗口供修正。
 
+URL 是磁力链接 / `.torrent` 时对话框会切换语义：标签变成「保存目录」，
+默认目录名按 `dn` 参数（没有则 infohash 前缀）或种子文件名推导，并在下方
+提示「BT 任务的内容会下载到该目录下」（见「BitTorrent 下载」）。
+
 ### 任务生命周期：冷启动回收与优雅退出
 **冷启动** — 业务进程启动后、scheduler.Run 启动前，调用
 `scheduler.ReclaimDownloadingTasks()`：扫 store 中所有 `Downloading` 行
@@ -816,6 +931,11 @@ PauseAll 把那些 job 从 `s.jobs` 移除并落盘 `Paused`，flushAll 就会
 预分配阶段的 slot（Start 已 reserve 但 `startAsync` 尚未替换为带 cancel
 的 runningJob）不会被 PauseAll 命中——这类任务的最终状态由下次冷启动的
 ReclaimDownloadingTasks 兜底。
+
+BitTorrent 任务走同一套生命周期：暂停/退出通过取消上下文让进度循环落盘
+`Paused` 并摘除种子，退出流程随后调用 `scheduler.CloseBittorrent()` 关掉
+BT 客户端（断开所有 peer、停止做种，磁盘数据保留）。做种中的任务不在
+`s.jobs` 里（状态已是 `Completed`、不占槽位），由 `CloseBittorrent` 统一收尾。
 
 ### 异步 Start 与 UI 线程
 
@@ -878,6 +998,22 @@ go test ./...
 - `_RaiseCapPromotesPending`：`SetMaxConcurrent` 调大时立即 promote 积压任务
 这些测试用 `blockingServer` 让 HTTP probe 稳定停留在 prepare 阶段，
 以便精确断言 cap 触发与 promote 时机。
+
+BitTorrent 相关：
+
+- `internal/bittorrent/bittorrent_test.go` 里的 `TestDownloadFromLoopbackPeer`
+  是端到端用例：本机起一个做种端（anacrolix 客户端 + 已就绪的数据目录），
+  再用 lgdm 的 `Manager` 下载，断言进度/文件列表、内容一致、`.part` 重命名，
+  并检查做种端确实上传了数据（证明是真实的 P2P 传输）。其余用例覆盖
+  `.torrent` 解析、重复 infohash 拒绝（`ErrAlreadyAdded`）、缓存元数据恢复。
+- `internal/scheduler/bittorrent_test.go` 覆盖设置 → 客户端配置的映射、
+  tracker 拆分、默认任务目录名推导、BT/普通任务的删除语义、
+  「每个种子文件一块」的分片换算，以及 `flushAll` 不会清空 BT 分片进度
+  （回归用例）。
+
+需要绑回环端口的用例（BT 的端到端下载、`internal/handoff`、
+`internal/engine` 的部分用例）在无法监听 socket 的环境里会 `t.Skip`，
+因此受限沙箱中 `go test ./...` 仍能跑到其余的单元用例。
 
 ## 许可证
 

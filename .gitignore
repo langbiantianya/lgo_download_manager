@@ -16,3 +16,7 @@ ldm.sqlite-shm
 ldm.sqlite-wal
 downloads/
 *.tmp
+# anacrolix/torrent 的「按目录分片完成库」：lgdm 显式用内存完成状态
+# (每个任务存储都带 .part 文件语义),理论上不会生成它;留一条以防
+# 受限环境下某个回退路径把它落到仓库里被误提交。
+.torrent.bolt.db

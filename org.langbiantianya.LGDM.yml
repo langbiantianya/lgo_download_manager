@@ -41,7 +41,7 @@ sdk: org.freedesktop.Sdk
 command: lgo_download_manager
 
 finish-args:
-  # --- 网络访问(HTTP/HTTPS/FTP/WebDAV 下载) ---
+  # --- 网络访问(HTTP/HTTPS/FTP/WebDAV/BitTorrent 下载) ---
   - --share=network
   - --share=ipc
   # --- 显示:Fyne 的 GL 渲染,Wayland 优先、X11 回退 ---

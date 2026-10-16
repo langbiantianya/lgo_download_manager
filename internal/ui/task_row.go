@@ -205,13 +205,13 @@ func (r *taskRow) bindButtons(t *store.Task, svc Service) {
 		if t.SavePath == "" {
 			return
 		}
-		openFolder(filepath.Dir(t.SavePath))
+		openFolder(taskFolder(t))
 	}
 	r.openFileBtn.OnTapped = func() {
 		if t.SavePath == "" {
 			return
 		}
-		openFile(t.SavePath)
+		openFile(taskFile(t))
 	}
 }
 
@@ -388,6 +388,28 @@ func displayName(t *store.Task) string {
 		return filepath.Base(t.SavePath)
 	}
 	return t.URL
+}
+
+// taskFolder 返回「打开文件夹」按钮应打开的目录。
+// 普通任务的 SavePath 是一个文件,打开其所在目录;BT 任务的 SavePath
+// 本身就是「任务目录」(种子内容与 .part 临时文件都在里面),直接打开它。
+func taskFolder(t *store.Task) string {
+	if scheduler.IsBittorrentTask(t) {
+		return t.SavePath
+	}
+	return filepath.Dir(t.SavePath)
+}
+
+// taskFile 返回「打开文件」按钮应打开的文件。BT 单文件种子用元数据里
+// 记下的相对路径定位;多文件种子没有单一文件可打开,退化为打开任务目录。
+func taskFile(t *store.Task) string {
+	if !scheduler.IsBittorrentTask(t) {
+		return t.SavePath
+	}
+	if t.BTFile == "" {
+		return t.SavePath
+	}
+	return filepath.Join(t.SavePath, filepath.FromSlash(t.BTFile))
 }
 
 // formatTime 把 time.Time 渲染为本地时区的 YYYY-MM-DD HH:MM:SS 字符串。

@@ -23,6 +23,11 @@
 //	error_message   TEXT
 //	created_at      DATETIME
 //	updated_at      DATETIME
+//	bt_file         TEXT  BT 单文件任务的相对路径(多文件种子为空)
+//
+// BitTorrent 任务额外使用 bt_metainfo 表缓存种子的 info 字典:
+// 磁力链接在首次抓到元数据后落库,后续「暂停 → 恢复」或进程重启
+// 都能直接从本地元数据续传,不必再依赖 DHT/tracker 重新抓取。
 //
 // 所有写入都通过 (*Store).Flush 完成：engine 中的 Ticker 每 2 秒调用
 // Flush 一次。生命周期事件（暂停/完成/失败）通过 FlushImmediate 强制同步。
@@ -175,6 +180,11 @@ type Task struct {
 	CreatedAt     time.Time `json:"created_at"`
 	UpdatedAt     time.Time `json:"updated_at"`
 	CompletedAt   time.Time `json:"completed_at"` // 零值表示尚未完成
+
+	// BTFile 是 BT 任务在「种子只有一个文件」时该文件相对任务目录的路径
+	// (例如 "ubuntu.iso");多文件种子为空——UI 据此决定「打开文件」按钮
+	// 是打开这个文件还是打开任务目录。非 BT 任务恒为空。
+	BTFile string `json:"bt_file,omitempty"`
 }
 
 // Store 封装 *sql.DB，并缓存进度刷盘用的 prepared statement。
@@ -260,6 +270,7 @@ func (s *Store) migrate() error {
 		status          TEXT NOT NULL DEFAULT 'Pending',
 		auth_data       TEXT NOT NULL DEFAULT '{}',
 		error_message   TEXT NOT NULL DEFAULT '',
+		bt_file         TEXT NOT NULL DEFAULT '',
 		created_at      DATETIME NOT NULL,
 		updated_at      DATETIME NOT NULL
 	);
@@ -273,6 +284,13 @@ CREATE TABLE IF NOT EXISTS settings (
 	ftp_passive         INTEGER NOT NULL DEFAULT 1,
 	prealloc            INTEGER NOT NULL DEFAULT 1,
 	max_concurrent      INTEGER NOT NULL DEFAULT 0
+);
+-- bt_metainfo 缓存每个 BT 任务种子的 info 字典(原始 bencode 字节)。
+-- 与 tasks 分表存放:变长且可能很大(每 piece 20 字节),而 tasks 行
+-- 会在每次进度事件里被序列化推给 UI,不能把元数据塞进 Task 结构体。
+CREATE TABLE IF NOT EXISTS bt_metainfo (
+	task_id         TEXT PRIMARY KEY,
+	info            BLOB NOT NULL
 );
 -- 索引与 ListTasks 的筛选/排序形状对齐（见 TaskSort.orderByClause）：
 -- status 服务侧边栏筛选，另外两条让默认排序与文件名排序免于全表排序。
@@ -291,6 +309,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_save_path    ON tasks(save_path ASC, id ASC
 		return err
 	}
 	if err := s.addColumnIfMissing("tasks", "completed_at", "DATETIME"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("tasks", "bt_file", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	if err := s.addColumnIfMissing("settings", "task_sort", `TEXT NOT NULL DEFAULT ''`); err != nil {
@@ -315,6 +336,32 @@ CREATE INDEX IF NOT EXISTS idx_tasks_save_path    ON tasks(save_path ASC, id ASC
 		return err
 	}
 	if err := s.addColumnIfMissing("settings", "language", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	// BitTorrent 相关设置列。缺省值即「首次运行默认值」:端口随机、
+	// 不限速、DHT/PEX 开启、完成后不做种、无附加 tracker。
+	if err := s.addColumnIfMissing("settings", "bt_port", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "bt_max_peers", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "bt_download_limit", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "bt_upload_limit", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "bt_dht", `INTEGER NOT NULL DEFAULT 1`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "bt_pex", `INTEGER NOT NULL DEFAULT 1`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "bt_seeding", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "bt_trackers", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	return nil
@@ -396,13 +443,13 @@ func (s *Store) CreateTask(t *Task) error {
 	_, err := s.db.Exec(`INSERT INTO tasks (
 		id,url,save_path,protocol,total_size,downloaded,support_range,
 		is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
-		auth_data,error_message,created_at,updated_at,completed_at
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		auth_data,error_message,created_at,updated_at,completed_at,bt_file
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		t.ID, t.URL, t.SavePath, t.Protocol, t.TotalSize, t.Downloaded,
 		boolToInt(t.SupportRange), boolToInt(t.IsAllocated), t.ChunkCount,
 		t.MinChunkSize,
 		string(cpJSON), string(rgJSON), string(t.Status), t.AuthData,
-		t.ErrorMessage, t.CreatedAt, t.UpdatedAt, nil,
+		t.ErrorMessage, t.CreatedAt, t.UpdatedAt, nil, t.BTFile,
 	)
 	if err != nil {
 		return fmt.Errorf("store insert: %w", err)
@@ -512,7 +559,7 @@ func (s *Store) GetTask(id string) (*Task, error) {
 	row := s.db.QueryRow(`SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
 		is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
-		auth_data,error_message,created_at,updated_at,completed_at
+		auth_data,error_message,created_at,updated_at,completed_at,bt_file
 		FROM tasks WHERE id=?`, id)
 	return scanTask(row)
 }
@@ -525,7 +572,7 @@ func (s *Store) ListTasks(filter StatusFilter, sort TaskSort) ([]*Task, error) {
 	query := `SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
 		is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
-		auth_data,error_message,created_at,updated_at,completed_at
+		auth_data,error_message,created_at,updated_at,completed_at,bt_file
 		FROM tasks`
 	if useWhere {
 		query += ` WHERE status = ?`
@@ -576,8 +623,54 @@ func (t *Task) Clone() *Task {
 func (s *Store) DeleteTask(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.db.Exec(`DELETE FROM tasks WHERE id=?`, id)
+	if _, err := s.db.Exec(`DELETE FROM tasks WHERE id=?`, id); err != nil {
+		return err
+	}
+	// 同一把锁内顺手清掉该任务的 BT 元数据缓存(magnet 的 info 字典),
+	// 避免删除任务后 bt_metainfo 表里留下永不回收的孤儿行。
+	_, err := s.db.Exec(`DELETE FROM bt_metainfo WHERE task_id=?`, id)
 	return err
+}
+
+// UpdateTaskBTFile 记录 BT 单文件任务的相对路径(多文件种子传空串)。
+// 由 scheduler 在拿到种子元数据后写入,供 UI 的「打开文件」按钮使用。
+func (s *Store) UpdateTaskBTFile(id, rel string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE tasks SET bt_file=?, updated_at=? WHERE id=?`,
+		rel, time.Now().UTC(), id)
+	return err
+}
+
+// SaveTorrentMetainfo 缓存一个 BT 任务的 info 字典(bencode 原始字节)。
+// 磁力链接在首次拿到元数据后调用;任务重启时优先用它恢复,避免再次
+// 依赖 DHT/tracker 抓元数据(离线或 tracker 全挂时也能续传)。
+func (s *Store) SaveTorrentMetainfo(id string, info []byte) error {
+	if len(info) == 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`INSERT INTO bt_metainfo (task_id, info) VALUES (?, ?)
+		ON CONFLICT(task_id) DO UPDATE SET info=excluded.info`, id, info)
+	if err != nil {
+		return fmt.Errorf("store save metainfo: %w", err)
+	}
+	return nil
+}
+
+// LoadTorrentMetainfo 读取缓存的 info 字典。没有缓存时返回 (nil, nil),
+// 让调用方回退到磁力链接/种子文件本身。
+func (s *Store) LoadTorrentMetainfo(id string) ([]byte, error) {
+	var info []byte
+	err := s.db.QueryRow(`SELECT info FROM bt_metainfo WHERE task_id=?`, id).Scan(&info)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("store load metainfo: %w", err)
+	}
+	return info, nil
 }
 
 // UpdateTaskChunkRanges 记录 engine 为某个任务实际规划的分块布局。
@@ -611,7 +704,7 @@ func scanTask(s scanner) (*Task, error) {
 	)
 	err := s.Scan(&t.ID, &t.URL, &t.SavePath, &t.Protocol, &total, &dwn,
 		&support, &alloc, &t.ChunkCount, &t.MinChunkSize, &cp, &rg, &t.Status, &t.AuthData,
-		&t.ErrorMessage, &t.CreatedAt, &t.UpdatedAt, &completedAtNS)
+		&t.ErrorMessage, &t.CreatedAt, &t.UpdatedAt, &completedAtNS, &t.BTFile)
 	if err != nil {
 		return nil, err
 	}
@@ -669,6 +762,38 @@ type Settings struct {
 	// 空值表示「未设置」——settings.Load 会在首启时通过系统语言兜底;
 	// settings.Load 也会校验持久化的值,不再受支持的标签会被替换为默认。
 	Language string
+
+	// ---- BitTorrent ----
+
+	// BTPort 是 BitTorrent 客户端的监听端口(同时用于 TCP 与 uTP/UDP);
+	// 0 表示由操作系统随机分配一个可用端口。
+	BTPort int
+
+	// BTMaxPeers 是每个 BT 任务允许建立的已连接 peer 数上限;
+	// <=0 表示使用 DefaultBTMaxPeers。
+	BTMaxPeers int
+
+	// BTDownloadLimitKiB / BTUploadLimitKiB 是 BT 客户端的全局限速(KiB/s);
+	// 0 表示不限速。与 HTTP 分片下载的线程数无关——BT 的速率由客户端
+	// 在连接层统一限流。
+	BTDownloadLimitKiB int
+	BTUploadLimitKiB   int
+
+	// BTDHT 控制是否启用 DHT:磁力链接没有 tracker 时几乎完全依赖
+	// DHT 找 peer,因此默认开启。
+	BTDHT bool
+
+	// BTPEX 控制是否启用 Peer Exchange(节点交换),默认开启。
+	BTPEX bool
+
+	// BTSeeding 表示下载完成后是否继续做种(上传给其它 peer)。
+	// 关闭时任务一旦完成即断开所有连接,不再上传。
+	BTSeeding bool
+
+	// BTTrackers 是附加 tracker 列表(逗号或换行分隔),会追加到每个
+	// BT 任务。对磁力链接尤其有用:内置 tracker 失效时仍能靠这些
+	// tracker 找到 peer。
+	BTTrackers string
 }
 
 // DefaultMaxConcurrent 是 MaxConcurrent 为 0/负数时的兜底默认值;
@@ -676,12 +801,24 @@ type Settings struct {
 // (aria2c 默认 5、IDM 默认 4) 的轻量级场景对齐。
 const DefaultMaxConcurrent = 3
 
+// DefaultBTMaxPeers 是 BTMaxPeers 为 0/负数时的兜底默认值。50 与
+// anacrolix/torrent 自身的 EstablishedConnsPerTorrent 默认值一致。
+const DefaultBTMaxPeers = 50
+
 // EffectiveMaxConcurrent 返回 MaxConcurrent 的有效值:<=0 视为默认。
 func (s Settings) EffectiveMaxConcurrent() int {
 	if s.MaxConcurrent <= 0 {
 		return DefaultMaxConcurrent
 	}
 	return s.MaxConcurrent
+}
+
+// EffectiveBTMaxPeers 返回 BTMaxPeers 的有效值:<=0 视为默认。
+func (s Settings) EffectiveBTMaxPeers() int {
+	if s.BTMaxPeers <= 0 {
+		return DefaultBTMaxPeers
+	}
+	return s.BTMaxPeers
 }
 
 // 则插入一条全零的记录（由调用方负责套用默认值），
@@ -706,6 +843,14 @@ func (s *Store) LoadSettings() (Settings, error) {
 		maxConc     int
 		autoStart   int
 		language    string
+		btPort      int
+		btMaxPeers  int
+		btDlLimit   int
+		btUlLimit   int
+		btDHT       int
+		btPEX       int
+		btSeeding   int
+		btTrackers  string
 	)
 	err := s.db.QueryRow(`SELECT default_save_dir, default_threads, min_chunk_size,
 		user_agent, cookies, ftp_passive, prealloc, task_sort,
@@ -713,10 +858,19 @@ func (s *Store) LoadSettings() (Settings, error) {
 		COALESCE(light_mode, 1),
 		COALESCE(max_concurrent, 0),
 		COALESCE(auto_start, 0),
-		COALESCE(language, '')
+		COALESCE(language, ''),
+		COALESCE(bt_port, 0),
+		COALESCE(bt_max_peers, 0),
+		COALESCE(bt_download_limit, 0),
+		COALESCE(bt_upload_limit, 0),
+		COALESCE(bt_dht, 1),
+		COALESCE(bt_pex, 1),
+		COALESCE(bt_seeding, 0),
+		COALESCE(bt_trackers, '')
 		FROM settings WHERE id=1`,
 	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc, &taskSort,
-		&proxyMode, &proxyURL, &proxyBypass, &lightMode, &maxConc, &autoStart, &language)
+		&proxyMode, &proxyURL, &proxyBypass, &lightMode, &maxConc, &autoStart, &language,
+		&btPort, &btMaxPeers, &btDlLimit, &btUlLimit, &btDHT, &btPEX, &btSeeding, &btTrackers)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 首次运行：插入一条全零行，以便后续 LoadSettings 能读到。
 		_, ierr := s.db.Exec(`INSERT OR IGNORE INTO settings (id) VALUES (1)`)
@@ -761,6 +915,16 @@ func (s *Store) LoadSettings() (Settings, error) {
 		// language 列缺省值为空:settings.Load 把空值视为「未设置」,
 		// 走系统语言兜底;校验/兜底都在 settings 层,这里只透传原始值。
 		Language: language,
+		// BT 列的缺省值即首次运行默认值(端口随机 / 不限速 / DHT+PEX 开启 /
+		// 完成后不做种 / 无附加 tracker),旧库经列迁移后同样落到这里。
+		BTPort:             btPort,
+		BTMaxPeers:         btMaxPeers,
+		BTDownloadLimitKiB: btDlLimit,
+		BTUploadLimitKiB:   btUlLimit,
+		BTDHT:              btDHT != 0,
+		BTPEX:              btPEX != 0,
+		BTSeeding:          btSeeding != 0,
+		BTTrackers:         btTrackers,
 	}, nil
 }
 
@@ -771,8 +935,9 @@ func (s *Store) SaveSettings(s2 Settings) error {
 	_, err := s.db.Exec(`INSERT INTO settings (id, default_save_dir, default_threads,
 		min_chunk_size, user_agent, cookies, ftp_passive, prealloc, task_sort,
 		proxy_mode, proxy_url, proxy_bypass, light_mode, max_concurrent, auto_start,
-		language)
-	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		language, bt_port, bt_max_peers, bt_download_limit, bt_upload_limit,
+		bt_dht, bt_pex, bt_seeding, bt_trackers)
+	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 			default_save_dir=excluded.default_save_dir,
 			default_threads=excluded.default_threads,
@@ -788,7 +953,15 @@ func (s *Store) SaveSettings(s2 Settings) error {
 			light_mode=excluded.light_mode,
 			max_concurrent=excluded.max_concurrent,
 			auto_start=excluded.auto_start,
-			language=excluded.language`,
+			language=excluded.language,
+			bt_port=excluded.bt_port,
+			bt_max_peers=excluded.bt_max_peers,
+			bt_download_limit=excluded.bt_download_limit,
+			bt_upload_limit=excluded.bt_upload_limit,
+			bt_dht=excluded.bt_dht,
+			bt_pex=excluded.bt_pex,
+			bt_seeding=excluded.bt_seeding,
+			bt_trackers=excluded.bt_trackers`,
 		s2.DefaultSaveDir, s2.DefaultThreads, s2.MinChunkSize,
 		s2.UserAgent, s2.Cookies, boolToInt(s2.FTPPassive), boolToInt(s2.Prealloc),
 		string(s2.TaskSort),
@@ -797,6 +970,14 @@ func (s *Store) SaveSettings(s2 Settings) error {
 		s2.MaxConcurrent,
 		boolToInt(s2.AutoStart),
 		s2.Language,
+		s2.BTPort,
+		s2.BTMaxPeers,
+		s2.BTDownloadLimitKiB,
+		s2.BTUploadLimitKiB,
+		boolToInt(s2.BTDHT),
+		boolToInt(s2.BTPEX),
+		boolToInt(s2.BTSeeding),
+		s2.BTTrackers,
 	)
 	if err != nil {
 		return fmt.Errorf("settings save: %w", err)

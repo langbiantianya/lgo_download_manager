@@ -52,6 +52,10 @@ type AddTaskInput struct {
 	SavePath     string
 	ChunkCount   int
 	MinChunkSize int64
+	// Protocol 是任务所属协议。留空时由业务进程按 URL 形态识别
+	// (magnet: / .torrent 会被识别为 BT);对话框在 BT 场景会显式传入,
+	// 使「保存路径」按任务目录语义处理。
+	Protocol protocol.ProtocolKind
 	// Auth 由调用方预填：业务进程在收到 MethodAdd 后,直接把 Auth 透传给
 	// scheduler.Add 的 AuthOptions,进而落到 store.Task.AuthData。
 	// "新建下载任务"对话框用 GlobalSettings.UserAgent/Cookies 填充,

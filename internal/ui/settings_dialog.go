@@ -186,6 +186,93 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	})
 	prealloc.SetChecked(GlobalSettings.Prealloc)
 
+	// ---- BitTorrent ----
+	//
+	// 这一组设置由 scheduler 映射成 bittorrent.Config:限速即刻生效,
+	// 端口/DHT/PEX 等客户端构造期参数在 BT 客户端可安全重建时生效
+	// (没有 BT 任务在跑时立即重建,否则等最后一个任务结束)。
+
+	// 监听端口:0 表示随机(默认),其余按有效端口范围 1..65535 校验。
+	btPortEntry := widget.NewEntry()
+	btPortEntry.SetText(fmt.Sprintf("%d", GlobalSettings.BTPort))
+	btPortEntry.SetPlaceHolder(ilocale.T("settings.btPort.placeholder"))
+	btPortEntry.OnChanged = func(s string) {
+		n, err := strconv.Atoi(strings.TrimSpace(s))
+		if err != nil || n < 0 || n > 65535 {
+			return
+		}
+		GlobalSettings.BTPort = n
+		persist()
+	}
+
+	// 全局限速(KiB/s,0 = 不限速)。
+	btDownEntry := widget.NewEntry()
+	btDownEntry.SetText(fmt.Sprintf("%d", GlobalSettings.BTDownloadLimitKiB))
+	btDownEntry.SetPlaceHolder(ilocale.T("settings.btLimit.placeholder"))
+	btDownEntry.OnChanged = func(s string) {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n >= 0 {
+			GlobalSettings.BTDownloadLimitKiB = n
+			persist()
+		}
+	}
+	btUpEntry := widget.NewEntry()
+	btUpEntry.SetText(fmt.Sprintf("%d", GlobalSettings.BTUploadLimitKiB))
+	btUpEntry.SetPlaceHolder(ilocale.T("settings.btLimit.placeholder"))
+	btUpEntry.OnChanged = func(s string) {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n >= 0 {
+			GlobalSettings.BTUploadLimitKiB = n
+			persist()
+		}
+	}
+	btRateUnit := widget.NewLabel(ilocale.T("settings.btLimitUnit"))
+	btDownRow := container.NewBorder(nil, nil, nil, btRateUnit, btDownEntry)
+	btUpRow := container.NewBorder(nil, nil, nil, btRateUnit, btUpEntry)
+
+	// 每个种子的最大连接数(留空/0 表示使用默认值)。
+	btPeersEntry := widget.NewEntry()
+	btPeersEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveBTMaxPeers()))
+	btPeersEntry.SetPlaceHolder(ilocale.T("settings.btPeers.placeholder"))
+	btPeersEntry.OnChanged = func(s string) {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+			GlobalSettings.BTMaxPeers = n
+			persist()
+		}
+	}
+
+	btDHT := widget.NewCheck(ilocale.T("settings.btDHT.desc"), func(checked bool) {
+		GlobalSettings.BTDHT = checked
+		persist()
+	})
+	btDHT.SetChecked(GlobalSettings.BTDHT)
+
+	btPEX := widget.NewCheck(ilocale.T("settings.btPEX.desc"), func(checked bool) {
+		GlobalSettings.BTPEX = checked
+		persist()
+	})
+	btPEX.SetChecked(GlobalSettings.BTPEX)
+
+	btSeeding := widget.NewCheck(ilocale.T("settings.btSeeding.desc"), func(checked bool) {
+		GlobalSettings.BTSeeding = checked
+		persist()
+	})
+	btSeeding.SetChecked(GlobalSettings.BTSeeding)
+
+	// 附加 tracker 往往是多条(list 很方便粘贴),用多行输入框并留出
+	// 三行可见高度。
+	btTrackersEntry := widget.NewMultiLineEntry()
+	btTrackersEntry.SetMinRowsVisible(3)
+	btTrackersEntry.SetText(GlobalSettings.BTTrackers)
+	btTrackersEntry.SetPlaceHolder(ilocale.T("settings.btTrackers.placeholder"))
+	btTrackersEntry.OnChanged = func(s string) {
+		GlobalSettings.BTTrackers = s
+		persist()
+	}
+
+	// 分区标题:沿用与其它分组一致的「粗体标签」样式,把 BitTorrent
+	// 相关的项在长表单里分隔出来。
+	btHeader := widget.NewLabel(ilocale.T("settings.bt.section"))
+	btHeader.TextStyle.Bold = true
+
 	browseBtn := widget.NewButton(ilocale.T("settings.browse"), func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
 			if err != nil || uri == nil {
@@ -267,6 +354,15 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		widget.NewFormItem(ilocale.T("settings.label.proxyBypass"), proxyBypassEntry),
 		widget.NewFormItem(ilocale.T("settings.label.ftp"), ftpPassive),
 		widget.NewFormItem(ilocale.T("settings.label.prealloc"), prealloc),
+		widget.NewFormItem("", btHeader),
+		widget.NewFormItem(ilocale.T("settings.label.btPort"), btPortEntry),
+		widget.NewFormItem(ilocale.T("settings.label.btDownloadLimit"), btDownRow),
+		widget.NewFormItem(ilocale.T("settings.label.btUploadLimit"), btUpRow),
+		widget.NewFormItem(ilocale.T("settings.label.btPeers"), btPeersEntry),
+		widget.NewFormItem(ilocale.T("settings.label.btDHT"), btDHT),
+		widget.NewFormItem(ilocale.T("settings.label.btPEX"), btPEX),
+		widget.NewFormItem(ilocale.T("settings.label.btSeeding"), btSeeding),
+		widget.NewFormItem(ilocale.T("settings.label.btTrackers"), btTrackersEntry),
 	)
 
 	scroll := container.NewScroll(form)

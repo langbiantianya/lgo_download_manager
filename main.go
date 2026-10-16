@@ -185,6 +185,10 @@ func main() {
 	// 会回退到 DefaultMaxConcurrent)。
 	sc.SetMaxConcurrent(cur.EffectiveMaxConcurrent())
 
+	// BitTorrent 设置推到 scheduler。BT 客户端是懒创建的:没有 BT 任务
+	// 时不会监听端口、不会建 DHT 路由表,因此这里只是登记配置。
+	sc.SetBittorrentConfig(scheduler.BittorrentConfigFrom(cur))
+
 	// 冷启动兜底：上次进程崩溃/被 kill -9 时,残留的 Downloading 任务
 	// 没有 engine 在跑,必须在 Run 之前把它们回收成 Paused,否则 UI 会
 	// 把这些任务显示为「下载中」却永远没有进度,用户无法恢复。
@@ -345,16 +349,30 @@ func main() {
 		logging.Printf("scheduler: pause all timed out after 5s, forcing exit: %v", pauseErr)
 		os.Exit(1)
 	}
+	// 关闭 BT 客户端:断开所有 peer 连接、停止做种(磁盘数据保留)。
+	// 放在 PauseAll 之后,确保 BT 任务的 Paused 状态已经落盘。
+	sc.CloseBittorrent()
 	cancel()
 	uim.Close()
 	tray.Stop()
 }
 
 // savePathFor 推导保存路径：URL 中指定的文件名 → 默认下载目录 + 推导名。
+//
+// BitTorrent 任务的保存路径是「任务目录」而不是单个文件:磁力链接按
+// 链接里的 dn(没有则 infohash 前缀)、.torrent 按去掉后缀的文件名建目录,
+// 种子内容随后下载到该目录之下。这与「新建任务」对话框里的推导规则
+// 一致(见 scheduler.BittorrentDefaultDir)。
 func savePathFor(s store.Settings, rawURL, name string) string {
 	saveDir := s.DefaultSaveDir
 	if saveDir == "" {
 		saveDir = defaultSaveDir()
+	}
+	if protocol.IsBitTorrent(rawURL) {
+		if name == "" {
+			name = scheduler.BittorrentDefaultDir(rawURL)
+		}
+		return filepath.Join(saveDir, protocol.SafeDirName(name, "bt-task"))
 	}
 	if name == "" {
 		name = filepath.Base(rawURL)

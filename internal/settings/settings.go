@@ -47,6 +47,17 @@ func Load(st *store.Store, forceLight bool) (store.Settings, error) {
 		persisted.LightMode = true
 		// 首次运行:同时下载任务数默认 3,与主流下载器轻量场景对齐。
 		persisted.MaxConcurrent = store.DefaultMaxConcurrent
+		// BitTorrent 默认值:监听端口随机、不限速、DHT/PEX 开启
+		// (磁力链接没有 tracker 时几乎只能靠它们找 peer)、
+		// 下载完成后不做种(默认不占用上传带宽)。
+		persisted.BTPort = 0
+		persisted.BTMaxPeers = store.DefaultBTMaxPeers
+		persisted.BTDownloadLimitKiB = 0
+		persisted.BTUploadLimitKiB = 0
+		persisted.BTDHT = true
+		persisted.BTPEX = true
+		persisted.BTSeeding = false
+		persisted.BTTrackers = ""
 	}
 	if forceLight {
 		persisted.LightMode = true
