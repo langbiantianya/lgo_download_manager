@@ -20,7 +20,8 @@
 #
 # 依赖:
 #   flatpak、flatpak-builder,以及每个目标架构的 SDK/runtime:
-#     flatpak install --user --arch=<架构> flathub org.gnome.Sdk//50 org.gnome.Platform//50
+#     flatpak install --user --arch=<架构> flathub org.freedesktop.Sdk//26.08 org.freedesktop.Platform//26.08
+#   (runtime / sdk / 版本号都取自 manifest,换 runtime 时这条命令跟着换)
 #   跨架构出包(例如在 x86_64 上出 aarch64)还要:
 #     1. 本机能执行该架构的构建步骤:  sudo dnf install -y qemu-user-static
 #        (装完 `flatpak --supported-arches` 会多出该架构)

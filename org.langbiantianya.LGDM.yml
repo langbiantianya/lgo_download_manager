@@ -6,8 +6,10 @@
 # 手工构建 / 直接装进用户安装:
 #   flatpak-builder --user --install --force-clean build-dir org.langbiantianya.LGDM.yml
 #
-# Runtime 选 GNOME 50:Fyne 走 EGL/GLFW 渲染,原生 Wayland 与 X11
-# (XWayland 兜底)会话都能跑。
+# Runtime 选 org.freedesktop.Platform 26.08:Fyne 走 EGL/GLFW 渲染,该 base
+# runtime 已带齐 GL/EGL/X11/Wayland/xkbcommon,原生 Wayland 与 X11(XWayland
+# 兜底)会话都能跑;构建时用配套的 org.freedesktop.Sdk 当 cgo 的 sysroot
+# (见 scripts/build_flatpak.sh 的 prepare_toolchain)。
 #
 # 应用 ID 必须与 manifest 文件名、.desktop 文件名、AppStream metainfo
 # 文件名保持一致(flatpak-builder 与桌面环境都按 ID 做匹配),并与

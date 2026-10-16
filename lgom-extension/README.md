@@ -138,6 +138,10 @@ npm run build:firefox
 或使用 Chromium 系列构建（如 `/usr/bin/microsoft-edge --load-extension=...`）
 进行脚本化测试。
 
+Microsoft Edge 不受这条限制：Edge 155 仍接受 `--load-extension`（本机实测
+headless 下加载构建产物、拦截下载并完成端口交接）。所以脚本化验证可以直接
+`microsoft-edge --headless=new --load-extension=build/chrome <url>`。
+
 未打包的 Chrome 扩展 ID 由目录路径决定，移动 `build/chrome` 会改变 ID；打包后的
 ID 由 CRX 签名私钥决定（`--key`，见「打包」）。想让未打包扩展的 ID 稳定，可在
 Chrome manifest 中用 `key` 固定（CI 用的是 `CHROME_EXTENSION_KEY` 对应的那把私钥）。
@@ -211,6 +215,10 @@ Chrome manifest 中用 `key` 固定（CI 用的是 `CHROME_EXTENSION_KEY` 对应
 发现与缓存：扩展先用 `storage.session`（键 `lgom_local_port`）里缓存的上次端口
 发一次 `GET /ping` 验证，失败就在候选表上并行探测，取响应且 `app` 匹配的最小
 端口。所有候选都无响应 → 视为「客户端没在运行」，静默降级到下一个通道。
+
+客户端装在 Flatpak / 沙箱里不影响这条通道：manifest 的 `--share=network` 让沙箱与
+宿主共用网络命名空间，扩展按宿主上的 `127.0.0.1:<候选端口>` 探测就能发现它
+（本机实测：Flatpak 实例收到 `handoff: request … origin=chrome-extension://…`）。
 
 请求头：每次请求都带 `X-LGOM-Client`（值不重要，存在即可）与
 `Content-Type: application/json`。客户端对 `POST /download` 的来源策略是：

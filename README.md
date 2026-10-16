@@ -320,9 +320,9 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 
 | 依赖 | 说明 |
 | --- | --- |
-| `flatpak` / `flatpak-builder` | 出包与安装；本机用的是 Flatpak 1.18 + flatpak-builder 1.4 |
+| `flatpak` / `flatpak-builder` | 出包与安装；本机用的是 Flatpak 1.18.4 + flatpak-builder 1.4.12 |
 | Go + C 工具链 | 二进制在**宿主机**上按目标架构编（沙箱内未必连得上 Go module proxy）；Fyne 是 cgo |
-| 每个架构的 SDK/runtime | `flatpak install --user --arch=<架构> flathub org.gnome.Sdk//50 org.gnome.Platform//50`；缺失时脚本会直接打出这条命令。发行版自带的 flathub 若是过滤过的（Fedora 就是），非本机架构的 ref 要另加未过滤远端，见「排错」 |
+| 每个架构的 SDK/runtime | `flatpak install --user --arch=<架构> flathub org.freedesktop.Sdk//26.08 org.freedesktop.Platform//26.08`；缺失时脚本会直接打出这条命令（runtime / sdk / 版本号都从 manifest 读，改 manifest 就得跟着改）。**SDK 是构建期的硬依赖**（当 sysroot 用），只有 Platform 装不出包；首次下载约 1 GB，慢网下这一步是主要耗时。发行版自带的 flathub 若是过滤过的（Fedora 就是），非本机架构的 ref 要另加未过滤远端，见「排错」 |
 | 跨架构出包 | ① 本机能执行目标架构的构建步骤：`sudo dnf install -y qemu-user-static`（注册 binfmt 后本机即可跑 aarch64 的构建命令；注意 `flatpak --supported-arches` 是静态列表，装了 qemu 也不会变）② 目标架构的 C 交叉编译器：`sudo dnf install -y gcc-aarch64-linux-gnu`，或用 `--cc-aarch64=<路径>` 指定 |
 
 **不需要**在本机装目标架构的 X11/GL/wayland 开发包：编译时用**目标架构的 flatpak SDK**
@@ -382,7 +382,7 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
 | 现象 | 原因 / 处理 |
 | --- | --- |
 | `本机无法执行 aarch64 的构建步骤` | 缺模拟器：`sudo dnf install -y qemu-user-static`（判据是 `/proc/sys/fs/binfmt_misc/qemu-aarch64` 存在且 enabled） |
-| `缺少 aarch64 的构建依赖 runtime/org.gnome.Sdk/aarch64/50` | 按脚本打印的命令装：`flatpak install --user --arch=aarch64 flathub org.gnome.Sdk//50 org.gnome.Platform//50` |
+| `缺少 aarch64 的构建依赖 runtime/org.freedesktop.Sdk/aarch64/26.08` | 按脚本打印的命令装：`flatpak install --user --arch=aarch64 flathub org.freedesktop.Sdk//26.08 org.freedesktop.Platform//26.08`（本机架构同理，把 `--arch` 去掉；只装 Platform 不够，SDK 才是 sysroot）。若远端只有 Platform / 卡在很慢的下载，可以先装好 SDK 再重跑脚本，脚本不会重复下载已装好的 ref |
 | 装 aarch64 ref 报 `未发现用于"flathub"的远程引用` | 发行版自带的 flathub 是**过滤过**的（Fedora 就是），只提供本机架构的 ref：`flatpak remote-add --user --if-not-exists flathub-all https://dl.flathub.org/repo/flathub.flatpakrepo`，再用 `--arch=aarch64 flathub-all` 装 |
 | `找不到 aarch64 的 C 交叉编译器` | `sudo dnf install -y gcc-aarch64-linux-gnu`，或 `--cc-aarch64=/usr/bin/aarch64-linux-gnu-gcc` |
 | `bin/lgo_download_manager-aarch64 的架构是 …，与目标 aarch64 不符` | `--skip-build` 复用了别的架构的二进制；删掉重编或换成匹配的二进制 |
@@ -393,7 +393,7 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
 
 ### 已验证 / 已知限制
 
-本机（Fedora 44 / Flatpak 1.18.2 / flatpak-builder 1.4.10 / GNOME 50 runtime /
+本机（Fedora 44 / Flatpak 1.18.4 / flatpak-builder 1.4.12 /
 `qemu-user-static` + `gcc-aarch64-linux-gnu`）实测：
 
 - `./scripts/build_flatpak.sh`（默认两个架构）一条命令出两份包：用目标架构的 flatpak SDK
@@ -414,6 +414,15 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
   `--open-url %u`，否则图标点击空 URL 时 `--open-url` 拿不到值会立即退出）。
 - 架构守卫：`--skip-build` 传入架构不符的二进制（伪造的 aarch64 ELF）会被直接拒绝，
   不会打进包里。
+- **本地端口通道在真实沙箱里实测通过**（打包脚本与 CI 出 26.08 包走的是同一条路径；
+  本机这次用的是已装的 `org.gnome.Sdk//50`，因为本机没装 26.08 的 SDK）：
+  `--install` 装出的实例（`flatpak run … --no-gui --debug`）在宿主可见的
+  `127.0.0.1:17821` 上监听，宿主上的浏览器扩展（Chromium 系与 Firefox 都试过，
+  headless + 临时加载构建产物触发真实下载）发起交接后，沙箱内日志出现
+  `handoff: request port=17821 origin=chrome-extension://… client=extension`
+  与 `handoff accepted`，随即开始下载——全程没落到 `lgom://` 回退。依据是
+  `--share=network`：沙箱与宿主共用网络命名空间，所以宿主的回环地址就是沙箱的
+  回环地址（见「沙箱内的行为差异」）。
 - `./scripts/build_flatpak_native.sh --arch=x86_64`（原生构建，不装 qemu、不用交叉
   编译器）同样一条命令出包，产物 11 MB；`--arch` 与宿主架构不符时在预检阶段直接
   拒绝（实测在 x86_64 上传 `--arch=aarch64` 立即报错退出）。
@@ -707,6 +716,7 @@ macOS 上 `ProcessType=Background` 标记为后台进程，不进入前台应用
               │ 业务进程（默认）        │
               │  store / scheduler      │
               │  托盘 + urllauncher     │
+              │  handoff(本地端口)      │
               │  uimgr.Manager          │
               └────────────┬───────────┘
                            │  拉起自身 + env 注入
@@ -729,7 +739,7 @@ macOS 上 `ProcessType=Background` 标记为后台进程，不进入前台应用
 ## 架构
 
 ```
-main.go                        # 命令行参数、单实例锁、URL 协议处理、退出信号
+main.go                        # 命令行参数、单实例锁、本地端口服务 + URL 协议处理、退出信号
 internal/store/                # SQLite 持久化（任务、设置、分片状态）
 internal/protocol/             # HTTP、HTTPS、FTP、WebDAV 驱动 + 代理 + 系统代理探测
   └── sysproxy/                #   跨平台系统代理检测（linux/darwin/windows/other）
@@ -852,6 +862,11 @@ go test ./...
 最有参考价值的一条测试是 `internal/ui/chunk_details_e2e_test.go` —
 它在没有 `Accept-Ranges` 的 httptest 服务上（强制走单流回退）跑真实的调度器加引擎，
 等待下载完成，并断言每一条 Range 进度条都达到 `Value = 1.0`。
+
+`internal/handoff/handoff_test.go` 覆盖浏览器接力的本地端口通道（需要能绑回环端口，
+沙箱里跑不了）：来源策略（扩展来源放行，网页 / `null` 来源、缺 `X-LGOM-Client` 头
+一律拒绝）、候选端口被占时顺延、全部被占时报错、只绑 `127.0.0.1`（非回环地址连不上）、
+请求体校验、handler 错误回传，以及发现文件 `handoff.json` 的内容。
 
 `internal/scheduler/scheduler_test.go` 中 `TestStartIsAsync` 用不可达端口验证：
 - `Start()` 在 500ms 内返回

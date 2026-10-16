@@ -34,7 +34,8 @@
 #
 # 依赖:
 #   flatpak、flatpak-builder,以及宿主架构的 SDK/runtime:
-#     flatpak install --user --arch=<架构> flathub org.gnome.Sdk//50 org.gnome.Platform//50
+#     flatpak install --user --arch=<架构> flathub org.freedesktop.Sdk//26.08 org.freedesktop.Platform//26.08
+#   (runtime / sdk / 版本号都取自 manifest,换 runtime 时这条命令跟着换)
 #   宿主 C 工具链(gcc 或 cc;Fyne 的 GL 绑定是 cgo)。
 
 set -euo pipefail
