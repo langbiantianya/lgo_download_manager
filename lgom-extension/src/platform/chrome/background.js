@@ -2,6 +2,7 @@ import { buildLgomUrl } from '$lib/url-builder.js';
 import { normalizeMetadata, shouldIntercept } from '$lib/metadata.js';
 import { getConfig } from '$lib/storage.js';
 import { appendRecent } from '$lib/recent.js';
+import { handoffReason } from '$lib/channels.js';
 import { registerHeaderListener, getCachedHeaders, warmHeaderCache } from './headers.js';
 import { triggerProtocol } from './protocol.js';
 
@@ -43,17 +44,13 @@ globalThis.chrome.downloads.onCreated.addListener(async (downloadItem) => {
 		);
 
 		const lgomUrl = buildLgomUrl(metadata, config.maxUrlLength);
-		const channel = await triggerProtocol(lgomUrl);
+		const channel = await triggerProtocol(metadata, lgomUrl);
 
-		// `forwarded-tab` means the native messaging host was unavailable and the
-		// browser's own confirmation dialog was used instead; the popup shows
-		// both as a successful hand-off, the reason is for diagnostics.
-		await recordRecent(
-			downloadItem.url,
-			metadata.name,
-			true,
-			channel === 'native' ? 'forwarded' : 'forwarded-tab'
-		);
+		// The reason records which channel took the download: `forwarded-port`
+		// (local port) or `forwarded-tab` (the lgom:// fallback, i.e. no client
+		// running). The popup shows both as a successful hand-off; the reason is
+		// for diagnostics.
+		await recordRecent(downloadItem.url, metadata.name, true, handoffReason(channel));
 	} catch (error) {
 		await recordRecent(downloadItem.url, downloadItem.filename, false, describeError(error));
 	}

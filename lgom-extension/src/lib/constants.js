@@ -6,17 +6,60 @@ export const LGOM_SCHEME = 'lgom';
 /** Host part of the download route. */
 export const LGOM_HOST = 'download';
 
-/**
- * Native messaging host name registered by `native-host/install.sh`.
- *
- * Deliberately platform-independent: the host is looked up by name inside the
- * browser's own user-level manifest directory, so the extension never has to
- * know which browser (or profile) is talking to it.
- */
-export const NATIVE_HOST_NAME = 'org.langbiantianya.lgom';
-
 /** Extension page kept open as the Chrome fallback hand-off tab. */
 export const HANDOFF_PAGE = 'handoff.html';
+
+/**
+ * Loopback host of the desktop client's local-port channel.
+ *
+ * `127.0.0.1` on purpose (not `localhost`): the client binds IPv4 loopback
+ * only, and this skips any DNS resolution in the hot path of every download.
+ */
+export const LOCAL_PORT_HOST = '127.0.0.1';
+
+/**
+ * Candidate ports for the local-port channel.
+ *
+ * Must stay in sync with `handoff.PortCandidates` on the Go side
+ * (`internal/handoff/handoff.go`): the desktop client binds the first free
+ * candidate and the extension probes this same list to discover it.
+ */
+export const LOCAL_PORT_CANDIDATES = [17821, 17822, 17823, 17824, 17825];
+
+/**
+ * Header every port-channel request must carry.
+ *
+ * A custom header turns the request into a non-simple one, so a web page would
+ * have to pass a CORS preflight first — and the desktop client only answers
+ * preflights for extension origins. A constant value is enough; presence is
+ * what the client checks.
+ */
+export const LOCAL_PORT_CLIENT_HEADER = 'X-LGOM-Client';
+
+/** Value sent with {@link LOCAL_PORT_CLIENT_HEADER}. */
+export const LOCAL_PORT_CLIENT_VALUE = 'extension';
+
+/**
+ * App identifier reported by the client's `GET /ping`.
+ *
+ * Also validates the *scheme* of the response: `chrome-extension://` (and
+ * Firefox's `moz-extension://`) pages are secure origins, so a page cannot
+ * fake this reply for a port that is not LGOM.
+ */
+export const LOCAL_PORT_APP_ID = 'lgo_download_manager';
+
+/** Port-channel API version the extension speaks. */
+export const LOCAL_PORT_API_VERSION = 1;
+
+/** storage.session key caching the discovered port. */
+export const LOCAL_PORT_CACHE_KEY = 'lgom_local_port';
+
+/** Per-candidate ping timeout (ms). Candidates are probed in parallel, so this
+ * is also the worst-case discovery time when the client is not running. */
+export const LOCAL_PORT_PING_TIMEOUT = 400;
+
+/** Timeout for one hand-off request (ms). */
+export const LOCAL_PORT_REQUEST_TIMEOUT = 5000;
 
 /** storage.local key holding the persisted InterceptConfig. */
 export const CONFIG_STORAGE_KEY = 'lgom_config';

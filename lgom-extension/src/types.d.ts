@@ -45,11 +45,6 @@ interface WebExtensionApi {
 		getBrowserInfo?(): Promise<{ name: string; vendor: string }>;
 		/** Extension-relative path → absolute `chrome-extension://` URL. */
 		getURL(path: string): string;
-		/**
-		 * Send one message to a native messaging host and resolve with its
-		 * reply. Rejects when the host is missing, forbidden, or died.
-		 */
-		sendNativeMessage(host: string, message: unknown): Promise<unknown>;
 	};
 	downloads: {
 		onCreated: {

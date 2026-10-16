@@ -26,6 +26,33 @@
 	"urlBudget": {
 		"message": "url budget"
 	},
+	"desktopClient": {
+		"message": "desktop client"
+	},
+	"desktopClientHint": {
+		"message": "The desktop client is reached over its loopback port. When it is not connected, downloads fall back to the lgom:// URL."
+	},
+	"portConnected": {
+		"message": "connected (port $PORT$)",
+		"placeholders": {
+			"port": {
+				"content": "$1",
+				"example": "17821"
+			}
+		}
+	},
+	"portDisconnected": {
+		"message": "not running"
+	},
+	"channelPort": {
+		"message": "port"
+	},
+	"channelNative": {
+		"message": "host"
+	},
+	"channelTab": {
+		"message": "url"
+	},
 	"recent": {
 		"message": "recent"
 	},
@@ -54,7 +81,7 @@
 		"message": "saved"
 	},
 	"handoffDescription": {
-		"message": "downloads are handed off through $URL$",
+		"message": "hand-offs go over the local port first and fall back to $URL$ while the client is not running",
 		"placeholders": {
 			"url": {
 				"content": "$1",
@@ -66,7 +93,7 @@
 		"message": "LGOM hand-off tab"
 	},
 	"handoffPageHint": {
-		"message": "Used to forward downloads to LGOM while the native messaging host is not installed. Leave it in the background; the extension reopens it when it is needed."
+		"message": "Last-resort channel: used when nothing answers on the local port, i.e. while the LGOM client is not running. Leave it in the background; the extension reopens it when it is needed."
 	},
 	"filterRules": {
 		"message": "filter rules"

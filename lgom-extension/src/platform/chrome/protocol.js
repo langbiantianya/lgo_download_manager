@@ -1,29 +1,30 @@
-import { sendToNativeHost } from './native-host.js';
 import { handOffViaTab } from './handoff-tab.js';
+import { sendToLocalPort } from '$lib/local-port.js';
+import { buildPortPayload } from '$lib/url-builder.js';
 
 /**
- * Hand the generated URL to the OS.
+ * Hand a download to the desktop client, quietest channel first.
  *
- * Preferred channel is the native messaging host: `runtime.sendNativeMessage`
- * spawns the locally installed bridge, which starts (or forwards to) the LGOM
- * client. Chrome shows no confirmation for it, and no tab is involved.
+ * 1. **Local port** — a loopback HTTP request to the already running client.
+ *    Nothing to install, no tab, no confirmation, and the metadata travels as
+ *    a JSON body instead of a navigable URL. Only works while the client runs.
+ * 2. **External protocol (`lgom://`)** — last resort. Chrome gates it behind
+ *    its own "Open LGOM?" dialog, but it is the only channel that works while
+ *    the client is not running, since it is what cold-starts it.
  *
- * The host is optional — a machine that never ran `native-host/install.sh`
- * still has to work — so a failed attempt falls through to the external
- * protocol channel (`lgom://`), which the browser gates behind its own
- * "Open LGOM?" dialog. Missing hosts are the normal case for un-bridged
- * installs and stay silent; a registered-but-unusable host is reported, since
- * that is an install error the user can fix.
+ * A client that is not running is the normal case for the port channel, so
+ * that stays silent; anything else is reported because it means a broken
+ * install the user can fix.
  *
+ * @param {import('$lib/types.js').DownloadMetadata} meta
  * @param {string} url
  * @returns {Promise<import('$lib/types.js').HandoffChannel>}
  */
-export async function triggerProtocol(url) {
-	const native = await sendToNativeHost(url);
-	if (native.ok) return 'native';
-
-	if (native.kind !== 'missing') {
-		console.warn(`native hand-off failed (${native.kind}): ${native.error}; using lgom:// tab`);
+export async function triggerProtocol(meta, url) {
+	const port = await sendToLocalPort(buildPortPayload(meta));
+	if (port.ok) return 'port';
+	if (port.kind !== 'unreachable') {
+		console.warn(`local port hand-off failed (${port.error}); using the lgom:// tab`);
 	}
 
 	await handOffViaTab(url);

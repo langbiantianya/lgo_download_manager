@@ -5,6 +5,7 @@ import { normalizeMetadata, shouldIntercept } from '$lib/metadata.js';
 import { getConfig } from '$lib/storage.js';
 import { appendRecent } from '$lib/recent.js';
 import { browser } from '$lib/platform-api.js';
+import { handoffReason } from '$lib/channels.js';
 
 registerHeaderListener();
 
@@ -49,13 +50,15 @@ browser.downloads.onCreated.addListener(async (downloadItem) => {
 		);
 
 		const lgomUrl = buildLgomUrl(metadata, config.maxUrlLength);
-		await triggerProtocol(lgomUrl);
+		const channel = await triggerProtocol(metadata, lgomUrl);
 
 		await appendRecent({
 			url: downloadItem.url,
 			name: metadata.name,
 			ok: true,
-			reason: 'forwarded',
+			// `forwarded-port` = the client's local port took it;
+			// `forwarded-tab` = the lgom:// fallback was used instead.
+			reason: handoffReason(channel),
 			timestamp: Date.now()
 		});
 	} catch (error) {

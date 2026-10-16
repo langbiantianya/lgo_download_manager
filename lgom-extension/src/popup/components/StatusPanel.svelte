@@ -2,11 +2,15 @@
 	import { getConfig } from '$lib/storage.js';
 	import { DEFAULT_CONFIG } from '$lib/constants.js';
 	import { i18nGetMessage } from '$lib/platform-api.js';
+	import { probeLocalPort } from '$lib/local-port.js';
 
 	let config = $state(
 		/** @type {import('$lib/types.js').InterceptConfig} */ ({ ...DEFAULT_CONFIG })
 	);
 	let loading = $state(true);
+	/** Port the desktop client answers on, or null while it is not running. */
+	let port = $state(/** @type {number | null} */ (null));
+	let probing = $state(true);
 
 	$effect(() => {
 		getConfig().then((loaded) => {
@@ -14,6 +18,21 @@
 			loading = false;
 		});
 	});
+
+	$effect(() => {
+		probeLocalPort().then((found) => {
+			port = found;
+			probing = false;
+		});
+	});
+
+	const desktopLabel = $derived(
+		probing
+			? i18nGetMessage('loading')
+			: port === null
+				? i18nGetMessage('portDisconnected')
+				: i18nGetMessage('portConnected', [String(port)])
+	);
 
 	const MODE_LABELS = {
 		all: 'modeAll',
@@ -37,6 +56,13 @@
 			<dd>{config.patterns.length}</dd>
 			<dt class="text-neutral-400">{i18nGetMessage('urlBudget')}</dt>
 			<dd>{config.maxUrlLength}</dd>
+			<dt class="text-neutral-400">{i18nGetMessage('desktopClient')}</dt>
+			<dd
+				class={port === null ? 'text-neutral-400' : 'text-green-400'}
+				title={i18nGetMessage('desktopClientHint')}
+			>
+				{desktopLabel}
+			</dd>
 		</dl>
 	{/if}
 </section>

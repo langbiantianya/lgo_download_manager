@@ -94,6 +94,25 @@ export function buildLgomUrl(meta, maxLength = 2000) {
 }
 
 /**
+ * Build the JSON body for the desktop client's local-port channel.
+ *
+ * Same fields as {@link buildLgomUrl}, but nothing has to survive percent
+ * encoding and the payload is not capped by `maxUrlLength`.
+ *
+ * @param {import('./types.js').DownloadMetadata} meta
+ * @returns {import('./types.js').PortHandoffPayload}
+ */
+export function buildPortPayload(meta) {
+	return {
+		url: meta.url,
+		name: meta.name,
+		ua: meta.ua,
+		headers: meta.headers,
+		cookies: meta.cookies
+	};
+}
+
+/**
  * Serialize a header map for transport, dropping hop-by-hop headers.
  *
  * @param {Record<string, string | string[] | undefined>} headers

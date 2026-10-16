@@ -1,7 +1,7 @@
 # lgdm — 本地下载管理器
 
 单文件可执行程序的下载管理器，提供 Fyne GUI、持久化的 SQLite 状态、
-并发的分片下载，以及用于浏览器接力的 `lgom://` URL 协议。
+并发的分片下载，以及用于浏览器接力的两条交接通道（本地端口 / `lgom://` URL 协议）。
 
 业务进程与 UI 子进程通过 Unix socket + 长度前缀 JSON 帧通信：业务进程
 持有 SQLite 与 scheduler、UI 子进程是单独的 Fyne 进程；托盘常驻业务进程，
@@ -19,6 +19,10 @@
   不使用代理（始终直连）、手动设置代理（自定义 URL + 绕过列表）。
   自动按平台检测：Linux (GNOME `gsettings` / KDE `kioslaverc` / `/etc/environment`)、
   macOS (`scutil --proxy`)、Windows (WinINET 注册表)。
+- 浏览器扩展接力：业务进程在 `127.0.0.1` 的候选端口（`17821`+）上收扩展的 JSON
+  交接请求（`internal/handoff`），不弹确认框、不开标签页、也不需要额外安装——
+  扩展侧按「本地端口 → `lgom://` URL」顺序尝试，URL 协议是最后手段；
+  详见「[浏览器扩展接力](#浏览器扩展接力)」。
 - `lgom://download?url=...&name=...&ua=...&headers=...&cookies=...` URL 协议 — 安装包会把它注册成桌面协议处理程序（Windows：`HKCU\Software\Classes\lgom`；Linux / Flatpak：`.desktop` 里的 `MimeType=x-scheme-handler/lgom`）：浏览器里的链接直接拉起 lgdm 并开始下载；lgdm 已在运行时，新进程把 URL 转发给主实例（Windows 命名管道 / 其它平台 Unix socket）后退出。
 - 任务列表与配置持久化到 SQLite（`lgdm.sqlite`）。
 - GUI 中实时显示进度、每个分片的速度条、下载速率与剩余时间（ETA）。
@@ -31,9 +35,8 @@
   出 MSI / EXE（x64 + arm64），Linux 用 `scripts/build_flatpak.sh` 出 Flatpak 单文件包
   （x86_64 + aarch64）；后者在同一份包上支持 `lgom://` 与开机自启。
   CI（GitHub Actions）在原生 x64 / arm64 runner 上按架构分别出包，见「持续集成」；
-  浏览器扩展 `lgom-extension/` 由 `extension.yml` 出 zip / crx / xpi，
-  以及配套的原生消息主机 `lgom-native-host-<版本>.tar.gz`
-  （Chrome 静默交接用，需要用户本地执行 `native-host/install.sh`，见扩展 README）。
+  浏览器扩展 `lgom-extension/` 由 `extension.yml` 出 zip / crx / xpi
+  （交接走本地端口，不需要额外安装本地组件）。
 
 ## 构建
 
@@ -365,6 +368,9 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
   （单实例锁 + URL 转发 socket）与自编译版本共用一份，两者同时启动也只有一个实例。
 - **lgom:// 协议**：`.desktop` 的 `MimeType=x-scheme-handler/lgom` 由 Flatpak 导出
   给宿主，浏览器点链接时转给运行中的实例。
+- **本地端口通道**：`--share=network` 让沙箱与宿主共用网络命名空间，
+  因此扩展按宿主上的 `127.0.0.1:17821` 探测就能发现运行在沙箱里的实例，
+  交接路径与自编译版本一致（`handoff.json` 落在沙箱共享的配置目录里）。
 - **托盘**：走 `--socket=session-bus`；GNOME 需要 AppIndicator 扩展才会显示托盘图标。
 - **路径**：`home` / `host` 授权让沙箱直接看到宿主文件系统，但沙箱里的 `/tmp` 是
   Flatpak 自己挂的私有 tmpfs（`--filesystem=host` 不会覆盖它），所以 manifest 里
@@ -435,7 +441,6 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
 | `linux.yml` | `flatpak-aarch64` | `ubuntu-24.04-arm` | `scripts/build_flatpak_native.sh --arch=aarch64` | `dist/lgdm-<版本>-aarch64.flatpak` |
 | `extension.yml` | `extension-chrome` | `ubuntu-latest` | `npm run package:chrome` | `lgom-extension/dist/lgom-extension-chrome-<版本>.{zip,crx}` |
 | `extension.yml` | `extension-firefox` | `ubuntu-latest` | `npm run package:firefox` | `lgom-extension/dist/lgom-extension-firefox-<版本>.{zip,xpi}` |
-| `extension.yml` | `release` | `ubuntu-latest` | `tar native-host/` (v* tag) | `lgom-extension/dist/lgom-native-host-<版本>.tar.gz` |
 
 触发：push 到 `master`、`v*` tag、PR、手动 `workflow_dispatch`。每个 job 把产物作为
 artifact 上传（保留 30 天）；**只有 `v*` tag** 会触发 `release` job，把所有 artifact
@@ -559,6 +564,47 @@ SQLite 数据库固定为 `<config>/lgdm.sqlite`。
 
 业务进程通过环境变量 `LGDM_DEBUG=1` 把 `--debug` 透传给由它自我复刻拉起的
 UI 子进程，避免子进程的日志悄悄落到文件里。
+
+## 浏览器扩展接力
+
+`lgom-extension/`（Chrome / Firefox MV3）拦截浏览器下载后，按下表顺序把任务交给
+lgdm。首选通道不弹浏览器确认框、也不开标签页，`lgom://` URL 只是最后手段：
+
+| 优先级 | 通道          | 需要什么                      | 能冷启动 lgdm | 确认框 / 标签页 |
+| ------ | ------------- | ----------------------------- | ------------- | --------------- |
+| 1      | 本地端口      | lgdm 正在运行（托盘常驻即可） | 否            | 无 / 无         |
+| 2      | `lgom://` URL | 系统里注册过 `lgom://` 处理器 | 是            | 有 / 复用标签页 |
+
+通道 2 属于外部协议启动，浏览器会在自己的确认对话框后放行（无法在扩展代码里
+suppress），但它同时把 lgdm 冷启动起来。通道 1 的短板是要求 lgdm 已经在跑，
+所以扩展每次都从头重试整条链：lgdm 没起来时这一步瞬间失败，直接往下走。
+
+### 本地端口
+
+业务进程在 `127.0.0.1` 上监听候选端口中的第一个空闲端口（`17821`、`17822`、
+`17823`、`17824`、`17825`；见 `internal/handoff`），扩展并行探测同一份列表来
+发现它。`GET /ping` 返回 `{"app":"lgo_download_manager","api":1,"port":…,"version":…}`
+作为身份确认，`POST /download` 接收与 URL 协议同样字段的 JSON 正文：
+
+```json
+{"url":"https://…","name":"a.zip","ua":"Mozilla/5.0 …","headers":"Referer: …","cookies":"sid=1"}
+```
+
+正文走 JSON 而不是查询串，所以不受 URL 长度限制，Cookie / User-Agent 也不会
+出现在可被导航、会进历史记录的 URL 里。落地路径与 `lgom://` 完全一致：弹
+「新建下载任务」对话框由用户确认；`--no-gui` / `--autostart` 形态则直接
+Add + Start（服务/CLI 语义不变）。
+
+只监听回环地址、不监听 `0.0.0.0`/`::`。`POST /download` 必须带
+`X-LGOM-Client` 头（逼普通网页先走预检），且带 `Origin` 时必须是扩展来源
+（`chrome-extension://` / `moz-extension://` / Edge 的 `extension://` /
+`safari-web-extension://`），否则 403；不带 `Origin` 的本机调用方
+（脚本、CLI）放行。细节与排障见 `lgom-extension/README.md` 的
+「本地端口通道」一节。
+
+当前监听端口、pid 与版本写在 `<config>/handoff.json`（`--config` 目录下），
+仅供排障与其它本机工具读取；扩展不读它，只探测固定候选端口。
+`--debug` 日志会打出监听端口与每条请求的 `origin`。
 
 ## URL 协议
 
@@ -692,6 +738,7 @@ internal/scheduler/            # 单任务生命周期、状态事件、进度�
 internal/prealloc/             # 磁盘预分配辅助
 internal/urllauncher/          # lgom:// URL 解析、单实例锁、URL 转发
                                #   （Windows 命名管道 / 其它平台 Unix socket）
+internal/handoff/              # 浏览器扩展的本地端口通道：127.0.0.1 上的 /ping 与 /download（JSON）
 internal/settings/             # 首次运行默认值 / --light 覆盖 / 进程级代理同步 / 开机自启调和
 internal/autostart/            # 跨平台开机自启：HKCU Run / XDG autostart / LaunchAgent（含 Flatpak）
 internal/logging/              # log/slog 门面：轮转文件 / --debug stderr / Windows console 挂接
@@ -707,7 +754,7 @@ scripts/build_flatpak.sh       # 打包入口：编译 + 出 Flatpak 安装包�
 scripts/build_flatpak_native.sh # 同上，但只出宿主架构的包（CI 用，不做交叉编译）
 .github/workflows/             # CI：windows.yml / linux.yml / extension.yml，按架构或平台分 job 出包
 lgom-extension/                # 浏览器扩展（Chrome / Firefox，MV3）：独立 npm 工具链，见其 README
-lgom-extension/native-host/    # 原生消息主机（POSIX sh）：让 Chrome 不弹确认框、不开标签页地交接下载
+                               #   交接顺序：本地端口 → lgom:// URL（最后手段）
 org.langbiantianya.LGDM.yml    # Flatpak manifest（app id / runtime / 权限 / 模块）
 flatpak/                       # Flatpak 用的 AppStream metainfo
 ```

@@ -14,7 +14,13 @@
 // 角色分派通过 ipc.EnvUIChild 环境变量完成：业务进程拉起子进程时
 // 会把 EnvUIChild=1 与 socket/token 一并注入。
 //
-// URL scheme：lgom://download?url=<encoded>[&name=<encoded>[&ua=<encoded>[&headers=<encoded>[&cookies=<encoded>]]]]
+// 浏览器接力有两条通道，扩展侧按这个优先级尝试：
+//
+//  1. 本地端口（internal/handoff）：业务进程在 127.0.0.1 的候选端口上
+//     收 JSON 请求，不弹确认框、不开标签页、不依赖额外安装；
+//  2. URL scheme（本文件的最后手段）：lgom://download?url=<encoded>
+//     [&name=<encoded>[&ua=<encoded>[&headers=<encoded>[&cookies=<encoded>]]]]
+//     —— 能冷启动客户端，但浏览器会弹「打开 LGOM？」确认框。
 package main
 
 import (
@@ -22,6 +28,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"lgo_download_manager/internal/handoff"
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/logging"
@@ -44,6 +51,11 @@ import (
 )
 
 const defaultDBFile = "lgdm.sqlite"
+
+// handoffInfoFile 是本地端口通道的发现文件（落在 --config 目录）：
+// 记录实际监听的端口,供排障与其它本机工具读取。浏览器扩展不读它,
+// 扩展是探测 handoff.PortCandidates 那几个固定端口来发现业务进程的。
+const handoffInfoFile = "handoff.json"
 
 // envLogDebug 跨进程传递 --debug 选择:业务进程启动时若用户指定了
 // --debug,则把该信号写进 LGDM_DEBUG,UI 子进程继承同一份配置。
@@ -199,22 +211,20 @@ func main() {
 	// 处理,hook 同步刷新本进程本地化界面。
 	uim.SetLanguage(cur.Language)
 
-	// 业务进程对 URL 转发的处理：解析 lgom:// 参数并把预填值交给 UI 子进程
-	// 的「新建下载任务」对话框,任务提交由用户在该对话框中确认后触发;
-	// 与 UI 内点「新建任务」按钮走的是同一条 IPC + Service.AddTask/Start
-	// 路径,只在是否预填 URL/Name/UA/Cookies 上不同。
+	// handleRequest 是「本地端口」与「lgom:// URL」两条通道共用的落地逻辑:
+	// 把一条下载请求的预填值交给 UI 子进程的「新建下载任务」对话框,任务
+	// 提交由用户在该对话框中确认后触发;与 UI 内点「新建任务」按钮走的是
+	// 同一条 IPC + Service.AddTask/Start 路径,只在是否预填
+	// URL/Name/UA/Cookies 上不同。
 	//
 	// --no-gui 模式下没有 UI 实例:此时回退到原先的「业务进程直接 Add+Start」,
 	// 服务/CLI 形态仍可独立工作;其它路径只要 UI 子进程拉起失败就只记录
 	// warning,由用户从托盘或重新转发 URL 触发。
-	handleDownloadURL := func(rawURL string) {
-		req, err := urllauncher.HandleURL(rawURL)
-		if err != nil {
-			logging.Printf("invalid URL: %v", err)
-			return
-		}
-		logging.Printf("queueing URL for dialog: %s", req.URL)
-
+	//
+	// 返回错误表示这条请求没有被业务进程接收(例如 UI 弹不出来),本地端口
+	// 通道会把它作为 {"ok":false,…} 回给扩展,扩展据此退到下一个通道。
+	handleRequest := func(req *urllauncher.DownloadRequest) error {
+		logging.Printf("queueing download request: %s", req.URL)
 		// --no-gui 与 --autostart 都没有 UI 实例可弹:都走「业务侧
 		// 直接 Add+Start」。autostart 路径主要处理 lgom:// 转发协议
 		// 在 OS 登录后立即触发 URL 的边角场景(罕见但真实:浏览器
@@ -222,7 +232,7 @@ func main() {
 		if *noGUI || *autostartSilent {
 			// CLI / 服务 / autostart 场景:业务侧直接创建并启动,无对话框可弹。
 			addAndStartFromURL(sc, cur, req)
-			return
+			return nil
 		}
 		if err := uim.SendShowAddTask(ipc.ShowAddTaskParams{
 			URL:     req.URL,
@@ -230,7 +240,19 @@ func main() {
 			UA:      req.UA,
 			Cookies: req.Cookies,
 		}); err != nil {
-			logging.Printf("cannot show add-task dialog for %s: %v", req.URL, err)
+			return fmt.Errorf("cannot show add-task dialog: %w", err)
+		}
+		return nil
+	}
+
+	handleDownloadURL := func(rawURL string) {
+		req, err := urllauncher.HandleURL(rawURL)
+		if err != nil {
+			logging.Printf("invalid URL: %v", err)
+			return
+		}
+		if err := handleRequest(req); err != nil {
+			logging.Printf("hand-off for %s failed: %v", req.URL, err)
 		}
 	}
 
@@ -241,6 +263,33 @@ func main() {
 			logging.Printf("urllauncher server error: %v", err)
 		}
 	}()
+
+	// 本地端口通道：浏览器扩展的首选交接方式（不弹确认框、不开标签页、
+	// 也不需要用户在本地装任何组件），直接投递下载请求；扩展侧按
+	// 「本地端口 → lgom:// URL」的顺序尝试，所以这里失败
+	// 只降级、不致命（扩展会退到 URL 协议，那条路仍能冷启动业务进程）。
+	//
+	// 与 URL 通道的差别只在参数怎么送过来：端口通道是 JSON 正文，
+	// URL 通道是 lgom:// 查询串，落地路径完全共用 handleRequest。
+	if hs, err := handoff.Start(func(r handoff.Request) error {
+		return handleRequest(&urllauncher.DownloadRequest{
+			URL:     r.URL,
+			Name:    r.Name,
+			UA:      r.UA,
+			Headers: r.Headers,
+			Cookies: r.Cookies,
+		})
+	}); err != nil {
+		logging.Printf("handoff: local port unavailable, extensions will fall back: %v", err)
+	} else {
+		logging.Printf("handoff: listening on 127.0.0.1:%d", hs.Port())
+		// 发现文件只为排障与其它本机工具服务（扩展是探测固定候选端口的,
+		// 不读这个文件）；写失败不影响通道本身。
+		if err := hs.WriteInfo(filepath.Join(logDir, handoffInfoFile)); err != nil {
+			logging.Printf("handoff: write %s: %v", handoffInfoFile, err)
+		}
+		defer hs.Close()
+	}
 
 	// 处理通过 --open-url / 位置参数传入的 URL（主进程本地触发）。
 	for _, u := range urls {

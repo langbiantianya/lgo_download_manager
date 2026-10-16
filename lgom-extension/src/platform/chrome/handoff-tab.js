@@ -8,8 +8,8 @@ let creating = null;
 /**
  * Hand the URL to the OS through the browser's external protocol launcher.
  *
- * Used when the native messaging host is not installed. Two things make this
- * channel bearable compared to a fresh tab per download:
+ * Used when nothing answers on the desktop client's local port. Two things make
+ * this channel bearable compared to a fresh tab per download:
  *
  * 1. **One tab, reused.** The hand-off tab is created once and navigated from
  *    then on. An external protocol navigation never commits — the browser bails

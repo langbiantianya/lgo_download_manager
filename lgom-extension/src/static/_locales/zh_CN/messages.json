@@ -26,6 +26,33 @@
 	"urlBudget": {
 		"message": "URL 预算"
 	},
+	"desktopClient": {
+		"message": "桌面端连接"
+	},
+	"desktopClientHint": {
+		"message": "桌面端通过本机回环端口接收交接；未连接时退到 lgom:// URL 标签页。"
+	},
+	"portConnected": {
+		"message": "已连接（端口 $PORT$）",
+		"placeholders": {
+			"port": {
+				"content": "$1",
+				"example": "17821"
+			}
+		}
+	},
+	"portDisconnected": {
+		"message": "未运行"
+	},
+	"channelPort": {
+		"message": "端口"
+	},
+	"channelNative": {
+		"message": "主机"
+	},
+	"channelTab": {
+		"message": "协议"
+	},
 	"recent": {
 		"message": "最近"
 	},
@@ -54,7 +81,7 @@
 		"message": "已保存"
 	},
 	"handoffDescription": {
-		"message": "下载通过 $URL$ 协议转发",
+		"message": "交接先走本地端口，客户端没在运行时回退到 $URL$ 协议",
 		"placeholders": {
 			"url": {
 				"content": "$1",
@@ -66,7 +93,7 @@
 		"message": "LGOM 转发标签页"
 	},
 	"handoffPageHint": {
-		"message": "原生消息主机未安装时，下载经由这个标签页转发给 LGOM。让它留在后台即可；关掉后扩展会在下次需要时重新打开。"
+		"message": "最后手段：本地端口无人应答（LGOM 客户端没在运行）时，下载经由这个标签页转发。让它留在后台即可；关掉后扩展会在下次需要时重新打开。"
 	},
 	"filterRules": {
 		"message": "过滤规则"

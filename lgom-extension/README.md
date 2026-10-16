@@ -1,25 +1,35 @@
 # LGOM 浏览器扩展
 
 拦截浏览器下载请求，把任务移交给 LGOM 桌面客户端（`lgo_download_manager`）。
-Chrome 的默认通道是**原生消息主机**（`runtime.sendNativeMessage`）——不弹
-"打开 LGOM？"确认框，也不开标签页；主机没装时自动回退到 `lgom://` URL 协议
-（复用单个转发标签页）。Firefox 走 `lgom://` 标签页。
+交接按「**本地端口** → **`lgom://` URL**」的顺序尝试：首选是桌面客户端的
+本机回环端口，既不弹"打开 LGOM？"确认框、也不开标签页；只有客户端没在运行
+（端口无人应答）时才退到 `lgom://`——那是最后手段，也是唯一能冷启动客户端的一条。
+
+两条通道的取舍：
+
+| 通道                          | 需要什么                       | 能冷启动客户端 | 浏览器确认框 / 标签页 |
+| ----------------------------- | ------------------------------ | -------------- | --------------------- |
+| 本地端口（`127.0.0.1:17821`） | 客户端正在运行（托盘常驻即可） | 否             | 无 / 无               |
+| `lgom://` URL                 | 系统里注册过 `lgom://` 处理器  | 是             | 有 / 复用单个标签页   |
+
+端口通道是首选：不依赖任何额外安装，元数据以 JSON 正文投递（不再受 URL 长度
+限制，Cookie / User-Agent 也不会出现在可被导航、会进历史记录的 URL 里）。
+它唯一的短板是要求客户端已经在跑，所以 `lgom://` 作为兜底保留。
 
 一套代码库，两个平台包：共享逻辑位于 `src/lib`，各浏览器独占的
 manifest、后台脚本和协议触发器位于 `src/platform/<target>`，
-Svelte 5 弹窗 / 选项页 / 转发页位于 `src/popup` / `src/options` / `src/handoff`，
-原生消息主机（POSIX sh，不进扩展包）位于 `native-host`。
+Svelte 5 弹窗 / 选项页 / 转发页位于 `src/popup` / `src/options` / `src/handoff`。
 
 ## 系统要求
 
-| 主机                          | Manifest | 后台上下文             | 默认交接通道                            |
-| ----------------------------- | -------- | ---------------------- | --------------------------------------- |
-| Chrome / Chromium / Edge 102+ | MV3      | ES 模块 Service Worker | 原生消息主机，缺省回退 `lgom://` 标签页 |
-| Firefox 140+                  | MV3      | ES 模块事件页面        | `lgom://` 标签页                        |
+| 主机                          | Manifest | 后台上下文             | 交接通道顺序                |
+| ----------------------------- | -------- | ---------------------- | --------------------------- |
+| Chrome / Chromium / Edge 102+ | MV3      | ES 模块 Service Worker | 本地端口 → `lgom://` 标签页 |
+| Firefox 140+                  | MV3      | ES 模块事件页面        | 本地端口 → `lgom://` 标签页 |
 
-Chrome 要做到完全不弹确认框、不开标签页，需要一次性安装原生消息主机
-（`native-host/install.sh`，见「[原生消息主机](#原生消息主机)」）；不装也能用，
-只是每次交接走 `lgom://` 回退通道。
+客户端在运行时（托盘常驻）交接完全静默：不弹确认框、不开标签页。客户端没在
+运行时两条路径都退到 `lgom://` 标签页，由浏览器的确认对话框放行，同时把客户端
+冷启动起来——之后的交接又回到端口通道。
 
 Chrome 版本下限由 `chrome.storage.session`（102+）的请求头缓存镜像功能决定，
 通过该 manifest 中的 `minimum_chrome_version` 强制执行。
@@ -69,9 +79,6 @@ build/<platform>/
   icons/               # src/static/icons
   _locales/            # src/static/_locales
 ```
-
-`native-host/` 不参与构建：原生消息主机的 manifest 必须由浏览器之外的本地程序
-写入，装不进扩展包。
 
 ## 打包（可直接安装的扩展包）
 
@@ -132,10 +139,8 @@ npm run build:firefox
 进行脚本化测试。
 
 未打包的 Chrome 扩展 ID 由目录路径决定，移动 `build/chrome` 会改变 ID；打包后的
-ID 由 CRX 签名私钥决定（`--key`，见「打包」）。原生消息主机按 ID 授权
-（manifest 里的 `allowed_origins`），所以装主机时要把当前 ID 交给
-`install.sh --extension-id`；想让未打包扩展的 ID 稳定，可在 Chrome manifest 中
-用 `key` 固定（CI 用的是 `CHROME_EXTENSION_KEY` 对应的那把私钥）。
+ID 由 CRX 签名私钥决定（`--key`，见「打包」）。想让未打包扩展的 ID 稳定，可在
+Chrome manifest 中用 `key` 固定（CI 用的是 `CHROME_EXTENSION_KEY` 对应的那把私钥）。
 
 ## 拦截原理
 
@@ -146,24 +151,98 @@ ID 由 CRX 签名私钥决定（`--key`，见「打包」）。原生消息主�
 2. `downloads.onCreated` 事件触发。如拦截已禁用或 URL 不匹配当前过滤模式，
    则不处理。
 3. 下载任务被取消并擦除。
-4. 缓存的请求头经 `normalizeMetadata` 转为元数据，`buildLgomUrl` 生成交接 URL。
-5. `triggerProtocol` 把 URL 交给桌面端，按优先级尝试两条通道：
-   **原生消息主机**（默认，`runtime.sendNativeMessage` → `native-host/lgom-bridge.sh`，
-   不弹确认框、不开标签页），失败后回退到 **`lgom://` 外部协议**——复用同一个
-   转发标签页 `tabs.update` 到该 URL。两条通道的取舍、确认对话框的一次性豁免
-   见「[原生消息主机](#原生消息主机)」与
-   「[确认提示与回退通道](#确认提示与回退通道)」。主机每次交接都重新尝试一次，
-   所以装好主机后无需重载浏览器即可生效。
+4. 缓存的请求头经 `normalizeMetadata` 转为元数据。同时生成两种表示：
+   `buildPortPayload` 的 JSON 正文（端口通道用）与 `buildLgomUrl` 的
+   `lgom://` URL（回退通道用）。
+5. `triggerProtocol` 按优先级尝试两条通道，返回实际成功的那条：
+
+   1. **本地端口**：`sendToLocalPort` 先确认客户端在监听（`GET /ping`），
+      再把 JSON 正文 `POST /download` 过去。不弹确认框、不开标签页，也不需要
+      任何额外安装。客户端没在跑时这一步极快失败，直接往下走。
+   2. **`lgom://` 外部协议**：最后手段。Chrome 复用同一个转发标签页
+      `tabs.update` 到该 URL，Firefox 新建标签页并在交接后移除。确认对话框的
+      一次性豁免见「[确认提示与回退通道](#确认提示与回退通道)」。
+
+   每次交接都从头重试整条链，所以把客户端跑起来后无需重载浏览器即可回到端口通道。
 
 6. 结果追加到最近拦截日志（最新优先，最多 50 条）——包括交接失败，
    这样弹窗不会在下载已被拦截但转发失败的情况下显示"尚无拦截记录"。
-   `reason` 记录走的是哪条通道：`forwarded`（原生主机）或
-   `forwarded-tab`（`lgom://` 回退，说明主机没装）。
+   `reason` 记录走的是哪条通道，弹窗里以徽标形式显示：
+
+| `reason`         | 通道                           | 弹窗徽标 |
+| ---------------- | ------------------------------ | -------- |
+| `forwarded-port` | 本地端口                       | 端口     |
+| `forwarded-tab`  | `lgom://` 回退（客户端没在跑） | 协议     |
+
+更早版本写入的 `forwarded` / `forwarded-native`（当时静默通道是原生消息主机）
+读出来仍按「主机」显示，方便对照旧日志。
+
+## 本地端口通道
+
+桌面客户端在 `127.0.0.1` 上监听候选端口中的第一个空闲端口，扩展探测同一份
+列表来发现它（两边的常量必须同步：Go 侧
+`internal/handoff/handoff.go` 的 `PortCandidates`，扩展侧
+`src/lib/constants.js` 的 `LOCAL_PORT_CANDIDATES`）：
+
+```
+17821, 17822, 17823, 17824, 17825
+```
+
+接口（`internal/handoff`）：
+
+| 请求                | 响应                                                                    |
+| ------------------- | ----------------------------------------------------------------------- |
+| `GET /ping`         | `200 {"app":"lgo_download_manager","api":1,"port":17821,"version":"…"}` |
+| `POST /download`    | `200 {"ok":true}` / 4xx-5xx `{"ok":false,"error":"…"}`                  |
+| `OPTIONS /download` | 预检应答（只对扩展来源放行）                                            |
+
+`POST /download` 的正文与 `lgom://download?…` 的参数一一对应：
+
+```json
+{
+	"url": "https://…",
+	"name": "a.zip",
+	"ua": "Mozilla/5.0 …",
+	"headers": "Referer: …",
+	"cookies": "sid=1"
+}
+```
+
+发现与缓存：扩展先用 `storage.session`（键 `lgom_local_port`）里缓存的上次端口
+发一次 `GET /ping` 验证，失败就在候选表上并行探测，取响应且 `app` 匹配的最小
+端口。所有候选都无响应 → 视为「客户端没在运行」，静默降级到下一个通道。
+
+请求头：每次请求都带 `X-LGOM-Client`（值不重要，存在即可）与
+`Content-Type: application/json`。客户端对 `POST /download` 的来源策略是：
+
+- 不带 `Origin`（curl、本机脚本）→ 放行；
+- `Origin` 是扩展来源（`chrome-extension://`、`moz-extension://`、
+  `extension://`（Edge）、`safari-web-extension://`）→ 放行，并回显
+  `Access-Control-Allow-Origin`；
+- 其它来源（含 `null`，即沙箱 iframe / `data:` 页面）→ `403`。
+
+自定义头把请求变成非简单请求，普通网页必须先过预检，而预检只对扩展来源放行，
+所以网页既发不出请求、也读不到响应。客户端只监听 `127.0.0.1`（不监听
+`0.0.0.0`/`::`），同机以外的连接进不来；收到的请求只会走「弹新建任务对话框」
+（`--no-gui` / `--autostart` 形态走与 `lgom://` 完全一致的直接入队路径）。
+
+排障：
+
+- 弹窗里「桌面端连接」显示端口号 → 端口通道可用；显示「未运行」→ 客户端没跑
+  （或端口被防火墙 / 安全软件挡住）。
+- 扩展控制台（`chrome://extensions` → 服务工作进程 / `about:debugging` →
+  检查）里出现 `local port hand-off failed (…)` → 客户端在，但拒了这条请求：
+  多为来源不是扩展、或业务进程弹不出对话框。
+- 客户端侧 `--debug` 日志会打出 `handoff: listening on 127.0.0.1:<端口>`、
+  每条请求的 `origin`（`handoff: request … origin=…`）与拒绝原因。
+- 客户端配置目录下的 `handoff.json` 记录当前监听端口、pid 与版本，供排障与
+  其它本机工具读取（扩展不读它，只探测固定候选端口）。
 
 ## 交接 URL 协议
 
-两条通道都携带同一个 `lgom://` URL：原生消息主机把它作为 JSON 负载里的 `url`
-字段转发，回退通道直接把它作为导航目标交给浏览器/操作系统。
+`lgom://` 回退通道携带这个 URL，直接把它作为导航目标交给浏览器/操作系统。
+（端口通道不用这个格式，它发的是[上面的 JSON 正文](#本地端口通道)；正因为
+如此它才不受 `maxUrlLength` 限制。）
 
 ```
 lgom://download?url=<编码>[&name=<编码>[&ua=<编码>][&headers=<编码>&cookies=<编码>]]
@@ -175,83 +254,11 @@ lgom://download?url=<编码>[&name=<编码>[&ua=<编码>][&headers=<编码>&cook
 降级为仅含核心参数（`url`、`name`、`ua`），以保证交接 URL 保持在
 LGOM IPC 帧限制内（`MAX_FRAME_LEN`，64 KiB）。
 
-## 原生消息主机
-
-### 安装
-
-扩展无法自己安装原生消息主机——manifest 必须由浏览器之外的本地程序写入。
-`native-host/install.sh` 就是那个程序，不需要 root：
-
-```sh
-# 扩展 ID 从 chrome://extensions 读（未打包扩展的 ID 由目录路径决定，
-# 打包后的 ID 由签名私钥决定，见「加载扩展」「打包」）
-lgom-extension/native-host/install.sh --extension-id <扩展 ID>
-
-lgom-extension/native-host/install.sh --help       # 全部选项
-lgom-extension/native-host/install.sh --uninstall  # 移除 manifest 与已安装的 bridge
-```
-
-它做两件事：
-
-1. 把 `lgom-bridge.sh` 复制到 `$XDG_DATA_HOME`（默认 `~/.local/share`）下的
-   `lgom-native-host/`，并在需要时写 `bridge.conf` 固定客户端路径；
-2. 在每个**已存在**的浏览器 profile 目录下写
-   `<profile>/NativeMessagingHosts/org.langbiantianya.lgom.json`
-   （即 Chromium 的 `DIR_USER_NATIVE_MESSAGING`；macOS 用
-   `~/Library/Application Support/...`）：Linux 是
-   `~/.config/{google-chrome,chromium,microsoft-edge,…}`，不在列表里的浏览器
-   用 `--browsers` 指定，自定义 profile 目录用 `--user-data-dir`。
-
-常用选项：`--extension-id id1,id2`（同时授权多个 ID，例如开发版 + 商店版）、
-`--lgdm-bin <绝对路径>`、`--browsers a,b`、`--user-data-dir <dir>`。
-写进 manifest 的 `allowed_origins` 只认这些 ID：没列进去的扩展调用
-`sendNativeMessage` 会被拒绝（扩展侧会记一条 `native hand-off failed (forbidden)`）。
-
-### 主机协议
-
-`lgom-bridge.sh` 是 POSIX sh，没有 Python/Node 依赖。它只做三件事：
-
-1. 从 stdin 读**一帧**原生消息：4 字节本机字节序长度 + UTF-8 JSON。
-   扩展固定发送 `{"url":"lgom://download?…"}`（URL 已百分号编码，因此负载里不含
-   引号或反斜杠，用 `sed` 取串是安全的）。
-2. 用该 URL 启动客户端：`lgo_download_manager <lgom://…>`，与 `.desktop` 的
-   `Exec=lgo_download_manager %u` 完全一致——已经在跑的实例会经它自己的单实例
-   socket 收到 URL，**bridge 不参与那套协议，Go 侧也不需要任何改动**。
-   客户端按 `bridge.conf` 的 `LGDM_BIN` → `PATH`（`lgo_download_manager`）→
-   Flatpak（`org.langbiantianya.LGDM`）→ `xdg-open` 依次解析。
-   启动时用 `setsid` 脱离宿主进程组：Chrome 收到回帧后会立刻杀掉 host。
-3. 回一帧结果后退出：成功 `{"ok":true}`；失败 `{"ok":false,"error":"<code>"}`，
-   code 为 `no-url` / `not-lgom` / `no-client`。单帧上限 1 MiB（Chrome 的限制）。
-
-扩展每次交接都先试主机：主机是后装的，装完刷新扩展即可生效，不需要重载浏览器；
-失败时按 error 分类，只有"没装"（`not found`）静默降级，其它情况会往扩展
-控制台写一条 warning（说明主机装了但用不了）。
-
-### 平台限制
-
-Windows 上原生消息主机必须是**可执行文件**（Chrome 用 `CreateProcess` 直接拉起，
-`.bat`/脚本不行，manifest 也没有传参位），因此 `install.sh` 在 Windows 上直接
-报错退出：那里的回退是下面「确认提示与回退通道」的单标签页方案，或者让 lgdm.exe
-自己实现原生消息主机模式（那就要改 Go 侧了）。
-
-### 排错
-
-- **最近日志里全是 `forwarded-tab`** → 主机没装，或 manifest 的
-  `allowed_origins` 里没有当前扩展 ID。`install.sh --extension-id <当前 ID>`
-  重装一次即可（改完不需要重载浏览器，但扩展 ID 变了必须重装）。
-- **Chrome 侧的原始错误**：带 `--enable-logging=stderr --log-level=1` 启动后
-  `grep -E "native_messag|launch_context"`，常见串是
-  `Specified native messaging host not found.`（manifest 不在或名字不对）、
-  `Access to the specified native messaging host is forbidden.`（ID 没授权）、
-  `Native host has exited.`（bridge 读帧失败提前退出，用下面那条命令单独试）。
-- **单独验证 bridge**：见「[验证构建](#验证构建)」里的拼帧命令——它不依赖浏览器，
-  能直接看出 bridge 是取到了 URL 还是回了 `no-url`/`no-client`。
-
 ## 确认提示与回退通道
 
 通过 `lgom://` 交接属于**外部协议启动**，浏览器会在确认对话框（"打开 LGOM？"）
-后放行——这个对话框无法在扩展代码里 suppress，属于浏览器安全策略。所以主机
-缺失时的目标不是"消灭对话框"，而是"只弹一次、并且不再每次新建标签页"：
+后放行——这个对话框无法在扩展代码里 suppress，属于浏览器安全策略。所以客户端
+没运行时的目标不是"消灭对话框"，而是"只弹一次、并且不再每次新建标签页"：
 
 - **Chrome：** 复用同一个转发标签页，每次 `tabs.update` 到新的 `lgom://` URL。
   之所以用 `tabs.update` 而不是 `tabs.create`：Chrome 只对带**可信发起方
@@ -269,8 +276,11 @@ Windows 上原生消息主机必须是**可执行文件**（Chrome 用 `CreatePr
   标签页完成交接后即移除（1 秒）。想免提示，在 `about:config` 里把
   `network.protocol-handler.warn-external.lgom` 设为 `false`。
 
-最近拦截日志里的 `reason` 能看出走的是哪条通道：`forwarded` = 原生主机，
-`forwarded-tab` = `lgom://` 回退（也就是主机没装）。
+最近拦截日志里的 `reason`（弹窗里显示为徽标）能看出走的是哪条通道：
+`forwarded-port` = 本地端口，`forwarded-tab` = `lgom://` 回退（客户端没在运行）。
+
+这段回退通道只有在客户端没运行时才会用到；客户端在跑时端口通道就接住了下载，
+不会开标签页、也不会弹确认框。
 
 ## 配置
 
@@ -292,18 +302,21 @@ Windows 上原生消息主机必须是**可执行文件**（Chrome 用 `CreatePr
 
 ## 权限
 
-| 权限              | 用途                              |
-| ----------------- | --------------------------------- |
-| `downloads`       | `onCreated` 及 `cancel` / `erase` |
-| `webRequest`      | 观察请求头以供交接                |
-| `storage`         | 配置、最近日志、请求头缓存镜像    |
-| `tabs`            | 打开并复用交接标签页              |
-| `nativeMessaging` | 与原生消息主机（bridge）通信      |
-| `<all_urls>`      | 拦截任意来源的下载                |
+| 权限                 | 用途                                     |
+| -------------------- | ---------------------------------------- |
+| `downloads`          | `onCreated` 及 `cancel` / `erase`        |
+| `webRequest`         | 观察请求头以供交接                       |
+| `storage`            | 配置、最近日志、请求头缓存镜像、端口缓存 |
+| `tabs`               | 打开并复用交接标签页                     |
+| `<all_urls>`         | 拦截任意来源的下载                       |
+| `http://127.0.0.1/*` | 访问客户端本地端口通道（见下）           |
 
-Chrome 声明 `downloads` / `nativeMessaging` / `storage` / `tabs` / `webRequest`；
-Firefox 走 `lgom://` 标签页，因此没有 `nativeMessaging`。两者都不需要
-`scripting`；均未请求 `webRequestBlocking`（因为只观察请求）。
+两个平台声明的权限一致（`downloads` / `storage` / `tabs` / `webRequest`），
+都不需要 `scripting`，也都没有请求 `webRequestBlocking`（因为只观察请求）。
+
+`http://127.0.0.1/*` 显式列出（`<all_urls>` 其实已覆盖回环地址），用来说明扩展
+为什么要访问本机端口。Go 侧对预检与响应都回显扩展来源的 CORS 头，所以即使浏览器
+没把这个主机权限发给扩展，端口通道依然能用。
 
 ## 国际化
 
@@ -317,29 +330,28 @@ Firefox 走 `lgom://` 标签页，因此没有 `nativeMessaging`。两者都不�
 
 ## 目录结构
 
-| 路径                                 | 内容                                                                 |
-| ------------------------------------ | -------------------------------------------------------------------- |
-| `src/lib/constants.js`               | 协议、存储键、缓存调优、默认值                                       |
-| `src/lib/types.js`                   | JSDoc typedef（无运行时导出）                                        |
-| `src/lib/platform-api.js`            | `browser`/`chrome` 处理、`i18nGetMessage`、平台名称                  |
-| `src/lib/url-builder.js`             | 请求头序列化、`buildLgomUrl`                                         |
-| `src/lib/metadata.js`                | `normalizeMetadata`、`shouldIntercept`                               |
-| `src/lib/storage.js`                 | 配置加载/保存                                                        |
-| `src/lib/recent.js`                  | 最近拦截日志                                                         |
-| `src/platform/chrome/`               | MV3 manifest、模块 Service Worker、请求头缓存、协议触发器            |
-| `src/platform/chrome/native-host.js` | 原生消息主机客户端（成败分类）                                       |
-| `src/platform/chrome/handoff-tab.js` | `lgom://` 回退：复用单个转发标签页                                   |
-| `src/platform/firefox/`              | MV3 事件页面、请求头缓存、协议触发器                                 |
-| `src/handoff/`                       | 转发标签页承载的扩展页（Chrome 回退通道可见的那个页面）              |
-| `src/popup/`                         | 工具栏弹窗（状态、主开关、最近列表）                                 |
-| `src/options/`                       | 选项页（协议、过滤规则、关于）                                       |
-| `src/static/`                        | 图标和 `_locales` 直接复制到构建输出                                 |
-| `src/types.d.ts`                     | 环境 `chrome`/`browser` 声明（不使用 `@types/chrome`）               |
-| `src/routes/layout.css`              | Tailwind v4 入口，被两个 UI 界面导入                                 |
-| `native-host/lgom-bridge.sh`         | 原生消息主机本体：读一帧、启动客户端、回一帧（POSIX sh，不进扩展包） |
-| `native-host/install.sh`             | 注册/卸载主机：写各浏览器 `NativeMessagingHosts` manifest            |
-| `scripts/build.mjs`                  | 构建入口：把 Vite 产物组装成 `build/<platform>/`                     |
-| `scripts/package.mjs`                | 打包入口：把 `build/<platform>/` 打成 `dist/` 里的 zip / crx / xpi   |
+| 路径                                 | 内容                                                               |
+| ------------------------------------ | ------------------------------------------------------------------ |
+| `src/lib/constants.js`               | 协议、存储键、缓存调优、默认值                                     |
+| `src/lib/types.js`                   | JSDoc typedef（无运行时导出）                                      |
+| `src/lib/platform-api.js`            | `browser`/`chrome` 处理、`i18nGetMessage`、平台名称                |
+| `src/lib/url-builder.js`             | 请求头序列化、`buildLgomUrl`、`buildPortPayload`                   |
+| `src/lib/local-port.js`              | 本地端口通道：`/ping` 发现 + 端口缓存 + `POST /download`           |
+| `src/lib/channels.js`                | 通道 → 最近日志 `reason` / 弹窗徽标的映射                          |
+| `src/lib/metadata.js`                | `normalizeMetadata`、`shouldIntercept`                             |
+| `src/lib/storage.js`                 | 配置加载/保存                                                      |
+| `src/lib/recent.js`                  | 最近拦截日志                                                       |
+| `src/platform/chrome/`               | MV3 manifest、模块 Service Worker、请求头缓存、协议触发器          |
+| `src/platform/chrome/handoff-tab.js` | `lgom://` 回退：复用单个转发标签页                                 |
+| `src/platform/firefox/`              | MV3 事件页面、请求头缓存、协议触发器                               |
+| `src/handoff/`                       | 转发标签页承载的扩展页（Chrome 回退通道可见的那个页面）            |
+| `src/popup/`                         | 工具栏弹窗（状态、主开关、最近列表）                               |
+| `src/options/`                       | 选项页（协议、过滤规则、关于）                                     |
+| `src/static/`                        | 图标和 `_locales` 直接复制到构建输出                               |
+| `src/types.d.ts`                     | 环境 `chrome`/`browser` 声明（不使用 `@types/chrome`）             |
+| `src/routes/layout.css`              | Tailwind v4 入口，被两个 UI 界面导入                               |
+| `scripts/build.mjs`                  | 构建入口：把 Vite 产物组装成 `build/<platform>/`                   |
+| `scripts/package.mjs`                | 打包入口：把 `build/<platform>/` 打成 `dist/` 里的 zip / crx / xpi |
 
 项目使用 JavaScript + JSDoc 类型注解，而非 TypeScript；`jsconfig.json`
 启用了 `checkJs`，`svelte-check` 是类型检查关卡。
@@ -370,22 +382,23 @@ npx web-ext run -s build/chrome -t chromium \                   # Chromium 系�
 // 在 Service Worker 上下文中
 await chrome.downloads.download({ url: 'https://example.com/file.zip' });
 await chrome.downloads.search({}); // 拦截取消擦除后为空 []
-// reason 就是走的通道：forwarded = 原生主机，forwarded-tab = lgom:// 回退
-await chrome.storage.local.get('lgom_recent'); // [{ ok: true, reason: 'forwarded' }]
+// reason 就是走的通道：forwarded-port / forwarded-tab
+await chrome.storage.local.get('lgom_recent'); // [{ ok: true, reason: 'forwarded-port' }]
 ```
 
-原生消息主机可以脱离浏览器单独验证：bridge 只依赖 stdin 上的
-`4 字节长度 + JSON`，喂它一帧就能看它是否按预期启动客户端并回帧
-（下面的 python3 只用来拼帧，bridge 自身不依赖 Python）：
+端口通道还能不依赖浏览器地直连验证：客户端在跑时（`--debug` 看日志，
+或读 `<config>/handoff.json` 里的端口）直接打它的接口即可：
 
 ```sh
-python3 -c 'import json,struct,sys;m=json.dumps({"url":"lgom://download?url=https%3A%2F%2Fexample.com%2Fa.zip"}).encode();sys.stdout.buffer.write(struct.pack("<I",len(m))+m)' \
-  | LGDM_BIN=/bin/echo ./native-host/lgom-bridge.sh | od -c
-# 0000000  \v  \0  \0  \0   {   "   o   k   "   :   t   r   u   e   }
-# bridge 已把 URL 交给 LGDM_BIN(它的 stdout 被丢弃,想看参数就指向一个记日志的脚本)
+curl -s http://127.0.0.1:17821/ping                       # {"app":"lgo_download_manager",…}
+curl -s -X POST -H 'Content-Type: application/json' \
+  -H 'X-LGOM-Client: extension' \
+  -d '{"url":"https://example.com/a.zip","name":"a.zip"}' \
+  http://127.0.0.1:17821/download                          # {"ok":true}
+# 带非扩展 Origin（含 null）会被拒：{"ok":false,"error":"origin not allowed: …"} + 403
 ```
 
-回退通道（无主机）在真实浏览器里的观测点：`lgom_recent` 的 `reason` 为
+回退通道在真实浏览器里的观测点：先停掉客户端，`lgom_recent` 的 `reason` 就变成
 `forwarded-tab`，且多次下载后标签页仍是同一个（`chrome.tabs.query({})` 里只有
 一个 `handoff.html`）。勾选一次"始终允许"后，后续交接不再弹确认框——记录落在
 profile 的 `protocol_handler.allowed_origin_protocol_pairs`。
@@ -394,9 +407,7 @@ profile 的 `protocol_handler.allowed_origin_protocol_pairs`。
 
 `.github/workflows/extension.yml` 在 push / PR / `v*` tag 上跑
 `npm ci` + `build:<platform>` + `package:<platform>`，产物作为 artifact 上传
-（保留 30 天）；`v*` tag 上把 zip / crx / xpi 一并附到 GitHub Release
-（外加 `lgom-native-host-<版本>.tar.gz`——原生消息主机装不到扩展包里，
-必须由用户本地执行，所以单独出包）。
+（保留 30 天）；`v*` tag 上把 zip / crx / xpi 一并附到 GitHub Release。
 版本号用 tag 去掉 `v`（`v1.2.3` → `1.2.3`），非 tag 推送用 manifest 里的版本。
 
 | secret                           | 用途                                                                                               |

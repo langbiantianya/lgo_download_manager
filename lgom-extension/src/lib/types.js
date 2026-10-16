@@ -18,23 +18,40 @@
  */
 
 /**
- * How a hand-off reached the desktop client.
+ * How a hand-off reached the desktop client. Tried in this order, cheapest and
+ * quietest first (see each platform's `triggerProtocol`).
  *
- * - `native`: through the native messaging host (no tab, no confirmation).
- * - `tab`:   by navigating an extension tab to `lgom://`, which the browser
- *            gates behind its own confirmation dialog.
+ * - `port`:   through the desktop client's loopback HTTP port. No tab, no
+ *             confirmation, no extra install — but the client has to be running.
+ * - `tab`:    by navigating an extension tab to `lgom://`, which the browser
+ *             gates behind its own confirmation dialog. Last resort, and the
+ *             only channel that can cold-start the client when it is not
+ *             running.
  *
- * @typedef {'native' | 'tab'} HandoffChannel
+ * @typedef {'port' | 'tab'} HandoffChannel
  */
 
 /**
  * @typedef {object} PlatformBridge
  * @property {() => string} getPlatformName
- * @property {(url: string) => Promise<HandoffChannel>} triggerProtocol
+ * @property {(meta: DownloadMetadata, url: string) => Promise<HandoffChannel>} triggerProtocol
  * @property {() => Promise<string>} getActiveTabUrl
  */
 
 export {};
+
+/**
+ * Body of a local-port hand-off request (`POST /download`): the same fields as
+ * the `lgom://download?…` query string, without the URL encoding or the size
+ * budget.
+ *
+ * @typedef {object} PortHandoffPayload
+ * @property {string} url
+ * @property {string} name
+ * @property {string} ua
+ * @property {string} headers
+ * @property {string} cookies
+ */
 
 /**
  * @typedef {object} LgomParams
