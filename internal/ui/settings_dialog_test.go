@@ -7,6 +7,7 @@
 package ui
 
 import (
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -154,6 +155,46 @@ func TestBuildSettingsContent_CategorizedTabs(t *testing.T) {
 		if got := form.Items[0].Text; got != want.firstItem {
 			t.Errorf("tab %d first item = %q, want %q", i, got, want.firstItem)
 		}
+	}
+}
+
+// TestBuildSettingsContent_BTConcurrencyTogether 锁定 BT 并发项的分组与
+// 命名:同时下载/同时做种应相邻,且 BT 页签内所有设置项都不再带
+// "BT "/"BT-" 前缀。
+func TestBuildSettingsContent_BTConcurrencyTogether(t *testing.T) {
+	test.NewApp()
+	defer test.NewApp()
+
+	prevLang := ilocale.Current()
+	ilocale.Set("zh-Hans")
+	defer ilocale.Set(prevLang)
+
+	GlobalSettings = store.Settings{}
+	defer func() { GlobalSettings = store.Settings{} }()
+
+	content := buildSettingsContent(nil, nil, nil)
+	tabs := content.(*container.AppTabs)
+	scroll := tabs.Items[3].Content.(*container.Scroll)
+	form := scroll.Content.(*widget.Form)
+
+	downloadLabel := ilocale.T("settings.label.btMaxConcurrent")
+	seedingLabel := ilocale.T("settings.label.btMaxSeeding")
+	downloadIdx, seedingIdx := -1, -1
+	for i, item := range form.Items {
+		switch item.Text {
+		case downloadLabel:
+			downloadIdx = i
+		case seedingLabel:
+			seedingIdx = i
+		}
+	}
+	for _, item := range form.Items {
+		if strings.HasPrefix(item.Text, "BT ") || strings.HasPrefix(item.Text, "BT-") {
+			t.Errorf("BT settings label %q still carries the BT prefix", item.Text)
+		}
+	}
+	if downloadIdx < 0 || seedingIdx != downloadIdx+1 {
+		t.Fatalf("download/seeding item indexes = %d/%d, want adjacent", downloadIdx, seedingIdx)
 	}
 }
 

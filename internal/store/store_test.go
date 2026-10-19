@@ -376,7 +376,9 @@ func TestSettingsBittorrentRoundtrip(t *testing.T) {
 	want.BTUploadLimitKiB = 128
 	want.BTDHT = false
 	want.BTPEX = false
-	want.BTSeeding = true
+	want.BTSeedRatio = 2.5
+	want.BTMaxSeeding = 3
+	want.BTMaxConcurrent = 4
 	want.BTTrackers = "udp://tracker.example.com:6969/announce\nhttp://t.example.org/announce"
 	if err := s.SaveSettings(want); err != nil {
 		t.Fatal(err)
@@ -397,12 +399,58 @@ func TestSettingsBittorrentRoundtrip(t *testing.T) {
 		t.Errorf("limits = %d/%d, want %d/%d", got.BTDownloadLimitKiB, got.BTUploadLimitKiB,
 			want.BTDownloadLimitKiB, want.BTUploadLimitKiB)
 	}
-	if got.BTDHT != want.BTDHT || got.BTPEX != want.BTPEX || got.BTSeeding != want.BTSeeding {
-		t.Errorf("bt flags = %v/%v/%v, want %v/%v/%v",
-			got.BTDHT, got.BTPEX, got.BTSeeding, want.BTDHT, want.BTPEX, want.BTSeeding)
+	if got.BTDHT != want.BTDHT || got.BTPEX != want.BTPEX ||
+		got.BTSeedRatio != want.BTSeedRatio || got.BTMaxSeeding != want.BTMaxSeeding ||
+		got.BTMaxConcurrent != want.BTMaxConcurrent {
+		t.Errorf("bt flags = %v/%v/%v/%d/%d, want %v/%v/%v/%d/%d",
+			got.BTDHT, got.BTPEX, got.BTSeedRatio, got.BTMaxSeeding, got.BTMaxConcurrent,
+			want.BTDHT, want.BTPEX, want.BTSeedRatio, want.BTMaxSeeding, want.BTMaxConcurrent)
 	}
 	if got.BTTrackers != want.BTTrackers {
 		t.Errorf("BTTrackers = %q, want %q", got.BTTrackers, want.BTTrackers)
+	}
+}
+
+// TestSettingsBittorrentSeedingMigration 验证旧库只有布尔 bt_seeding 时,
+// 新列 bt_seed_ratio / bt_max_seeding / bt_max_concurrent 的 -1 哨兵
+// 会落到新版默认值。
+func TestSettingsBittorrentSeedingMigration(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if _, err := s.LoadSettings(); err != nil { // 创建 settings 行
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`UPDATE settings SET bt_seeding=1, bt_seed_ratio=-1, bt_max_seeding=-1, bt_max_concurrent=-1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BTSeedRatio != DefaultBTSeedRatio || got.BTMaxSeeding != DefaultBTMaxSeeding ||
+		got.BTMaxConcurrent != DefaultBTMaxConcurrent {
+		t.Errorf("legacy defaults = ratio %v / seeding %d / concurrent %d, want %v / %d / %d",
+			got.BTSeedRatio, got.BTMaxSeeding, got.BTMaxConcurrent,
+			DefaultBTSeedRatio, DefaultBTMaxSeeding, DefaultBTMaxConcurrent)
+	}
+
+	if _, err := s.db.Exec(`UPDATE settings SET bt_seeding=0, bt_seed_ratio=-1, bt_max_seeding=-1, bt_max_concurrent=-1 WHERE id=1`); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.BTSeedRatio != DefaultBTSeedRatio || got.BTMaxSeeding != DefaultBTMaxSeeding ||
+		got.BTMaxConcurrent != DefaultBTMaxConcurrent {
+		t.Errorf("legacy defaults = ratio %v / seeding %d / concurrent %d, want %v / %d / %d",
+			got.BTSeedRatio, got.BTMaxSeeding, got.BTMaxConcurrent,
+			DefaultBTSeedRatio, DefaultBTMaxSeeding, DefaultBTMaxConcurrent)
 	}
 }
 

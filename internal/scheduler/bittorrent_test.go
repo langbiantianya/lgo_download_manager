@@ -29,7 +29,9 @@ func TestBittorrentConfigFromSettings(t *testing.T) {
 		BTUploadLimitKiB:   64,
 		BTDHT:              true,
 		BTPEX:              false,
-		BTSeeding:          true,
+		BTSeedRatio:        2.5,
+		BTMaxSeeding:       4,
+		BTMaxConcurrent:    2,
 		BTTrackers:         "udp://a.example:6969/announce, http://b.example/announce\nudp://c.example:1337/announce",
 	}
 	cfg := BittorrentConfigFrom(s)
@@ -45,8 +47,9 @@ func TestBittorrentConfigFromSettings(t *testing.T) {
 	if cfg.UploadLimit != 64*1024 {
 		t.Errorf("UploadLimit = %d, want %d", cfg.UploadLimit, 64*1024)
 	}
-	if !cfg.EnableDHT || cfg.EnablePEX || !cfg.Seeding {
-		t.Errorf("flags = dht:%v pex:%v seeding:%v, want true/false/true", cfg.EnableDHT, cfg.EnablePEX, cfg.Seeding)
+	if !cfg.EnableDHT || cfg.EnablePEX || cfg.SeedRatio != 2.5 || cfg.MaxSeeding != 4 || cfg.MaxConcurrentTasks != 2 {
+		t.Errorf("flags = dht:%v pex:%v seedRatio:%v maxSeeding:%d maxConcurrent:%d, want true/false/2.5/4/2",
+			cfg.EnableDHT, cfg.EnablePEX, cfg.SeedRatio, cfg.MaxSeeding, cfg.MaxConcurrentTasks)
 	}
 	want := []string{
 		"udp://a.example:6969/announce",
@@ -64,6 +67,127 @@ func TestBittorrentConfigFromSettings(t *testing.T) {
 	empty := BittorrentConfigFrom(store.Settings{})
 	if empty.MaxPeersPerTorrent != store.DefaultBTMaxPeers {
 		t.Errorf("default MaxPeersPerTorrent = %d, want %d", empty.MaxPeersPerTorrent, store.DefaultBTMaxPeers)
+	}
+}
+
+// TestSeedRatioReached 验证分享率判定:上传量达到总大小*分享率时停止。
+func TestSeedRatioReached(t *testing.T) {
+	if seedRatioReached(199, 100, 2) {
+		t.Error("199/100 should not reach ratio 2")
+	}
+	if !seedRatioReached(200, 100, 2) {
+		t.Error("200/100 should reach ratio 2")
+	}
+	if seedRatioReached(999, 100, 0) {
+		t.Error("ratio 0 means no seeding, not a reached ratio")
+	}
+}
+
+// TestSeedingQueueLimit 验证同时做种上限:前 2 条立即上传,第 3 条进入
+// 等待队列;调大上限后按 FIFO 补位。
+func TestSeedingQueueLimit(t *testing.T) {
+	oldStart := startSeedMonitor
+	startSeedMonitor = func(*Scheduler, string, *bittorrent.Handle, int64) {}
+	defer func() { startSeedMonitor = oldStart }()
+
+	s := &Scheduler{
+		btCfg:   bittorrent.Config{SeedRatio: 2, MaxSeeding: 2},
+		btSeeds: map[string]*seedEntry{},
+	}
+	if !s.keepSeeding("a", &bittorrent.Handle{}, 100) {
+		t.Fatal("first seed rejected")
+	}
+	if !s.keepSeeding("b", &bittorrent.Handle{}, 100) {
+		t.Fatal("second seed rejected")
+	}
+	if !s.keepSeeding("c", &bittorrent.Handle{}, 100) {
+		t.Fatal("third seed should be accepted into the queue")
+	}
+	s.seedsMu.Lock()
+	order, queue := append([]string(nil), s.btSeedOrder...), append([]string(nil), s.btSeedQueue...)
+	s.seedsMu.Unlock()
+	if !reflect.DeepEqual(order, []string{"a", "b"}) || !reflect.DeepEqual(queue, []string{"c"}) {
+		t.Fatalf("order=%v queue=%v, want [a b]/[c]", order, queue)
+	}
+
+	s.btMu.Lock()
+	s.btCfg.MaxSeeding = 3
+	s.btMu.Unlock()
+	s.rebalanceSeeds()
+	s.seedsMu.Lock()
+	order, queue = append([]string(nil), s.btSeedOrder...), append([]string(nil), s.btSeedQueue...)
+	s.seedsMu.Unlock()
+	if !reflect.DeepEqual(order, []string{"a", "b", "c"}) || len(queue) != 0 {
+		t.Fatalf("after raise: order=%v queue=%v, want [a b c]/[]", order, queue)
+	}
+
+	s.btMu.Lock()
+	s.btCfg.MaxSeeding = 1
+	s.btMu.Unlock()
+	s.rebalanceSeeds()
+	s.seedsMu.Lock()
+	order, queue = append([]string(nil), s.btSeedOrder...), append([]string(nil), s.btSeedQueue...)
+	s.seedsMu.Unlock()
+	if !reflect.DeepEqual(order, []string{"a"}) || !reflect.DeepEqual(queue, []string{"b", "c"}) {
+		t.Fatalf("after lower: order=%v queue=%v, want [a]/[b c]", order, queue)
+	}
+}
+
+// TestBTConcurrentAccounting 验证 BT 专用并发上限只统计 BT 任务,
+// 不会被同进程内的 HTTP/FTP 任务占用名额。
+func TestBTConcurrentAccounting(t *testing.T) {
+	s := New(nil)
+	s.btMaxConcurrent = 2
+	s.jobs["bt-1"] = &runningJob{bt: true}
+	s.jobs["http-1"] = &runningJob{bt: false}
+
+	s.mu.Lock()
+	btJobs := s.btJobsLocked()
+	limit := s.effectiveBTMaxConcurrentLocked()
+	s.mu.Unlock()
+	if btJobs != 1 {
+		t.Errorf("btJobsLocked = %d, want 1", btJobs)
+	}
+	if limit != 2 {
+		t.Errorf("effectiveBTMaxConcurrentLocked = %d, want 2", limit)
+	}
+}
+
+// TestBTConcurrentCapQueuesPending 验证 BT 专用上限已满时,新 BT 任务
+// 保持在 Pending,不会先创建客户端再失败。
+func TestBTConcurrentCapQueuesPending(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	sc := New(st)
+	sc.maxConcurrent = 10
+	sc.btMaxConcurrent = 2
+	sc.jobs["bt-a"] = &runningJob{bt: true}
+	sc.jobs["bt-b"] = &runningJob{bt: true}
+
+	tk, err := sc.Add(AddTaskInput{
+		URL:      "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+		SavePath: t.TempDir(),
+		Protocol: protocol.ProtoBT,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.Start(tk.ID); err != nil {
+		t.Fatalf("Start should queue silently: %v", err)
+	}
+	if _, exists := sc.jobs[tk.ID]; exists {
+		t.Fatal("BT task acquired a slot while BT cap was full")
+	}
+	got, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != store.TaskStatus.Pending {
+		t.Errorf("status = %q, want Pending", got.Status)
 	}
 }
 

@@ -14,13 +14,14 @@
 - 支持断点续传：暂停/恢复后会从已下载的字节偏移处继续，已完成的分片不会重新下载。
 - BitTorrent 下载：`magnet:` 磁力链接与 `.torrent` 种子（本地路径或 HTTP 链接），
   底层用 [anacrolix/torrent](https://github.com/anacrolix/torrent)；DHT / PEX /
-  tracker、全局限速、做种开关、随机或固定监听端口；进度按「每个种子文件一块」
+  tracker、全局限速、做种分享率与同时做种数、BT 专用并发上限、首次启动自动选择并持久化的监听端口；进度按「每个种子文件一块」
   展示；磁力链接的元数据会缓存进库，之后离线也能续传；详见
   「[BitTorrent 下载](#bittorrent-下载)」。
 - 任务级参数设置（URL、保存路径、并发数、分片大小、UA、Cookies、FTP 模式、代理）。
 - 并发任务数量上限：可在「设置」里配置同时下载的最大任务数（默认 3）。超出限额
   的新任务保持 `Pending`（UI 显示为「等待中」），按 FIFO 顺序在有 slot 释放时自动启动；
-  上限调小不会强制暂停正在运行的任务（仅影响后续新增）。
+  上限调小不会强制暂停正在运行的任务（仅影响后续新增）。BT 任务另有独立并发上限，
+  默认同时下载 2 个。
 - HTTP/HTTPS 代理三种模式：系统代理（自动检测桌面会话代理设置）、
   不使用代理（始终直连）、手动设置代理（自定义 URL + 绕过列表）。
   自动按平台检测：Linux (GNOME `gsettings` / KDE `kioslaverc` / `/etc/environment`)、
@@ -711,20 +712,22 @@ macOS 上 `ProcessType=Background` 标记为后台进程，不进入前台应用
 | Proxy bypass        | ""               | 手动模式下的绕过列表（逗号分隔）           |
 | Light mode          | true             | 关闭主窗口时释放 widget 树                 |
 | Auto start          | false            | 操作系统登录后是否静默自启（详见「开机自启」） |
-| BT listen port      | 0（随机）        | BT 客户端监听端口（TCP/uTP）；0 = 随机分配 |
+| BT listen port      | 首次启动自动选择 | BT 客户端监听端口（TCP/uTP）；选择后持久化，0 = 每次启动由系统随机分配 |
+| BT max concurrent   | 2                | BT 任务专用的同时下载上限                 |
+| BT max seeding      | 2                | 同时上传的做种任务数上限                   |
 | BT download limit   | 0（不限）        | BT 客户端全局限速（KiB/s），0 = 不限速     |
 | BT upload limit     | 0（不限）        | BT 客户端全局上传限速（KiB/s）             |
 | BT max connections  | 50               | 单个种子的最大已连接 peer 数               |
 | DHT                 | true             | 启用 DHT（磁力链接没有 tracker 时靠它找 peer） |
 | PEX                 | true             | 启用节点交换（与 peer 交换可用节点）       |
-| BT seeding          | false            | 下载完成后继续做种（上传给其它 peer）      |
+| BT seeding          | 2                | 做种分享率：上传量达到下载量的 2 倍后停止；0 = 不做种 |
 | Extra trackers      | ""               | 附加 tracker（每行一个），追加到每个 BT 任务 |
 
 每次修改都会立即持久化。
 
 ## BitTorrent 下载
 
-BT 任务与 HTTP 分片任务共用任务列表、状态机、并发上限与排序，但底层走
+BT 任务与 HTTP 分片任务共用任务列表、状态机与排序，但底层走
 `internal/bittorrent`（封装 anacrolix/torrent）：进程内共享一个 BT 客户端
 （一个监听端口、一份 DHT 路由表、一份连接池），每个任务只持有自己的种子句柄
 与独立的任务目录。BT 客户端是**懒创建**的——没有 BT 任务时不监听端口、
@@ -768,17 +771,20 @@ DHT/tracker（离线、tracker 全挂也能续传）。进程异常退出后的�
 
 ### 做种
 
-默认「下载完成后不再上传」：任务完成即断开连接、释放并发槽位。开启
-「BT seeding」后，任务完成后继续上传，此时任务状态已是「已完成」、不再占用
-并发上限；删除任务或退出程序时停止做种。
+默认分享率为 2，同时最多保留 2 条做种任务上传：任务完成后不占用下载并发
+槽位，累计上传量达到下载总量的 2 倍后自动停止。超过同时做种上限的任务会
+保留种子但暂停上传，等前面的任务达到分享率释放名额后按 FIFO 顺序接替。
+把「做种分享率」设为 0 表示下载完成后不做种。删除任务或退出程序时也会
+停止对应做种。
 
 ### 代理、端口与连通性
 
 - tracker 公告、webseed、种子文件的 HTTP 抓取都走「代理模式」里的同一套设置
   （System / Disabled / Manual + 绕过列表）；BT 的 peer 连接不是 HTTP，
   因此不受 HTTP 代理影响；
-- 监听端口默认随机（`0`）。要接受入站连接（提升速度）得填一个固定端口并在
-  路由器上做映射——lgdm **不会**自动改路由器配置（不启用 UPnP/NAT-PMP）；
+- 首次启动会探测一个 TCP/UDP 都可绑定的端口并持久化，后续启动沿用；填 `0`
+  则每次启动由系统重新随机分配。要接受入站连接（提升速度）得填一个固定端口
+  并在路由器上做映射——lgdm **不会**自动改路由器配置（不启用 UPnP/NAT-PMP）；
 - DHT / PEX 默认开启：磁力链接没有 tracker 时几乎完全依赖它们找 peer。
 
 ### 与 HTTP 任务共用的部分
@@ -947,9 +953,10 @@ BT 客户端（断开所有 peer、停止做种，磁盘数据保留）。做种
 ### 并发任务数量上限与 FIFO 提升
 
 `MaxConcurrent`（默认 3，可通过「设置」调整）限制同时占用 engine slot
-的任务数。`scheduler.Start` 在入参任务处于 `Pending` 且 `len(jobs) >= cap`
-时静默返回 nil——任务在 store 里保持 `Pending`（UI 渲染为「等待中」），
-不占 slot、不增 wg，等待被 `promotePending` 拉起。
+的任务总数；BT 任务还额外受 `BTMaxConcurrent`（默认 2）约束。`scheduler.Start`
+在入参任务处于 `Pending` 且全局或 BT 专用上限已满时静默返回 nil——任务在
+store 里保持 `Pending`（UI 渲染为「等待中」），不占 slot、不增 wg，等待被
+`promotePending` 拉起。
 
 `releaseSlot` 与 `startAsync` 的清理 defer 都会触发 `promotePending`：
 扫 store 中所有 `Pending` 且无 slot 的任务，按 `created_at ASC` 顺序，

@@ -7,6 +7,8 @@
 package settings
 
 import (
+	"fmt"
+	"net"
 	"path/filepath"
 	"testing"
 
@@ -34,10 +36,14 @@ func TestLoad_FirstRunDefaults(t *testing.T) {
 	}
 }
 
-// TestLoad_BittorrentDefaults 锁定 BT 的首次运行默认值:端口随机、不限速、
-// DHT/PEX 开启(磁力链接没有 tracker 时几乎只能靠它们找 peer)、
-// 下载完成后不做种。这些值会随首次运行一起落盘。
+// TestLoad_BittorrentDefaults 锁定 BT 的首次运行默认值:自动选一个可用
+// 监听端口、不限速、DHT/PEX 开启(磁力链接没有 tracker 时几乎只能靠
+// 它们找 peer)、分享率 2、BT 同时下载上限 2。这些值会随首次运行一起落盘。
 func TestLoad_BittorrentDefaults(t *testing.T) {
+	oldPicker := pickBTPort
+	pickBTPort = func() int { return 51413 }
+	defer func() { pickBTPort = oldPicker }()
+
 	dbPath := filepath.Join(t.TempDir(), "state.db")
 	st, err := store.Open(dbPath)
 	if err != nil {
@@ -49,8 +55,8 @@ func TestLoad_BittorrentDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if got.BTPort != 0 {
-		t.Errorf("BTPort = %d, want 0 (random port)", got.BTPort)
+	if got.BTPort != 51413 {
+		t.Errorf("BTPort = %d, want 51413 (picked on first run)", got.BTPort)
 	}
 	if got.EffectiveBTMaxPeers() != store.DefaultBTMaxPeers {
 		t.Errorf("EffectiveBTMaxPeers = %d, want %d", got.EffectiveBTMaxPeers(), store.DefaultBTMaxPeers)
@@ -64,8 +70,14 @@ func TestLoad_BittorrentDefaults(t *testing.T) {
 	if !got.BTPEX {
 		t.Error("BTPEX default = false, want true")
 	}
-	if got.BTSeeding {
-		t.Error("BTSeeding default = true, want false (do not upload after completion by default)")
+	if got.BTSeedRatio != store.DefaultBTSeedRatio {
+		t.Errorf("BTSeedRatio = %v, want %v", got.BTSeedRatio, store.DefaultBTSeedRatio)
+	}
+	if got.BTMaxSeeding != store.DefaultBTMaxSeeding {
+		t.Errorf("BTMaxSeeding = %d, want %d", got.BTMaxSeeding, store.DefaultBTMaxSeeding)
+	}
+	if got.BTMaxConcurrent != store.DefaultBTMaxConcurrent {
+		t.Errorf("BTMaxConcurrent = %d, want %d", got.BTMaxConcurrent, store.DefaultBTMaxConcurrent)
 	}
 
 	// 再次加载必须从库里读回同一份默认值(首启落盘过一次)。
@@ -73,8 +85,15 @@ func TestLoad_BittorrentDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load (second): %v", err)
 	}
-	if !again.BTDHT || !again.BTPEX || again.BTSeeding {
-		t.Errorf("persisted BT flags = %v/%v/%v, want true/true/false", again.BTDHT, again.BTPEX, again.BTSeeding)
+	if again.BTPort != 51413 {
+		t.Errorf("persisted BTPort = %d, want 51413", again.BTPort)
+	}
+	if !again.BTDHT || !again.BTPEX || again.BTSeedRatio != store.DefaultBTSeedRatio ||
+		again.BTMaxSeeding != store.DefaultBTMaxSeeding ||
+		again.BTMaxConcurrent != store.DefaultBTMaxConcurrent {
+		t.Errorf("persisted BT flags = %v/%v/%v/%d/%d, want true/true/%v/%d/%d",
+			again.BTDHT, again.BTPEX, again.BTSeedRatio, again.BTMaxSeeding, again.BTMaxConcurrent,
+			store.DefaultBTSeedRatio, store.DefaultBTMaxSeeding, store.DefaultBTMaxConcurrent)
 	}
 }
 
@@ -98,7 +117,9 @@ func TestLoad_BittorrentPersistedWins(t *testing.T) {
 	cur.BTUploadLimitKiB = 256
 	cur.BTDHT = false
 	cur.BTPEX = false
-	cur.BTSeeding = true
+	cur.BTSeedRatio = 1.5
+	cur.BTMaxSeeding = 3
+	cur.BTMaxConcurrent = 4
 	cur.BTTrackers = "udp://tracker.example.com:6969/announce"
 	if err := Save(st, cur); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -114,12 +135,35 @@ func TestLoad_BittorrentPersistedWins(t *testing.T) {
 	if got.BTDownloadLimitKiB != 4096 || got.BTUploadLimitKiB != 256 {
 		t.Errorf("limits = %d/%d, want 4096/256", got.BTDownloadLimitKiB, got.BTUploadLimitKiB)
 	}
-	if got.BTDHT || got.BTPEX || !got.BTSeeding {
-		t.Errorf("BT flags = %v/%v/%v, want false/false/true", got.BTDHT, got.BTPEX, got.BTSeeding)
+	if got.BTDHT || got.BTPEX || got.BTSeedRatio != 1.5 || got.BTMaxSeeding != 3 || got.BTMaxConcurrent != 4 {
+		t.Errorf("BT flags = %v/%v/%v/%d/%d, want false/false/1.5/3/4",
+			got.BTDHT, got.BTPEX, got.BTSeedRatio, got.BTMaxSeeding, got.BTMaxConcurrent)
 	}
 	if got.BTTrackers != "udp://tracker.example.com:6969/announce" {
 		t.Errorf("BTTrackers = %q", got.BTTrackers)
 	}
+}
+
+// TestPickAvailableBTPort 验证探测结果确实能同时绑定 TCP 与 UDP。
+// 受限沙箱不允许监听端口时跳过,不影响其余默认值测试。
+func TestPickAvailableBTPort(t *testing.T) {
+	port := pickAvailableBTPort()
+	if port == 0 {
+		t.Skip("sandbox does not allow binding TCP/UDP ports")
+	}
+	if port < 1 || port > 65535 {
+		t.Fatalf("picked port = %d, want 1..65535", port)
+	}
+	tcpLn, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("picked TCP port %d is not available: %v", port, err)
+	}
+	defer tcpLn.Close()
+	udpLn, err := net.ListenPacket("udp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		t.Fatalf("picked UDP port %d is not available: %v", port, err)
+	}
+	defer udpLn.Close()
 }
 
 // TestLoad_ForceLightOverridesDefault 验证 --light flag 强制开启 LightMode。

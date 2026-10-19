@@ -192,7 +192,8 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	// 端口/DHT/PEX 等客户端构造期参数在 BT 客户端可安全重建时生效
 	// (没有 BT 任务在跑时立即重建,否则等最后一个任务结束)。
 
-	// 监听端口:0 表示随机(默认),其余按有效端口范围 1..65535 校验。
+	// 监听端口:首次运行由 settings.Load 选择并持久化;0 表示交给系统
+	// 随机分配,其余按有效端口范围 1..65535 校验。
 	btPortEntry := widget.NewEntry()
 	btPortEntry.SetText(fmt.Sprintf("%d", GlobalSettings.BTPort))
 	btPortEntry.SetPlaceHolder(ilocale.T("settings.btPort.placeholder"))
@@ -203,6 +204,17 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		}
 		GlobalSettings.BTPort = n
 		persist()
+	}
+
+	// BT 任务专用的同时下载上限,独立于“通用/下载”页里的全局并发数。
+	btMaxConcurrentEntry := widget.NewEntry()
+	btMaxConcurrentEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveBTMaxConcurrent()))
+	btMaxConcurrentEntry.SetPlaceHolder(ilocale.T("settings.btMaxConcurrent.placeholder"))
+	btMaxConcurrentEntry.OnChanged = func(s string) {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+			GlobalSettings.BTMaxConcurrent = n
+			persist()
+		}
 	}
 
 	// 全局限速(KiB/s,0 = 不限速)。
@@ -251,11 +263,25 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	})
 	btPEX.SetChecked(GlobalSettings.BTPEX)
 
-	btSeeding := widget.NewCheck(ilocale.T("settings.btSeeding.desc"), func(checked bool) {
-		GlobalSettings.BTSeeding = checked
-		persist()
-	})
-	btSeeding.SetChecked(GlobalSettings.BTSeeding)
+	// 分享率:上传量达到下载量的该倍数后停止做种;0 表示不做种。
+	btSeedingEntry := widget.NewEntry()
+	btSeedingEntry.SetText(formatSeedRatio(GlobalSettings.BTSeedRatio))
+	btSeedingEntry.SetPlaceHolder(ilocale.T("settings.btSeeding.placeholder"))
+	btSeedingEntry.OnChanged = func(s string) {
+		if n, err := strconv.ParseFloat(strings.TrimSpace(s), 64); err == nil && n >= 0 {
+			GlobalSettings.BTSeedRatio = n
+			persist()
+		}
+	}
+	btMaxSeedingEntry := widget.NewEntry()
+	btMaxSeedingEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveBTMaxSeeding()))
+	btMaxSeedingEntry.SetPlaceHolder(ilocale.T("settings.btMaxSeeding.placeholder"))
+	btMaxSeedingEntry.OnChanged = func(s string) {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+			GlobalSettings.BTMaxSeeding = n
+			persist()
+		}
+	}
 
 	// 附加 tracker 往往是多条(list 很方便粘贴),用多行输入框并留出
 	// 三行可见高度。
@@ -359,12 +385,14 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	)
 	bittorrentForm := widget.NewForm(
 		widget.NewFormItem(ilocale.T("settings.label.btPort"), btPortEntry),
+		widget.NewFormItem(ilocale.T("settings.label.btMaxConcurrent"), btMaxConcurrentEntry),
+		widget.NewFormItem(ilocale.T("settings.label.btMaxSeeding"), btMaxSeedingEntry),
 		widget.NewFormItem(ilocale.T("settings.label.btDownloadLimit"), btDownRow),
 		widget.NewFormItem(ilocale.T("settings.label.btUploadLimit"), btUpRow),
 		widget.NewFormItem(ilocale.T("settings.label.btPeers"), btPeersEntry),
 		widget.NewFormItem(ilocale.T("settings.label.btDHT"), btDHT),
 		widget.NewFormItem(ilocale.T("settings.label.btPEX"), btPEX),
-		widget.NewFormItem(ilocale.T("settings.label.btSeeding"), btSeeding),
+		widget.NewFormItem(ilocale.T("settings.label.btSeeding"), btSeedingEntry),
 		widget.NewFormItem(ilocale.T("settings.label.btTrackers"), btTrackersEntry),
 	)
 
@@ -394,6 +422,11 @@ func proxyModeLabel(m protocol.ProxyMode) string {
 		return ilocale.T("settings.proxyMode.manual")
 	}
 	return ilocale.T("settings.proxyMode.system")
+}
+
+// formatSeedRatio 用最短十进制形式显示分享率,避免默认 2 显示成 "2.000000"。
+func formatSeedRatio(v float64) string {
+	return strconv.FormatFloat(v, 'f', -1, 64)
 }
 
 // sortLabel 返回任务排序方式在当前语言下的显示标签。

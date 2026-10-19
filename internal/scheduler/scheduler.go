@@ -59,19 +59,33 @@ type Scheduler struct {
 	btMu  sync.Mutex
 	bt    *bittorrent.Manager
 	btCfg bittorrent.Config
+	// btMaxConcurrent 是 BT 任务专用的同时下载上限,独立于全局
+	// maxConcurrent;<=0 时沿用默认值。
+	btMaxConcurrent int
 
 	// seedsMu 保护 btSeeds:「已下载完成但按设置继续做种」的任务句柄。
 	// 这些任务已经 Completed、不占并发槽位,但客户端仍在为它们上传,
 	// 直到任务被删除或程序退出(见 bittorrent.go)。
-	seedsMu sync.Mutex
-	btSeeds map[string]*bittorrent.Handle
+	seedsMu     sync.Mutex
+	btSeeds     map[string]*seedEntry
+	btSeedOrder []string // 正在上传的种子,按进入顺序排列
+	btSeedQueue []string // 已保留种子但让出上传名额的等待队列(FIFO)
 
 	// 事件订阅者(GUI)。筛选逻辑在消费侧完成。
 	Subs []chan Event
 }
 
+// seedEntry 是一个已完成后保留在 BT 客户端里的做种句柄。
+type seedEntry struct {
+	handle *bittorrent.Handle
+	total  int64
+}
+
 type runningJob struct {
 	task *store.Task
+	// bt 标记该任务是否走 BitTorrent 路径,用于 BT 专用并发上限。
+	// 准备阶段 task 可能尚未赋值,因此不能只靠 task.Protocol 判断。
+	bt bool
 	// cancel 取消 engine 的运行上下文；prepareCancel 用于在 Start 预留 slot
 	// 之后、engine goroutine 启动之前的「准备阶段」（probe / 预分配）取消
 	// 任务。该阶段 cancel 仍为 nil，因此 Pause/PauseAll/Cancel/Delete 必须
@@ -146,10 +160,11 @@ func chunkProgressFrom(cs []engine.ChunkSnapshot) []int64 {
 // New 构造一个由给定 Store 支撑的 Scheduler。
 func New(s *store.Store) *Scheduler {
 	return &Scheduler{
-		st:            s,
-		jobs:          map[string]*runningJob{},
-		maxConcurrent: store.DefaultMaxConcurrent,
-		btSeeds:       map[string]*bittorrent.Handle{},
+		st:              s,
+		jobs:            map[string]*runningJob{},
+		maxConcurrent:   store.DefaultMaxConcurrent,
+		btSeeds:         map[string]*seedEntry{},
+		btMaxConcurrent: store.DefaultBTMaxConcurrent,
 		// BT 客户端的首启默认配置:随机端口、DHT/PEX 开启、不限速、
 		// 完成后不做种。main/uimgr 会用持久化设置覆盖它。
 		btCfg: bittorrent.Config{
@@ -173,8 +188,27 @@ func (s *Scheduler) SetMaxConcurrent(n int) {
 	s.promotePending()
 }
 
+// effectiveBTMaxConcurrentLocked 返回 BT 专用并发上限;调用方需持有 s.mu。
+func (s *Scheduler) effectiveBTMaxConcurrentLocked() int {
+	if s.btMaxConcurrent <= 0 {
+		return store.DefaultBTMaxConcurrent
+	}
+	return s.btMaxConcurrent
+}
+
+// btJobsLocked 统计当前已占 slot 的 BT 任务;调用方需持有 s.mu。
+func (s *Scheduler) btJobsLocked() int {
+	n := 0
+	for _, rj := range s.jobs {
+		if rj != nil && rj.bt {
+			n++
+		}
+	}
+	return n
+}
+
 // promotePending 把 store 里最早创建的 Pending 任务(尚未占 slot 的)
-// 按 FIFO 顺序提升到 Downloading,直到达到 MaxConcurrent 上限或没有
+// 按 FIFO 顺序提升到 Downloading,直到达到全局/BT 专用并发上限或没有
 // 候选任务为止。每个候选走一次 Start——Start 内部仍受并发上限保护,
 // 因此本方法在并发调用下也是安全的。
 //
@@ -193,9 +227,16 @@ func (s *Scheduler) promotePending() {
 		s.mu.Lock()
 		_, busy := s.jobs[tk.ID]
 		full := len(s.jobs) >= limit
+		btFull := protocol.ProtocolKind(tk.Protocol) == protocol.ProtoBT &&
+			s.btJobsLocked() >= s.effectiveBTMaxConcurrentLocked()
 		s.mu.Unlock()
 		if full {
 			return
+		}
+		if btFull {
+			// BT 专用上限已满时跳过该候选,但继续尝试后面的 HTTP/FTP
+			// 任务,避免一个 BT 队列堵住其它协议。
+			continue
 		}
 		if busy {
 			continue
@@ -287,14 +328,18 @@ func (s *Scheduler) Start(taskID string) error {
 		s.mu.Unlock()
 		return errors.New("scheduler: task already running")
 	}
-	// 并发上限检查:任务已经在引擎中跑时直接放行;Pending 任务
-	// (新加入的)若当前 slots 已满,留在 Pending 不报错——调用方
-	// (UI 对话框)无需特殊处理,等待 promotePending 自然提升即可。
-	if tk0.Status == store.TaskStatus.Pending && len(s.jobs) >= s.maxConcurrent {
-		s.mu.Unlock()
-		// 静默排队:不分配 slot、不增 wg;后续有任务完成时由
-		// promotePending 把它提升到 Downloading。
-		return nil
+	// 并发上限检查:Pending 任务同时受全局 maxConcurrent 与 BT 专用
+	// btMaxConcurrent 约束。超出时留在 Pending 不报错——调用方(UI
+	// 对话框)无需特殊处理,等待 promotePending 自然提升即可。
+	if tk0.Status == store.TaskStatus.Pending {
+		btFull := protocol.ProtocolKind(tk0.Protocol) == protocol.ProtoBT &&
+			s.btJobsLocked() >= s.effectiveBTMaxConcurrentLocked()
+		if len(s.jobs) >= s.maxConcurrent || btFull {
+			s.mu.Unlock()
+			// 静默排队:不分配 slot、不增 wg;后续有任务完成时由
+			// promotePending 把它提升到 Downloading。
+			return nil
+		}
 	}
 	// 立即预留 slot,携带 prepareCtx/prepareCancel 以便 Pause/PauseAll
 	// 在 probe/预分配阶段也能中止任务;同时把 wg.Add 提到这里,
@@ -303,6 +348,7 @@ func (s *Scheduler) Start(taskID string) error {
 	s.jobs[taskID] = &runningJob{
 		prepareCtx:    prepareCtx,
 		prepareCancel: prepareCancel,
+		bt:            protocol.ProtocolKind(tk0.Protocol) == protocol.ProtoBT,
 		sess:          newJobSession(),
 	}
 	s.wg.Add(1)

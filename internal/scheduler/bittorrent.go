@@ -29,6 +29,17 @@ const btProgressEvery = time.Second
 // peer 时周期性记一条,便于区分「网络不通」与「卡死」。
 const btMetadataLogEvery = 30 * time.Second
 
+// startSeedMonitor 可在测试中替换,避免用零值句柄启动真实分享率轮询。
+// 在 init 中赋值以避开 monitor→dropSeedIf→promoteSeedQueue→本变量的
+// 包级初始化环。
+var startSeedMonitor func(s *Scheduler, taskID string, h *bittorrent.Handle, total int64)
+
+func init() {
+	startSeedMonitor = func(s *Scheduler, taskID string, h *bittorrent.Handle, total int64) {
+		go s.monitorSeedRatio(taskID, h, total)
+	}
+}
+
 // BittorrentConfigFrom 把持久化设置映射为 BT 客户端配置。
 // 供 main.go 启动时与 uimgr 每次保存设置时调用。
 func BittorrentConfigFrom(s store.Settings) bittorrent.Config {
@@ -39,7 +50,9 @@ func BittorrentConfigFrom(s store.Settings) bittorrent.Config {
 		UploadLimit:        int64(s.BTUploadLimitKiB) * 1024,
 		EnableDHT:          s.BTDHT,
 		EnablePEX:          s.BTPEX,
-		Seeding:            s.BTSeeding,
+		SeedRatio:          s.BTSeedRatio,
+		MaxSeeding:         s.EffectiveBTMaxSeeding(),
+		MaxConcurrentTasks: s.EffectiveBTMaxConcurrent(),
 		ExtraTrackers:      SplitTrackers(s.BTTrackers),
 		HTTPProxy:          protocol.HTTPProxyFunc(),
 	}
@@ -75,9 +88,21 @@ func (s *Scheduler) SetBittorrentConfig(cfg bittorrent.Config) {
 	m := s.bt
 	s.btCfg = cfg
 	s.btMu.Unlock()
+	s.mu.Lock()
+	s.btMaxConcurrent = cfg.MaxConcurrentTasks
+	s.mu.Unlock()
+	// 关闭做种时立即停止已登记的做种句柄;分享率调小由各任务的监控
+	// goroutine 在下一个采样周期读到新值后生效。
+	if cfg.SeedRatio <= 0 {
+		s.dropAllSeeds()
+	} else {
+		s.rebalanceSeeds()
+	}
 	if m != nil {
 		m.ApplyConfig(cfg)
 	}
+	// BT 并发上限可能被调大,立即尝试提升排队的 Pending 任务。
+	s.promotePending()
 }
 
 // bittorrentClient 返回共享的 BT 客户端管理器,首次调用时按当前配置创建。
@@ -101,10 +126,9 @@ func (s *Scheduler) CloseBittorrent() {
 	m := s.bt
 	s.bt = nil
 	s.btMu.Unlock()
-	// 做种句柄随客户端一起失效,清掉引用避免退出后重复 Drop。
-	s.seedsMu.Lock()
-	s.btSeeds = map[string]*bittorrent.Handle{}
-	s.seedsMu.Unlock()
+	// 先关闭做种句柄,让分享率监控 goroutine 收到 Done 后退出;
+	// 再关闭客户端统一释放剩余连接。
+	s.dropAllSeeds()
 	if m != nil {
 		if err := m.Close(); err != nil {
 			logging.Printf("scheduler: close bittorrent client: %v", err)
@@ -115,43 +139,224 @@ func (s *Scheduler) CloseBittorrent() {
 // ---- 做种任务簿记 ----
 
 // keepSeeding 把「已下载完成但按设置继续做种」的句柄登记下来:任务从此
-// 不再占用并发槽位(已 Completed),但客户端仍保持上传,直到用户删除任务
-// 或退出程序。
-func (s *Scheduler) keepSeeding(taskID string, h *bittorrent.Handle) {
+// 不再占用并发槽位(已 Completed),但客户端仍保持上传,直到分享率达标、
+// 用户删除任务或退出程序。关闭做种时返回 false,调用方需要照常关闭句柄。
+// 达到同时做种上限时,新完成的种子进入等待队列并暂停上传;已有种子
+// 达到分享率释放名额后,队列按 FIFO 顺序接替上传。
+func (s *Scheduler) keepSeeding(taskID string, h *bittorrent.Handle, total int64) bool {
+	s.btMu.Lock()
+	ratio := s.btCfg.SeedRatio
+	limit := s.btCfg.MaxSeeding
+	s.btMu.Unlock()
+	if ratio <= 0 || total <= 0 {
+		return false
+	}
+	if limit <= 0 {
+		limit = store.DefaultBTMaxSeeding
+	}
+
 	s.seedsMu.Lock()
 	if s.btSeeds == nil {
-		s.btSeeds = map[string]*bittorrent.Handle{}
+		s.btSeeds = map[string]*seedEntry{}
 	}
-	old := s.btSeeds[taskID]
-	s.btSeeds[taskID] = h
+	old := s.removeSeedLocked(taskID)
+	entry := &seedEntry{handle: h, total: total}
+	s.btSeeds[taskID] = entry
+	queued := len(s.btSeedOrder) >= limit
+	if queued {
+		h.DisallowUpload()
+		s.btSeedQueue = append(s.btSeedQueue, taskID)
+	} else {
+		h.AllowUpload()
+		s.btSeedOrder = append(s.btSeedOrder, taskID)
+	}
 	s.seedsMu.Unlock()
-	if old != nil && old != h {
-		old.Close()
+	if old != nil && old.handle != nil && old.handle != h {
+		old.handle.Close()
 	}
+	if queued {
+		logging.Printf("scheduler: bt task %s queued for seeding (limit %d)", taskID, limit)
+		return true
+	}
+	startSeedMonitor(s, taskID, h, total)
+	return true
+}
+
+// removeSeedLocked 从活动集合与等待队列中删除记录;调用方需持有 seedsMu。
+// 返回值仅用于调用方在释放锁后关闭句柄。
+func (s *Scheduler) removeSeedLocked(taskID string) *seedEntry {
+	e := s.btSeeds[taskID]
+	if e == nil {
+		return nil
+	}
+	delete(s.btSeeds, taskID)
+	s.btSeedOrder = removeString(s.btSeedOrder, taskID)
+	s.btSeedQueue = removeString(s.btSeedQueue, taskID)
+	return e
+}
+
+// removeString 返回去掉 target 后的新切片,避免调用方持有旧底层数组。
+func removeString(list []string, target string) []string {
+	out := list[:0]
+	for _, s := range list {
+		if s != target {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// seedRatioCheckEvery 是分享率采样周期。做种上传本身由客户端维护,
+// 这里只读取累计上传字节,5s 的检查频率足够且不会增加明显开销。
+const seedRatioCheckEvery = 5 * time.Second
+
+// monitorSeedRatio 周期性检查累计上传量,达到当前分享率后停止做种。
+// 每次采样都读取最新配置,因此用户在设置里调小分享率或关闭做种后
+// 不需要重启任务。句柄被删除/替换时 Done 关闭,goroutine 自行退出。
+func (s *Scheduler) monitorSeedRatio(taskID string, h *bittorrent.Handle, total int64) {
+	if total <= 0 {
+		return
+	}
+	ticker := time.NewTicker(seedRatioCheckEvery)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.Done():
+			return
+		case <-ticker.C:
+			// 句柄可能在进入本分支的同时被删除/替换;先确认仍存活再读统计。
+			select {
+			case <-h.Done():
+				return
+			default:
+			}
+			s.btMu.Lock()
+			ratio := s.btCfg.SeedRatio
+			s.btMu.Unlock()
+			if ratio <= 0 {
+				_ = s.dropSeedIf(taskID, h)
+				return
+			}
+			if seedRatioReached(h.UploadedData(), total, ratio) {
+				if s.dropSeedIf(taskID, h) {
+					logging.Printf("scheduler: bt task %s reached seed ratio %.2f; stopping seed", taskID, ratio)
+				}
+				return
+			}
+		}
+	}
+}
+
+// seedRatioReached 判断上传量是否达到 total*ratio。ratio<=0 时不做种。
+func seedRatioReached(uploaded, total int64, ratio float64) bool {
+	return ratio > 0 && total > 0 && float64(uploaded) >= float64(total)*ratio
+}
+
+// dropSeedIf 仅在 taskID 仍指向 h 时停止做种,避免误关同一任务的新句柄。
+func (s *Scheduler) dropSeedIf(taskID string, h *bittorrent.Handle) bool {
+	s.seedsMu.Lock()
+	e := s.btSeeds[taskID]
+	if e == nil || e.handle != h {
+		s.seedsMu.Unlock()
+		return false
+	}
+	s.removeSeedLocked(taskID)
+	s.seedsMu.Unlock()
+	h.Close()
+	s.promoteSeedQueue()
+	return true
 }
 
 // dropSeed 停止某个任务的做种(任务被删除/取消时调用)。
 func (s *Scheduler) dropSeed(taskID string) {
 	s.seedsMu.Lock()
-	h := s.btSeeds[taskID]
-	delete(s.btSeeds, taskID)
+	e := s.removeSeedLocked(taskID)
 	s.seedsMu.Unlock()
-	if h != nil {
-		h.Close()
+	if e != nil && e.handle != nil {
+		e.handle.Close()
 	}
+	s.promoteSeedQueue()
 }
 
 // dropAllSeeds 停止所有做种(退出流程调用)。
 func (s *Scheduler) dropAllSeeds() {
 	s.seedsMu.Lock()
 	seeds := s.btSeeds
-	s.btSeeds = map[string]*bittorrent.Handle{}
+	s.btSeeds = map[string]*seedEntry{}
+	s.btSeedOrder = nil
+	s.btSeedQueue = nil
 	s.seedsMu.Unlock()
-	for _, h := range seeds {
-		if h != nil {
-			h.Close()
+	for _, e := range seeds {
+		if e != nil && e.handle != nil {
+			e.handle.Close()
 		}
 	}
+}
+
+// promoteSeedQueue 在有名额时把等待队列中的种子提升为上传状态,
+// 每个接替上传的种子启动独立的分享率监控。
+func (s *Scheduler) promoteSeedQueue() {
+	s.btMu.Lock()
+	ratio := s.btCfg.SeedRatio
+	limit := s.btCfg.MaxSeeding
+	s.btMu.Unlock()
+	if ratio <= 0 {
+		return
+	}
+	if limit <= 0 {
+		limit = store.DefaultBTMaxSeeding
+	}
+
+	type promoted struct {
+		taskID string
+		entry  *seedEntry
+	}
+	var started []promoted
+	s.seedsMu.Lock()
+	for len(s.btSeedQueue) > 0 && len(s.btSeedOrder) < limit {
+		taskID := s.btSeedQueue[0]
+		s.btSeedQueue = s.btSeedQueue[1:]
+		e := s.btSeeds[taskID]
+		if e == nil || e.handle == nil {
+			continue
+		}
+		e.handle.AllowUpload()
+		s.btSeedOrder = append(s.btSeedOrder, taskID)
+		started = append(started, promoted{taskID: taskID, entry: e})
+	}
+	s.seedsMu.Unlock()
+	for _, p := range started {
+		startSeedMonitor(s, p.taskID, p.entry.handle, p.entry.total)
+	}
+}
+
+// rebalanceSeeds 在同时做种上限变化后调整活动集合:上限调小时把最新的
+// 活动种子移入等待队列并暂停上传;调大时立即补位。
+func (s *Scheduler) rebalanceSeeds() {
+	s.btMu.Lock()
+	ratio := s.btCfg.SeedRatio
+	limit := s.btCfg.MaxSeeding
+	s.btMu.Unlock()
+	if ratio <= 0 {
+		s.dropAllSeeds()
+		return
+	}
+	if limit <= 0 {
+		limit = store.DefaultBTMaxSeeding
+	}
+
+	s.seedsMu.Lock()
+	for len(s.btSeedOrder) > limit {
+		taskID := s.btSeedOrder[len(s.btSeedOrder)-1]
+		s.btSeedOrder = s.btSeedOrder[:len(s.btSeedOrder)-1]
+		if e := s.btSeeds[taskID]; e != nil && e.handle != nil {
+			e.handle.DisallowUpload()
+			// 从活动集合尾部往前移入时前插,保持等待队列按原活动顺序 FIFO。
+			s.btSeedQueue = append([]string{taskID}, s.btSeedQueue...)
+		}
+	}
+	s.seedsMu.Unlock()
+	s.promoteSeedQueue()
 }
 
 // ---- 任务启动 ----
@@ -374,9 +579,12 @@ func (s *Scheduler) completeBittorrent(
 	// 做种:任务已 Completed、槽位即将释放,但客户端继续保持该种子上传。
 	// 句柄因此不在 defer 里摘除,而是登记到 btSeeds,等删除任务或退出时停止。
 	if handle.Seeding() {
-		s.keepSeeding(taskID, handle)
-		*seedingKept = true
-		logging.Printf("scheduler: bt task %s completed, seeding continues", taskID)
+		if s.keepSeeding(taskID, handle, snap.Total) {
+			*seedingKept = true
+			logging.Printf("scheduler: bt task %s completed, seeding registered", taskID)
+		} else {
+			logging.Printf("scheduler: bt task %s completed, seeding disabled", taskID)
+		}
 	}
 }
 

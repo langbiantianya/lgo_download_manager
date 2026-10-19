@@ -198,7 +198,7 @@ func TestDownloadFromLoopbackPeer(t *testing.T) {
 		MaxPeersPerTorrent: 8,
 		EnableDHT:          false,
 		EnablePEX:          false,
-		Seeding:            false,
+		SeedRatio:          0,
 	})
 	if err != nil {
 		t.Fatalf("manager: %v", err)

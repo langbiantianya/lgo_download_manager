@@ -12,6 +12,8 @@
 package settings
 
 import (
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 
@@ -23,6 +25,9 @@ import (
 )
 
 const mib = int64(1 << 20)
+
+// pickBTPort 可在测试中替换,避免依赖沙箱是否允许监听回环端口。
+var pickBTPort = pickAvailableBTPort
 
 // Load 从存储读取持久化设置，应用首次运行默认值与 forceLight 覆盖，
 // 并把代理配置同步到 protocol 包。首次运行时自动保存默认值行。
@@ -47,20 +52,30 @@ func Load(st *store.Store, forceLight bool) (store.Settings, error) {
 		persisted.LightMode = true
 		// 首次运行:同时下载任务数默认 3,与主流下载器轻量场景对齐。
 		persisted.MaxConcurrent = store.DefaultMaxConcurrent
-		// BitTorrent 默认值:监听端口随机、不限速、DHT/PEX 开启
-		// (磁力链接没有 tracker 时几乎只能靠它们找 peer)、
-		// 下载完成后不做种(默认不占用上传带宽)。
-		persisted.BTPort = 0
+		// BitTorrent 默认值:首次启动选一个当前可用的监听端口并持久化,
+		// 之后每次启动沿用;不限速、DHT/PEX 开启(磁力链接没有 tracker
+		// 时几乎只能靠它们找 peer)、分享率 2、同时做种 2 条、BT 同时下载 2 个。
+		persisted.BTPort = pickBTPort()
 		persisted.BTMaxPeers = store.DefaultBTMaxPeers
 		persisted.BTDownloadLimitKiB = 0
 		persisted.BTUploadLimitKiB = 0
 		persisted.BTDHT = true
 		persisted.BTPEX = true
-		persisted.BTSeeding = false
+		persisted.BTSeedRatio = store.DefaultBTSeedRatio
+		persisted.BTMaxSeeding = store.DefaultBTMaxSeeding
+		persisted.BTMaxConcurrent = store.DefaultBTMaxConcurrent
 		persisted.BTTrackers = ""
 	}
 	if forceLight {
 		persisted.LightMode = true
+	}
+	// BT 专用并发/做种上限 <=0 视为未配置,统一落到默认值;这样 UI 和
+	// 持久化都不会显示/保存 0 这种需要 scheduler 再兜底的值。
+	if persisted.BTMaxSeeding <= 0 {
+		persisted.BTMaxSeeding = store.DefaultBTMaxSeeding
+	}
+	if persisted.BTMaxConcurrent <= 0 {
+		persisted.BTMaxConcurrent = store.DefaultBTMaxConcurrent
 	}
 	// Language 兜底:
 	//   - 持久化值非空 → Normalize 折叠一次,无效标签 → 默认 zh-Hans;
@@ -81,6 +96,32 @@ func Load(st *store.Store, forceLight bool) (store.Settings, error) {
 		}
 	}
 	return persisted, nil
+}
+
+// pickAvailableBTPort 返回一个 TCP 与 UDP 都能绑定的端口。BT 客户端会
+// 同时用这两种协议监听,只检查 TCP 可能在真正启动时因 UDP 占用而失败。
+// 返回 0 表示当前环境无法探测端口,调用方沿用旧语义交给系统随机分配。
+func pickAvailableBTPort() int {
+	for attempt := 0; attempt < 8; attempt++ {
+		tcpLn, err := net.Listen("tcp", ":0")
+		if err != nil {
+			return 0
+		}
+		addr, ok := tcpLn.Addr().(*net.TCPAddr)
+		if !ok {
+			tcpLn.Close()
+			return 0
+		}
+		udpAddr := fmt.Sprintf(":%d", addr.Port)
+		udpLn, err := net.ListenPacket("udp", udpAddr)
+		if err == nil {
+			udpLn.Close()
+			tcpLn.Close()
+			return addr.Port
+		}
+		tcpLn.Close()
+	}
+	return 0
 }
 
 // Save 持久化设置并同步进程级代理配置与开机自启。任何 UI 修改后均可安全调用。

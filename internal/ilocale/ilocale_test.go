@@ -101,6 +101,9 @@ func TestT_PerLanguageCoveredKeys(t *testing.T) {
 		"settings.tab.download",
 		"settings.tab.network",
 		"settings.tab.bittorrent",
+		"settings.label.btMaxConcurrent",
+		"settings.label.btSeeding",
+		"settings.label.btMaxSeeding",
 		// 托盘菜单与 tooltip —— 业务进程里也用,跨 6 语言都必须有覆盖。
 		"tray.menu.open",
 		"tray.menu.open.tooltip",
@@ -126,6 +129,31 @@ func TestT_PerLanguageCoveredKeys(t *testing.T) {
 				// 翻译"可能"恰好相同(例如英文/德文都短),但覆盖面积极小;
 				// 这里只看它是否被加载——已经验证非空,所以允许相同。
 				t.Logf("%s key %q happens to equal zh-Hans text %q", lang, k, got)
+			}
+		}
+	}
+}
+
+// TestBTSettingsLabelsNoPrefix 验证 BT 页签内的设置项名称不再带 BT
+// 前缀/标记,页签标题本身仍保留 BitTorrent。
+func TestBTSettingsLabelsNoPrefix(t *testing.T) {
+	keys := []string{
+		"settings.label.btPort",
+		"settings.label.btMaxConcurrent",
+		"settings.label.btMaxSeeding",
+		"settings.label.btDownloadLimit",
+		"settings.label.btUploadLimit",
+		"settings.label.btPeers",
+		"settings.label.btDHT",
+		"settings.label.btPEX",
+		"settings.label.btSeeding",
+		"settings.label.btTrackers",
+	}
+	for _, lang := range Supported {
+		Set(lang)
+		for _, key := range keys {
+			if label := T(key); strings.Contains(label, "BT") {
+				t.Errorf("%s %s = %q, should not contain BT", lang, key, label)
 			}
 		}
 	}

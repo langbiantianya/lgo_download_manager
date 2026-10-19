@@ -338,8 +338,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_save_path    ON tasks(save_path ASC, id ASC
 	if err := s.addColumnIfMissing("settings", "language", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
-	// BitTorrent 相关设置列。缺省值即「首次运行默认值」:端口随机、
-	// 不限速、DHT/PEX 开启、完成后不做种、无附加 tracker。
+	// BitTorrent 相关设置列。数值列的 0/-1 是「尚未配置」哨兵,
+	// 首次运行的具体默认值(可用端口、分享率 2、做种/下载并发 2 等)
+	// 由 settings.Load 套用。
 	if err := s.addColumnIfMissing("settings", "bt_port", `INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
@@ -359,6 +360,21 @@ CREATE INDEX IF NOT EXISTS idx_tasks_save_path    ON tasks(save_path ASC, id ASC
 		return err
 	}
 	if err := s.addColumnIfMissing("settings", "bt_seeding", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	// bt_seed_ratio 是新版的「分享率」设置。-1 是迁移哨兵:老库新增
+	// 该列后读到 -1,由 LoadSettings 统一套用新版默认值 2。
+	if err := s.addColumnIfMissing("settings", "bt_seed_ratio", `REAL NOT NULL DEFAULT -1`); err != nil {
+		return err
+	}
+	// bt_max_seeding 是同时做种任务数上限。-1 同样是迁移哨兵,
+	// 老库升级后落到默认值 2。
+	if err := s.addColumnIfMissing("settings", "bt_max_seeding", `INTEGER NOT NULL DEFAULT -1`); err != nil {
+		return err
+	}
+	// bt_max_concurrent 是 BT 任务专用的同时下载上限。-1 同样是迁移
+	// 哨兵,老库升级后落到默认值 2。
+	if err := s.addColumnIfMissing("settings", "bt_max_concurrent", `INTEGER NOT NULL DEFAULT -1`); err != nil {
 		return err
 	}
 	if err := s.addColumnIfMissing("settings", "bt_trackers", `TEXT NOT NULL DEFAULT ''`); err != nil {
@@ -786,9 +802,16 @@ type Settings struct {
 	// BTPEX 控制是否启用 Peer Exchange(节点交换),默认开启。
 	BTPEX bool
 
-	// BTSeeding 表示下载完成后是否继续做种(上传给其它 peer)。
-	// 关闭时任务一旦完成即断开所有连接,不再上传。
-	BTSeeding bool
+	// BTSeedRatio 是做种分享率:上传量达到下载量的该倍数后停止做种。
+	// 0 表示下载完成后不再做种。
+	BTSeedRatio float64
+
+	// BTMaxSeeding 是同时保持上传的做种任务数上限。<=0 表示使用默认值,
+	// 分享率为 0 时仍完全不做种。
+	BTMaxSeeding int
+
+	// BTMaxConcurrent 是 BT 任务专用的同时下载上限。<=0 表示使用默认值。
+	BTMaxConcurrent int
 
 	// BTTrackers 是附加 tracker 列表(逗号或换行分隔),会追加到每个
 	// BT 任务。对磁力链接尤其有用:内置 tracker 失效时仍能靠这些
@@ -805,12 +828,37 @@ const DefaultMaxConcurrent = 3
 // anacrolix/torrent 自身的 EstablishedConnsPerTorrent 默认值一致。
 const DefaultBTMaxPeers = 50
 
+// DefaultBTSeedRatio 是首次运行与旧库迁移时使用的做种分享率。
+const DefaultBTSeedRatio = 2.0
+
+// DefaultBTMaxSeeding 是同时做种任务数的兜底默认值。
+const DefaultBTMaxSeeding = 2
+
+// DefaultBTMaxConcurrent 是 BTMaxConcurrent 未配置时的兜底值。
+const DefaultBTMaxConcurrent = 2
+
 // EffectiveMaxConcurrent 返回 MaxConcurrent 的有效值:<=0 视为默认。
 func (s Settings) EffectiveMaxConcurrent() int {
 	if s.MaxConcurrent <= 0 {
 		return DefaultMaxConcurrent
 	}
 	return s.MaxConcurrent
+}
+
+// EffectiveBTMaxConcurrent 返回 BT 专用并发上限的有效值:<=0 视为默认。
+func (s Settings) EffectiveBTMaxConcurrent() int {
+	if s.BTMaxConcurrent <= 0 {
+		return DefaultBTMaxConcurrent
+	}
+	return s.BTMaxConcurrent
+}
+
+// EffectiveBTMaxSeeding 返回同时做种任务数的有效值:<=0 视为默认。
+func (s Settings) EffectiveBTMaxSeeding() int {
+	if s.BTMaxSeeding <= 0 {
+		return DefaultBTMaxSeeding
+	}
+	return s.BTMaxSeeding
 }
 
 // EffectiveBTMaxPeers 返回 BTMaxPeers 的有效值:<=0 视为默认。
@@ -828,29 +876,31 @@ func (s *Store) LoadSettings() (Settings, error) {
 	defer s.mu.Unlock()
 
 	var (
-		saveDir     string
-		threads     int
-		minChunk    int64
-		ua          string
-		cookies     string
-		passive     int
-		prealloc    int
-		taskSort    string
-		proxyMode   string
-		proxyURL    string
-		proxyBypass string
-		lightMode   int
-		maxConc     int
-		autoStart   int
-		language    string
-		btPort      int
-		btMaxPeers  int
-		btDlLimit   int
-		btUlLimit   int
-		btDHT       int
-		btPEX       int
-		btSeeding   int
-		btTrackers  string
+		saveDir         string
+		threads         int
+		minChunk        int64
+		ua              string
+		cookies         string
+		passive         int
+		prealloc        int
+		taskSort        string
+		proxyMode       string
+		proxyURL        string
+		proxyBypass     string
+		lightMode       int
+		maxConc         int
+		autoStart       int
+		language        string
+		btPort          int
+		btMaxPeers      int
+		btDlLimit       int
+		btUlLimit       int
+		btDHT           int
+		btPEX           int
+		btSeedRatio     float64
+		btMaxSeeding    int
+		btMaxConcurrent int
+		btTrackers      string
 	)
 	err := s.db.QueryRow(`SELECT default_save_dir, default_threads, min_chunk_size,
 		user_agent, cookies, ftp_passive, prealloc, task_sort,
@@ -865,12 +915,14 @@ func (s *Store) LoadSettings() (Settings, error) {
 		COALESCE(bt_upload_limit, 0),
 		COALESCE(bt_dht, 1),
 		COALESCE(bt_pex, 1),
-		COALESCE(bt_seeding, 0),
+		COALESCE(bt_seed_ratio, -1),
+		COALESCE(bt_max_seeding, -1),
+		COALESCE(bt_max_concurrent, -1),
 		COALESCE(bt_trackers, '')
 		FROM settings WHERE id=1`,
 	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc, &taskSort,
 		&proxyMode, &proxyURL, &proxyBypass, &lightMode, &maxConc, &autoStart, &language,
-		&btPort, &btMaxPeers, &btDlLimit, &btUlLimit, &btDHT, &btPEX, &btSeeding, &btTrackers)
+		&btPort, &btMaxPeers, &btDlLimit, &btUlLimit, &btDHT, &btPEX, &btSeedRatio, &btMaxSeeding, &btMaxConcurrent, &btTrackers)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 首次运行：插入一条全零行，以便后续 LoadSettings 能读到。
 		_, ierr := s.db.Exec(`INSERT OR IGNORE INTO settings (id) VALUES (1)`)
@@ -885,6 +937,17 @@ func (s *Store) LoadSettings() (Settings, error) {
 	// 兼容升级：未持久化 proxy_mode 时根据 proxy_url 是否非空推断。
 	// - 空 URL ⇒ System（默认，与"未启用"语义一致）
 	// - 非空 URL ⇒ Manual（旧版的"启用 HTTP 代理"）
+	if btSeedRatio < 0 {
+		// 兼容旧库:旧版只有布尔 bt_seeding,-1 表示尚未配置。
+		// 新版的默认分享率是 2,老库升级后也落到这个新默认。
+		btSeedRatio = DefaultBTSeedRatio
+	}
+	if btMaxConcurrent < 0 {
+		btMaxConcurrent = DefaultBTMaxConcurrent
+	}
+	if btMaxSeeding < 0 {
+		btMaxSeeding = DefaultBTMaxSeeding
+	}
 	mode := protocol.ParseProxyMode(proxyMode)
 	if proxyMode == "" {
 		if proxyURL != "" {
@@ -915,15 +978,17 @@ func (s *Store) LoadSettings() (Settings, error) {
 		// language 列缺省值为空:settings.Load 把空值视为「未设置」,
 		// 走系统语言兜底;校验/兜底都在 settings 层,这里只透传原始值。
 		Language: language,
-		// BT 列的缺省值即首次运行默认值(端口随机 / 不限速 / DHT+PEX 开启 /
-		// 完成后不做种 / 无附加 tracker),旧库经列迁移后同样落到这里。
+		// BT 列的缺省值只表达「尚未配置」;首次运行默认值由 settings.Load
+		// 套用,旧库的 bt_seeding 布尔开关在上方迁移为分享率/并发默认值。
 		BTPort:             btPort,
 		BTMaxPeers:         btMaxPeers,
 		BTDownloadLimitKiB: btDlLimit,
 		BTUploadLimitKiB:   btUlLimit,
 		BTDHT:              btDHT != 0,
 		BTPEX:              btPEX != 0,
-		BTSeeding:          btSeeding != 0,
+		BTSeedRatio:        btSeedRatio,
+		BTMaxSeeding:       btMaxSeeding,
+		BTMaxConcurrent:    btMaxConcurrent,
 		BTTrackers:         btTrackers,
 	}, nil
 }
@@ -936,8 +1001,8 @@ func (s *Store) SaveSettings(s2 Settings) error {
 		min_chunk_size, user_agent, cookies, ftp_passive, prealloc, task_sort,
 		proxy_mode, proxy_url, proxy_bypass, light_mode, max_concurrent, auto_start,
 		language, bt_port, bt_max_peers, bt_download_limit, bt_upload_limit,
-		bt_dht, bt_pex, bt_seeding, bt_trackers)
-	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		bt_dht, bt_pex, bt_seeding, bt_seed_ratio, bt_max_seeding, bt_max_concurrent, bt_trackers)
+	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(id) DO UPDATE SET
 			default_save_dir=excluded.default_save_dir,
 			default_threads=excluded.default_threads,
@@ -961,6 +1026,9 @@ func (s *Store) SaveSettings(s2 Settings) error {
 			bt_dht=excluded.bt_dht,
 			bt_pex=excluded.bt_pex,
 			bt_seeding=excluded.bt_seeding,
+			bt_seed_ratio=excluded.bt_seed_ratio,
+			bt_max_seeding=excluded.bt_max_seeding,
+			bt_max_concurrent=excluded.bt_max_concurrent,
 			bt_trackers=excluded.bt_trackers`,
 		s2.DefaultSaveDir, s2.DefaultThreads, s2.MinChunkSize,
 		s2.UserAgent, s2.Cookies, boolToInt(s2.FTPPassive), boolToInt(s2.Prealloc),
@@ -976,7 +1044,10 @@ func (s *Store) SaveSettings(s2 Settings) error {
 		s2.BTUploadLimitKiB,
 		boolToInt(s2.BTDHT),
 		boolToInt(s2.BTPEX),
-		boolToInt(s2.BTSeeding),
+		boolToInt(s2.BTSeedRatio > 0),
+		s2.BTSeedRatio,
+		s2.BTMaxSeeding,
+		s2.BTMaxConcurrent,
 		s2.BTTrackers,
 	)
 	if err != nil {

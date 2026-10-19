@@ -64,8 +64,14 @@ type Config struct {
 	EnableDHT bool
 	// EnablePEX 控制是否启用 Peer Exchange(节点交换)。
 	EnablePEX bool
-	// Seeding 为 true 时下载完成后继续做种上传;为 false 时任务完成即断开。
-	Seeding bool
+	// SeedRatio 是做种分享率:上传量达到下载量的该倍数后由 scheduler
+	// 停止做种。0 表示任务完成即断开。
+	SeedRatio float64
+	// MaxSeeding 是 scheduler 允许同时上传的做种任务数。
+	MaxSeeding int
+	// MaxConcurrentTasks 是 scheduler 允许同时运行的 BT 任务数;
+	// 该值不参与底层客户端构造,仅随配置一起传递。
+	MaxConcurrentTasks int
 	// ExtraTrackers 是追加到每个任务的 tracker 列表(逗号/换行已在
 	// scheduler 侧拆分)。磁力链接自带 tracker 较少时尤其有用。
 	ExtraTrackers []string
@@ -203,7 +209,7 @@ func (m *Manager) startClientLocked() error {
 	tc.ListenPort = cfg.ListenPort // 0 => 系统随机分配
 	tc.NoDHT = !cfg.EnableDHT
 	tc.DisablePEX = !cfg.EnablePEX
-	tc.Seed = cfg.Seeding
+	tc.Seed = cfg.SeedRatio > 0
 	maxPeers := cfg.MaxPeersPerTorrent
 	if maxPeers <= 0 {
 		maxPeers = defaultMaxPeersPerTorrent
@@ -258,7 +264,7 @@ func requiresRestart(old, cfg Config) bool {
 		old.MaxPeersPerTorrent != cfg.MaxPeersPerTorrent ||
 		old.EnableDHT != cfg.EnableDHT ||
 		old.EnablePEX != cfg.EnablePEX ||
-		old.Seeding != cfg.Seeding ||
+		(old.SeedRatio > 0) != (cfg.SeedRatio > 0) ||
 		strings.Join(old.ExtraTrackers, ",") != strings.Join(cfg.ExtraTrackers, ",") ||
 		(old.HTTPProxy == nil) != (cfg.HTTPProxy == nil) {
 		return true
@@ -460,6 +466,32 @@ func (h *Handle) Name() string { return h.t.Name() }
 
 // Seeding 报告当前任务是否处于做种状态(数据已完整且愿意未取偿上传)。
 func (h *Handle) Seeding() bool { return h.t.Seeding() }
+
+// UploadedData 返回已上传的负载字节数,供分享率控制使用。
+func (h *Handle) UploadedData() int64 {
+	stats := h.t.Stats()
+	return stats.BytesWrittenData.Int64()
+}
+
+// Done 在句柄关闭后关闭,供做种监控 goroutine 退出。
+func (h *Handle) Done() <-chan struct{} { return h.done }
+
+// AllowUpload 允许该种子向 peer 上传数据,用于做种队列晋升。
+func (h *Handle) AllowUpload() {
+	if h == nil || h.t == nil {
+		return
+	}
+	h.t.AllowDataUpload()
+}
+
+// DisallowUpload 暂停该种子的数据上传,但保留种子和连接;用于做种
+// 队列超限时让出上传名额。
+func (h *Handle) DisallowUpload() {
+	if h == nil || h.t == nil {
+		return
+	}
+	h.t.DisallowDataUpload()
+}
 
 // InfoBytes 返回种子的 info 字典(未拿到元数据时为 nil),供持久化缓存。
 func (h *Handle) InfoBytes() []byte {
