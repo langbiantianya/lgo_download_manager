@@ -27,6 +27,10 @@ main.status.disk.unset: "Не задано"
 main.status.disk.error: "Недоступно ({{ .Err }})"
 
 settings.header.title: "Настройки"
+settings.tab.general: "Общие"
+settings.tab.download: "Загрузки"
+settings.tab.network: "Сеть"
+settings.tab.bittorrent: "BitTorrent"
 settings.label.saveDir: "Каталог сохранения по умолчанию"
 settings.label.threads: "Потоков по умолчанию"
 settings.label.maxConcurrent: "Одновременных задач"
@@ -112,7 +116,6 @@ time.hours: "{{ .N }} ч"
 time.hoursMinutes: "{{ .H }} ч {{ .M }} мин"
 
 # BitTorrent (магнит-ссылки / файлы .torrent)
-settings.bt.section: "BitTorrent"
 settings.label.btPort: "Порт прослушивания BT"
 settings.btPort.placeholder: "0 = случайный порт"
 settings.label.btDownloadLimit: "Ограничение скачивания BT"

@@ -27,6 +27,10 @@ main.status.disk.unset: "Not configured"
 main.status.disk.error: "Unavailable ({{ .Err }})"
 
 settings.header.title: "Settings"
+settings.tab.general: "General"
+settings.tab.download: "Downloads"
+settings.tab.network: "Network"
+settings.tab.bittorrent: "BitTorrent"
 settings.label.saveDir: "Default Save Directory"
 settings.label.threads: "Default Concurrent Threads"
 settings.label.maxConcurrent: "Concurrent Tasks"
@@ -112,7 +116,6 @@ time.hours: "{{ .N }}h"
 time.hoursMinutes: "{{ .H }}h {{ .M }}m"
 
 # BitTorrent (magnet links / .torrent files)
-settings.bt.section: "BitTorrent"
 settings.label.btPort: "BT listen port"
 settings.btPort.placeholder: "0 = pick a random port"
 settings.label.btDownloadLimit: "BT download limit"

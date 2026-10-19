@@ -10,8 +10,11 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/test"
+	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
@@ -100,6 +103,58 @@ func TestSettingsPersist_NilSvcIsSafe(t *testing.T) {
 		}
 	}()
 	settingsPersist(nil, nil, nil) // must not panic
+}
+
+// TestBuildSettingsContent_CategorizedTabs 锁定设置页的分类结构:
+// 常规、下载、网络、BitTorrent 各自独立成页,避免新增设置项后又
+// 把所有控件堆回同一条长表单。
+func TestBuildSettingsContent_CategorizedTabs(t *testing.T) {
+	test.NewApp()
+	defer test.NewApp()
+
+	prevLang := ilocale.Current()
+	ilocale.Set("en")
+	defer ilocale.Set(prevLang)
+
+	GlobalSettings = store.Settings{DefaultSaveDir: "/tmp"}
+	defer func() { GlobalSettings = store.Settings{} }()
+
+	content := buildSettingsContent(nil, nil, nil)
+	tabs, ok := content.(*container.AppTabs)
+	if !ok {
+		t.Fatalf("settings content = %T, want *container.AppTabs", content)
+	}
+	wantTabs := []struct {
+		title     string
+		firstItem string
+	}{
+		{"General", ilocale.T("settings.label.language")},
+		{"Downloads", ilocale.T("settings.label.saveDir")},
+		{"Network", ilocale.T("settings.label.ua")},
+		{"BitTorrent", ilocale.T("settings.label.btPort")},
+	}
+	if len(tabs.Items) != len(wantTabs) {
+		t.Fatalf("settings tabs = %d, want %d", len(tabs.Items), len(wantTabs))
+	}
+	for i, want := range wantTabs {
+		if got := tabs.Items[i].Text; got != want.title {
+			t.Errorf("tab %d title = %q, want %q", i, got, want.title)
+		}
+		scroll, ok := tabs.Items[i].Content.(*container.Scroll)
+		if !ok {
+			t.Fatalf("tab %d content = %T, want *container.Scroll", i, tabs.Items[i].Content)
+		}
+		form, ok := scroll.Content.(*widget.Form)
+		if !ok {
+			t.Fatalf("tab %d scroll content = %T, want *widget.Form", i, scroll.Content)
+		}
+		if len(form.Items) == 0 {
+			t.Fatalf("tab %d has no form items", i)
+		}
+		if got := form.Items[0].Text; got != want.firstItem {
+			t.Errorf("tab %d first item = %q, want %q", i, got, want.firstItem)
+		}
+	}
 }
 
 // TestApplyLanguage_SuppressesSettingsPersistDuringRebuild 端到端回归。

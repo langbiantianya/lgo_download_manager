@@ -268,11 +268,6 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		persist()
 	}
 
-	// 分区标题:沿用与其它分组一致的「粗体标签」样式,把 BitTorrent
-	// 相关的项在长表单里分隔出来。
-	btHeader := widget.NewLabel(ilocale.T("settings.bt.section"))
-	btHeader.TextStyle.Bold = true
-
 	browseBtn := widget.NewButton(ilocale.T("settings.browse"), func() {
 		dialog.ShowFolderOpen(func(uri fyne.ListableURI, err error) {
 			if err != nil || uri == nil {
@@ -338,23 +333,31 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	//   → 重译所有 widget。
 	langSelect := buildLanguageSelect(persist)
 
-	form := widget.NewForm(
+	// 设置项按用途分页,避免所有配置堆在同一条长表单里。
+	// 每个页签内部仍用 Form,保持标签与输入控件对齐;页签标题在
+	// 切换语言后由 showSettingsPage 重建本页时重新翻译。
+	generalForm := widget.NewForm(
 		widget.NewFormItem(ilocale.T("settings.label.language"), langSelect),
 		widget.NewFormItem(ilocale.T("settings.label.autoStart"), autoStartCheck),
 		widget.NewFormItem(ilocale.T("settings.label.lightMode"), lightModeCheck),
 		widget.NewFormItem(ilocale.T("settings.label.sort"), sortSelect),
+	)
+	downloadForm := widget.NewForm(
 		widget.NewFormItem(ilocale.T("settings.label.saveDir"), container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
 		widget.NewFormItem(ilocale.T("settings.label.threads"), threadsEntry),
 		widget.NewFormItem(ilocale.T("settings.label.maxConcurrent"), maxConcEntry),
 		widget.NewFormItem(ilocale.T("settings.label.minChunk"), chunkSizeRow),
+		widget.NewFormItem(ilocale.T("settings.label.ftp"), ftpPassive),
+		widget.NewFormItem(ilocale.T("settings.label.prealloc"), prealloc),
+	)
+	networkForm := widget.NewForm(
 		widget.NewFormItem(ilocale.T("settings.label.ua"), uaEntry),
 		widget.NewFormItem(ilocale.T("settings.label.cookies"), cookiesEntry),
 		widget.NewFormItem(ilocale.T("settings.label.proxyMode"), proxyModeSelect),
 		widget.NewFormItem(ilocale.T("settings.label.proxyURL"), proxyURLEntry),
 		widget.NewFormItem(ilocale.T("settings.label.proxyBypass"), proxyBypassEntry),
-		widget.NewFormItem(ilocale.T("settings.label.ftp"), ftpPassive),
-		widget.NewFormItem(ilocale.T("settings.label.prealloc"), prealloc),
-		widget.NewFormItem("", btHeader),
+	)
+	bittorrentForm := widget.NewForm(
 		widget.NewFormItem(ilocale.T("settings.label.btPort"), btPortEntry),
 		widget.NewFormItem(ilocale.T("settings.label.btDownloadLimit"), btDownRow),
 		widget.NewFormItem(ilocale.T("settings.label.btUploadLimit"), btUpRow),
@@ -365,9 +368,19 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		widget.NewFormItem(ilocale.T("settings.label.btTrackers"), btTrackersEntry),
 	)
 
-	scroll := container.NewScroll(form)
-	scroll.SetMinSize(fyne.NewSize(500, 400))
-	return scroll
+	tabItem := func(titleKey string, form *widget.Form) *container.TabItem {
+		scroll := container.NewVScroll(form)
+		scroll.SetMinSize(fyne.NewSize(500, 360))
+		return container.NewTabItem(ilocale.T(titleKey), scroll)
+	}
+	tabs := container.NewAppTabs(
+		tabItem("settings.tab.general", generalForm),
+		tabItem("settings.tab.download", downloadForm),
+		tabItem("settings.tab.network", networkForm),
+		tabItem("settings.tab.bittorrent", bittorrentForm),
+	)
+	tabs.SetTabLocation(container.TabLocationTop)
+	return tabs
 }
 
 // proxyModeLabel 返回代理模式在当前语言下的显示标签。

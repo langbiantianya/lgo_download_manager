@@ -28,6 +28,10 @@ main.status.disk.unset: "未设置"
 main.status.disk.error: "不可用 ({{ .Err }})"
 
 settings.header.title: "设置"
+settings.tab.general: "通用"
+settings.tab.download: "下载"
+settings.tab.network: "网络"
+settings.tab.bittorrent: "BitTorrent"
 settings.label.saveDir: "默认保存目录"
 settings.label.threads: "默认并发线程数"
 settings.label.maxConcurrent: "同时下载任务数"
@@ -113,7 +117,6 @@ time.hours: "{{ .N }} 小时"
 time.hoursMinutes: "{{ .H }} 小时 {{ .M }} 分"
 
 # BitTorrent(磁力链接 / .torrent 种子)
-settings.bt.section: "BitTorrent"
 settings.label.btPort: "BT 监听端口"
 settings.btPort.placeholder: "0 = 由系统随机分配"
 settings.label.btDownloadLimit: "BT 下载限速"

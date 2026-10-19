@@ -27,6 +27,10 @@ main.status.disk.unset: "未設定"
 main.status.disk.error: "無法使用 ({{ .Err }})"
 
 settings.header.title: "設定"
+settings.tab.general: "一般"
+settings.tab.download: "下載"
+settings.tab.network: "網路"
+settings.tab.bittorrent: "BitTorrent"
 settings.label.saveDir: "預設儲存目錄"
 settings.label.threads: "預設並行緒數"
 settings.label.maxConcurrent: "同時下載任務數"
@@ -112,7 +116,6 @@ time.hours: "{{ .N }} 小時"
 time.hoursMinutes: "{{ .H }} 小時 {{ .M }} 分"
 
 # BitTorrent(磁力連結 / .torrent 種子)
-settings.bt.section: "BitTorrent"
 settings.label.btPort: "BT 監聽連接埠"
 settings.btPort.placeholder: "0 = 由系統隨機分配"
 settings.label.btDownloadLimit: "BT 下載限速"

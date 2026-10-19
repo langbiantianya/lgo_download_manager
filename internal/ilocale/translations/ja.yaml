@@ -27,6 +27,10 @@ main.status.disk.unset: "未設定"
 main.status.disk.error: "取得できません ({{ .Err }})"
 
 settings.header.title: "設定"
+settings.tab.general: "一般"
+settings.tab.download: "ダウンロード"
+settings.tab.network: "ネットワーク"
+settings.tab.bittorrent: "BitTorrent"
 settings.label.saveDir: "デフォルトの保存先"
 settings.label.threads: "デフォルトの並列スレッド数"
 settings.label.maxConcurrent: "同時ダウンロード数"
@@ -112,7 +116,6 @@ time.hours: "{{ .N }}時間"
 time.hoursMinutes: "{{ .H }}時間 {{ .M }}分"
 
 # BitTorrent(マグネットリンク / .torrent ファイル)
-settings.bt.section: "BitTorrent"
 settings.label.btPort: "BT 待ち受けポート"
 settings.btPort.placeholder: "0 = ランダムに割り当て"
 settings.label.btDownloadLimit: "BT ダウンロード制限"

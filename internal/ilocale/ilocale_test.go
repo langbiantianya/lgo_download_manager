@@ -96,6 +96,11 @@ func TestT_PerLanguageCoveredKeys(t *testing.T) {
 		"taskRow.status.paused",
 		"addTask.start",
 		"taskList.empty",
+		// 设置页分类页签:每个语言都必须有可读的短标题。
+		"settings.tab.general",
+		"settings.tab.download",
+		"settings.tab.network",
+		"settings.tab.bittorrent",
 		// 托盘菜单与 tooltip —— 业务进程里也用,跨 6 语言都必须有覆盖。
 		"tray.menu.open",
 		"tray.menu.open.tooltip",

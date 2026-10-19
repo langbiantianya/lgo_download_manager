@@ -27,6 +27,10 @@ main.status.disk.unset: "Nicht festgelegt"
 main.status.disk.error: "Nicht verfügbar ({{ .Err }})"
 
 settings.header.title: "Einstellungen"
+settings.tab.general: "Allgemein"
+settings.tab.download: "Downloads"
+settings.tab.network: "Netzwerk"
+settings.tab.bittorrent: "BitTorrent"
 settings.label.saveDir: "Standard-Speicherordner"
 settings.label.threads: "Standard-Threads"
 settings.label.maxConcurrent: "Gleichzeitige Aufträge"
@@ -112,7 +116,6 @@ time.hours: "{{ .N }} Std."
 time.hoursMinutes: "{{ .H }} Std. {{ .M }} Min."
 
 # BitTorrent (Magnet-Links / .torrent-Dateien)
-settings.bt.section: "BitTorrent"
 settings.label.btPort: "BT-Listen-Port"
 settings.btPort.placeholder: "0 = zufälliger Port"
 settings.label.btDownloadLimit: "BT-Download-Limit"
