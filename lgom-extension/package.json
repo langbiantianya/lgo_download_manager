@@ -14,8 +14,8 @@
 		"package:firefox": "node scripts/package.mjs firefox",
 		"package:all": "node scripts/package.mjs chrome && node scripts/package.mjs firefox",
 		"preview": "vite preview",
-		"check": "node -e \"try{require('fs').statSync('svelte.config.js');require('child_process').execSync('svelte-kit sync',{stdio:'inherit'})}catch(e){}\" && svelte-check --tsconfig ./jsconfig.json",
-		"check:watch": "node -e \"try{require('fs').statSync('svelte.config.js');require('child_process').execSync('svelte-kit sync',{stdio:'inherit'})}catch(e){}\" && svelte-check --tsconfig ./jsconfig.json --watch",
+		"check": "svelte-check --tsconfig ./jsconfig.json",
+		"check:watch": "svelte-check --tsconfig ./jsconfig.json --watch",
 		"lint": "prettier --check . && eslint .",
 		"format": "prettier --write ."
 	},
