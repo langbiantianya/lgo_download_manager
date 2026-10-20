@@ -78,7 +78,13 @@ type Scheduler struct {
 	btTasks   map[string]*bittorrent.Handle
 
 	// 事件订阅者(GUI)。筛选逻辑在消费侧完成。
-	Subs []chan Event
+	//
+	// subs 由 subMu 单独保护,不与 mu 混用:退订路径会关闭通道,
+	// 而 publish 要往通道里写,两者必须互斥,否则会撞出
+	// "send on closed channel" panic(旧实现把快照复制到锁外再发送,
+	// 退订正好在那个窗口里 close 掉通道)。
+	subMu sync.Mutex
+	subs  []chan Event
 }
 
 // seedEntry 是一个已完成后保留在 BT 客户端里的做种句柄。
@@ -835,15 +841,17 @@ func (s *Scheduler) ResetTask(taskID string) error {
 // Subscribe 返回一个事件通道。返回的 func 被调用时取消订阅。
 func (s *Scheduler) Subscribe() (<-chan Event, func()) {
 	ch := make(chan Event, 64)
-	s.mu.Lock()
-	s.Subs = append(s.Subs, ch)
-	s.mu.Unlock()
+	s.subMu.Lock()
+	s.subs = append(s.subs, ch)
+	s.subMu.Unlock()
 	return ch, func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		for i, c := range s.Subs {
+		// 退订与 publish 互斥:持 subMu 关闭通道,保证不会有人正往
+		// 这个通道里写。通道满了就丢弃事件的语义保持不变。
+		s.subMu.Lock()
+		defer s.subMu.Unlock()
+		for i, c := range s.subs {
 			if c == ch {
-				s.Subs = append(s.Subs[:i], s.Subs[i+1:]...)
+				s.subs = append(s.subs[:i], s.subs[i+1:]...)
 				close(ch)
 				return
 			}
@@ -852,11 +860,13 @@ func (s *Scheduler) Subscribe() (<-chan Event, func()) {
 }
 
 // publish 向所有订阅者发送事件;通道已满时丢弃。
+//
+// 发送在 subMu 保护下完成,与退订(关闭通道)互斥。发送本身是非阻塞的
+// (select + default),持锁不会拖住订阅者。
 func (s *Scheduler) publish(ev Event) {
-	s.mu.Lock()
-	subs := append([]chan Event(nil), s.Subs...)
-	s.mu.Unlock()
-	for _, ch := range subs {
+	s.subMu.Lock()
+	defer s.subMu.Unlock()
+	for _, ch := range s.subs {
 		select {
 		case ch <- ev:
 		default:

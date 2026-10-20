@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1044,4 +1045,46 @@ func waitForPick(t *testing.T, timeout time.Duration, cond func() string) string
 	}
 	t.Fatalf("no pick within %v", timeout)
 	return ""
+}
+
+// TestSubscribeUnsubscribeRace 回归测试:退订与广播并发时不得 panic。
+//
+// 旧实现把订阅者快照复制到锁外再发送,退订正好落在那个窗口里把通道
+// close 掉,广播就会撞出 "send on closed channel" —— 整个业务进程崩掉。
+// 现在发送与关闭都在 subMu 保护下互斥。
+func TestSubscribeUnsubscribeRace(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sc := New(st)
+
+	const (
+		subscribers = 32
+		rounds     = 200
+	)
+	for round := 0; round < rounds; round++ {
+		unsubAll := make([]func(), 0, subscribers)
+		for i := 0; i < subscribers; i++ {
+			_, unsub := sc.Subscribe()
+			unsubAll = append(unsubAll, unsub)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				sc.publish(Event{Why: "race"})
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for _, u := range unsubAll {
+				u()
+			}
+		}()
+		wg.Wait()
+	}
 }

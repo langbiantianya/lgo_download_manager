@@ -18,6 +18,7 @@ import (
 
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
+	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
 
@@ -313,5 +314,42 @@ func TestHandshake_AppliesAuthoritativeLanguage(t *testing.T) {
 	}
 	if got := ilocale.T("main.toolbar.new"); got == "新建任务" {
 		t.Fatalf("T('main.toolbar.new') still zh-Hans %q after handshake with lang=en", got)
+	}
+}
+
+// TestIpcClient_BroadcastUnsubscribeRace 回归测试:退订与广播并发时不得
+// panic("send on closed channel")。
+//
+// 旧实现的 broadcast 把订阅者快照复制到锁外再发送,退订正好落在那个
+// 窗口里把通道 close 掉就会撞车——UI 子进程直接闪退。现在发送与关闭
+// 都在 subsMu 保护下互斥。
+func TestIpcClient_BroadcastUnsubscribeRace(t *testing.T) {
+	c := &ipcClient{}
+
+	const (
+		subscribers = 32
+		rounds     = 200
+	)
+	for round := 0; round < rounds; round++ {
+		unsubAll := make([]func(), 0, subscribers)
+		for i := 0; i < subscribers; i++ {
+			_, unsub := c.Subscribe()
+			unsubAll = append(unsubAll, unsub)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				c.broadcast(scheduler.Event{Why: "race"})
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for _, u := range unsubAll {
+				u()
+			}
+		}()
+		wg.Wait()
 	}
 }

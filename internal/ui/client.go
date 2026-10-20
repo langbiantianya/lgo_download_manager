@@ -256,6 +256,8 @@ func (c *ipcClient) Subscribe() (<-chan scheduler.Event, func()) {
 	c.subs = append(c.subs, ch)
 	c.subsMu.Unlock()
 	return ch, func() {
+		// 退订与 broadcast 互斥:持 subsMu 关闭通道,保证不会有人正往
+		// 这个通道里写(否则会撞出 "send on closed channel" panic)。
 		c.subsMu.Lock()
 		defer c.subsMu.Unlock()
 		for i, s := range c.subs {
@@ -269,11 +271,14 @@ func (c *ipcClient) Subscribe() (<-chan scheduler.Event, func()) {
 }
 
 // broadcast 向所有订阅者非阻塞派发事件（与 scheduler.publish 的丢弃语义一致）。
+//
+// 发送在 subsMu 保护下完成:退订会关闭通道,若在锁外发送,就会与
+// 「退订的同时广播」撞出 send on closed channel。发送带 default,
+// 不会阻塞持锁的 goroutine。
 func (c *ipcClient) broadcast(ev scheduler.Event) {
 	c.subsMu.Lock()
-	subs := append([]chan scheduler.Event(nil), c.subs...)
-	c.subsMu.Unlock()
-	for _, ch := range subs {
+	defer c.subsMu.Unlock()
+	for _, ch := range c.subs {
 		select {
 		case ch <- ev:
 		default:
