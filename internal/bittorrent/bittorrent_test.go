@@ -35,6 +35,28 @@ func requireLoopback(t *testing.T) {
 	_ = l.Close()
 }
 
+// removeAllWithRetry 删除目录树,遇到「文件被占用」就稍等再试。
+//
+// Windows 不允许删除仍被其它句柄打开的文件,Linux 允许(删掉之后句柄依然
+// 有效),所以同一个测试在 Linux 上永远是绿的,在 Windows 上会偶发失败。
+// anacrolix 客户端 Close() 之后,做种端的 peer 连接 goroutine 还可能短暂
+// 持有数据文件的句柄,这里给它留一点时间。
+func removeAllWithRetry(t *testing.T, dir string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := os.RemoveAll(dir)
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Logf("remove %s: %v (目录可能仍被占用)", dir, err)
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // fakePayload 生成确定性的测试数据(不依赖随机源,失败可复现)。
 func fakePayload(n int) []byte {
 	b := make([]byte, n)
@@ -145,7 +167,17 @@ func TestDownloadFromLoopbackPeer(t *testing.T) {
 	mi, torrentBytes := makeSingleFileTorrent(t, "hello.bin", content, pieceLength)
 
 	// ---- 做种端:直接用 anacrolix 客户端,数据已在 DataDir 里 ----
-	seedDir := t.TempDir()
+	//
+	// 这个目录自己建、自己删(不用 t.TempDir):传输刚结束时做种端的 peer
+	// 连接 goroutine 可能还短暂持有数据文件的句柄,Windows 上文件被占用时
+	// 删不掉,Go 的 TempDir 清理会直接报 "The process cannot access the file
+	// because it is being used by another process" 让用例失败。Linux 上删
+	// 打开着的文件是允许的,所以同一段代码在 Linux 上一直是绿的。
+	seedDir, err := os.MkdirTemp("", "lgdm-bt-seed-")
+	if err != nil {
+		t.Fatalf("seed dir: %v", err)
+	}
+	t.Cleanup(func() { removeAllWithRetry(t, seedDir) })
 	if err := os.WriteFile(filepath.Join(seedDir, "hello.bin"), content, 0o644); err != nil {
 		t.Fatalf("seed file: %v", err)
 	}

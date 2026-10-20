@@ -23,6 +23,24 @@
 //
 // 与 HTTP 分片引擎的关系:scheduler 对 BT 任务不再构造 ProtocolDriver,
 // 而是走本包的 Manager/Handle,进度由 Handle.Snapshot 提供。
+//
+// uTP 传输层:anacrolix/torrent 有两套实现 —— cgo 下的
+// github.com/anacrolix/go-libutp(C++ 源码)与纯 Go 的 github.com/anacrolix/utp,
+// 由 build tag `disable_libutp` 切换(见上游 utp_libutp.go / utp_go.go)。
+// 本项目**保留 C++ 那套**(不传 disable_libutp),为此在构建侧做了两件事:
+//
+//  1. 必须同时给出 C 与 C++ 编译器。Go 编 .cpp 用 CXX,并且只要依赖里有
+//     任何一个包带 .cpp,整个二进制的外部链接也改用 CXX
+//     (cmd/go/internal/work/gc.go 的 ld());而 Go 在 Windows 上的默认 CXX
+//     是写死的 "g++"、**不从 CC 推导**(cmd/go/internal/cfg/zdefaultcc.go),
+//     只给 gcc 不给 g++ 会直接报 "exec: \"g++\": executable file not found"。
+//     交叉编译时给错目标的 g++ 更致命:目标文件与 GOARCH 不匹配,链接阶段才炸。
+//     打包脚本因此按 CC 推导同目录、同目标的 C++ 编译器并显式传给 Go。
+//
+//  2. 链接时加 -extldflags=-static,把 C++ 运行时(static libstdc++/libc++、
+//     libgcc/libunwind、winpthread)静态进 exe。安装包只装 lgdm.exe 一个文件,
+//     不带那些 DLL;动态链的话程序能启动、一建 BT 客户端就以 0xc0000135
+//     (STATUS_DLL_NOT_FOUND)退出 —— BT 客户端是懒创建的,这个坑只在开任务时炸。
 package bittorrent
 
 import (

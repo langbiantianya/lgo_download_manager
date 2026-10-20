@@ -16,6 +16,12 @@ permissions:
 #   - arm64: windows-11-arm(原生 arm64,仅公开仓库可用)
 # 脚本要求 -Arch 与宿主 CPU 一致 —— runner 贴错标签会立刻报错,而不是安静地
 # 出一个架构不符的包。不走交叉编译,因此没有 LLVM-MinGW target 选择。
+#
+# 每个 job 的步骤:
+#   1. setup C/C++ toolchain —— 显式配好**同目标**的 gcc 与 g++(uTP 是 C++ 源码,
+#      Go 的默认 CXX 写死 "g++" 且不从 CC 推导;详见该步骤里的注释);
+#   2. package —— 编译并出 MSI / EXE(C++ 运行时静态进 exe);
+#   3. check imports —— 确认产物不动态依赖 C/C++ 运行时(安装包只发 lgdm.exe)。
 
 jobs:
   windows-x64:
@@ -33,11 +39,36 @@ jobs:
           go-version: '1.26.6'
           cache: true
 
+      # 显式配置 C/C++ 工具链(gcc 与 g++)。
+      #
+      # 为什么必须显式配:BT 的 uTP 传输层用 anacrolix/go-libutp,那是 **C++
+      # 源码**(.cpp)。Go 侧有两处要用 C++ 编译器:
+      #   1. 编译 .cpp —— cgo 用 CXX 编 go-libutp 的 C++ 文件;
+      #   2. **整个二进制的外部链接** —— 只要依赖里有任何一个包带 .cpp,Go 就把
+      #      CXX 当作最终链接器(cmd/go/internal/work/gc.go 的 ld())。
+      # 而 Go 在 Windows 上的默认 C++ 编译器是**写死的 "g++"**、**不从 CC 推导**
+      # (cmd/go/internal/cfg/zdefaultcc.go 的 DefaultCXX)。只给 gcc 不给 g++ 就会:
+      #   - 机器上没有 g++:github.com/anacrolix/go-libutp: exec: "g++":
+      #     executable file not found in %PATH%
+      #   - g++ 架构对不上:windows-11-arm 镜像上 PATH 里的 mingw 是 **x64** 的,
+      #     拿它编 arm64 的 C++ 目标文件要到链接阶段才炸 —— arm64 job 之前就是
+      #     这么挂的。
+      # 所以这里要的不是「随便一个 gcc」,而是**同目标的一对 gcc + g++**。
+      #
+      # 这一步交给 scripts/package_native.ps1:它按宿主架构挑一套完整的
+      # gcc/g++(自带 LLVM-MinGW 官方 release 兜底,下载带 SHA256 校验),
+      # 把 CC / CXX 写进 GITHUB_ENV 传给后面的打包步骤,并把版本打出来。
+      - name: setup C/C++ toolchain (gcc + g++)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File scripts/package_native.ps1 `
+            -Arch x64 -PrintToolchain
+
       # 打包依赖(脚本缺啥用 winget 装啥,不传 -SkipToolInstall):
       #   - WiX Toolset CLI 6.x  (MSI)
       #   - Inno Setup 6         (EXE)
-      # C 编译器:windows runner 自带 mingw-w64 GCC,脚本按 gcc → clang →
-      # LLVM-MinGW 的顺序解析宿主编译器。
+      # C 编译器:上面那一步配好的 gcc;C++ 编译器:同目录推导出的 g++。
 
       - name: package x64 (MSI + EXE)
         shell: pwsh
@@ -45,6 +76,16 @@ jobs:
           $ErrorActionPreference = 'Stop'
           pwsh -NoProfile -File scripts/package_native.ps1 `
             -Arch x64 -Format both
+
+      # 产物只依赖系统 DLL 吗?安装包只装 lgdm.exe 一个文件、不带第三方 DLL ——
+      # 产物一旦动态导入 C/C++ 运行时(libstdc++/libc++/libunwind 等),装上去
+      # 一开 BT 任务就会以 0xc0000135(STATUS_DLL_NOT_FOUND)退出(BT 客户端是懒
+      # 创建的,平时看不出来)。这里当场拦住,别把「装上就崩」的包发出去。
+      - name: check imports (no C/C++ runtime)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File scripts/check_imports.ps1 -Exe bin/lgdm-x64.exe
 
       - name: upload artifact
         uses: actions/upload-artifact@v4
@@ -72,8 +113,21 @@ jobs:
           cache: true
 
       # 与 x64 同一个脚本,只是 -Arch 不同:GOARCH=arm64 在 arm64 宿主上,
-      # cgo 直接用宿主 C 编译器(缺 GCC 时脚本会装 LLVM-MinGW,其自带的
+      # cgo 直接用宿主 C 编译器(缺 GCC 时脚本会取 LLVM-MinGW,其自带的
       # aarch64-w64-mingw32-clang 在同架构宿主上跑仍是原生编译)。
+      #
+      # C++ 编译器必须显式配:Go 的默认 CXX 写死是 "g++"、不从 CC 推导,而
+      # windows-11-arm 镜像上 PATH 里的 mingw(gcc 与 g++)都是 **x64** 的 ——
+      # 本机原生编译时拿 x64 的 g++ 去编 C++ 目标文件,编出来的目标文件与
+      # GOARCH=arm64 不匹配,链接阶段才炸。下面这步由脚本挑一套**同架构**的
+      # gcc + g++(必要时下载 LLVM-MinGW 的 aarch64 官方 release,它在 arm64
+      # 宿主上跑就是原生编译,不是交叉工具链),并写进 GITHUB_ENV。
+      - name: setup C/C++ toolchain (gcc + g++)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File scripts/package_native.ps1 `
+            -Arch arm64 -PrintToolchain
 
       - name: package arm64 (MSI + EXE)
         shell: pwsh
@@ -81,6 +135,13 @@ jobs:
           $ErrorActionPreference = 'Stop'
           pwsh -NoProfile -File scripts/package_native.ps1 `
             -Arch arm64 -Format both
+
+      # 同 x64:产物不能动态依赖 C/C++ 运行时(安装包只发 lgdm.exe 一个文件)。
+      - name: check imports (no C/C++ runtime)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          pwsh -NoProfile -File scripts/check_imports.ps1 -Exe bin/lgdm-arm64.exe
 
       - name: upload artifact
         uses: actions/upload-artifact@v4

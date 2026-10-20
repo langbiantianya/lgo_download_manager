@@ -48,9 +48,35 @@
 ## 构建
 
 ```sh
-go build -o bin/lgdm.exe .        # Windows,本机架构(手工调试用;打包脚本统一产出 bin\lgdm-<arch>.exe)
-go build -o bin/lgdm .            # Linux / macOS(手工调试用;Flatpak 脚本产出 bin/lgo_download_manager-<架构>)
+go build -o bin/lgdm.exe .   # Windows,本机架构(手工调试用;打包脚本统一产出 bin\lgdm-<arch>.exe)
+go build -o bin/lgdm .       # Linux / macOS(手工调试用;Flatpak 脚本产出 bin/lgo_download_manager-<架构>)
 ```
+
+> **Windows 上要 C 与 C++ 两把编译器**：BT 依赖的 anacrolix/torrent 有两套 uTP
+> 实现 —— cgo 下的 `anacrolix/go-libutp`（C++ 源码）与纯 Go 的
+> `anacrolix/utp`，由 build tag `disable_libutp` 切换。Windows 上 cgo 必须开
+> （Fyne 的 GL 绑定只有 cgo 实现），所以默认走 C++ 那套 —— 本项目**保留 uTP**，
+> 不加 `disable_libutp`。于是：
+>
+> - 编译期要一个 **C++ 编译器**：`g++` 不会从 `CC` 推导
+>   （`cmd/go/internal/cfg/zdefaultcc.go` 的 `DefaultCXX` 写死 `"g++"`），
+>   只装了 clang / LLVM-MinGW 的机器上会直接报
+>   `github.com/anacrolix/go-libutp: exec: "g++": executable file not found in %PATH%`；
+>   而且只要依赖里有 `.cpp`，Go 就把 CXX 当作整个二进制的**外部链接器**
+>   （`cmd/go/internal/work/gc.go` 的 `ld()`），CXX 必须是真正的 C++ driver，
+>   拿 gcc 顶替会在链接阶段失败；
+> - 运行期默认会把 C++ 运行时（`libc++.dll` / `libunwind.dll`，或 MinGW 的
+>   `libstdc++-6.dll` / `libgcc_s_seh-1.dll` / `libwinpthread-1.dll`）**动态**链进 exe。
+>   安装包只装 `lgdm.exe` 一个文件、不带这些 DLL，而 BT 客户端是懒创建的，
+>   所以**程序能启动、一开 BT 任务就崩**（进程以 `0xc0000135`
+>   STATUS_DLL_NOT_FOUND 退出）。
+>
+> 打包脚本（`scripts/package.ps1`、`scripts/package_native.ps1`、
+> `scripts/build_flatpak*.sh`）已经把这两件事处理掉了：按 `CC` **同目录、
+> 同目标**推导 C++ 编译器（`x86_64-w64-mingw32-clang` → `x86_64-w64-mingw32-clang++`，
+> 裸 `gcc.exe` → 同目录 `g++.exe`）并显式传给 Go；链接时加
+> `-extldflags=-static` 把 C++ 运行时静态进 exe，产物只依赖系统 DLL
+> （与 v0.0.4 那个「干净单文件」的基线一致）。
 
 Windows 上**正式发布**的二进制是 GUI 子系统构建（`go build -ldflags "-H windowsgui"`），
 从 lgom:// 协议 / 资源管理器拉起时不会闪出黑色控制台窗口；从 cmd / PowerShell
@@ -223,11 +249,22 @@ bin\lgdm-x64.exe                     bin\lgdm-arm64.exe
   ```powershell
   $env:GOARCH='arm64'; $env:CGO_ENABLED='1'
   $env:CC='C:\...\llvm-mingw-<ver>-ucrt-x86_64\bin\aarch64-w64-mingw32-clang.exe'
-  go build -trimpath -o bin\lgdm-arm64.exe .
+  $env:CXX='C:\...\llvm-mingw-<ver>-ucrt-x86_64\bin\aarch64-w64-mingw32-clang++.exe'
+  go build -trimpath -ldflags '-extldflags=-static' -o bin\lgdm-arm64.exe .
   ```
 
   `-CCArm64` 也要给 Windows 绝对路径（`/c/...` 这种会被 Go 拒绝：
   `CC environment variable is relative; must be absolute path`）。
+- **C 与 C++ 编译器必须成对提供**：`CXX` 不会从 `CC` 推导（Go 的 `DefaultCXX`
+  写死 `"g++"`），而 uTP 的 C++ 源码既要用 CXX 编译、又要让 CXX 当整个二进制
+  的外部链接器。脚本按 `CC` 同目录推导 C++ 编译器（`<triplet>-clang` →
+  `<triplet>-clang++`，`<triplet>-gcc` → `<triplet>-g++`，裸 `gcc.exe` → 同目录
+  `g++.exe`），推导不出来就报错；交叉编译时还会校验目标架构 —— PATH 上的
+  `g++` 往往是**宿主**架构的，拿它编目标架构的 C++ 目标文件要到链接阶段才炸
+  （CI 的 arm64 job 之前就是这么挂的）。
+- **C++ 运行时静态链接**：链接参数带 `-extldflags=-static`，C++ 运行时
+  （`libstdc++`/`libc++`、`libgcc`/`libunwind`、winpthread）静态进 exe ——
+  安装包只发 `lgdm.exe`，不带那些 DLL（细节见「构建」一节）。
 - 出包前脚本会读 PE 头的 `Machine` 字段校验产物架构（x64=`0x8664`、
   arm64=`0xAA64`），防止 `-SkipBuild` 复用了另一个架构的二进制、或工具链
   target 传错，打出「平台与载荷不匹配」的包。
@@ -306,6 +343,8 @@ msiexec /x {ProductCode} /qn                                      # ProductCode 
 | `go: CC environment variable is relative; must be absolute path` | `CC` 给了 `/c/...` 形式；改成 `C:\...` |
 | `cgo: C compiler "C:\\Program" not found: exec: "C:\\Program": ...` | `CC` 指向的路径**带空格**（如 `C:\Program Files\llvm-mingw\...`、`C:\Program Files\LLVM\...`），Go 按空白切词只拿到 `C:\Program`。脚本现在会给带空格的 `CC` 自动加引号（Go 用 `str.SplitQuotedFields` 解析，加引号即可）；手工设 `CC` 时要自己写成 `"C:\Program Files\...\gcc.exe"` |
 | `gcc_arm64.S: Error: no such instruction: 'stp x29,x30,[sp,'`（一堆 `stp`/`ldp`/`blr` 报错） | 用的 C 编译器不是 aarch64 目标 —— 这是 **x86 汇编器在读 AArch64 汇编**。`windows-11-arm` 镜像的 PATH 上带着 x64 的 mingw `gcc.exe`，直接拿它配 `GOARCH=arm64` 就会这样。脚本现在用 `-dumpmachine` 校验每个候选编译器，目标不符的会跳过（并打印原因），改用 LLVM-MinGW 的 `aarch64-w64-mingw32-clang` |
+| `github.com/anacrolix/go-libutp: exec: "g++": executable file not found in %PATH%` | Go 的默认 C++ 编译器是写死的 `"g++"`、**不从 `CC` 推导**（`cmd/go/internal/cfg/zdefaultcc.go`），而 uTP 是 C++ 源码。装一套 mingw-w64 / LLVM-MinGW（gcc 与 g++ 一起），或手工设 `$env:CXX` 指向与 `CC` 同目录、同目标的 C++ 编译器；打包脚本会自动推导 |
+| 装好的程序**一开 BT 任务就退出**（`0xc0000135` STATUS_DLL_NOT_FOUND） | 产物动态依赖了 C/C++ 运行时（`libstdc++-6.dll` / `libc++.dll` 等），而安装包只发 `lgdm.exe` 一个文件。链接要带 `-extldflags=-static`；用 `pwsh -File scripts\check_imports.ps1 -Exe bin\lgdm-x64.exe` 查一下产物（CI 里也会自动查） |
 | `-CC 指向的编译器不是 <arch> 目标` | 显式传的 `-CC` / 编译器本身目标不符；错误信息里带 `-dumpmachine` 的实际输出 |
 | `winget 安装 ... 返回 -1978335189` | winget 认为已装其它版本；脚本会继续查找已安装的工具，找不到再按提示手动装 |
 | 编辑 `scripts/package.ps1` 后 Windows PowerShell 5.1 报语法错误 | 脚本含中文，必须存成 **UTF-8 with BOM**（PS 7 不敏感，PS 5.1 会按 ANSI 读） |
@@ -457,6 +496,14 @@ dist/flatpak/<架构>/sysroot/             # 编译用的 sysroot 视图(指向�
 | `linux.yml` | `flatpak-aarch64` | `ubuntu-24.04-arm` | `scripts/build_flatpak_native.sh --arch=aarch64` | `dist/lgdm-<版本>-aarch64.flatpak` |
 | `extension.yml` | `extension-chrome` | `ubuntu-latest` | `npm run package:chrome` | `lgom-extension/dist/lgom-extension-chrome-<版本>.{zip,crx}` |
 | `extension.yml` | `extension-firefox` | `ubuntu-latest` | `npm run package:firefox` | `lgom-extension/dist/lgom-extension-firefox-<版本>.{zip,xpi}` |
+
+两个 Windows job 都会先跑一步 **setup C/C++ toolchain (gcc + g++)**：
+`scripts/package_native.ps1 -Arch <arch> -PrintToolchain` 按 runner 的宿主架构挑一
+套**同架构**的 gcc + g++（`windows-11-arm` 镜像上 PATH 里的 mingw 是 x64 的，
+不能用；脚本会改下 LLVM-MinGW 官方 release 的 aarch64 包 —— 那套工具链在
+arm64 宿主上跑是**原生编译**，不是交叉工具链），把 `CC` / `CXX`
+写进 `GITHUB_ENV` 传给后面的打包步骤，并把版本号打进日志。C++ 编译器为什么
+必须显式配见「构建」一节。
 
 触发：push 到 `master`、`v*` tag、PR、手动 `workflow_dispatch`。每个 job 把产物作为
 artifact 上传（保留 30 天）；**只有 `v*` tag** 会触发 `release` job，把所有 artifact
@@ -877,6 +924,7 @@ assets/                        # 图标（安装包快捷方式 / lgom:// Defaul
 installer/                     # lgdm.wxs（WiX MSI）、installer.iss（Inno Setup EXE）
 scripts/package.ps1            # 打包入口：编译 + 出 MSI / EXE 安装包（可交叉）
 scripts/package_native.ps1     # 同上，但只出宿主架构的包（CI 用，不做交叉编译）
+scripts/check_imports.ps1      # 校验产物没有动态依赖 C/C++ 运行时（安装包只发 lgdm.exe）
 scripts/build_flatpak.sh       # 打包入口：编译 + 出 Flatpak 安装包（可交叉）
 scripts/build_flatpak_native.sh # 同上，但只出宿主架构的包（CI 用，不做交叉编译）
 .github/workflows/             # CI：windows.yml / linux.yml / extension.yml，按架构或平台分 job 出包

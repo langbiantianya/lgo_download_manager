@@ -31,6 +31,45 @@
       获取工具**不依赖 winget**:CI 的 windows-11-arm 镜像没有 winget,而且
       winget 清单里的版本号与上游发布标签并不总是一致。
 
+      **C 与 C++ 编译器必须成对提供** —— 原因见下面「为什么需要 C++ 编译器」。
+
+    为什么需要 C++ 编译器:
+      BT 的 uTP 传输层用 anacrolix/go-libutp,那是 **C++ 源码**(.cpp)。Go 侧
+      有两处要用 C++ 编译器:
+
+        1. 编译 .cpp:cgo 用 CXX 编 go-libutp 的 C++ 文件;
+        2. **整个二进制的外部链接** —— 只要依赖里有任何一个包带 .cpp,Go 就把
+           CXX 当作最终链接器(见 cmd/go/internal/work/gc.go 的 ld():
+           "If the user has not specified the -extld option, then specify the
+           appropriate linker. In case of C++ code, use the compiler named by
+           the CXX environment variable or defaultCXX if CXX is not set.")。
+
+      而 Go 在 Windows 上的默认 C++ 编译器是**写死的 "g++"**,**不会**从 CC 推导
+      (见 cmd/go/internal/cfg/zdefaultcc.go 的 DefaultCXX)。只给 CC 不给 CXX
+      会有两种坏结果:
+
+        - 机器上没有 g++:直接报
+          github.com/anacrolix/go-libutp: exec: "g++": executable file not found in %PATH%
+        - 机器上的 g++ 架构对不上(CI 的 windows-11-arm 上 PATH 的 mingw g++
+          是 x64 的):编出来的 C++ 目标文件与 GOARCH 不匹配,链接阶段才炸
+          —— arm64 CI 的 job 就是这么挂的。
+
+      所以脚本按解析出来的 CC **推导同目录、同目标的 C++ 编译器**
+      (<triplet>-clang → <triplet>-clang++,<triplet>-gcc → <triplet>-g++,
+      裸 gcc.exe → 同目录 g++.exe),并把 CXX 显式传给 Go。
+
+    为什么还要静态链接:
+      C++ 那套默认会把 C++ 运行时**动态链进 exe** —— MinGW 的
+      libstdc++-6.dll / libgcc_s_seh-1.dll / libwinpthread-1.dll,或 LLVM-MinGW
+      的 libc++.dll / libunwind.dll。而安装包只装 lgdm.exe 一个文件
+      (见 installer/lgdm.wxs 与 installer/installer.iss),不带这些 DLL。
+      BT 客户端是懒创建的,所以这些 DLL 只在**建客户端时**才被加载:程序能
+      启动、一开 BT 任务就以 0xc0000135(STATUS_DLL_NOT_FOUND)退出。
+
+      因此链接时加 `-extldflags=-static`:C++ 运行时静态进 exe,产物就只依赖
+      系统 DLL(与 v0.0.4 那个「干净单文件」的基线一致)。
+      (uTP 照常保留 —— 静态链的是运行时,不是把它换成纯 Go 实现。)
+
 .PARAMETER Arch
     目标架构,必须与当前宿主架构一致:x64 / arm64(也接受 amd64 / aarch64)。
     CI 里显式传,用来把「runner 架构」这件事钉死。
@@ -61,12 +100,20 @@
 
 .PARAMETER CC
     显式指定 C 编译器(默认按 gcc → clang → LLVM-MinGW 的宿主 triplet 解析)。
+    环境变量 CC 优先于自动解析(CI 用它把配好的工具链传进来)。
+
+.PARAMETER PrintToolchain
+    只解析并打印 C / C++ 工具链(把 CC、CXX 写进 GITHUB_ENV,若已设置),
+    不编译也不打包。CI 用它把「配好的 gcc 与 g++」传给后面的打包步骤。
 
 .EXAMPLE
     pwsh -File scripts\package_native.ps1 -Arch x64
 
 .EXAMPLE
     pwsh -File scripts\package_native.ps1 -Arch arm64 -Format msi -Version v1.0.0
+
+.EXAMPLE
+    pwsh -File scripts\package_native.ps1 -Arch x64 -PrintToolchain
 #>
 #Requires -Version 5.1
 [CmdletBinding()]
@@ -84,7 +131,8 @@ param(
     [switch]$SkipToolInstall,
     [string]$WixPath,
     [string]$IsccPath,
-    [string]$CC
+    [string]$CC,
+    [switch]$PrintToolchain
 )
 
 $ErrorActionPreference = 'Stop'
@@ -423,6 +471,18 @@ function Resolve-CC {
         return $resolved
     }
 
+    # 环境变量优先:CI 步骤会先把配好的 CC 导进环境(见 windows.yml 的
+    # 「setup C/C++ toolchain」),这里就不该再去找 PATH 上的别的编译器。
+    if ($env:CC) {
+        if (-not (Test-Path -LiteralPath $env:CC)) { throw "环境变量 CC 指向的编译器不存在: $env:CC" }
+        $resolved = (Resolve-Path -LiteralPath $env:CC).Path
+        if (-not (Test-CCMatchesArch $resolved (Split-Path -Leaf $resolved))) {
+            throw ("环境变量 CC 指向的编译器不是 ${slug} 目标: {0}(-dumpmachine: {1});期望 {2}" -f `
+                $resolved, (Get-CCTriple $resolved), $ccArchPattern)
+        }
+        return $resolved
+    }
+
     # 名字带三元组的优先:它们的目标由名字确定,不依赖 PATH 上碰巧是什么。
     $prefixed = @("$mingwPrefix-clang.exe", "$mingwPrefix-gcc.exe")
     $plain = @('gcc.exe', 'clang.exe')
@@ -451,6 +511,74 @@ function Resolve-CC {
 
     https://github.com/mstorsjo/llvm-mingw/releases
 "@
+}
+
+# Resolve-CXX <CCPath>:与 CC 配套的 **C++** 编译器,返回绝对路径;找不到返回 $null。
+#
+# 为什么必须成对提供:BT 的 uTP 实现是 C++ 源码(anacrolix/go-libutp),Go 用
+# CXX 编 .cpp,并且在依赖里存在 .cpp 时把 CXX 当作整个二进制的外部链接器
+# (cmd/go/internal/work/gc.go 的 ld())。而 Go 在 Windows 上的默认 CXX 是写死
+# 的 "g++"、**不从 CC 推导**,所以必须由脚本显式给出一个**同目标**的 C++
+# 编译器 —— CI 的 windows-11-arm 上 PATH 里的 g++ 是 x64 的,拿它去编 arm64
+# 的 C++ 目标文件,链接阶段才会炸。
+#
+# 候选按 CC 的形态在**同一个目录**里找(同目录即同工具链,目标自然一致):
+#   x86_64-w64-mingw32-clang(.exe) → x86_64-w64-mingw32-clang++.exe
+#   x86_64-w64-mingw32-gcc(.exe)   → x86_64-w64-mingw32-g++.exe
+#   clang(.exe) / gcc(.exe)        → 同目录的 clang++.exe / g++.exe
+function Resolve-CXX([string]$CCPath) {
+    $dir = $null
+    $leaf = $null
+    $base = $null
+    $ext = $null
+    if ($CCPath) {
+        $dir = Split-Path -Parent $CCPath
+        $leaf = Split-Path -Leaf $CCPath
+        $base = [IO.Path]::GetFileNameWithoutExtension($leaf)
+        $ext = [IO.Path]::GetExtension($leaf)
+    }
+
+    # 显式给的 C++ 编译器优先:CI 的「setup C/C++ toolchain」步骤会把配好的
+    # CXX 导进环境(GITHUB_ENV),这里直接用,不去 PATH 上另找一个。
+    if ($env:CXX) {
+        if (Test-Path -LiteralPath $env:CXX) {
+            $resolved = (Resolve-Path -LiteralPath $env:CXX).Path
+            if (Test-CCMatchesArch $resolved (Split-Path -Leaf $resolved)) {
+                return $resolved
+            }
+            Write-Note ("跳过 CXX {0}:目标不是 {1}(-dumpmachine: {2})" -f `
+                $resolved, $slug, (Get-CCTriple $resolved))
+        }
+    }
+
+    $candidates = @()
+    if ($base -and $base -match 'clang$') {
+        $candidates += "$base++$ext"
+    } elseif ($base -and $base -match 'g\+\+$') {
+        $candidates += "$base$ext"
+    } elseif ($base -and $base -match 'gcc$') {
+        $candidates += (($base -replace 'gcc$', 'g++') + $ext)
+    } elseif ($base -and $base -match '^(cc|c\+\+)$') {
+        $candidates += "$base$ext"
+    }
+    foreach ($c in $candidates) {
+        $p = Join-Path $dir $c
+        if (-not (Test-Path -LiteralPath $p)) { continue }
+        $resolved = (Resolve-Path -LiteralPath $p).Path
+        if (Test-CCMatchesArch $resolved $c) { return $resolved }
+        Write-Note ("跳过 {0}:目标不是 {1}(-dumpmachine: {2})" -f `
+            $resolved, $slug, (Get-CCTriple $resolved))
+    }
+    # 同目录没有就退到 PATH 上找 —— 但**必须验目标**:CI 的 windows-11-arm 上
+    # PATH 里的 g++ 是 x64 的,拿它编 arm64 的 C++ 目标文件要到链接阶段才炸。
+    foreach ($name in @('g++.exe', 'clang++.exe')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if (-not $cmd) { continue }
+        if (Test-CCMatchesArch $cmd.Source $name) { return $cmd.Source }
+        Write-Note ("跳过 {0}:目标不是 {1}(-dumpmachine: {2})" -f `
+            $name, $slug, (Get-CCTriple $cmd.Source))
+    }
+    return $null
 }
 
 # ---------------------------------------------------------------------------
@@ -496,7 +624,7 @@ function Get-WindowsVersion([string]$BuildVersion) {
 # 编译
 # ---------------------------------------------------------------------------
 
-function Invoke-Build($CCPath) {
+function Invoke-Build($CCPath, $CXXPath) {
     $v = Get-BuildVersion
     $commit = Invoke-Git @('rev-parse', '--short', 'HEAD')
     if (-not $commit) { $commit = 'unknown' }
@@ -506,9 +634,14 @@ function Invoke-Build($CCPath) {
     # -H windowsgui 让 Windows 不再为 lgdm 弹 console 窗口(浏览器 lgom://
     # 协议/资源管理器拉起时不再闪黑窗);用户加 --debug 时内部 AttachConsole
     # 把日志挂回终端,行为不变。
+    #
+    # -extldflags=-static:C++ 运行时(static libstdc++/libc++、libgcc/libunwind、
+    # winpthread)静态进 exe。安装包只装 lgdm.exe 一个文件,不带那些 DLL ——
+    # 动态链的话,程序能启动、一建 BT 客户端就以 0xc0000135 退出。
     $ldflags = @(
         '-s', '-w',
         '-H', 'windowsgui',
+        '-extldflags=-static',
         '-X', "lgo_download_manager/internal/version.Version=$v",
         '-X', "lgo_download_manager/internal/version.Commit=$commit",
         '-X', "lgo_download_manager/internal/version.Date=$date"
@@ -521,17 +654,22 @@ function Invoke-Build($CCPath) {
     $env:GOARCH = $goarch
     $env:CGO_ENABLED = '1'
     if ($CCPath) { $env:CC = (Format-CCForGo $CCPath) }
+    # CXX 必须显式给:Go 不会从 CC 推导它(默认写死 "g++"),而 BT 的 uTP 是
+    # C++ 源码,Go 编 .cpp 与最终外部链接都用 CXX。
+    if ($CXXPath) { $env:CXX = (Format-CCForGo $CXXPath) }
     try {
         Invoke-Native 'go' @('build', '-trimpath', '-ldflags', $ldflags, '-o', $exePath, '.') $RepoRoot
     } finally {
         Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
         if ($CCPath) { Remove-Item Env:CC -ErrorAction SilentlyContinue }
+        if ($CXXPath) { Remove-Item Env:CXX -ErrorAction SilentlyContinue }
     }
 
     $size = [math]::Round((Get-Item -LiteralPath $exePath).Length / 1MB, 1)
     $ccLabel = if ($CCPath) { Split-Path -Leaf $CCPath } else { 'go default (gcc)' }
-    Write-Note ("built {0} ({1} MB, GOARCH={2}, CC={3}, version {4}, commit {5})" -f
-        $exePath, $size, $goarch, $ccLabel, $v, $commit)
+    $cxxLabel = if ($CXXPath) { Split-Path -Leaf $CXXPath } else { 'go default (g++)' }
+    Write-Note ("built {0} ({1} MB, GOARCH={2}, CC={3}, CXX={4}, version {5}, commit {6})" -f
+        $exePath, $size, $goarch, $ccLabel, $cxxLabel, $v, $commit)
 }
 
 # ---------------------------------------------------------------------------
@@ -699,10 +837,44 @@ Write-Note "version      $buildVersion (MSI/VersionInfo: $numericVersion)"
 
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
 
+# C 与 C++ 编译器必须成对:Go 不会从 CC 推导 CXX(默认写死 "g++"),而 BT 的
+# uTP 实现是 C++ 源码,编 .cpp 与最终外部链接都用 CXX。脚本按 CC 推导同目录、
+# 同目标的 C++ 编译器;推导不出来就直接报错,免得编到一半才炸。
+$ccPath = Resolve-CC
+$cxxPath = Resolve-CXX $ccPath
+if (-not $cxxPath) {
+    throw @"
+找不到与 C 编译器配套的 **C++** 编译器。
+  C 编译器: $ccPath
+  C++ 编译器必须与它同目录、同目标:
+    <triplet>-clang(.exe) → <triplet>-clang++.exe
+    <triplet>-gcc(.exe)   → <triplet>-g++.exe
+    gcc.exe / clang.exe   → 同目录的 g++.exe / clang++.exe
+BT 的 uTP 传输层是 C++ 源码(anacrolix/go-libutp),Go 用 CXX 编 .cpp,
+并且在依赖里有 .cpp 时把 CXX 当作整个二进制的外部链接器。
+装 LLVM-MinGW(x86_64 与 aarch64 都带)或 MSYS2 的 mingw-w64 即可。
+"@
+}
+
+if ($PrintToolchain) {
+    # 只解析工具链并把它导进环境(GITHUB_ENV),不编译、不打包 ——
+    # CI 用它把「配好的 gcc / g++」传给后续的打包步骤,顺带把版本打出来。
+    Write-Step "C/C++ 工具链($slug)"
+    Write-Note "CC  $ccPath"
+    Write-Note "CXX $cxxPath"
+    & $ccPath --version 2>&1 | Select-Object -First 1 | ForEach-Object { Write-Note "     $_" }
+    & $cxxPath --version 2>&1 | Select-Object -First 1 | ForEach-Object { Write-Note "     $_" }
+    if ($env:GITHUB_ENV) {
+        "CC=$ccPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "CXX=$cxxPath" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        Write-Note "已写入 GITHUB_ENV:CC / CXX"
+    }
+    exit 0
+}
+
 if (-not $SkipBuild) {
-    $ccPath = Resolve-CC
     Write-Step "go build ($slug)"
-    Invoke-Build $ccPath
+    Invoke-Build $ccPath $cxxPath
 } elseif (-not (Test-Path -LiteralPath $exePath)) {
     throw ("-SkipBuild 指定为跳过编译,但 {0} 不存在" -f $exePath)
 }

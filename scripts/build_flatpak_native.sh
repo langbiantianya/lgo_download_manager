@@ -176,8 +176,8 @@ build_version() {
 #     usr/lib/... -> SDK 库的符号链接;ld 脚本按 SDK 绝对路径改写
 #   再由 CC 包装脚本把 -isystem/-idirafter/-B/-L 指过来。
 prepare_toolchain() {
-    local arch="$1" real_cc="$2"
-    local sdk_dir triplet sdk_lib shim shim_lib wrapper b f
+    local arch="$1" real_cc="$2" real_cxx="$3"
+    local sdk_dir triplet sdk_lib shim shim_lib wrapper cxx_wrapper b f
     sdk_dir="$(flatpak info --show-location "runtime/${SDK_NAME}/${arch}/${SDK_BRANCH}")/files"
     [[ -d "$sdk_dir" ]] || die "找不到 ${arch} 的 SDK 目录: $sdk_dir"
     triplet="$(triplet_of "$arch")"
@@ -242,7 +242,38 @@ exec "${real_cc}" \
     "\$@"
 EOF
     chmod +x "$wrapper"
+
+    # C++ 包装脚本:同样的 sysroot 参数,只是换成 C++ 编译器。
+    #
+    # 为什么必须单独一个:BT 的 uTP 传输层是 C++ 源码(anacrolix/go-libutp),
+    # Go 用 CXX 编 .cpp,并且在依赖里有 .cpp 时把 CXX 当作整个二进制的外部
+    # 链接器(cmd/go/internal/work/gc.go 的 ld())。CXX 必须是**真正的 C++
+    # driver** —— 不能拿 gcc 顶替:链接阶段输入只有 .o 文件,gcc 会按 C 处理,
+    # 不会自动带上 libstdc++。
+    #
+    # 也不能用宿主 PATH 上的 g++:那样 C++ 头文件与 libstdc++ 会来自宿主,
+    # 而不是目标 runtime 的 SDK —— 编出来的二进制可能要求比 runtime 更新的
+    # libstdc++,在沙箱里起不来。
+    cxx_wrapper="${DIST_DIR}/flatpak/${arch}/cxx-${arch}.sh"
+    cat > "$cxx_wrapper" <<EOF
+#!/bin/sh
+# 由 scripts/build_flatpak_native.sh 生成,勿手工改:C++ 版,参数与 cc-${arch}.sh 相同。
+exec "${real_cxx}" \
+    -isystem "${shim}/usr/include" \
+    -idirafter "${shim}/usr/include/${triplet}" \
+    -B"${shim}/usr/lib/${triplet}/" \
+    -L"${shim}/usr/lib/${triplet}" \
+    -Wl,-rpath-link,"${shim}/usr/lib/${triplet}" \
+    "\$@"
+EOF
+    chmod +x "$cxx_wrapper"
+
+    # 回显**两个**包装脚本的路径,各一行:第 1 行 CC,第 2 行 CXX。
+    #
+    # 为什么不能只设个全局变量:调用方是用 $(prepare_toolchain ...) 接的,
+    # 那是子 shell —— 这里赋的变量在调用方看不到,只能靠回显传出去。
     echo "$wrapper"
+    echo "$cxx_wrapper"
 }
 
 # pkgconfig_libdirs <shim>
@@ -271,6 +302,37 @@ resolve_cc() {
     die "找不到宿主 C 编译器(gcc/cc):Fyne 的 GL 绑定是 cgo,没有 C 工具链编不过
       Fedora:        sudo dnf install -y gcc
       Debian/Ubuntu: sudo apt install gcc"
+}
+
+# resolve_cxx <cc>:与 C 编译器配套的 **C++** 编译器。
+#
+# BT 的 uTP 传输层是 C++ 源码(anacrolix/go-libutp),Go 用 CXX 编 .cpp,并且在
+# 依赖里有 .cpp 时把 CXX 当作整个二进制的外部链接器
+# (cmd/go/internal/work/gc.go 的 ld())。CXX 必须是**真正的 C++ driver**:
+# 拿 gcc 顶替不行 —— 链接阶段输入只有 .o 文件,gcc 会按 C 处理,不会自动带上
+# libstdc++。而且必须与 C 编译器同工具链。
+resolve_cxx() {
+    local cc="$1" base dir cand c
+    base="$(basename "$cc")"
+    dir="$(dirname "$cc")"
+    case "$base" in
+        *clang)       cand="${base%clang}clang++" ;;
+        *g++)         cand="$base" ;;
+        *-gcc)        cand="${base%-gcc}-g++" ;;
+        gcc|gcc-*)    cand="g++" ;;
+        *c++)         cand="$base" ;;
+        cc|cc-*)      cand="c++" ;;
+        *)            cand="" ;;
+    esac
+    if [[ -n "$cand" && -x "${dir}/${cand}" ]]; then echo "${dir}/${cand}"; return; fi
+    for c in g++ c++; do
+        if [[ -x "${dir}/${c}" ]]; then echo "${dir}/${c}"; return; fi
+    done
+    die "找不到与 ${cc} 配套的 C++ 编译器(g++/clang++)。
+      BT 的 uTP 传输层是 C++ 源码(anacrolix/go-libutp),Go 用 CXX 编 .cpp 并
+      作为整个二进制的外部链接器;缺了它编不过。
+      Fedora:        sudo dnf install -y gcc-c++
+      Debian/Ubuntu: sudo apt install g++"
 }
 
 # ---------------------------------------------------------------------------
@@ -317,6 +379,7 @@ done
 if ! $SKIP_BUILD; then
     require_cmd go "Flatpak 包里的二进制要在宿主机上编好(沙箱内未必能访问 module proxy)"
     resolve_cc >/dev/null
+    resolve_cxx "$(resolve_cc)" >/dev/null
 fi
 
 VERSION="$(build_version)"
@@ -336,7 +399,12 @@ if $SKIP_BUILD; then
     log_ok "复用已有二进制 $BIN_PATH"
 else
     real_cc="$(resolve_cc)"
-    cc="$(prepare_toolchain "$ARCH" "$real_cc")"
+    real_cxx="$(resolve_cxx "$real_cc")"
+    # prepare_toolchain 回显两行:CC 包装脚本、CXX 包装脚本。
+    toolchains="$(prepare_toolchain "$ARCH" "$real_cc" "$real_cxx")"
+    cc="$(printf '%s\n' "$toolchains" | sed -n 1p)"
+    cxx="$(printf '%s\n' "$toolchains" | sed -n 2p)"
+    [[ -x "$cc" && -x "$cxx" ]] || die "编译器包装脚本没生成成功:$toolchains"
     pkg_libdir="$(pkgconfig_libdirs "${BUILD_ROOT}/sysroot")"
     [[ -n "$pkg_libdir" ]] || die "${ARCH} 的 SDK 里没有 pkgconfig 目录,无法解析 X11/GL 依赖"
 
@@ -347,14 +415,19 @@ else
     LDFLAGS+=" -X lgo_download_manager/internal/version.Commit=${COMMIT}"
     LDFLAGS+=" -X lgo_download_manager/internal/version.Date=${DATE}"
 
-    log_step "go build → bin/${BIN_NAME}-${ARCH}(CC=$(basename "$real_cc"),sysroot=${BUILD_ROOT}/sysroot)"
+    log_step "go build → bin/${BIN_NAME}-${ARCH}(CC=$(basename "$real_cc"),CXX=$(basename "$real_cxx"),sysroot=${BUILD_ROOT}/sysroot)"
     mkdir -p "${REPO_ROOT}/bin"
     # PKG_CONFIG_SYSROOT_DIR/PKG_CONFIG_LIBDIR 让 pkg-config 只在 sysroot 里找,
     # 并把 -I/-L 前缀改写成 sysroot 下的路径;PKG_CONFIG_PATH 清空,避免宿主的
     # .pc 混进来。GOOS/GOARCH/CGO_ENABLED 显式给出,与宿主架构一致。
+    #
+    # CXX 指向 C++ 版包装脚本:BT 的 uTP 是 C++ 源码,Go 用 CXX 编 .cpp 并
+    # 作为整个二进制的外部链接器,而 C++ 头文件与 libstdc++ 必须来自目标
+    # runtime 的 SDK(不是宿主)—— 否则编出来的二进制可能要求比 runtime
+    # 更新的 libstdc++,在沙箱里起不来。
     (
         cd "$REPO_ROOT"
-        GOOS=linux GOARCH="$(goarch_of "$ARCH")" CGO_ENABLED=1 CC="$cc" \
+        GOOS=linux GOARCH="$(goarch_of "$ARCH")" CGO_ENABLED=1 CC="$cc" CXX="$cxx" \
         PKG_CONFIG_SYSROOT_DIR="${BUILD_ROOT}/sysroot" \
         PKG_CONFIG_LIBDIR="$pkg_libdir" \
         PKG_CONFIG_PATH= \
