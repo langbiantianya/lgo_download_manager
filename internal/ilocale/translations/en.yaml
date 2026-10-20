@@ -141,6 +141,7 @@ addTask.bt.hint: "A BitTorrent task saves into a folder: the torrent's contents 
 
 # BT task details panel (torrent info)
 details.bt.section: "Torrent info"
+details.bt.section.pieces: "Piece progress"
 details.bt.section.trackers: "Trackers"
 details.bt.section.files: "Files"
 details.bt.infoHash: "Info hash"

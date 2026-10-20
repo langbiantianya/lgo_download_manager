@@ -105,6 +105,11 @@ func TestBTInfoEndToEnd(t *testing.T) {
 	if back.Name != detail.Name {
 		t.Errorf("round-tripped name = %q, want %q", back.Name, detail.Name)
 	}
+	// 分片热力图的桶也要能过 JSON:UI 进程收到的就是这个编码。
+	if len(back.PieceBuckets) != len(detail.PieceBuckets) {
+		t.Errorf("round-tripped piece buckets = %d, want %d",
+			len(back.PieceBuckets), len(detail.PieceBuckets))
+	}
 }
 
 // TestBTInfoUnknownTask 验证任务不在运行时 bt_info 返回错误而不是空

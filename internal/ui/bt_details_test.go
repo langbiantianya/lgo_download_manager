@@ -49,26 +49,45 @@ func (s *btStubService) Settings() store.Settings          { return store.Settin
 func (s *btStubService) SaveSettings(store.Settings) error { return nil }
 func (s *btStubService) Close() error                      { return nil }
 
+// samplePieceBuckets 造一份分片热力图数据:前面四成已经下完,中间三成
+// 下了一半(逐步推进),后面三成还没动——这样图上能同时看到「完成 /
+// 在传 / 没动」三种颜色。
+func samplePieceBuckets() []uint8 {
+	out := make([]uint8, 256)
+	for i := range out {
+		switch {
+		case i < 102:
+			out[i] = 255
+		case i < 180:
+			out[i] = uint8(255 - (i-102)*3)
+		default:
+			out[i] = 0
+		}
+	}
+	return out
+}
+
 // sampleBTDetail 造一份覆盖面板各字段的详情快照。
 func sampleBTDetail() *bittorrent.Detail {
 	return &bittorrent.Detail{
-		Name:        "debian-13.7.0-amd64-netinst.iso",
-		InfoHash:    "0123456789abcdef0123456789abcdef01234567",
-		Total:       1000,
-		Downloaded:  400,
-		Uploaded:    200,
-		SpeedBPS:    1024,
-		UploadBPS:   512,
-		Peers:       7,
-		TotalPeers:  30,
-		Seeders:     2,
-		Leechers:    5,
-		PieceLength: 256,
-		Pieces:      10,
-		PiecesDone:  4,
-		Seeding:     true,
-		Complete:    true,
-		Trackers:    []string{"udp://tracker.example:6969/announce"},
+		Name:         "debian-13.7.0-amd64-netinst.iso",
+		InfoHash:     "0123456789abcdef0123456789abcdef01234567",
+		Total:        1000,
+		Downloaded:   400,
+		Uploaded:     200,
+		SpeedBPS:     1024,
+		UploadBPS:    512,
+		Peers:        7,
+		TotalPeers:   30,
+		Seeders:      2,
+		Leechers:     5,
+		PieceLength:  256,
+		Pieces:       10,
+		PiecesDone:   4,
+		Seeding:      true,
+		Complete:     true,
+		Trackers:     []string{"udp://tracker.example:6969/announce"},
+		PieceBuckets: samplePieceBuckets(),
 		Files: []bittorrent.FileProgress{
 			{Path: "debian-13.7.0-amd64-netinst.iso", Length: 1000, Completed: 400},
 			{Path: "README", Length: 100, Completed: 100},
@@ -246,6 +265,28 @@ func TestBTFormatHelpers(t *testing.T) {
 	}
 }
 
+// TestBTDetailsPanelFeedsPieceMosaic 校验分片进度真的接到了热力图上:
+// 面板刷新时要把快照里的分片桶交给热力图,不然图上永远是空的——
+// 「BT 详情只有完整进度、没有分片热力图」正是要修的问题。
+func TestBTDetailsPanelFeedsPieceMosaic(t *testing.T) {
+	test.NewApp()
+	defer test.NewApp()
+
+	p := newBTDetailsPanel(&store.Task{ID: "bt-1", Protocol: "BT"})
+	d := sampleBTDetail()
+	p.update(d)
+
+	got, _ := p.mosaic.snapshot()
+	if len(got) != len(d.PieceBuckets) {
+		t.Fatalf("mosaic buckets = %d, want %d", len(got), len(d.PieceBuckets))
+	}
+	for i := range d.PieceBuckets {
+		if got[i] != d.PieceBuckets[i] {
+			t.Fatalf("bucket %d = %d, want %d", i, got[i], d.PieceBuckets[i])
+		}
+	}
+}
+
 // TestBTDetailsPanelRenders 把 BT 详情面板渲染成图片,断言画面上确实有
 // 东西(不是一整片空白)——面板的 widget 树一旦摆错(尺寸为 0、内容被挤
 // 出可视区),文字还在但画面会是空的,只有渲染出来才看得出来。
@@ -266,7 +307,7 @@ func TestBTDetailsPanelRenders(t *testing.T) {
 	p.update(sampleBTDetail())
 
 	w := test.NewWindow(p.content())
-	w.Resize(fyne.NewSize(760, 720))
+	w.Resize(fyne.NewSize(780, 720))
 	img := w.Canvas().Capture()
 	if img == nil {
 		t.Fatal("canvas capture returned nil")

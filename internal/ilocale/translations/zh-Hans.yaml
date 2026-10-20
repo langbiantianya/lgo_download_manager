@@ -142,6 +142,7 @@ addTask.bt.hint: "BitTorrent 任务的保存路径是一个目录，种子内容
 
 # BT 任务详情面板（种子信息）
 details.bt.section: "种子信息"
+details.bt.section.pieces: "分片进度"
 details.bt.section.trackers: "Tracker"
 details.bt.section.files: "文件"
 details.bt.infoHash: "种子哈希"

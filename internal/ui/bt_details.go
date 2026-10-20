@@ -63,6 +63,10 @@ type btDetailsPanel struct {
 	// filesBox 承载种子内每个文件的一行(名称 + 进度条 + 尺寸)。
 	filesBox *fyne.Container
 
+	// mosaic 是分片热力图:把分片级完成度画成马赛克,和 HTTP 面板的
+	// 字节马赛克同一套视觉语言。
+	mosaic *pieceMosaic
+
 	// root 是面板的纵向内容根容器,整体放进一个滚动容器里展示。
 	root *fyne.Container
 
@@ -91,7 +95,8 @@ type btFileRow struct {
 // showBTDetails 打开 BT 任务的详情窗口。
 //
 // 与 showChunkDetails 的 HTTP 版布局完全不同:这里不放「字节区间马赛克」
-// (BT 没有字节区间分片的概念),而是给出种子特有的实时信息。
+// (BT 没有字节区间分片的概念),而是给出种子特有的实时信息,并且按分片
+// 画一张热力马赛克图(参见 piece_mosaic.go)——分片是 BT 真正的进度单位。
 //
 // 返回值是面板本身,供测试断言渲染内容。
 func showBTDetails(t *store.Task, svc Service, parent fyne.Window) *btDetailsPanel {
@@ -102,7 +107,7 @@ func showBTDetails(t *store.Task, svc Service, parent fyne.Window) *btDetailsPan
 
 	w := fyne.CurrentApp().NewWindow(titleStr)
 	w.SetContent(p.content())
-	w.Resize(fyne.NewSize(760, 720))
+	w.Resize(fyne.NewSize(780, 720))
 	w.Show()
 
 	w.SetOnClosed(func() { p.stop() })
@@ -175,6 +180,7 @@ func newBTDetailsPanel(t *store.Task) *btDetailsPanel {
 	)
 
 	p.filesBox = container.NewVBox()
+	p.mosaic = newPieceMosaic()
 
 	// 面板的行数多(十几个字段 + 三个分区),默认的行间距(theme.Padding=4)
 	// 会把内容顶出一屏。这里用 2px 的紧凑间距,让「种子信息 / Tracker /
@@ -203,11 +209,23 @@ func newBTDetailsPanel(t *store.Task) *btDetailsPanel {
 	return p
 }
 
-// content 返回面板的可滚动内容。
+// content 返回面板的布局:上半是可滚动的种子信息,下半是分片热力图。
+//
+// 用 VSplit 而不是 Border:Border 布局会把「上」按最小高度摆好,剩下的
+// 空间空在那儿,信息区和热力图之间会裂开一条缝。VSplit 让信息区占满
+// 剩下的空间,热力图贴着底边,中间的分隔条还可以拖。
 func (p *btDetailsPanel) content() fyne.CanvasObject {
 	scroll := container.NewScroll(p.root)
-	scroll.SetMinSize(fyne.NewSize(560, 360))
-	return scroll
+	scroll.SetMinSize(fyne.NewSize(560, 300))
+
+	heat := container.NewVBox(
+		btSectionLabel("details.bt.section.pieces", "分片进度"),
+		p.mosaic.content(),
+	)
+	split := container.NewVSplit(scroll, heat)
+	// 热力图大概占下面四分之一,信息区占上面四分之三。
+	split.SetOffset(0.72)
+	return split
 }
 
 // poll 周期性拉取 BT 详情并刷新面板,直到窗口关闭。
@@ -274,6 +292,7 @@ func (p *btDetailsPanel) update(d *bittorrent.Detail) {
 	}
 	p.lblNote.SetText("")
 	p.updateFiles(d.Files)
+	p.mosaic.update(d.PieceBuckets)
 }
 
 // markInactive 在任务不在运行(未启动 / 已暂停 / 已完成且未做种)时调用:

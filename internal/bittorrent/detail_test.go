@@ -8,6 +8,8 @@ package bittorrent
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -66,12 +68,68 @@ func TestDetailReportsTorrentFacts(t *testing.T) {
 	if d.PiecesDone > d.Pieces {
 		t.Errorf("PiecesDone = %d, must not exceed Pieces = %d", d.PiecesDone, d.Pieces)
 	}
+	// 分片热力图的数据:分片不多时一块一桶,桶数与分片数一致。
+	if len(d.PieceBuckets) != d.Pieces {
+		t.Errorf("PieceBuckets = %d, want %d", len(d.PieceBuckets), d.Pieces)
+	}
+	// 盘上没有数据,桶值应该全是 0(「未开始」)。
+	for i, v := range d.PieceBuckets {
+		if v != 0 {
+			t.Errorf("bucket %d = %d, want 0", i, v)
+		}
+	}
 	if d.Uploaded < 0 {
 		t.Errorf("Uploaded = %d, want >= 0", d.Uploaded)
 	}
 	// 这个种子没有 announce 地址,tracker 列表应为空而不是塞进别的东西。
 	if len(d.Trackers) != 0 {
 		t.Errorf("Trackers = %v, want empty", d.Trackers)
+	}
+}
+
+// TestDetailPieceBucketsReflectCompleteData 校验分片桶在真实 BT 客户端
+// 上反映的是分片完成度:数据已经在盘上、anacrolix 认下这些分片之后,
+// 桶值应该全是 255(「已下完」),而不是一片 0——分片热力图画的就是这个。
+func TestDetailPieceBucketsReflectCompleteData(t *testing.T) {
+	requireLoopback(t)
+	content := fakePayload(300 << 10)
+	const pieceLength = 64 << 10
+	_, torrentBytes := makeSingleFileTorrent(t, "verify.bin", content, pieceLength)
+
+	// 数据先放好:anacrolix 的文件存储按「正式文件在不在、长度对不对」
+	// 认下已完成的分片(与 lgdm 断点续传的判定口径一致)。
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "verify.bin"), content, 0o644); err != nil {
+		t.Fatalf("write data: %v", err)
+	}
+
+	m, err := New(Config{MaxPeersPerTorrent: 4, EnableDHT: false, EnablePEX: false})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	defer m.Close()
+
+	h, err := m.AddTorrentBytes(context.Background(), torrentBytes, dir)
+	if err != nil {
+		t.Fatalf("AddTorrentBytes: %v", err)
+	}
+	defer h.Close()
+	h.StartDownloading()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := h.WaitInfo(ctx); err != nil {
+		t.Fatalf("WaitInfo: %v", err)
+	}
+
+	d := h.Detail()
+	if len(d.PieceBuckets) != d.Pieces {
+		t.Fatalf("PieceBuckets = %d, want %d", len(d.PieceBuckets), d.Pieces)
+	}
+	for i, v := range d.PieceBuckets {
+		if v != 255 {
+			t.Errorf("bucket %d = %d, want 255 (the piece is already on disk)", i, v)
+		}
 	}
 }
 

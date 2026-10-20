@@ -141,6 +141,7 @@ addTask.bt.hint: "Для задачи BitTorrent путь сохранения �
 
 # Панель сведений о задаче BitTorrent (информация о торренте)
 details.bt.section: "Информация о торренте"
+details.bt.section.pieces: "Прогресс кусочков"
 details.bt.section.trackers: "Трекеры"
 details.bt.section.files: "Файлы"
 details.bt.infoHash: "Инфо-хеш"

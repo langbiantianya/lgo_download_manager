@@ -141,6 +141,7 @@ addTask.bt.hint: "BitTorrent 任務的儲存路徑是一個目錄，種子內容
 
 # BT 任務詳情面板（種子資訊）
 details.bt.section: "種子資訊"
+details.bt.section.pieces: "分片進度"
 details.bt.section.trackers: "Tracker"
 details.bt.section.files: "檔案"
 details.bt.infoHash: "種子雜湊"

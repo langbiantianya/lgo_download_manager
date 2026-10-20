@@ -141,6 +141,7 @@ addTask.bt.hint: "BitTorrent タスクの保存先はフォルダです。トレ
 
 # BT タスク詳細パネル（トレント情報）
 details.bt.section: "トレント情報"
+details.bt.section.pieces: "ピースの進捗"
 details.bt.section.trackers: "トラッカー"
 details.bt.section.files: "ファイル"
 details.bt.infoHash: "情報ハッシュ"

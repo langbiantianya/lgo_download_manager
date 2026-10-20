@@ -109,6 +109,15 @@ const defaultMaxPeersPerTorrent = 50
 // 「偷走」字节增量,各自算出来的速度都偏低。
 const minSpeedSample = 500 * time.Millisecond
 
+// maxPieceBuckets 是详情快照里分片进度的最大桶数。分片热力图最多画
+// maxTiles(1024) 块,再细也看不出来。
+const maxPieceBuckets = 1024
+
+// maxPieceScan 是单次采样最多读取的分片数。超大体积 + 极小分片的种子
+// 会有几十万个分片,逐个读会让每秒的详情采样变得很重;超过这个数就
+// 按等距抽样(桶内的完成度用样本估算)。
+const maxPieceScan = 65536
+
 // Manager 拥有进程内共享的 BT 客户端。
 //
 // 并发安全:所有导出方法都可以从多个 goroutine 调用。
@@ -207,6 +216,11 @@ type Detail struct {
 	PieceLength int64
 	Pieces      int
 	PiecesDone  int
+	// PieceBuckets 是分片级进度:把全部分片按等宽分成最多 maxPieceBuckets
+	// 个桶,每个桶一个字节(0=未开始,255=完整),值是桶内已下载字节的占比。
+	// 「分片热力图」按它着色——分片数可能上万,而马赛克最多画 1024 块,
+	// 聚合后既够画又不占 IPC 带宽。
+	PieceBuckets []uint8
 	// Seeding 表示数据已完整且正在做种;Complete 表示数据已完整。
 	Seeding  bool
 	Complete bool
@@ -736,6 +750,7 @@ func (h *Handle) Detail() Detail {
 	d.PieceLength = info.PieceLength
 	d.Pieces = info.NumPieces()
 	d.PiecesDone = stats.PiecesComplete
+	d.PieceBuckets = h.pieceBuckets(info.PieceLength, info.TotalLength(), info.NumPieces())
 
 	files := h.t.Files()
 	d.Files = make([]FileProgress, 0, len(files))
@@ -759,6 +774,74 @@ func (h *Handle) Detail() Detail {
 	d.SpeedBPS = h.measureSpeed(d.Downloaded)
 	d.UploadBPS = h.measureUploadSpeed(d.Uploaded)
 	return d
+}
+
+// pieceBuckets 采样分片级完成度,并按等宽桶聚合。
+//
+// 分片是 BT 天然的进度单位:每个分片「还差多少字节」直接来自
+// anacrolix 的 PieceBytesMissing(已完整的分片返回 0,未完整的返回
+// 「分片长度 - 已下载的脏字节」)。桶的值是桶内已下载字节的占比(0..255),
+// 也就是「这一片区域还剩多少」——正好是热力图要的量。
+func (h *Handle) pieceBuckets(pieceLength, totalLength int64, numPieces int) []uint8 {
+	return aggregatePieces(pieceLength, totalLength, numPieces, h.t.PieceBytesMissing)
+}
+
+// aggregatePieces 按等宽桶聚合分片完成度。
+//
+// missingFn(piece) 返回该分片还差多少字节(已完整的分片返回 0)。抽成
+// 参数是为了能脱离真实的 BT 客户端做单元测试。
+//
+// 分片数超过 maxPieceScan 时按等距抽样:桶内完成度用样本估算,
+// 误差对一张热力图来说无所谓,但省掉了每秒钟几十万次加锁。
+func aggregatePieces(pieceLength, totalLength int64, numPieces int, missingFn func(int) int64) []uint8 {
+	if numPieces <= 0 || pieceLength <= 0 || missingFn == nil {
+		return nil
+	}
+	buckets := numPieces
+	if buckets > maxPieceBuckets {
+		buckets = maxPieceBuckets
+	}
+	stride := 1
+	if numPieces > maxPieceScan {
+		stride = (numPieces + maxPieceScan - 1) / maxPieceScan
+	}
+	// 每个桶覆盖 [lo, hi) 的分片。
+	per := (numPieces + buckets - 1) / buckets
+	out := make([]uint8, buckets)
+	for b := 0; b < buckets; b++ {
+		lo := b * per
+		if lo >= numPieces {
+			break
+		}
+		hi := lo + per
+		if hi > numPieces {
+			hi = numPieces
+		}
+		var done, total int64
+		for i := lo; i < hi; i += stride {
+			length := pieceLength
+			if last := numPieces - 1; i == last {
+				// 末片通常比其它片短。
+				length = totalLength - int64(last)*pieceLength
+			}
+			if length <= 0 {
+				continue
+			}
+			missing := missingFn(i)
+			if missing < 0 {
+				missing = 0
+			}
+			if missing > length {
+				missing = length
+			}
+			done += length - missing
+			total += length
+		}
+		if total > 0 {
+			out[b] = uint8(done * 255 / total)
+		}
+	}
+	return out
 }
 
 // Complete 报告种子数据是否已全部完成(含做种阶段)。

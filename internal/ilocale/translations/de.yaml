@@ -141,6 +141,7 @@ addTask.bt.hint: "Eine BitTorrent-Aufgabe speichert in einen Ordner: die Inhalte
 
 # Details-Panel für BT-Aufgaben (Torrent-Info)
 details.bt.section: "Torrent-Info"
+details.bt.section.pieces: "Piece-Fortschritt"
 details.bt.section.trackers: "Tracker"
 details.bt.section.files: "Dateien"
 details.bt.infoHash: "Info-Hash"
