@@ -23,6 +23,7 @@ import (
 
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
+	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/ui/nativefolder"
@@ -187,7 +188,7 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 				if nativefolder.IsCancelled(err) {
 					return
 				}
-				fyne.Do(func() { dialog.ShowError(err, parent) })
+				fyne.Do(func() { showError(parent, err) })
 				return
 			}
 			fyne.Do(func() {
@@ -320,11 +321,11 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 			Auth:         taskAuth,
 		})
 		if err != nil {
-			dialog.ShowError(err, parent)
+			showError(parent, err)
 			return
 		}
 		if err := svc.Start(tk.ID); err != nil {
-			dialog.ShowError(err, parent)
+			showError(parent, err)
 			return
 		}
 		if closeWin != nil {
@@ -363,6 +364,43 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 	}
 
 	w.Show()
+}
+
+// errorParent 返回能承载错误对话框的窗口。
+//
+// lgom:// 转发路径没有主窗口可传（parent 为 nil），而 Fyne 的
+// dialog.ShowError 会解引用 parent.Canvas()——nil 会直接 panic，整个 UI
+// 子进程就此消失（业务进程还活着，只是窗口没了）。这里退回到全局主
+// 窗口，再退回到应用里的第一个窗口。
+func errorParent(parent fyne.Window) fyne.Window {
+	if parent != nil {
+		return parent
+	}
+	if globalWin != nil {
+		return globalWin
+	}
+	for _, w := range fyne.CurrentApp().Driver().AllWindows() {
+		if w != nil {
+			return w
+		}
+	}
+	return nil
+}
+
+// showError 弹一个错误对话框。
+//
+// parent 可能为 nil（lgom:// 转发路径），此时退回全局主窗口；实在没有
+// 窗口可挂（不该发生）就只记日志——绝不因为「没有窗口」而 panic。
+func showError(parent fyne.Window, err error) {
+	if err == nil {
+		return
+	}
+	p := errorParent(parent)
+	if p == nil {
+		logging.Printf("ui: no window to show the error dialog: %v", err)
+		return
+	}
+	dialog.ShowError(err, p)
 }
 
 func notEmptyValidator() fyne.StringValidator {
