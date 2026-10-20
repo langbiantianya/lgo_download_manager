@@ -57,16 +57,45 @@ func settingsPersist(svc Service, onChange func(), suppressPersist func() bool) 
 	}
 }
 
+// newSaveDirEntry 构造「设置 → 下载 → 保存位置」的输入框。
+//
+// 空目录会被拒绝并把文本弹回上一个有效值:目录为空会让 settings.Load
+// 拿不到可用的落盘位置(旧版本还会把整份设置重置成默认值),所以这里
+// 不接受空输入,只把用户改坏的这一次编辑挡在门外。
+//
+// last 记录最近一次被接受的目录值;restoring 用于抑制 SetText 触发的
+// 那一次回调(Fyne 的 Entry.SetText 会同步调用 OnChanged)。
+func newSaveDirEntry(persist func()) *widget.Entry {
+	entry := widget.NewEntry()
+	entry.SetText(GlobalSettings.DefaultSaveDir)
+	last := GlobalSettings.DefaultSaveDir
+	restoring := false
+	entry.OnChanged = func(s string) {
+		if restoring {
+			// 这是弹回旧值时 SetText 触发的回调,忽略即可。
+			restoring = false
+			return
+		}
+		if strings.TrimSpace(s) == "" {
+			// 空目录无效:弹回上一个有效值。
+			if last != "" {
+				restoring = true
+				entry.SetText(last)
+			}
+			return
+		}
+		last = s
+		GlobalSettings.DefaultSaveDir = s
+		persist()
+	}
+	return entry
+}
+
 func buildSettingsContent(svc Service, onChange func(), suppressPersist func() bool) fyne.CanvasObject {
 	persist := func() {
 		settingsPersist(svc, onChange, suppressPersist)
 	}
-	dirEntry := widget.NewEntry()
-	dirEntry.SetText(GlobalSettings.DefaultSaveDir)
-	dirEntry.OnChanged = func(s string) {
-		GlobalSettings.DefaultSaveDir = s
-		persist()
-	}
+	dirEntry := newSaveDirEntry(persist)
 
 	threadsEntry := widget.NewEntry()
 	threadsEntry.SetText(fmt.Sprintf("%d", GlobalSettings.DefaultThreads))

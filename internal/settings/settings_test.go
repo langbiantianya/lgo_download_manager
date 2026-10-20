@@ -351,3 +351,86 @@ func TestLoad_Language_InvalidPersistedNormalized(t *testing.T) {
 		t.Errorf("Language = %q, want default %q (invalid persisted value must normalize)", got.Language, ilocale.DefaultLanguage)
 	}
 }
+
+// TestLoad_EmptySaveDirKeepsOtherSettings 回归测试。
+//
+// 旧版用「下载目录为空」判定首次运行,于是目录一旦被清空,线程数/分块/
+// UA/BT 端口/DHT/PEX/分享率等一整套设置都会被重置成默认值。
+// 现在首次运行只看「用户有没有保存过设置」(store 的 initialized 标记),
+// 目录为空时只补目录本身,其余设置原样保留。
+func TestLoad_EmptySaveDirKeepsOtherSettings(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "state.db")
+	st, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	// 一次首启,让默认值落盘(initialized=1)。
+	if _, err := Load(st, false); err != nil {
+		t.Fatalf("first Load: %v", err)
+	}
+
+	// 用户改过一堆设置,其中下载目录被清空。
+	if err := st.SaveSettings(store.Settings{
+		DefaultSaveDir:     "",
+		DefaultThreads:     16,
+		MinChunkSize:       32 * 1024 * 1024,
+		UserAgent:          "my-agent/1.0",
+		Cookies:            "a=b",
+		MaxConcurrent:      7,
+		BTPort:             51413,
+		BTMaxPeers:         42,
+		BTDownloadLimitKiB: 4096,
+		BTUploadLimitKiB:   256,
+		BTDHT:              false,
+		BTPEX:              false,
+		BTSeedRatio:        1.5,
+		BTMaxSeeding:       3,
+		BTMaxConcurrent:    4,
+		BTTrackers:         "udp://tracker.example.com:6969/announce",
+	}); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+
+	got, err := Load(st, false)
+	if err != nil {
+		t.Fatalf("Load (after save): %v", err)
+	}
+
+	// 其余设置必须原样保留。
+	if got.DefaultThreads != 16 {
+		t.Errorf("DefaultThreads = %d, want 16 (must not be reset)", got.DefaultThreads)
+	}
+	if got.MinChunkSize != 32*1024*1024 {
+		t.Errorf("MinChunkSize = %d, want %d (must not be reset)", got.MinChunkSize, 32*1024*1024)
+	}
+	if got.UserAgent != "my-agent/1.0" {
+		t.Errorf("UserAgent = %q, want %q (must not be reset)", got.UserAgent, "my-agent/1.0")
+	}
+	if got.MaxConcurrent != 7 {
+		t.Errorf("MaxConcurrent = %d, want 7 (must not be reset)", got.MaxConcurrent)
+	}
+	if got.BTPort != 51413 || got.BTMaxPeers != 42 {
+		t.Errorf("BTPort/BTMaxPeers = %d/%d, want 51413/42 (must not be reset)", got.BTPort, got.BTMaxPeers)
+	}
+	if got.BTDownloadLimitKiB != 4096 || got.BTUploadLimitKiB != 256 {
+		t.Errorf("BT limits = %d/%d, want 4096/256 (must not be reset)",
+			got.BTDownloadLimitKiB, got.BTUploadLimitKiB)
+	}
+	if got.BTDHT || got.BTPEX {
+		t.Errorf("BTDHT/BTPEX = %v/%v, want false/false (must not be reset)", got.BTDHT, got.BTPEX)
+	}
+	if got.BTSeedRatio != 1.5 || got.BTMaxSeeding != 3 || got.BTMaxConcurrent != 4 {
+		t.Errorf("BT ratio/seeding/concurrent = %v/%d/%d, want 1.5/3/4 (must not be reset)",
+			got.BTSeedRatio, got.BTMaxSeeding, got.BTMaxConcurrent)
+	}
+	if got.BTTrackers != "udp://tracker.example.com:6969/announce" {
+		t.Errorf("BTTrackers = %q (must not be reset)", got.BTTrackers)
+	}
+
+	// 目录为空只补这一个字段:给出一个可用的默认位置。
+	if got.DefaultSaveDir == "" {
+		t.Errorf("DefaultSaveDir = %q, want a non-empty fallback", got.DefaultSaveDir)
+	}
+}

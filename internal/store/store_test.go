@@ -543,3 +543,69 @@ func TestTaskBTFileRoundtrip(t *testing.T) {
 		t.Fatalf("BTFile after clear = %q, want empty", got.BTFile)
 	}
 }
+
+// TestLoadSettingsEx_SavedFlag 锁定「这份设置是否已经被保存过」的判定。
+//
+// settings 表要求恰好一行,LoadSettings 在库里没有行时会插入一条占位行。
+// 占位行不能当成「用户保存过设置」——否则「下载目录被清空」这类单字段
+// 异常会被误判成首次运行,把一整套设置重置成默认值。
+func TestLoadSettingsEx_SavedFlag(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	// 全新库:还没有任何行。
+	if _, saved, err := s.LoadSettingsEx(); err != nil {
+		t.Fatal(err)
+	} else if saved {
+		t.Fatal("fresh database reported saved=true")
+	}
+
+	// LoadSettings 会插入占位行,但占位行不代表用户保存过设置。
+	if _, err := s.LoadSettings(); err != nil {
+		t.Fatal(err)
+	}
+	if _, saved, err := s.LoadSettingsEx(); err != nil {
+		t.Fatal(err)
+	} else if saved {
+		t.Fatal("placeholder row must not count as saved")
+	}
+
+	// 真正保存过一次之后才算 saved。
+	if err := s.SaveSettings(Settings{DefaultSaveDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	if _, saved, err := s.LoadSettingsEx(); err != nil {
+		t.Fatal(err)
+	} else if !saved {
+		t.Fatal("after SaveSettings expected saved=true")
+	}
+}
+
+// TestLoadSettingsEx_EmptyDirStillSaved 验证「保存过但目录为空」仍算
+// saved:true —— 这正是旧版把整套设置重置掉的那个场景。
+func TestLoadSettingsEx_EmptyDirStillSaved(t *testing.T) {
+	dir := t.TempDir()
+	s, err := Open(filepath.Join(dir, "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	if err := s.SaveSettings(Settings{DefaultThreads: 16}); err != nil {
+		t.Fatal(err)
+	}
+	got, saved, err := s.LoadSettingsEx()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !saved {
+		t.Fatal("saved=false for an explicitly saved row with an empty dir")
+	}
+	if got.DefaultThreads != 16 {
+		t.Fatalf("DefaultThreads = %d, want 16", got.DefaultThreads)
+	}
+}

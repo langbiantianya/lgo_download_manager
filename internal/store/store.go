@@ -380,6 +380,22 @@ CREATE INDEX IF NOT EXISTS idx_tasks_save_path    ON tasks(save_path ASC, id ASC
 	if err := s.addColumnIfMissing("settings", "bt_trackers", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
+	// initialized 标记「这份设置已经被保存过一次」。
+	//
+	// settings 表要求恰好一行(id=1),LoadSettings 在库里没有行时会插入
+	// 一条占位行。占位行本身说明不了「用户保存过设置」——一旦拿它当
+	// 首次运行标记,「下载目录被清空」这类场景就会把线程数/分块/UA/
+	// BT 端口等一整套设置重置成默认值。用这一列显式记录「已保存过」,
+	// 才能把「首次运行」和「保存过但某个字段为空」区分开。
+	if err := s.addColumnIfMissing("settings", "initialized", `INTEGER NOT NULL DEFAULT 0`); err != nil {
+		return err
+	}
+	// 老库升级:已经有下载目录的行一定是用户保存过的设置,补上标记,
+	// 避免升级后被当成首次运行而重置一遍设置(老版本是用「目录为空」
+	// 来近似判断首次运行的)。
+	if _, err := s.db.Exec(`UPDATE settings SET initialized=1 WHERE id=1 AND default_save_dir<>''`); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -869,9 +885,22 @@ func (s Settings) EffectiveBTMaxPeers() int {
 	return s.BTMaxPeers
 }
 
+// LoadSettings 读取持久化设置。若 settings 表里还没有 id=1 的行，
 // 则插入一条全零的记录（由调用方负责套用默认值），
 // 并返回零值的 Settings。
 func (s *Store) LoadSettings() (Settings, error) {
+	set, _, err := s.LoadSettingsEx()
+	return set, err
+}
+
+// LoadSettingsEx 与 LoadSettings 相同，但额外报告「这份设置是否已经被
+// 保存过」。
+//
+// saved=false 表示这是真正的首次运行：settings 表里只有一条占位行，
+// 用户从来没有保存过设置，调用方应当套用全套默认值；
+// saved=true 表示用户已经保存过设置，此时即便某些字段为空（例如下载
+// 目录被清空）也必须原样保留 —— 否则一次误操作就会把用户配置全部重置。
+func (s *Store) LoadSettingsEx() (Settings, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -901,6 +930,7 @@ func (s *Store) LoadSettings() (Settings, error) {
 		btMaxSeeding    int
 		btMaxConcurrent int
 		btTrackers      string
+		initialized     int
 	)
 	err := s.db.QueryRow(`SELECT default_save_dir, default_threads, min_chunk_size,
 		user_agent, cookies, ftp_passive, prealloc, task_sort,
@@ -918,21 +948,24 @@ func (s *Store) LoadSettings() (Settings, error) {
 		COALESCE(bt_seed_ratio, -1),
 		COALESCE(bt_max_seeding, -1),
 		COALESCE(bt_max_concurrent, -1),
-		COALESCE(bt_trackers, '')
+		COALESCE(bt_trackers, ''),
+		COALESCE(initialized, 0)
 		FROM settings WHERE id=1`,
 	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc, &taskSort,
 		&proxyMode, &proxyURL, &proxyBypass, &lightMode, &maxConc, &autoStart, &language,
-		&btPort, &btMaxPeers, &btDlLimit, &btUlLimit, &btDHT, &btPEX, &btSeedRatio, &btMaxSeeding, &btMaxConcurrent, &btTrackers)
+		&btPort, &btMaxPeers, &btDlLimit, &btUlLimit, &btDHT, &btPEX, &btSeedRatio, &btMaxSeeding, &btMaxConcurrent, &btTrackers,
+		&initialized)
 	if errors.Is(err, sql.ErrNoRows) {
 		// 首次运行：插入一条全零行，以便后续 LoadSettings 能读到。
+		// 该行的 initialized 保持 0 —— 它只是占位，不代表用户保存过设置。
 		_, ierr := s.db.Exec(`INSERT OR IGNORE INTO settings (id) VALUES (1)`)
 		if ierr != nil {
-			return Settings{}, fmt.Errorf("settings init: %w", ierr)
+			return Settings{}, false, fmt.Errorf("settings init: %w", ierr)
 		}
-		return Settings{}, nil
+		return Settings{}, false, nil
 	}
 	if err != nil {
-		return Settings{}, fmt.Errorf("settings load: %w", err)
+		return Settings{}, false, fmt.Errorf("settings load: %w", err)
 	}
 	// 兼容升级：未持久化 proxy_mode 时根据 proxy_url 是否非空推断。
 	// - 空 URL ⇒ System（默认，与"未启用"语义一致）
@@ -990,10 +1023,13 @@ func (s *Store) LoadSettings() (Settings, error) {
 		BTMaxSeeding:       btMaxSeeding,
 		BTMaxConcurrent:    btMaxConcurrent,
 		BTTrackers:         btTrackers,
-	}, nil
+	}, initialized != 0, nil
 }
 
 // SaveSettings upsert 已持久化的 settings 行。
+//
+// 写入时同时把 initialized 置 1：这份设置从此算「用户保存过」，
+// 下次启动不再走首次运行的全套默认值（见 LoadSettingsEx）。
 func (s *Store) SaveSettings(s2 Settings) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1001,8 +1037,9 @@ func (s *Store) SaveSettings(s2 Settings) error {
 		min_chunk_size, user_agent, cookies, ftp_passive, prealloc, task_sort,
 		proxy_mode, proxy_url, proxy_bypass, light_mode, max_concurrent, auto_start,
 		language, bt_port, bt_max_peers, bt_download_limit, bt_upload_limit,
-		bt_dht, bt_pex, bt_seeding, bt_seed_ratio, bt_max_seeding, bt_max_concurrent, bt_trackers)
-	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		bt_dht, bt_pex, bt_seeding, bt_seed_ratio, bt_max_seeding, bt_max_concurrent, bt_trackers,
+		initialized)
+	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
 	ON CONFLICT(id) DO UPDATE SET
 			default_save_dir=excluded.default_save_dir,
 			default_threads=excluded.default_threads,
@@ -1029,7 +1066,8 @@ func (s *Store) SaveSettings(s2 Settings) error {
 			bt_seed_ratio=excluded.bt_seed_ratio,
 			bt_max_seeding=excluded.bt_max_seeding,
 			bt_max_concurrent=excluded.bt_max_concurrent,
-			bt_trackers=excluded.bt_trackers`,
+			bt_trackers=excluded.bt_trackers,
+			initialized=excluded.initialized`,
 		s2.DefaultSaveDir, s2.DefaultThreads, s2.MinChunkSize,
 		s2.UserAgent, s2.Cookies, boolToInt(s2.FTPPassive), boolToInt(s2.Prealloc),
 		string(s2.TaskSort),

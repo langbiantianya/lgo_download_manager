@@ -241,3 +241,40 @@ func TestApplyLanguage_SuppressesSettingsPersistDuringRebuild(t *testing.T) {
 		t.Fatalf("applyLanguage rebuild caused %d SaveSettings calls (loop regression)", got)
 	}
 }
+
+// TestSaveDirEntryRejectsEmpty 回归测试:下载目录输入框不接受空值。
+//
+// 空目录会被业务进程当成「没有有效保存位置」——旧版本更糟,直接当成
+// 首次运行把整套设置重置成默认值。清空输入框时必须把文本弹回上一个
+// 有效值,并且不产生一次落盘。
+func TestSaveDirEntryRejectsEmpty(t *testing.T) {
+	test.NewApp()
+	defer test.NewApp()
+
+	GlobalSettings = store.Settings{DefaultSaveDir: "/tmp/dl"}
+	defer func() { GlobalSettings = store.Settings{} }()
+
+	var persisted atomic.Int32
+	entry := newSaveDirEntry(func() { persisted.Add(1) })
+
+	// 清空输入框。
+	entry.SetText("")
+	if GlobalSettings.DefaultSaveDir != "/tmp/dl" {
+		t.Fatalf("save dir = %q, want the previous value kept", GlobalSettings.DefaultSaveDir)
+	}
+	if entry.Text != "/tmp/dl" {
+		t.Fatalf("entry text = %q, want the previous value restored", entry.Text)
+	}
+	if got := persisted.Load(); got != 0 {
+		t.Fatalf("persist called %d times for an empty dir, want 0", got)
+	}
+
+	// 合法的新值照常生效并落盘。
+	entry.SetText("/tmp/other")
+	if GlobalSettings.DefaultSaveDir != "/tmp/other" {
+		t.Fatalf("save dir = %q, want /tmp/other", GlobalSettings.DefaultSaveDir)
+	}
+	if got := persisted.Load(); got != 1 {
+		t.Fatalf("persist called %d times, want 1", got)
+	}
+}

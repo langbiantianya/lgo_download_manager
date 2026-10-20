@@ -31,12 +31,17 @@ var pickBTPort = pickAvailableBTPort
 
 // Load 从存储读取持久化设置，应用首次运行默认值与 forceLight 覆盖，
 // 并把代理配置同步到 protocol 包。首次运行时自动保存默认值行。
+//
+// 「首次运行」的判定依据是「用户有没有保存过设置」(store 的 initialized
+// 标记),而不是「下载目录是否为空」——后者会把「目录被清空」这种
+// 单字段异常误判成首次运行,把线程数/分块/UA/BT 端口等一整套设置
+// 全部重置成默认值。
 func Load(st *store.Store, forceLight bool) (store.Settings, error) {
-	persisted, err := st.LoadSettings()
+	persisted, saved, err := st.LoadSettingsEx()
 	if err != nil {
 		return store.Settings{}, err
 	}
-	firstRun := persisted.DefaultSaveDir == ""
+	firstRun := !saved
 	if firstRun {
 		home, _ := os.UserHomeDir()
 		persisted.DefaultSaveDir = filepath.Join(home, "Downloads")
@@ -89,10 +94,26 @@ func Load(st *store.Store, forceLight bool) (store.Settings, error) {
 	} else {
 		persisted.Language = ilocale.Normalize(persisted.Language)
 	}
+	// 非首次运行、但下载目录为空时的兜底:只补这一个字段,其余设置是
+	// 用户自己配的,一个字都不能动。旧版本把「目录为空」当成首次运行,
+	// 一旦目录被清空就会把整套设置重置——这里只做最小修复。
+	dirFallback := false
+	if persisted.DefaultSaveDir == "" {
+		home, _ := os.UserHomeDir()
+		persisted.DefaultSaveDir = filepath.Join(home, "Downloads")
+		dirFallback = true
+		logging.Printf("settings: save dir was empty, fallback to %q", persisted.DefaultSaveDir)
+	}
 	ApplyProxy(persisted)
 	if firstRun {
 		if err := Save(st, persisted); err != nil {
 			logging.Printf("settings: save first-run defaults: %v", err)
+		}
+	} else if dirFallback {
+		// 只回写这一个修复过的字段,用 store 直写避免触发 ApplyAutoStart
+		// 等与本次修复无关的副作用。
+		if err := st.SaveSettings(persisted); err != nil {
+			logging.Printf("settings: persist save dir fallback: %v", err)
 		}
 	}
 	return persisted, nil
