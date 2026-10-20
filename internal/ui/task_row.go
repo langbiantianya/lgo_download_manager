@@ -191,15 +191,24 @@ func (r *taskRow) bindButtons(t *store.Task, svc Service) {
 		down := store.TaskStatus.Downloading
 		r.optimisticStatus = &down
 		fyne.Do(func() { r.refresh() })
-		_ = svc.Start(taskID)
+		if err := svc.Start(taskID); err != nil {
+			// 启动失败要把乐观状态收回去,否则界面会一直停在「下载中」。
+			r.optimisticStatus = nil
+			fyne.Do(func() { r.refresh() })
+			showError(globalWin, err)
+		}
 	}
 	pauseBtn.OnTapped = func() {
 		paused := store.TaskStatus.Paused
 		r.optimisticStatus = &paused
 		fyne.Do(func() { r.refresh() })
-		_ = svc.Pause(taskID)
+		if err := svc.Pause(taskID); err != nil {
+			r.optimisticStatus = nil
+			fyne.Do(func() { r.refresh() })
+			showError(globalWin, err)
+		}
 	}
-	r.cancelBtn.OnTapped = func() { svc.Delete(taskID) }
+	r.cancelBtn.OnTapped = func() { confirmDelete(t, svc) }
 	r.detailsBtn.OnTapped = func() { showChunkDetails(t, svc, globalWin) }
 	r.openFolderBtn.OnTapped = func() {
 		if t.SavePath == "" {
@@ -339,6 +348,23 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool) {
 		r.setVis(r.startBtn, showStart, true)
 		r.setVis(r.pauseBtn, showPause, false)
 	}
+}
+
+// confirmDelete 删除任务前先问一句。
+//
+// 删除会连同已下载的数据一起清掉(scheduler.Delete → removeTaskData 先删
+// .part 文件),之前是零确认:手滑点一下,几个 GB 的进度就没了。
+func confirmDelete(t *store.Task, svc Service) {
+	name := displayName(t)
+	message := ilocale.TF("taskRow.delete.confirm",
+		"确定删除任务「{{ .Name }}」吗?已下载的内容也会一并删除。",
+		map[string]any{"Name": name})
+	showConfirmDialog(globalWin, ilocale.T("taskRow.delete.title"), message,
+		ilocale.T("taskRow.delete.confirmBtn"), func() {
+			if err := svc.Delete(t.ID); err != nil {
+				showError(globalWin, err)
+			}
+		})
 }
 
 // setText 仅在文本与上次写入的不同（或尚未渲染过）时写标签。

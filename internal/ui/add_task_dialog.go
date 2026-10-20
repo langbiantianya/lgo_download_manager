@@ -13,17 +13,16 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/container"
-	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
-	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/ui/nativefolder"
@@ -178,11 +177,19 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 	// 同步阻塞在 UI 线程上,直接在 goroutine 中执行,选择结束后用
 	// fyne.Do 把结果切回 UI 线程。
 	browseBtn := widget.NewButton(ilocale.T("addTask.browse"), func() {
+		// widget 的字段只能在事件线程上读:goroutine 里直接读
+		// savePathEntry.Text 是数据竞争(go test -race 会报出来)。
+		// 这里先把需要的值取出来再进 goroutine。
+		cur := savePathEntry.Text
+		base := filepath.Base(cur)
+		if base == "." || base == string(filepath.Separator) {
+			base = defaultName
+		}
+		startDir := filepath.Dir(cur)
+		if startDir == "" || startDir == "." {
+			startDir = GlobalSettings.DefaultSaveDir
+		}
 		go func() {
-			startDir := filepath.Dir(savePathEntry.Text)
-			if startDir == "" || startDir == "." {
-				startDir = GlobalSettings.DefaultSaveDir
-			}
 			chosen, err := nativefolder.PickFolder(startDir)
 			if err != nil {
 				if nativefolder.IsCancelled(err) {
@@ -192,7 +199,7 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 				return
 			}
 			fyne.Do(func() {
-				savePathEntry.SetText(uniqueSavePath(filepath.Join(chosen, filepath.Base(savePathEntry.Text))))
+				savePathEntry.SetText(uniqueSavePath(filepath.Join(chosen, base)))
 			})
 		}()
 	})
@@ -217,6 +224,37 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 	// 后续 URL 变化不再覆盖用户输入——这既保住了人工选择,也让 BT/BT 之间
 	// 的 URL 切换能自然刷新默认目录名。
 	autoSavePath := filepath.Join(GlobalSettings.DefaultSaveDir, defaultName)
+
+	// probeDebounce 是 URL 变化后等待多久才真正发起探测。连续键击时每敲
+	// 一个字符就发一次探测请求,会在网络上打出一串无用的请求——这里等到
+	// 用户停下来再探一次。
+	const probeDebounce = 400 * time.Millisecond
+
+	// probe 合并连续键击产生的探测请求,并给每次探测编号:只有最后一次
+	// 探测的结果会被采纳。早先发起的探测可能回来得更晚,不能让它把大小
+	// 预览覆盖成旧值。
+	probe := &debouncer{delay: probeDebounce}
+
+	// probeSize 在后台探测 URL 对应的文件大小,并把结果显示到大小标签上。
+	// 探测失败或大小未知时清空预览(静默,大小只是个预览)。
+	probeSize := func(rawURL string, seq uint64) {
+		go func() {
+			size, perr := svc.Probe(rawURL)
+			if perr != nil || size <= 0 {
+				fyne.Do(func() {
+					if probe.IsCurrent(seq) {
+						sizeLabel.SetText("")
+					}
+				})
+				return
+			}
+			fyne.Do(func() {
+				if probe.IsCurrent(seq) {
+					sizeLabel.SetText(formatSize(size))
+				}
+			})
+		}()
+	}
 
 	// 从 URL 提取文件名并更新保存路径，同时异步探测文件大小
 	updateFromURL := func(rawURL string) {
@@ -244,21 +282,6 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 			savePathEntry.SetText(uniqueSavePath(nextDefault))
 		}
 		autoSavePath = nextDefault
-		// 异步探测（经业务进程，代理配置一致）。失败时静默清空预览。
-		go func() {
-			size, perr := svc.Probe(rawURL)
-			if perr != nil {
-				fyne.Do(func() { sizeLabel.SetText("") })
-				return
-			}
-			if size <= 0 {
-				fyne.Do(func() { sizeLabel.SetText("") })
-				return
-			}
-			fyne.Do(func() {
-				sizeLabel.SetText(formatSize(size))
-			})
-		}()
 	}
 
 	// URL 变化时触发
@@ -268,6 +291,10 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 			return
 		}
 		updateFromURL(s)
+		// 探测合并:连续键击时只探最后一次,免得每敲一个字就发一次请求。
+		probe.Trigger(func(seq uint64) {
+			fyne.Do(func() { probeSize(s, seq) })
+		})
 	}
 
 	formContent := container.NewVBox(
@@ -344,6 +371,9 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 
 	w.SetOnClosed(func() {
 		closeWin = nil
+		// 对话框关了就不该再探测:停掉待触发的定时器,已经发出的探测
+		// 回来后也只会更新一个没人看的标签。
+		probe.Stop()
 	})
 
 	w.SetContent(container.NewBorder(nil, footer, nil, nil, container.NewPadded(formContent)))
@@ -364,43 +394,6 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 	}
 
 	w.Show()
-}
-
-// errorParent 返回能承载错误对话框的窗口。
-//
-// lgom:// 转发路径没有主窗口可传（parent 为 nil），而 Fyne 的
-// dialog.ShowError 会解引用 parent.Canvas()——nil 会直接 panic，整个 UI
-// 子进程就此消失（业务进程还活着，只是窗口没了）。这里退回到全局主
-// 窗口，再退回到应用里的第一个窗口。
-func errorParent(parent fyne.Window) fyne.Window {
-	if parent != nil {
-		return parent
-	}
-	if globalWin != nil {
-		return globalWin
-	}
-	for _, w := range fyne.CurrentApp().Driver().AllWindows() {
-		if w != nil {
-			return w
-		}
-	}
-	return nil
-}
-
-// showError 弹一个错误对话框。
-//
-// parent 可能为 nil（lgom:// 转发路径），此时退回全局主窗口；实在没有
-// 窗口可挂（不该发生）就只记日志——绝不因为「没有窗口」而 panic。
-func showError(parent fyne.Window, err error) {
-	if err == nil {
-		return
-	}
-	p := errorParent(parent)
-	if p == nil {
-		logging.Printf("ui: no window to show the error dialog: %v", err)
-		return
-	}
-	dialog.ShowError(err, p)
 }
 
 func notEmptyValidator() fyne.StringValidator {

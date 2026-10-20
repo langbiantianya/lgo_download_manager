@@ -353,3 +353,52 @@ func TestIpcClient_BroadcastUnsubscribeRace(t *testing.T) {
 		wg.Wait()
 	}
 }
+
+// TestIpcClient_OnCloseAfterDisconnect 回归测试。
+//
+// 业务进程在 UI 子进程注册 onClose 之前就断开连接时,关闭信号会丢:
+// UI 不知道业务进程已经走了,窗口就一直挂着(而且用户看不出来)。
+// 这里锁定:连接已经断了之后再注册的 onClose 必须立刻被调用一次。
+func TestIpcClient_OnCloseAfterDisconnect(t *testing.T) {
+	c := &ipcClient{quit: make(chan struct{})}
+	c.notifyClose()
+
+	called := 0
+	c.SetOnClose(func() { called++ })
+	if called != 1 {
+		t.Fatalf("onClose called %d times, want 1 (the disconnect must not be swallowed)", called)
+	}
+}
+
+// TestIpcClient_MalformedResultDoesNotHang 回归测试。
+//
+// 业务进程回了一条解析不了的 MsgResult 时,旧实现直接 continue,把这条
+// 请求丢在一边:调用方只能干等到 30 秒超时。这里锁定:坏掉的响应也要
+// 给等待方一个答复。
+func TestIpcClient_MalformedResultDoesNotHang(t *testing.T) {
+	client, srv := newHandshakedClient(t)
+	go client.run()
+
+	// 合法 JSON,但不是 ResultData 的形状。
+	bad, err := ipc.Encode(map[string]any{"not": "a result"})
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	bad.Type = ipc.MsgResult
+	bad.ID = "1" // 客户端的第一个请求
+	if err := ipc.NewConn(srv).Send(bad); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- client.request("ui.list", nil, nil) }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("request returned nil error for a malformed result")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("request hung on a malformed result (should fail fast)")
+	}
+	client.Close()
+}

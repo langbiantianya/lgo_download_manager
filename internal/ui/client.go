@@ -34,17 +34,25 @@ type ipcClient struct {
 	subs     []chan scheduler.Event
 	settings store.Settings
 
+	// 下面几个回调由主 goroutine 注册、由 IPC 读循环读取,统一由 pendMu
+	// 保护——注册与读取分属不同 goroutine,不加锁就是数据竞争
+	// (go test -race 能稳定报出来)。
 	onShow        func()
 	onClose       func()
 	onShowAddTask func(ipc.ShowAddTaskParams)
 	onLanguage    func() // 收到 MsgInit/MsgLanguage 时调用,负责 UI 重译
+
+	// closed 记录连接是否已经断开。onClose 可能在连接断开之后才注册
+	// (冷启动时序:业务进程先走,UI 子进程后连上),那时要把「已经关闭」
+	// 补给它,否则 UI 不知道业务进程已经走了,窗口就一直挂着。
+	closed bool
 
 	// showAddTaskQ 在 onShowAddTask 尚未注册前缓存收到的 MsgShowAddTask。
 	// 业务进程的 lgom:// 转发可能在 RunChild 还没调到 SetOnShowAddTask
 	// 时就已发送;不缓存就直接丢弃,主窗口被 ShowFromTray 拉起后却看不到
 	// 对话框。容量 1:同一会话内 URL 转发连续触发概率极低,丢一条比塞一队
 	// 陈旧 URL 更安全。
-	showAddTaskQ []ipc.ShowAddTaskParams
+	showAddTaskQ       []ipc.ShowAddTaskParams
 	showAddTaskDrained bool
 
 	quit chan struct{}
@@ -76,10 +84,21 @@ func dialAndHandshake(socket, token string) (*ipcClient, store.Settings, error) 
 	}
 
 	// 等待第一条消息：业务端在握手成功后立即发送 MsgInit。
+	// 握手有读超时:业务进程连上了却一直没推 MsgInit(它自己卡住了),
+	// 没有超时的话 UI 子进程会永远挂在这里,连窗口都出不来。
+	if err := conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		conn.Close()
+		return nil, store.Settings{}, fmt.Errorf("set handshake deadline: %w", err)
+	}
 	msg, err := conn.Recv()
 	if err != nil {
 		conn.Close()
 		return nil, store.Settings{}, fmt.Errorf("wait init: %w", err)
+	}
+	// 握手完成:清掉读超时,运行期的连接要能一直等着业务进程的消息。
+	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+		conn.Close()
+		return nil, store.Settings{}, fmt.Errorf("clear handshake deadline: %w", err)
 	}
 	if msg.Type != ipc.MsgInit {
 		conn.Close()
@@ -121,12 +140,14 @@ func (c *ipcClient) run() {
 		case ipc.MsgResult:
 			var res ipc.ResultData
 			if err := json.Unmarshal(msg.Data, &res); err != nil {
-				continue
+				// 解析失败也要给等待方一个答复,否则这次请求会一直
+				// 等到 30 秒超时才返回。
+				res = ipc.ResultData{Error: "malformed result: " + err.Error()}
 			}
 			c.deliver(msg.ID, res)
 		case ipc.MsgShow:
-			if c.onShow != nil {
-				c.onShow()
+			if hook := c.showHook(); hook != nil {
+				hook()
 			}
 		case ipc.MsgShowAddTask:
 			var p ipc.ShowAddTaskParams
@@ -159,20 +180,35 @@ func (c *ipcClient) run() {
 				//   完成后会基于 ilocale.Current 立即跑一次 applyLanguage,
 				//   不需要额外通知。
 				ilocale.Set(init.Settings.Language)
-				if c.onLanguage != nil {
-					c.onLanguage() // 调用方自行切到 fyne 事件线程
+				if hook := c.languageHook(); hook != nil {
+					hook() // 调用方自行切到 fyne 事件线程
 				}
 			}
 		case ipc.MsgLanguage:
 			var ld ipc.LanguageData
 			if err := json.Unmarshal(msg.Data, &ld); err == nil {
 				ilocale.Set(ld.Language)
-				if c.onLanguage != nil {
-					c.onLanguage() // 调用方自行切到 fyne 事件线程
+				if hook := c.languageHook(); hook != nil {
+					hook() // 调用方自行切到 fyne 事件线程
 				}
 			}
 		}
 	}
+}
+
+// showHook 返回 MsgShow 回调（读循环用）。注册与读取分属不同 goroutine,
+// 这里统一由 pendMu 保护,避免数据竞争。
+func (c *ipcClient) showHook() func() {
+	c.pendMu.Lock()
+	defer c.pendMu.Unlock()
+	return c.onShow
+}
+
+// languageHook 返回语言变更回调（读循环用）。
+func (c *ipcClient) languageHook() func() {
+	c.pendMu.Lock()
+	defer c.pendMu.Unlock()
+	return c.onLanguage
 }
 
 // request 发送一个远程调用并同步等待结果。
@@ -243,8 +279,12 @@ func (c *ipcClient) setSettings(s store.Settings) {
 func (c *ipcClient) notifyClose() {
 	c.once.Do(func() {
 		close(c.quit)
-		if c.onClose != nil {
-			c.onClose()
+		c.pendMu.Lock()
+		c.closed = true
+		hook := c.onClose
+		c.pendMu.Unlock()
+		if hook != nil {
+			hook()
 		}
 	})
 }
@@ -364,10 +404,25 @@ func (c *ipcClient) Close() error {
 }
 
 // SetOnShow 注册 MsgShow（业务托盘「显示窗口」）回调。
-func (c *ipcClient) SetOnShow(f func()) { c.onShow = f }
+func (c *ipcClient) SetOnShow(f func()) {
+	c.pendMu.Lock()
+	c.onShow = f
+	c.pendMu.Unlock()
+}
 
 // SetOnClose 注册业务侧要求退出（MsgClose / 连接断开）时的回调。
-func (c *ipcClient) SetOnClose(f func()) { c.onClose = f }
+//
+// 连接可能已经断了才轮到这次注册(冷启动时序),那种情况下立刻把
+// 「已经关闭」补给它——否则 UI 会一直以为业务进程还在。
+func (c *ipcClient) SetOnClose(f func()) {
+	c.pendMu.Lock()
+	c.onClose = f
+	closed := c.closed
+	c.pendMu.Unlock()
+	if closed && f != nil {
+		f()
+	}
+}
 
 // SetOnShowAddTask 注册 MsgShowAddTask（业务转发 lgom:// 后弹出对话框）回调。
 // f 在 IPC 读循环里被调用,实现在 Fyne 事件线程上自行 fyne.Do。
