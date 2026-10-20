@@ -136,6 +136,56 @@ func (s *Scheduler) CloseBittorrent() {
 	}
 }
 
+// ---- BT 句柄登记表 ----
+
+// registerBTHandle 把 BT 任务的句柄登记进详情查询表。
+//
+// 登记覆盖「下载中」与「做种中」两种状态:做种时任务早已 Completed,
+// 但客户端仍在为它上传,详情面板要能看到实时的上传速度与 peer 构成。
+func (s *Scheduler) registerBTHandle(taskID string, h *bittorrent.Handle) {
+	if taskID == "" || h == nil {
+		return
+	}
+	s.btTasksMu.Lock()
+	defer s.btTasksMu.Unlock()
+	if s.btTasks == nil {
+		s.btTasks = map[string]*bittorrent.Handle{}
+	}
+	s.btTasks[taskID] = h
+}
+
+// unregisterBTHandle 把句柄从详情查询表摘除。h 为 nil 表示无条件摘除;
+// 否则只在登记的仍是同一个句柄时才摘,避免误删同一任务的新句柄。
+func (s *Scheduler) unregisterBTHandle(taskID string, h *bittorrent.Handle) {
+	s.btTasksMu.Lock()
+	defer s.btTasksMu.Unlock()
+	cur, ok := s.btTasks[taskID]
+	if !ok {
+		return
+	}
+	if h != nil && cur != h {
+		return
+	}
+	delete(s.btTasks, taskID)
+}
+
+// BTTaskDetail 返回 BT 任务的实时详情快照(种子哈希、分片、上下行速度、
+// peer 构成、tracker 与文件清单)。
+//
+// 这些数据是易变的(peer 数每秒都在变),刻意不进 store.Task——那是落库的
+// 静态快照。任务不在运行(未启动、已暂停、或已完成且未做种)时返回错误,
+// UI 据此把面板切到「会话已结束」状态。
+func (s *Scheduler) BTTaskDetail(taskID string) (*bittorrent.Detail, error) {
+	s.btTasksMu.Lock()
+	h := s.btTasks[taskID]
+	s.btTasksMu.Unlock()
+	if h == nil {
+		return nil, fmt.Errorf("scheduler: bt task %s is not active", taskID)
+	}
+	d := h.Detail()
+	return &d, nil
+}
+
 // ---- 做种任务簿记 ----
 
 // keepSeeding 把「已下载完成但按设置继续做种」的句柄登记下来:任务从此
@@ -262,6 +312,8 @@ func (s *Scheduler) dropSeedIf(taskID string, h *bittorrent.Handle) bool {
 	}
 	s.removeSeedLocked(taskID)
 	s.seedsMu.Unlock()
+	// 句柄即将关闭:先从详情查询表摘除,免得 UI 轮询到已失效的种子。
+	s.unregisterBTHandle(taskID, h)
 	h.Close()
 	s.promoteSeedQueue()
 	return true
@@ -273,6 +325,7 @@ func (s *Scheduler) dropSeed(taskID string) {
 	e := s.removeSeedLocked(taskID)
 	s.seedsMu.Unlock()
 	if e != nil && e.handle != nil {
+		s.unregisterBTHandle(taskID, e.handle)
 		e.handle.Close()
 	}
 	s.promoteSeedQueue()
@@ -286,8 +339,9 @@ func (s *Scheduler) dropAllSeeds() {
 	s.btSeedOrder = nil
 	s.btSeedQueue = nil
 	s.seedsMu.Unlock()
-	for _, e := range seeds {
+	for taskID, e := range seeds {
 		if e != nil && e.handle != nil {
+			s.unregisterBTHandle(taskID, e.handle)
 			e.handle.Close()
 		}
 	}
@@ -400,6 +454,7 @@ func (s *Scheduler) startBittorrent(taskID string, tk *store.Task, rj *runningJo
 			s.mu.Unlock()
 			// 未转交给做种簿记的句柄在这里摘除种子(下载中/暂停/失败)。
 			if handle != nil && !seedingKept {
+				s.unregisterBTHandle(taskID, handle)
 				handle.Close()
 			}
 			rjRef.sess.finish()
@@ -430,6 +485,9 @@ func (s *Scheduler) startBittorrent(taskID string, tk *store.Task, rj *runningJo
 		// 请求下载全部内容。磁力链接的元数据可能还没到,这一步会在
 		// 元数据就绪后再标记分片(见 bittorrent.Handle.StartDownloading)。
 		handle.StartDownloading()
+		// 登记句柄:「任务详情」窗口靠它查实时 BT 状态(peer 数、上下行
+		// 速度、做种情况)——这些数据不进 store.Task,那是落库的静态快照。
+		s.registerBTHandle(taskID, handle)
 
 		rjRef.dirtyMu.Lock()
 		rjRef.status = store.TaskStatus.Downloading

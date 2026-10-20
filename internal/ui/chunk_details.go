@@ -22,6 +22,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"lgo_download_manager/internal/ilocale"
+	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
 
@@ -85,9 +86,17 @@ type chunkMosaic struct {
 	flushTimer    *time.Timer
 }
 
-// showChunkDetails 打开一个窗口，展示任务按分块的下载进度。
-// 每个分块被渲染为瓦片墙中的一块——参见 chunkMosaic。
-func showChunkDetails(t *store.Task, svc Service, parent fyne.Window) {
+// showChunkDetails 打开一个窗口，展示任务的下载进度。
+//
+// HTTP/FTP 等任务按分块渲染为瓦片墙(参见 chunkMosaic);BT 任务换一套
+// 面板——种子哈希、分片、上下行速度、peer 构成、tracker 与文件清单
+// (参见 bt_details.go),与 qBittorrent / aria2 的 BT 信息面板一致。
+//
+// 返回值是 BT 面板(非 BT 任务为 nil),供测试断言渲染内容。
+func showChunkDetails(t *store.Task, svc Service, parent fyne.Window) *btDetailsPanel {
+	if scheduler.IsBittorrentTask(t) {
+		return showBTDetails(t, svc, parent)
+	}
 	name := taskName(t)
 	titleStr := ilocale.TF("details.title", fmt.Sprintf("任务详情: %s", name), map[string]any{"Name": name})
 
@@ -140,6 +149,7 @@ func showChunkDetails(t *store.Task, svc Service, parent fyne.Window) {
 			})
 		}
 	}()
+	return nil
 }
 
 // newChunkMosaic 创建一个空马赛克；resizeForTotal 会在知道文件大小后

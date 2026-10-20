@@ -9,6 +9,7 @@ package ipc
 import (
 	"encoding/json"
 
+	"lgo_download_manager/internal/bittorrent"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/store"
 )
@@ -32,6 +33,11 @@ const (
 	// MethodProbe 探测 URL 目标大小（新建任务对话框的大小预览）。
 	// Params: ProbeParams；Result: ProbeResult。
 	MethodProbe = "probe"
+	// MethodBTInfo 查询 BT 任务的实时详情（种子哈希、分片、上下行速度、
+	// peer 构成、tracker、文件清单）。这些是每秒都在变的易变数据，
+	// 刻意不进 store.Task，UI 以轮询方式取回。
+	// Params: BTInfoParams；Result: *bittorrent.Detail。
+	MethodBTInfo = "bt_info"
 )
 
 // ListParams 是 MethodList 的参数，镜像 store.ListTasks 的筛选语义。
@@ -64,6 +70,15 @@ type ProbeParams struct {
 type ProbeResult struct {
 	TotalSize int64 `json:"total_size"`
 }
+
+// BTInfoParams 是 MethodBTInfo 的参数。
+type BTInfoParams struct {
+	TaskID string `json:"task_id"`
+}
+
+// BTInfoResult 是 MethodBTInfo 的结果。直接复用 bittorrent.Detail:
+// ipc → bittorrent 是单向依赖(bittorrent 只依赖 logging),不存在环。
+type BTInfoResult = bittorrent.Detail
 
 // InitData 是 MsgInit 的负载：业务进程持有的权威设置快照。
 type InitData struct {

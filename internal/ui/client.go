@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"lgo_download_manager/internal/bittorrent"
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/scheduler"
@@ -327,6 +328,15 @@ func (c *ipcClient) Probe(url string) (int64, error) {
 		return 0, err
 	}
 	return res.TotalSize, nil
+}
+
+// BTTaskDetail 向业务进程索取 BT 任务的实时详情快照。
+func (c *ipcClient) BTTaskDetail(taskID string) (*bittorrent.Detail, error) {
+	var d *bittorrent.Detail
+	if err := c.request(ipc.MethodBTInfo, ipc.BTInfoParams{TaskID: taskID}, &d); err != nil {
+		return nil, err
+	}
+	return d, nil
 }
 
 func (c *ipcClient) Settings() store.Settings {

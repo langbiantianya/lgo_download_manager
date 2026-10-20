@@ -197,6 +197,81 @@ func TestTF_TemplateRendering(t *testing.T) {
 	}
 }
 
+// TestBTDetailsKeysCovered 验证 BT 详情面板的文案在所有语言里都有覆盖。
+// 缺一个 key 就会在界面上露出裸的 key 名(比如 "details.bt.seeders"),
+// 对用户来说就是半成品。
+func TestBTDetailsKeysCovered(t *testing.T) {
+	keys := []string{
+		"details.bt.section",
+		"details.bt.section.trackers",
+		"details.bt.section.files",
+		"details.bt.infoHash",
+		"details.bt.total",
+		"details.bt.downloaded",
+		"details.bt.uploaded",
+		"details.bt.ratio",
+		"details.bt.downloadSpeed",
+		"details.bt.uploadSpeed",
+		"details.bt.peers",
+		"details.bt.totalPeers",
+		"details.bt.seeders",
+		"details.bt.leechers",
+		"details.bt.pieceLength",
+		"details.bt.pieces",
+		"details.bt.piecesDone",
+		"details.bt.state",
+		"details.bt.createdAt",
+		"details.bt.completedAt",
+		"details.bt.state.waiting",
+		"details.bt.state.downloading",
+		"details.bt.state.seeding",
+		"details.bt.state.complete",
+		"details.bt.state.inactive",
+		"details.bt.trackers.empty",
+		"details.bt.file.progress",
+		"details.bt.note",
+	}
+	for _, lang := range Supported {
+		Set(lang)
+		for _, k := range keys {
+			if got := T(k); got == "" || got == k {
+				t.Errorf("%s key %q not translated (got %q)", lang, k, got)
+			}
+		}
+	}
+}
+
+// TestBTDetailsTemplateRendering 验证带占位符的 BT 文案在每个语言下都能
+// 正常替换——占位符漏了会直接显示 "{{ .Pct }}" 给用户看。
+func TestBTDetailsTemplateRendering(t *testing.T) {
+	cases := []struct {
+		id   string
+		data map[string]any
+		want []string
+	}{
+		{"details.bt.file.progress",
+			map[string]any{"Done": "400 B", "Total": "1.0 KB", "Pct": "40.0"},
+			[]string{"400 B", "1.0 KB", "40.0"}},
+		{"details.bt.note",
+			map[string]any{"Err": "boom"},
+			[]string{"boom"}},
+	}
+	for _, lang := range Supported {
+		Set(lang)
+		for _, c := range cases {
+			got := TF(c.id, c.id, c.data)
+			for _, sub := range c.want {
+				if !strings.Contains(got, sub) {
+					t.Errorf("%s TF(%q) = %q, missing %q", lang, c.id, got, sub)
+				}
+			}
+			if strings.Contains(got, "{{") {
+				t.Errorf("%s TF(%q) = %q, has unsubstituted template placeholder", lang, c.id, got)
+			}
+		}
+	}
+}
+
 // TestSet_Idempotent 验证连续 Set 同一语言不会改变 Current——避免
 // 误把 UI 刷新当作语言变更去重建整个主窗口。
 func TestSet_Idempotent(t *testing.T) {

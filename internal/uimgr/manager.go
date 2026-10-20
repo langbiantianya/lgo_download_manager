@@ -500,6 +500,15 @@ func (m *Manager) dispatch(method string, raw json.RawMessage) (any, error) {
 		}
 		return ipc.ProbeResult{TotalSize: size}, nil
 
+	case ipc.MethodBTInfo:
+		var p ipc.BTInfoParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			return nil, err
+		}
+		// BT 详情是实时快照,直接从 scheduler 的句柄登记表取;
+		// 任务不在运行时返回错误,UI 据此显示「会话已结束」。
+		return m.sc.BTTaskDetail(p.TaskID)
+
 	default:
 		return nil, fmt.Errorf("uimgr: unknown method %q", method)
 	}

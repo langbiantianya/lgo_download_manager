@@ -13,6 +13,7 @@ import (
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/test"
 
+	"lgo_download_manager/internal/bittorrent"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
@@ -47,6 +48,9 @@ func (c *countingService) Pause(string) error                        { return ni
 func (c *countingService) Delete(string) error                       { return nil }
 func (c *countingService) IsPreparing(string) bool                   { return false }
 func (c *countingService) Probe(string) (int64, error)               { return 0, nil }
+func (c *countingService) BTTaskDetail(string) (*bittorrent.Detail, error) {
+	return nil, nil
+}
 func (c *countingService) Settings() store.Settings                  { return store.Settings{} }
 func (c *countingService) SaveSettings(store.Settings) error         { return nil }
 func (c *countingService) Close() error                              { return nil }

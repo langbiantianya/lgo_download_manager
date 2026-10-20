@@ -54,8 +54,16 @@ func TestAddTaskDialog_BittorrentFolderSemantics(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	defer func() {
+		// 与生产退出流程一致:先暂停所有任务(等写者停止),再关 BT 客户端。
+		// 否则 BT 任务的 goroutine 还会往任务目录里写文件,与临时目录
+		// 清理并发(Windows 上表现为 "The directory is not empty",
+		// 用例随机失败)。
+		pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = sc.PauseAll(pauseCtx)
+		pauseCancel()
 		cancel()
 		<-done
+		sc.CloseBittorrent()
 	}()
 	go func() {
 		sc.Run(ctx)

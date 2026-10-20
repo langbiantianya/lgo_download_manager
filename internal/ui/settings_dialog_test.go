@@ -15,6 +15,7 @@ import (
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/bittorrent"
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
@@ -39,6 +40,9 @@ func (r *recordingSvc) Pause(string) error                        { return nil }
 func (r *recordingSvc) Delete(string) error                       { return nil }
 func (r *recordingSvc) IsPreparing(string) bool                   { return false }
 func (r *recordingSvc) Probe(string) (int64, error)               { return 0, nil }
+func (r *recordingSvc) BTTaskDetail(string) (*bittorrent.Detail, error) {
+	return nil, nil
+}
 func (r *recordingSvc) Settings() store.Settings                  { return store.Settings{} }
 func (r *recordingSvc) SaveSettings(_ store.Settings) error {
 	r.saved.Add(1)

@@ -71,6 +71,12 @@ type Scheduler struct {
 	btSeedOrder []string // 正在上传的种子,按进入顺序排列
 	btSeedQueue []string // 已保留种子但让出上传名额的等待队列(FIFO)
 
+	// btTasksMu 保护 btTasks:BT 任务当前句柄的登记表(下载中与做种中
+	// 都在内)。「任务详情」窗口靠它查实时 BT 状态(peer 数、上下行
+	// 速度、做种情况)——这些数据不进 store.Task,那是落库的静态快照。
+	btTasksMu sync.Mutex
+	btTasks   map[string]*bittorrent.Handle
+
 	// 事件订阅者(GUI)。筛选逻辑在消费侧完成。
 	Subs []chan Event
 }

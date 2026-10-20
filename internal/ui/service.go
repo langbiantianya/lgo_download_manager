@@ -7,6 +7,7 @@
 package ui
 
 import (
+	"lgo_download_manager/internal/bittorrent"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
@@ -36,6 +37,13 @@ type Service interface {
 	IsPreparing(taskID string) bool
 	// Probe 探测 URL 目标大小（新建任务对话框的尺寸预览）。
 	Probe(url string) (int64, error)
+
+	// BTTaskDetail 返回 BT 任务的实时详情：种子哈希、分片大小与数量、
+	// 上下行速度、已连接 peer 的构成、做种状态、tracker 列表与文件清单。
+	// 这些是每秒都在变的易变数据，刻意不进 store.Task（落库的静态快照），
+	// 「任务详情」窗口靠轮询本方法刷新 BT 面板。
+	// 非 BT 任务或任务当前不在运行时返回错误。
+	BTTaskDetail(taskID string) (*bittorrent.Detail, error)
 
 	// Settings 返回当前权威设置快照。
 	Settings() store.Settings

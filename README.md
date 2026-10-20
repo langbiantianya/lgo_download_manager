@@ -834,11 +834,27 @@ DHT/tracker（离线、tracker 全挂也能续传）。进程异常退出后的�
   并在路由器上做映射——lgdm **不会**自动改路由器配置（不启用 UPnP/NAT-PMP）；
 - DHT / PEX 默认开启：磁力链接没有 tracker 时几乎完全依赖它们找 peer。
 
+### 「任务详情」：BT 专属信息面板
+
+BT 任务的「任务详情」窗口**不**沿用 HTTP 任务那套通用字段与分块马赛克
+（BT 没有「字节区间分片」的概念），而是给出一块种子专属的信息面板，
+字段组织参照 qBittorrent / aria2：
+
+- 种子哈希（Infohash）、种子名、来源 URL、保存目录、添加 / 完成时间；
+- 状态（下载中 / 做种中 / 已完成 / 会话已结束）、下载与上传速度；
+- 总大小、已下载、已上传、分享率；
+- 已连接 peer 数、tracker / DHT 报告的节点总数、其中的做种者与下载者；
+- 分片大小、分片总数、已完成分片数；
+- tracker 地址列表、种子内文件清单（每个文件一行进度条与完成度）。
+
+面板每秒钟向业务进程取一次实时快照（IPC 方法 `bt_info`），窗口打开期间
+持续刷新。这些数据是易变的（peer 数每秒都在变），刻意**不**进
+`store.Task`——那是落库的静态快照；BT 任务的句柄由 scheduler 单独登记，
+任务暂停 / 结束且不做种时句柄被摘除，面板随之显示「会话已结束」。
+
 ### 与 HTTP 任务共用的部分
 
 - 进度、速度、ETA、状态筛选、排序、搜索、并发上限与 FIFO 排队；
-- 「任务详情」的分块马赛克与分片视图：BT 任务按「每个种子文件一块」渲染，
-  一块对应一个文件（区间按文件在种子内的偏移拼接）；
 - 设置改动：限速立刻生效；监听端口 / DHT / PEX / 连接数上限这类客户端
   构造期参数在没有 BT 任务运行时立即重建客户端生效，否则延后到最后一个
   BT 任务结束（做种中的任务也算「在运行」）。
@@ -942,7 +958,7 @@ flatpak/                       # Flatpak 用的 AppStream metainfo
 - `MsgHello`（UI→业务）：握手 token
 - `MsgInit`（业务→UI）：权威设置快照
 - `MsgCall`（UI→业务）：`list` / `add` / `start` / `pause` / `delete` / `probe` /
-  `save_settings`，返回 `MsgResult`
+  `bt_info` / `save_settings`，返回 `MsgResult`
 - `MsgEvent`（业务→UI）：scheduler 事件（added / started / progress / paused /
   completed / failed / updated）
 - `MsgShow`（业务→UI）：托盘「显示窗口」菜单

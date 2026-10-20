@@ -21,6 +21,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"lgo_download_manager/internal/ipc"
+	"lgo_download_manager/internal/bittorrent"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
@@ -66,6 +67,9 @@ func (l *localServiceAdapter) IsPreparing(id string) bool {
 }
 func (l *localServiceAdapter) Probe(_ string) (int64, error) {
 	return 0, nil
+}
+func (l *localServiceAdapter) BTTaskDetail(id string) (*bittorrent.Detail, error) {
+	return l.sc.BTTaskDetail(id)
 }
 func (l *localServiceAdapter) Settings() store.Settings {
 	s, _ := l.st.LoadSettings()
@@ -407,6 +411,9 @@ func (e *errStartService) IsPreparing(id string) bool {
 }
 func (e *errStartService) Probe(u string) (int64, error) {
 	return e.inner.Probe(u)
+}
+func (e *errStartService) BTTaskDetail(id string) (*bittorrent.Detail, error) {
+	return e.inner.BTTaskDetail(id)
 }
 func (e *errStartService) Settings() store.Settings            { return e.inner.Settings() }
 func (e *errStartService) SaveSettings(s store.Settings) error { return e.inner.SaveSettings(s) }

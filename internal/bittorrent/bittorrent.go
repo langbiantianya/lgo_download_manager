@@ -54,6 +54,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/anacrolix/torrent"
@@ -102,6 +103,12 @@ type Config struct {
 // EstablishedConnsPerTorrent 默认值保持一致。
 const defaultMaxPeersPerTorrent = 50
 
+// minSpeedSample 是两次速度采样之间的最小间隔。低于这个间隔就沿用
+// 上一次的结果而不重置基准——调度器(每秒采一次进度)与详情面板
+// (每秒采一次详情)都会读速度,若每次采样都重置基准,两者会互相
+// 「偷走」字节增量,各自算出来的速度都偏低。
+const minSpeedSample = 500 * time.Millisecond
+
 // Manager 拥有进程内共享的 BT 客户端。
 //
 // 并发安全:所有导出方法都可以从多个 goroutine 调用。
@@ -136,6 +143,17 @@ type Handle struct {
 	lastBytes  int64
 	lastSample time.Time
 	speed      float64
+	// 上传方向的速度采样:与下载方向同构,单独记一份基准字节数与
+	// 基准时间(两者共用一个时间基准会让后采样的一方永远算出 0)。
+	lastUpBytes  int64
+	lastUpSample time.Time
+	upSpeed      float64
+
+	// closed 在 Close 之后置位。Close 会把种子从客户端摘除,此后
+	// Torrent 上的统计/文件表都不再可信;而详情采样(UI 轮询)与做种
+	// 监控可能正与 Close 并发,置位后它们直接返回,不去触碰已失效的
+	// Torrent 对象。
+	closed atomic.Bool
 }
 
 // FileProgress 是单个种子文件(相对任务目录)的进度。
@@ -159,6 +177,43 @@ type Snapshot struct {
 	Seeding    bool
 	Complete   bool
 	Files      []FileProgress
+}
+
+// Detail 是 BT 任务的详情快照:供「任务详情」窗口展示。
+//
+// 字段组织参照 qBittorrent / aria2 的 BT 信息面板——种子哈希(Infohash)、
+// 分片大小与数量、上下行速度、已连接 peer 的构成、做种状态、tracker 列表
+// 与文件清单。这些全是**易变**数据(peer 数每秒都在变),必须实时采样,
+// 因此不走 store.Task(那是落库的静态快照),而是单独一条 IPC 查询。
+type Detail struct {
+	// Name 是种子名(元数据未到时可能为空)。
+	Name string
+	// InfoHash 是种子的 infohash(40 位十六进制)。
+	InfoHash string
+	// Total 是种子总大小;Downloaded/Uploaded 分别是已下载/已上传字节数。
+	Total      int64
+	Downloaded int64
+	Uploaded   int64
+	// SpeedBPS 是下载速度(字节/秒);UploadBPS 是上传速度(字节/秒)。
+	SpeedBPS   float64
+	UploadBPS  float64
+	// Peers 是已建立的连接数;TotalPeers 是 tracker/DHT 报告的 peer 总数;
+	// Seeders 是其中已连接的做种者;Leechers 是其余(下载者)。
+	Peers      int
+	TotalPeers int
+	Seeders    int
+	Leechers   int
+	// PieceLength 是分片大小;Pieces 是分片总数;PiecesDone 是已完成分片数。
+	PieceLength int64
+	Pieces      int
+	PiecesDone  int
+	// Seeding 表示数据已完整且正在做种;Complete 表示数据已完整。
+	Seeding  bool
+	Complete bool
+	// Files 是种子内各文件的进度。
+	Files []FileProgress
+	// Trackers 是种子声明的 tracker 地址(announce URL)。
+	Trackers []string
 }
 
 // New 构造 Manager 并立即创建底层客户端。cfg 中的代理函数可以为 nil。
@@ -440,7 +495,15 @@ func (m *Manager) addSpec(ctx context.Context, spec *torrent.TorrentSpec, dir st
 		return nil, ErrAlreadyAdded
 	}
 	m.active++
-	return &Handle{m: m, t: t, dir: dir, st: st, done: make(chan struct{}), lastSample: time.Now()}, nil
+	return &Handle{
+		m:             m,
+		t:             t,
+		dir:           dir,
+		st:            st,
+		done:          make(chan struct{}),
+		lastSample:    time.Now(),
+		lastUpSample:  time.Now(),
+	}, nil
 }
 
 // ---- Handle ----
@@ -530,6 +593,10 @@ func (h *Handle) Trackers() [][]string {
 // anacrolix 内部的 piece 对齐填充),因此恒有 Downloaded <= Total,
 // 进度条不会超过 100%。
 func (h *Handle) Snapshot() Snapshot {
+	// 句柄已关闭:种子已从客户端摘除,统计不再可信,直接返回空快照。
+	if h.closed.Load() || h.t == nil {
+		return Snapshot{}
+	}
 	snap := Snapshot{Name: h.t.Name()}
 	// 元数据未到时 anacrolix 还没有初始化文件表(initFiles 在 info 就绪时
 	// 才跑),读 Files() 会解引用空指针直接崩溃。磁力链接在找到持有该
@@ -579,14 +646,119 @@ func (h *Handle) measureSpeed(downloaded int64) float64 {
 	now := time.Now()
 	dt := now.Sub(h.lastSample).Seconds()
 	diff := downloaded - h.lastBytes
-	h.lastBytes = downloaded
-	h.lastSample = now
-	if dt <= 0 || diff <= 0 {
+	if diff < 0 {
+		// 计数器回退(重新开始下载):重置基准。
+		h.lastBytes = downloaded
+		h.lastSample = now
 		h.speed = 0
 		return 0
 	}
+	if dt < minSpeedSample.Seconds() {
+		// 采样太密:保留上一次的基准与结果,否则多个采样者会互相
+		// 分走同一次字节增量,速度会被低估。
+		return h.speed
+	}
+	h.lastBytes = downloaded
+	h.lastSample = now
 	h.speed = float64(diff) / dt
 	return h.speed
+}
+
+// measureUploadSpeed 与 measureSpeed 同构,算的是上传方向的速度。
+//
+// 上传字节数取自 anacrolix 的 BytesWrittenData(真正发给 peer 的负载
+// 字节,不含协议头),因此做种时的上传速度就是这份计数的变化率。
+// 时间基准与下载方向分开记,否则两次采样紧挨着发生时,后采样的一方
+// 会因为时间差≈0 而永远算出 0。
+func (h *Handle) measureUploadSpeed(uploaded int64) float64 {
+	h.sampleMu.Lock()
+	defer h.sampleMu.Unlock()
+	now := time.Now()
+	dt := now.Sub(h.lastUpSample).Seconds()
+	diff := uploaded - h.lastUpBytes
+	if diff < 0 {
+		h.lastUpBytes = uploaded
+		h.lastUpSample = now
+		h.upSpeed = 0
+		return 0
+	}
+	if dt < minSpeedSample.Seconds() {
+		return h.upSpeed
+	}
+	h.lastUpBytes = uploaded
+	h.lastUpSample = now
+	h.upSpeed = float64(diff) / dt
+	return h.upSpeed
+}
+
+// Detail 采样一次 BT 详情:种子哈希、分片、上下行速度、peer 构成、
+// tracker 与文件清单——「任务详情」窗口用它渲染 BT 专用面板。
+//
+// 与 Snapshot 的区别:Detail 多出 infohash、分片信息、上传量与上传速度,
+// 这些只对 BT 有意义,不该塞进 store.Task(那是落库的通用快照)。
+//
+// 元数据未到时(磁力链接刚起步)只能给出连接数与速度,其余字段留空。
+func (h *Handle) Detail() Detail {
+	// 句柄已关闭:种子已从客户端摘除,此时读 Stats()/Files() 可能拿到
+	// 半失效的数据甚至触发上游的 nil 解引用,直接返回空详情。
+	if h.closed.Load() || h.t == nil {
+		return Detail{}
+	}
+	d := Detail{Name: h.t.Name()}
+	stats := h.t.Stats()
+	d.Peers = stats.ActivePeers
+	d.TotalPeers = stats.TotalPeers
+	d.Seeders = stats.ConnectedSeeders
+	// anacrolix 没有单独的「做种者/下载者」计数,已连接的 peer 里减去
+	// 做种者即近似下载者。
+	if d.Leechers = d.Peers - d.Seeders; d.Leechers < 0 {
+		d.Leechers = 0
+	}
+	d.Uploaded = stats.BytesWrittenData.Int64()
+
+	mi := h.t.Metainfo()
+	if len(mi.InfoBytes) > 0 {
+		d.InfoHash = mi.HashInfoBytes().HexString()
+	}
+	for _, tier := range mi.UpvertedAnnounceList() {
+		d.Trackers = append(d.Trackers, tier...)
+	}
+
+	// 元数据未到时 anacrolix 还没有初始化文件表(见 Snapshot 的同款分支),
+	// 这时读 Files() 会解引用空指针直接崩溃。
+	if h.t.Info() == nil {
+		d.SpeedBPS = h.measureSpeed(0)
+		d.UploadBPS = h.measureUploadSpeed(d.Uploaded)
+		return d
+	}
+
+	info := h.t.Info()
+	d.PieceLength = info.PieceLength
+	d.Pieces = info.NumPieces()
+	d.PiecesDone = stats.PiecesComplete
+
+	files := h.t.Files()
+	d.Files = make([]FileProgress, 0, len(files))
+	for _, f := range files {
+		length := f.Length()
+		done := f.BytesCompleted()
+		if done > length {
+			done = length
+		}
+		d.Total += length
+		d.Downloaded += done
+		d.Files = append(d.Files, FileProgress{
+			Path:      filepath.ToSlash(f.Path()),
+			Length:    length,
+			Completed: done,
+		})
+	}
+
+	d.Seeding = h.t.Seeding()
+	d.Complete = h.t.Complete().Bool()
+	d.SpeedBPS = h.measureSpeed(d.Downloaded)
+	d.UploadBPS = h.measureUploadSpeed(d.Uploaded)
+	return d
 }
 
 // Complete 报告种子数据是否已全部完成(含做种阶段)。
@@ -596,7 +768,9 @@ func (h *Handle) Complete() bool { return h.t.Complete().Bool() }
 // 下次 Start 时按 .part / 正式文件名重新识别已完成的部分。
 func (h *Handle) Close() {
 	h.once.Do(func() {
-		// 先唤醒「等元数据再标记下载」的 goroutine,再摘除种子。
+		// 先标记关闭:让并发的 Detail/Snapshot 采样立刻退出,再唤醒
+		// 「等元数据再标记下载」的 goroutine,最后摘除种子。
+		h.closed.Store(true)
 		close(h.done)
 		h.t.Drop()
 		if h.st != nil {
