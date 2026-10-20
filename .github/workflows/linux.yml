@@ -18,6 +18,51 @@ permissions:
 # gcc-aarch64-linux-gnu 之类的交叉工具链 —— 原生构建用宿主 gcc。
 
 jobs:
+  portability:
+    name: portability (cgo-free cross compile)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.6'
+          cache: true
+
+      # 跨平台编译检查。internal/ui 依赖 Fyne 的 OpenGL 绑定(需要 cgo),
+      # 无法在无 cgo 环境下交叉编译;但业务侧的这批包是纯 Go 的,可以为
+      # linux / darwin / windows × amd64 / arm64 全部编译一遍。
+      #
+      # 之前 internal/ui/disk_unix.go 里 Statfs_t.Bsize 的类型在 darwin 上
+      # 是 uint32,在 linux 上是 int64,macOS 构建直接编译失败——CI 没有
+      # macOS 作业,这个洞就漏了过去。这个 job 就是来堵这类洞的。
+      - name: cross-compile the cgo-free packages
+        run: |
+          set -euo pipefail
+          packages="
+            ./internal/autostart/
+            ./internal/bittorrent/
+            ./internal/diskstat/
+            ./internal/engine/
+            ./internal/ipc/
+            ./internal/logging/
+            ./internal/protocol/
+            ./internal/scheduler/
+            ./internal/settings/
+            ./internal/store/
+            ./internal/uimgr/
+            ./internal/urllauncher/
+          "
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              echo "::group::build $os/$arch"
+              GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build $packages
+              echo "::endgroup::"
+            done
+          done
+
   flatpak-x86_64:
     name: flatpak x86_64
     runs-on: ubuntu-24.04

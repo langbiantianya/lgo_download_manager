@@ -18,6 +18,7 @@ import (
 	"fyne.io/fyne/v2/widget"
 
 	"lgo_download_manager/internal/autostart"
+	"lgo_download_manager/internal/diskstat"
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
@@ -482,7 +483,7 @@ func diskSpaceAt(path string) string {
 	if dir == "" {
 		dir = "."
 	}
-	free, total, err := diskUsage(dir)
+	free, total, err := diskstat.Usage(dir)
 	if err != nil {
 		return ilocale.TF("main.status.disk.error", fmt.Sprintf("不可用 (%v)", err), map[string]any{"Err": err.Error()})
 	}

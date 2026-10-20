@@ -6,25 +6,34 @@
 
 //go:build windows
 
-package ui
+package diskstat
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"syscall"
 	"unsafe"
 )
 
 var (
-	kernel32                 = syscall.NewLazyDLL("kernel32.dll")
-	procGetDiskFreeSpaceExW  = kernel32.NewProc("GetDiskFreeSpaceExW")
+	kernel32                = syscall.NewLazyDLL("kernel32.dll")
+	procGetDiskFreeSpaceExW = kernel32.NewProc("GetDiskFreeSpaceExW")
 )
 
-// platformDiskUsage 使用 Win32 GetDiskFreeSpaceExW 读取 path 所在卷的
+// platformUsage 使用 Win32 GetDiskFreeSpaceExW 读取 path 所在卷的
 // 可用字节与总字节。等价于 POSIX 的 Statfs → Bavail/Total 语义。
+//
+// GetDiskFreeSpaceExW 只接受目录路径（传文件会报「目录名无效」），
+// 而 POSIX 的 statfs 对文件路径照样能用——这里把两者对齐：路径指向
+// 文件时改用它的父目录。
 //
 // 该函数对路径不存在的容忍与 POSIX 版一致：失败时返回 (0, 0, err)，
 // 调用方 (main_window.go / settings_dialog.go) 已对 err 做兜底显示。
-func platformDiskUsage(path string) (free, total int64, err error) {
+func platformUsage(path string) (free, total int64, err error) {
+	if fi, statErr := os.Stat(path); statErr == nil && !fi.IsDir() {
+		path = filepath.Dir(path)
+	}
 	pathPtr, err := syscall.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, 0, fmt.Errorf("diskUsage: invalid path: %w", err)

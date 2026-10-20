@@ -23,6 +23,7 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/diskstat"
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/store"
 )
@@ -537,7 +538,7 @@ func (sb *statusBar) refreshDiskSpace() {
 	if d == "" {
 		d = "."
 	}
-	free, total, err := diskUsage(d)
+	free, total, err := diskstat.Usage(d)
 	if err != nil {
 		sb.diskLabel.SetText(ilocale.TF("main.status.disk.error", fmt.Sprintf("不可用 (%v)", err), map[string]any{
 			"Err": err.Error(),
