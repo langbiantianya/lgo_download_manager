@@ -98,8 +98,15 @@ type btFileRow struct {
 // (BT 没有字节区间分片的概念),而是给出种子特有的实时信息,并且按分片
 // 画一张热力马赛克图(参见 piece_mosaic.go)——分片是 BT 真正的进度单位。
 //
-// 返回值是面板本身,供测试断言渲染内容。
+// 一个任务只开一个详情窗口:已经开着的把老窗口置前(参见
+// details_window.go),不再新开一个。
+//
+// 返回值是本次新建的面板(窗口已存在时为 nil),供测试断言渲染内容。
 func showBTDetails(t *store.Task, svc Service, parent fyne.Window) *btDetailsPanel {
+	// 同一任务已经开着详情窗口:置前即可,别再开一个一模一样的。
+	if focusExistingDetails(t.ID) {
+		return nil
+	}
 	name := taskName(t)
 	titleStr := ilocale.TF("details.title", fmt.Sprintf("任务详情: %s", name), map[string]any{"Name": name})
 
@@ -110,7 +117,7 @@ func showBTDetails(t *store.Task, svc Service, parent fyne.Window) *btDetailsPan
 	w.Resize(fyne.NewSize(780, 720))
 	w.Show()
 
-	w.SetOnClosed(func() { p.stop() })
+	registerDetailsWindow(t.ID, w, p.stop)
 	go p.poll(svc, t.ID)
 	return p
 }

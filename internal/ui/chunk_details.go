@@ -92,10 +92,18 @@ type chunkMosaic struct {
 // 面板——种子哈希、分片、上下行速度、peer 构成、tracker 与文件清单
 // (参见 bt_details.go),与 qBittorrent / aria2 的 BT 信息面板一致。
 //
-// 返回值是 BT 面板(非 BT 任务为 nil),供测试断言渲染内容。
+// 一个任务只开一个详情窗口:已经开着的把老窗口置前(参见
+// details_window.go),不再新开一个。
+//
+// 返回值是本次新建的 BT 面板(非 BT 任务、或者窗口已存在时为 nil),
+// 供测试断言渲染内容。
 func showChunkDetails(t *store.Task, svc Service, parent fyne.Window) *btDetailsPanel {
 	if scheduler.IsBittorrentTask(t) {
 		return showBTDetails(t, svc, parent)
+	}
+	// 同一任务已经开着详情窗口:置前即可,别再开一个一模一样的。
+	if focusExistingDetails(t.ID) {
+		return nil
 	}
 	name := taskName(t)
 	titleStr := ilocale.TF("details.title", fmt.Sprintf("任务详情: %s", name), map[string]any{"Name": name})
@@ -135,10 +143,10 @@ func showChunkDetails(t *store.Task, svc Service, parent fyne.Window) *btDetails
 	w.Resize(fyne.NewSize(640, 460))
 	w.Show()
 
-	// 先订阅业务事件流拿到 unsub，再注册 SetOnClosed，
+	// 先订阅业务事件流拿到 unsub，再登记窗口（登记时会挂上 SetOnClosed），
 	// 保证窗口关闭时取消订阅。
 	ch, unsub := svc.Subscribe()
-	w.SetOnClosed(func() { unsub() })
+	registerDetailsWindow(t.ID, w, unsub)
 	go func() {
 		for ev := range ch {
 			if ev.Task == nil || ev.Task.ID != t.ID {
