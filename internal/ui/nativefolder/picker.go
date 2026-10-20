@@ -15,6 +15,17 @@
 // only the shared contract.
 package nativefolder
 
+import "lgo_download_manager/internal/ilocale"
+
+// pickerTitle 是原生目录选择器的窗口标题。
+//
+// 早期版本在各平台实现里直接硬编码中文「选择保存位置」,界面语言切到
+// 英文/日文/俄文之后,系统弹出的原生对话框仍然顶着中文标题。标题现在
+// 跟着界面语言走。
+func pickerTitle() string {
+	return ilocale.T("picker.title")
+}
+
 // ErrCancelled is returned when the user dismisses the dialog without
 // selecting a folder. Callers should treat it as a non-error.
 var ErrCancelled = errCancelled{}

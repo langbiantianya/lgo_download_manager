@@ -449,7 +449,26 @@ func (db *diskBar) Refresh() {
 		return
 	}
 	db.fill.FillColor = colorForProgress(db.progress)
+	// 进度变了,填充条的长度也得跟着变:长度原先只在 Layout() 里算,
+	// 而 Layout() 只在重新布局时才会跑,于是进度条的长度一直停在旧值上
+	// (实测 20% 跳到 80%,填充部分的像素宽度纹丝不动)。
+	db.applyFill(db.Size())
 	db.fill.Refresh()
+}
+
+// applyFill 按给定尺寸更新填充条的长度:宽度 = 进度 × 总宽。
+func (db *diskBar) applyFill(size fyne.Size) {
+	if db.fill == nil {
+		return
+	}
+	barW := float32(db.progress) * size.Width
+	if barW < 0 {
+		barW = 0
+	}
+	if barW > size.Width {
+		barW = size.Width
+	}
+	db.fill.Resize(fyne.NewSize(barW, size.Height))
 }
 
 type diskBarRenderer struct {
@@ -460,11 +479,7 @@ type diskBarRenderer struct {
 
 func (r *diskBarRenderer) Layout(size fyne.Size) {
 	r.bg.Resize(size)
-	barW := float32(r.b.progress) * size.Width
-	if barW < 0 {
-		barW = 0
-	}
-	r.fill.Resize(fyne.NewSize(barW, size.Height))
+	r.b.applyFill(size)
 }
 
 func (r *diskBarRenderer) MinSize() fyne.Size           { return r.b.MinSize() }

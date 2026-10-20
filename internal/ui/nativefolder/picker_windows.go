@@ -157,7 +157,7 @@ func PickFolder(initialDir string) (string, error) {
 	defer releaseCom(dlg)
 
 	comCall(comSlot(dlg, 9) /* SetOptions */, dlg, uintptr(fosPickFolders))
-	setDialogTitle(dlg, "选择保存位置")
+	setDialogTitle(dlg, pickerTitle())
 
 	if initialDir != "" {
 		if err := setFolderFromPath(dlg, initialDir); err != nil {

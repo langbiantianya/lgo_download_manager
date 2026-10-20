@@ -46,7 +46,7 @@ func pickZenity(initialDir string) (string, error) {
 	args := []string{
 		"--file-selection",
 		"--directory",
-		"--title=选择保存位置",
+		"--title=" + pickerTitle(),
 	}
 	if initialDir != "" {
 		args = append(args, "--filename="+filepath.Join(initialDir, "")+"/")
@@ -80,7 +80,7 @@ func pickZenity(initialDir string) (string, error) {
 func pickKDialog(initialDir string) (string, error) {
 	args := []string{
 		"--getexistingdirectory",
-		"--title", "选择保存位置",
+		"--title", pickerTitle(),
 	}
 	if initialDir != "" {
 		args = append(args, initialDir)

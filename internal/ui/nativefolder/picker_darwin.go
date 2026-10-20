@@ -37,14 +37,19 @@ func PickFolder(initialDir string) (string, error) {
 		locationExpr = fmt.Sprintf("of POSIX file %q\n\t\t", escaped)
 	}
 
+	// 标题会嵌进 AppleScript 的字符串字面量,反斜杠与引号都要转义,
+	// 否则带引号的译文会把脚本语法弄坏。
+	prompt := strings.ReplaceAll(pickerTitle(), `\`, `\\`)
+	prompt = strings.ReplaceAll(prompt, `"`, `\"`)
+
 	script := fmt.Sprintf(`
 try
-	set theFolder to choose folder with prompt "选择保存位置" %s
+	set theFolder to choose folder with prompt "%s" %s
 	return POSIX path of theFolder
 on error number -128
 	error number -128
 end try
-`, locationExpr)
+`, prompt, locationExpr)
 
 	// Bound the run so a stuck Apple event cannot wedge the UI.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
