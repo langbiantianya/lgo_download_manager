@@ -27,6 +27,18 @@ import (
 
 const mib = int64(1 << 20)
 
+// 设置项的取值上限。超出上限的输入一律不采纳(保留上一个有效值):
+// 手滑填进来的数字(线程数 100000、分块 100000 MiB)没有实际意义,
+// 却能把引擎压垮。
+const (
+	maxThreads      = 64
+	maxChunkMiB     = 1024
+	maxConcurrent   = 64
+	maxBTConcurrent = 64
+	maxBTSeeding    = 64
+	maxBTPeers      = 1000
+)
+
 // GlobalSettings 是 UI 侧持有的设置镜像，供“新建任务”预填、状态栏
 // 磁盘空间、任务排序等即时读取。权威设置在业务进程（store）；UI 通过
 // svc.SaveSettings 持久化，业务进程负责应用代理配置。每次修改镜像后
@@ -100,7 +112,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	threadsEntry := widget.NewEntry()
 	threadsEntry.SetText(fmt.Sprintf("%d", GlobalSettings.DefaultThreads))
 	threadsEntry.OnChanged = func(s string) {
-		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n <= maxThreads {
 			GlobalSettings.DefaultThreads = n
 			persist()
 		}
@@ -111,7 +123,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	chunkSizeEntry := widget.NewEntry()
 	chunkSizeEntry.SetText(fmt.Sprintf("%d", GlobalSettings.MinChunkSize/mib))
 	chunkSizeEntry.OnChanged = func(s string) {
-		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n <= maxChunkMiB {
 			GlobalSettings.MinChunkSize = int64(n) * mib
 			persist()
 		}
@@ -140,7 +152,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	maxConcEntry := widget.NewEntry()
 	maxConcEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveMaxConcurrent()))
 	maxConcEntry.OnChanged = func(s string) {
-		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n <= maxConcurrent {
 			GlobalSettings.MaxConcurrent = n
 			persist()
 		}
@@ -224,6 +236,35 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 
 	// 监听端口:首次运行由 settings.Load 选择并持久化;0 表示交给系统
 	// 随机分配,其余按有效端口范围 1..65535 校验。
+	//
+	// 端口占用检查:被别的程序占着时 BT 客户端起不来,而这个故障在启动
+	// 之前完全看不出来。检查放在后台线程(监听端口是阻塞操作),结果回到
+	// UI 线程再更新提示行。
+	btPortHint := widget.NewLabel("")
+	btPortHint.TextStyle.Italic = true
+	btPortHint.Wrapping = fyne.TextWrapWord
+	btPortHint.Hide()
+	checkBTPort := func(port int) {
+		go func() {
+			busy := portBusy(port)
+			fyne.Do(func() {
+				if GlobalSettings.BTPort != port {
+					// 用户又改了端口,这次的结果作废。
+					return
+				}
+				if busy {
+					btPortHint.SetText(ilocale.TF("settings.btPort.busy",
+						fmt.Sprintf("端口 %d 已被占用,BT 客户端可能无法启动", port),
+						map[string]any{"Port": port}))
+					btPortHint.Show()
+				} else {
+					btPortHint.SetText("")
+					btPortHint.Hide()
+				}
+			})
+		}()
+	}
+
 	btPortEntry := widget.NewEntry()
 	btPortEntry.SetText(fmt.Sprintf("%d", GlobalSettings.BTPort))
 	btPortEntry.SetPlaceHolder(ilocale.T("settings.btPort.placeholder"))
@@ -234,6 +275,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		}
 		GlobalSettings.BTPort = n
 		persist()
+		checkBTPort(n)
 	}
 
 	// BT 任务专用的同时下载上限,独立于“通用/下载”页里的全局并发数。
@@ -241,7 +283,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	btMaxConcurrentEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveBTMaxConcurrent()))
 	btMaxConcurrentEntry.SetPlaceHolder(ilocale.T("settings.btMaxConcurrent.placeholder"))
 	btMaxConcurrentEntry.OnChanged = func(s string) {
-		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n <= maxBTConcurrent {
 			GlobalSettings.BTMaxConcurrent = n
 			persist()
 		}
@@ -275,7 +317,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	btPeersEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveBTMaxPeers()))
 	btPeersEntry.SetPlaceHolder(ilocale.T("settings.btPeers.placeholder"))
 	btPeersEntry.OnChanged = func(s string) {
-		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n <= maxBTPeers {
 			GlobalSettings.BTMaxPeers = n
 			persist()
 		}
@@ -307,7 +349,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	btMaxSeedingEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveBTMaxSeeding()))
 	btMaxSeedingEntry.SetPlaceHolder(ilocale.T("settings.btMaxSeeding.placeholder"))
 	btMaxSeedingEntry.OnChanged = func(s string) {
-		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n <= maxBTSeeding {
 			GlobalSettings.BTMaxSeeding = n
 			persist()
 		}
@@ -414,7 +456,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		widget.NewFormItem(ilocale.T("settings.label.proxyBypass"), proxyBypassEntry),
 	)
 	bittorrentForm := widget.NewForm(
-		widget.NewFormItem(ilocale.T("settings.label.btPort"), btPortEntry),
+		widget.NewFormItem(ilocale.T("settings.label.btPort"), container.NewVBox(btPortEntry, btPortHint)),
 		widget.NewFormItem(ilocale.T("settings.label.btMaxConcurrent"), btMaxConcurrentEntry),
 		widget.NewFormItem(ilocale.T("settings.label.btMaxSeeding"), btMaxSeedingEntry),
 		widget.NewFormItem(ilocale.T("settings.label.btDownloadLimit"), btDownRow),
@@ -516,33 +558,12 @@ func diskSpaceAt(path string) string {
 	if err != nil {
 		return ilocale.TF("main.status.disk.error", fmt.Sprintf("不可用 (%v)", err), map[string]any{"Err": err.Error()})
 	}
-	return ilocale.TF("main.status.disk.format", fmt.Sprintf("可用 %s / 总计 %s", humanBytes(free), humanBytes(total)), map[string]any{
-		"Free":  humanBytes(free),
-		"Total": humanBytes(total),
+	return ilocale.TF("main.status.disk.format", fmt.Sprintf("可用 %s / 总计 %s", formatBytes(free), formatBytes(total)), map[string]any{
+		"Free":  formatBytes(free),
+		"Total": formatBytes(total),
 	})
 }
 
-// humanBytes 将 n 格式化为简短的人类可读字符串。
-func humanBytes(n int64) string {
-	const (
-		KB = 1 << 10
-		MB = 1 << 20
-		GB = 1 << 30
-		TB = 1 << 40
-	)
-	switch {
-	case n >= TB:
-		return fmt.Sprintf("%.1f TB", float64(n)/TB)
-	case n >= GB:
-		return fmt.Sprintf("%.1f GB", float64(n)/GB)
-	case n >= MB:
-		return fmt.Sprintf("%.1f MB", float64(n)/MB)
-	case n >= KB:
-		return fmt.Sprintf("%.1f KB", float64(n)/KB)
-	default:
-		return fmt.Sprintf("%d B", n)
-	}
-}
 
 // formatRemainingTime 将剩余秒数渲染为简短的中文字符串。
 func formatRemainingTime(secs int) string {

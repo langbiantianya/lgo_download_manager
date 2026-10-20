@@ -112,7 +112,7 @@ func showChunkDetails(t *store.Task, svc Service, parent fyne.Window) *btDetails
 	urlLabel.Wrapping = fyne.TextWrapWord
 	protoLabel := widget.NewLabel(ilocale.TF("details.protocol", fmt.Sprintf("协议: %s", t.Protocol), map[string]any{"Protocol": t.Protocol}))
 	pathLabel := widget.NewLabel(ilocale.TF("details.path", "路径: "+t.SavePath, map[string]any{"Path": t.SavePath}))
-	sizeLabel := widget.NewLabel(ilocale.TF("details.total", fmt.Sprintf("总计: %s", formatBytes(t.TotalSize)), map[string]any{"Size": formatBytes(t.TotalSize)}))
+	sizeLabel := widget.NewLabel(ilocale.TF("details.total", fmt.Sprintf("总计: %s", taskSizeText(t.TotalSize)), map[string]any{"Size": taskSizeText(t.TotalSize)}))
 	uaLabel := widget.NewLabel(uaForTask(t))
 	createdAtLabel := widget.NewLabel(ilocale.TF("details.createdAt", "添加时间: "+formatTime(t.CreatedAt), map[string]any{"Time": formatTime(t.CreatedAt)}))
 	completedAtLabel := widget.NewLabel(ilocale.TF("details.completedAt", "下载完成时间: "+formatTime(t.CompletedAt), map[string]any{"Time": formatTime(t.CompletedAt)}))

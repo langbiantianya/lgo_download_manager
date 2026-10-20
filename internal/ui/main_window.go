@@ -208,10 +208,13 @@ func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 		// 「准备中」任务,scheduler.Pause 也能通过 prepareCancel 立刻中止;
 		// 对已经不在运行的任务 Pause 会返回 error,这里忽略即可。
 		// 同时为每个被请求暂停的 row 设置乐观状态,让 UI 立刻反映。
+		//
+		// 请求并发发起:每一次 Pause 都是一次阻塞的 IPC 往返,串行做的话
+		// 任务一多,工具栏按钮要卡上好几秒才恢复响应。
 		paused := store.TaskStatus.Paused
 		for _, tk := range m.taskList.allTasks() {
 			m.taskList.setOptimistic(tk.ID, paused)
-			_ = m.svc.Pause(tk.ID)
+			go func(id string) { _ = m.svc.Pause(id) }(tk.ID)
 		}
 	})
 	resumeAllBtn := widget.NewButtonWithIcon("", theme.MediaPlayIcon(), func() {
@@ -219,7 +222,7 @@ func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 		for _, tk := range m.taskList.allTasks() {
 			if tk.Status == store.TaskStatus.Paused || tk.Status == store.TaskStatus.Failed {
 				m.taskList.setOptimistic(tk.ID, down)
-				_ = m.svc.Start(tk.ID)
+				go func(id string) { _ = m.svc.Start(id) }(tk.ID)
 			}
 		}
 	})
@@ -535,9 +538,9 @@ func (sb *statusBar) setDiskSpace(free, total int64) {
 	}
 	frac := 1.0 - float64(free)/float64(total)
 	sb.diskBar.setProgress(frac)
-	sb.diskLabel.SetText(ilocale.TF("main.status.disk.format", fmt.Sprintf("磁盘空间: 可用 %s / 总计 %s", humanBytes(free), humanBytes(total)), map[string]any{
-		"Free": humanBytes(free),
-		"Total": humanBytes(total),
+	sb.diskLabel.SetText(ilocale.TF("main.status.disk.format", fmt.Sprintf("磁盘空间: 可用 %s / 总计 %s", formatBytes(free), formatBytes(total)), map[string]any{
+		"Free": formatBytes(free),
+		"Total": formatBytes(total),
 	}))
 }
 

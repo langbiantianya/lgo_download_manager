@@ -275,9 +275,9 @@ func (p *btDetailsPanel) update(d *bittorrent.Detail) {
 	if d.Name != "" {
 		p.lblName.SetText(d.Name)
 	}
-	p.lblTotal.SetText(btFormatBytes(d.Total))
-	p.lblDownloaded.SetText(btFormatBytes(d.Downloaded))
-	p.lblUploaded.SetText(btFormatBytes(d.Uploaded))
+	p.lblTotal.SetText(formatBytes(d.Total))
+	p.lblDownloaded.SetText(formatBytes(d.Downloaded))
+	p.lblUploaded.SetText(formatBytes(d.Uploaded))
 	p.lblRatio.SetText(btFormatRatio(d.Uploaded, d.Downloaded))
 	p.lblDownSpeed.SetText(formatBPS(d.SpeedBPS))
 	p.lblUpSpeed.SetText(formatBPS(d.UploadBPS))
@@ -285,7 +285,7 @@ func (p *btDetailsPanel) update(d *bittorrent.Detail) {
 	p.lblTotalPeers.SetText(strconv.Itoa(d.TotalPeers))
 	p.lblSeeders.SetText(strconv.Itoa(d.Seeders))
 	p.lblLeechers.SetText(strconv.Itoa(d.Leechers))
-	p.lblPieceLen.SetText(btFormatBytes(d.PieceLength))
+	p.lblPieceLen.SetText(formatBytes(d.PieceLength))
 	p.lblPieces.SetText(strconv.Itoa(d.Pieces))
 	p.lblPiecesDone.SetText(fmt.Sprintf("%d / %d", d.PiecesDone, d.Pieces))
 	p.lblState.SetText(btStateText(d))
@@ -366,8 +366,8 @@ func (r *btFileRow) update(f bittorrent.FileProgress) {
 	r.info.SetText(ilocale.TF("details.bt.file.progress",
 		"{{ .Done }} / {{ .Total }} ({{ .Pct }}%)",
 		map[string]any{
-			"Done":  btFormatBytes(f.Completed),
-			"Total": btFormatBytes(f.Length),
+			"Done":  formatBytes(f.Completed),
+			"Total": formatBytes(f.Length),
 			"Pct":   fmt.Sprintf("%.1f", frac*100),
 		}))
 }
@@ -382,14 +382,7 @@ func btSectionLabel(id, def string) *widget.Label {
 	return widget.NewLabelWithStyle(ilocale.TS(id, def), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 }
 
-// btFormatBytes 格式化字节数。与 formatBytes 的差别:0 显示成 "0 B"
-// 而不是「未知大小」——BT 面板里 0 是有意义的(还没收到元数据、上传量为 0)。
-func btFormatBytes(n int64) string {
-	if n <= 0 {
-		return "0 B"
-	}
-	return formatBytes(n)
-}
+
 
 // btFormatRatio 计算并格式化分享率(已上传 / 已下载)。
 func btFormatRatio(uploaded, downloaded int64) string {

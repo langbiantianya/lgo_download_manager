@@ -250,7 +250,7 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 			}
 			fyne.Do(func() {
 				if probe.IsCurrent(seq) {
-					sizeLabel.SetText(formatSize(size))
+					sizeLabel.SetText(formatBytes(size))
 				}
 			})
 		}()
@@ -413,19 +413,4 @@ type errEmptyField struct{}
 
 func (errEmptyField) Error() string { return ilocale.T("addTask.required") }
 
-// formatSize 将字节数格式化为人类可读字符串。
-func formatSize(n int64) string {
-	const KB = 1 << 10
-	const MB = 1 << 20
-	const GB = 1 << 30
-	switch {
-	case n >= GB:
-		return strconv.FormatFloat(float64(n)/GB, 'f', 2, 64) + " GB"
-	case n >= MB:
-		return strconv.FormatFloat(float64(n)/MB, 'f', 2, 64) + " MB"
-	case n >= KB:
-		return strconv.FormatFloat(float64(n)/KB, 'f', 2, 64) + " KB"
-	default:
-		return strconv.FormatInt(n, 10) + " B"
-	}
-}
+

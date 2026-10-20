@@ -7,7 +7,6 @@
 package ui
 
 import (
-	"fmt"
 	"path/filepath"
 	"time"
 
@@ -265,7 +264,7 @@ func (r *taskRow) effectiveStatus(t *store.Task) (store.Status, bool) {
 func (r *taskRow) refreshProgress(t *store.Task, eff store.Status) {
 	r.setText(r.name, &r.st.name, displayName(t))
 	r.setText(r.createdAtLbl, &r.st.createdAt, ilocale.T("taskRow.createdAt.prefix")+formatTime(t.CreatedAt))
-	r.setText(r.size, &r.st.size, formatBytes(t.TotalSize))
+	r.setText(r.size, &r.st.size, taskSizeText(t.TotalSize))
 
 	pct := 0.0
 	if t.TotalSize > 0 {
@@ -347,6 +346,11 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool) {
 		r.startBtn.Importance = widget.LowImportance
 		r.setVis(r.startBtn, showStart, true)
 		r.setVis(r.pauseBtn, showPause, false)
+		// 失败的任务不该还留着「打开文件夹/打开文件」——文件可能根本没
+		// 落盘。之前这个分支没重置,任务从「已完成」变成「失败」后按钮
+		// 会一直亮着。
+		r.setVis(r.openFolderBtn, showFolder, false)
+		r.setVis(r.openFileBtn, showFile, false)
 	}
 }
 
@@ -447,34 +451,10 @@ func formatTime(t time.Time) string {
 	return t.Local().Format("2006-01-02 15:04:05")
 }
 
-// formatBytes 使用二进制单位后缀格式化 n。
-func formatBytes(n int64) string {
-	if n <= 0 {
-		return ilocale.T("taskRow.size.unknown")
-	}
-	const (
-		KB = 1 << 10
-		MB = 1 << 20
-		GB = 1 << 30
-		TB = 1 << 40
-	)
-	switch {
-	case n >= TB:
-		return fmt.Sprintf("%.2f TB", float64(n)/TB)
-	case n >= GB:
-		return fmt.Sprintf("%.2f GB", float64(n)/GB)
-	case n >= MB:
-		return fmt.Sprintf("%.1f MB", float64(n)/MB)
-	case n >= KB:
-		return fmt.Sprintf("%.1f KB", float64(n)/KB)
-	default:
-		return fmt.Sprintf("%d B", n)
-	}
-}
 
 // formatBPS 以字节/秒为单位格式化速度。
-// 单位后缀 "/s" 与 formatBytes 数值部分都跟着当前语言;
-// 完整字符串里只有数值部分会变,所以这里把单位做进模板而非拼字符串。
+// 单位后缀 "/s" 与 formatBytes 一样是固定的英文缩写,数值部分才随
+// 语言变化——所以这里直接拼接,不走模板。
 func formatBPS(bps float64) string {
 	if bps <= 0 {
 		return ilocale.T("taskRow.speed.none")

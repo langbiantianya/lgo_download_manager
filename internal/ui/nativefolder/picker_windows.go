@@ -11,6 +11,7 @@ package nativefolder
 import (
 	"fmt"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"unsafe"
 )
@@ -131,6 +132,13 @@ func releaseCom(obj uintptr) {
 // — the same control Windows Explorer itself uses for "Choose a folder".
 // If the user cancels the picker, returns ErrCancelled.
 func PickFolder(initialDir string) (string, error) {
+	// COM 是线程亲和的:CoInitializeEx 必须在调用 IFileDialog::Show 的那个
+	// 线程上完成。这个函数是从后台 goroutine 里调用的,goroutine 随时
+	// 可能被调度到另一个线程上——不锁住 OS 线程的话,初始化与实际调用
+	// 可能落在两个不同的线程,COM 会以 RPC_E_WRONG_THREAD 失败。
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	// COM must be initialised on the thread that calls IFileDialog::Show.
 	// fyne's UI goroutine is not guaranteed to be COM-initialised, so we
 	// initialise here. S_FALSE (1) means "already initialised" — fine.

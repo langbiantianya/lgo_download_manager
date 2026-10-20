@@ -251,11 +251,11 @@ func TestShowChunkDetailsPicksBTPanel(t *testing.T) {
 // TestBTFormatHelpers 校验面板里的格式化辅助:0 字节要显示成 "0 B" 而不是
 // 「未知大小」(BT 面板里 0 是有意义的),分享率在还没下载任何东西时是 "-"。
 func TestBTFormatHelpers(t *testing.T) {
-	if got := btFormatBytes(0); got != "0 B" {
-		t.Errorf("btFormatBytes(0) = %q, want 0 B", got)
+	if got := formatBytes(0); got != "0 B" {
+		t.Errorf("formatBytes(0) = %q, want 0 B", got)
 	}
-	if got := btFormatBytes(1024); got != "1.0 KB" {
-		t.Errorf("btFormatBytes(1024) = %q, want 1.0 KB", got)
+	if got := formatBytes(1024); got != "1.0 KB" {
+		t.Errorf("formatBytes(1024) = %q, want 1.0 KB", got)
 	}
 	if got := btFormatRatio(100, 0); got != "-" {
 		t.Errorf("btFormatRatio(100, 0) = %q, want -", got)
