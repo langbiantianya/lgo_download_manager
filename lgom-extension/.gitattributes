@@ -1,0 +1,14 @@
+# 扩展目录的行尾统一为 LF。
+#
+# 扩展的工具链（prettier / eslint / vite）按 LF 处理文件：Windows 上
+# core.autocrlf=true 会把检出结果转成 CRLF，于是 `npm run lint` 在本机
+# 必然失败（prettier 报「行尾不符」），而 CI（Linux）检出的就是 LF——
+# 本机与 CI 看到的内容不一致。钉成 eol=lf 之后两边一致。
+#
+# 顺序要紧：通配规则在前，下面的二进制规则在后才能覆盖它。
+* text=auto eol=lf
+
+# 二进制资源不参与行尾/编码转换：图标一旦被改写，打包出的快捷方式
+# /DefaultIcon 就会坏。与根目录 .gitattributes 的意图一致。
+*.png -text -diff
+*.ico -text -diff
