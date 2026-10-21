@@ -61,6 +61,7 @@ npm run build:all        # -> build/chrome/ 和 build/firefox/
 | `npm run package:all`     | 两个平台都出成品                        |
 | `npm run dev`             | 监听文件变更自动重新构建 Chrome 包      |
 | `npm run dev:firefox`     | 同上，针对 Firefox                      |
+| `npm test`                | 单元测试（`node:test`，零新依赖）       |
 | `npm run check`           | `svelte-check`（基于 `jsconfig.json`）  |
 | `npm run lint`            | `prettier --check` + `eslint`           |
 | `npm run format`          | `prettier --write`                      |
@@ -358,11 +359,40 @@ LGOM IPC 帧限制内（`MAX_FRAME_LEN`，64 KiB）。
 | `src/static/`                        | 图标和 `_locales` 直接复制到构建输出                               |
 | `src/types.d.ts`                     | 环境 `chrome`/`browser` 声明（不使用 `@types/chrome`）             |
 | `src/routes/layout.css`              | Tailwind v4 入口，被两个 UI 界面导入                               |
+| `tests/`                             | `node:test` 单元测试（见下）                                       |
 | `scripts/build.mjs`                  | 构建入口：把 Vite 产物组装成 `build/<platform>/`                   |
 | `scripts/package.mjs`                | 打包入口：把 `build/<platform>/` 打成 `dist/` 里的 zip / crx / xpi |
 
 项目使用 JavaScript + JSDoc 类型注解，而非 TypeScript；`jsconfig.json`
 启用了 `checkJs`，`svelte-check` 是类型检查关卡。
+
+## 测试
+
+```sh
+npm test
+```
+
+用 Node 自带的 `node:test`，不引任何新依赖。测试直接加载 `src/` 里的真实源码
+（平台层用 `$lib/…` 别名，由 `tests/helpers/alias-loader.mjs` 这个解析钩子
+接上），浏览器 API 由 `tests/helpers/browser-stub.mjs` 打桩，因此整套测试
+不需要真实浏览器、不碰网络、也不依赖桌面客户端。
+
+| 文件                              | 覆盖                                                              |
+| --------------------------------- | ----------------------------------------------------------------- |
+| `tests/url-builder.test.mjs`      | `lgom://` URL 的构造与预算降级、JSON 正文、请求头提取与逐跳头剥离 |
+| `tests/metadata.test.mjs`         | 元数据归一化（文件名/UA/Cookie/Referer）、三种过滤模式            |
+| `tests/channels.test.mjs`         | 通道 → `reason` / 弹窗徽标的映射（含历史 reason）                 |
+| `tests/local-port.test.mjs`       | 端口通道：发现、端口缓存、交接成功/被拒/不可达、5xx 忘记端口      |
+| `tests/platform-chrome.test.mjs`  | Chrome 拦截流程：端口通道、回退标签页、开关关闭、白名单跳过       |
+| `tests/platform-firefox.test.mjs` | Firefox 拦截流程：端口通道、回退标签页、标签页用后即关            |
+| `tests/manifest.test.mjs`         | manifest 权限与后台形态、i18n 键对齐、扩展与 Go 侧的端口候选契约  |
+
+两条通道的判定靠打桩的 `fetch` 切换（客户端在跑 / 没在跑），不依赖真实端口。
+
+`tests/local-port.test.mjs` 里还有一条对着真实 HTTP 的用例：起一个照着
+`internal/handoff` 行为实现的假客户端，完整跑一遍 `/ping` + `POST /download`。
+它需要候选端口（17821–17825）空闲——真客户端在场时会跳过，因为扩展会取
+「最小的应答端口」，那样就可能打到真实客户端身上。
 
 ## 验证构建
 
@@ -414,9 +444,11 @@ profile 的 `protocol_handler.allowed_origin_protocol_pairs`。
 ## 持续集成
 
 `.github/workflows/extension.yml` 在 push / PR / `v*` tag 上跑
-`npm ci` + `build:<platform>` + `package:<platform>`，产物作为 artifact 上传
-（保留 30 天）；`v*` tag 上把 zip / crx / xpi 一并附到 GitHub Release。
-版本号用 tag 去掉 `v`（`v1.2.3` → `1.2.3`），非 tag 推送用 manifest 里的版本。
+`npm ci` + `npm test` + `build:<platform>` + `package:<platform>`，产物作为
+artifact 上传（保留 30 天）；`v*` tag 上把 zip / crx / xpi 一并附到 GitHub
+Release。版本号用 tag 去掉 `v`（`v1.2.3` → `1.2.3`），非 tag 推送用 manifest
+里的版本。测试是构建的前置关卡（`extension-test` → `extension-chrome` /
+`extension-firefox`），测试不过就不出包。
 
 | secret                           | 用途                                                                                               |
 | -------------------------------- | -------------------------------------------------------------------------------------------------- |

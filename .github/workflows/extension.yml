@@ -17,8 +17,36 @@ permissions:
 # 版本号:tag 推 v1.2.3 用 1.2.3,其余情况用 manifest 里的版本。
 
 jobs:
+  # 扩展的单元测试（node:test，零新依赖）。跑在构建前面：测试不过就别出包。
+  extension-test:
+    name: extension test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: lgom-extension
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: lgom-extension/package-lock.json
+
+      - name: install deps
+        run: npm ci
+
+      # 覆盖：URL 构造与预算降级、请求头提取与逐跳头剥离、过滤模式、
+      # 端口通道的发现/缓存/交接、Chrome 与 Firefox 的拦截流程、
+      # manifest 权限与 i18n 键的一致性、扩展与 Go 侧的端口候选契约。
+      - name: test
+        run: npm test
+
   extension-chrome:
     name: extension chrome
+    needs: [extension-test]
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -79,6 +107,7 @@ jobs:
 
   extension-firefox:
     name: extension firefox
+    needs: [extension-test]
     runs-on: ubuntu-latest
     defaults:
       run:
