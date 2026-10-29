@@ -796,6 +796,8 @@ BT 并发/做种数 ≤ 64、BT peer 数 ≤ 1000）：超上限的输入不采�
 - HTTP/WebDAV 的 HEAD/`PROPFIND` 探测之后会发一个 1 字节 Range 请求验证真实能力，
   避免只凭 `Accept-Ranges` 头误判；分片响应必须是精确的 `206`，且
   `Content-Range` 与请求区间一致。
+- HEAD/PROPFIND 使用独立的短时间预算；服务器不支持或迟迟不响应探测方法时，
+  会更快降级到 1 字节 Range 请求，而不是耗尽整个任务探测时限。
 - 服务端若忽略 Range 并返回 `200`，不会把完整响应写到中途偏移，而会自动降级为从
   字节 0 开始的单流下载；短响应、错误区间和长度不符会被视为失败或可重试错误。
 - HTTP/WebDAV 会持久化 ETag 与 Last-Modified，并在分片请求中发送 `If-Range`；

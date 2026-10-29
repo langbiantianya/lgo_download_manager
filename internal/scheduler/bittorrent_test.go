@@ -345,7 +345,8 @@ func TestFlushKeepsBtChunkProgress(t *testing.T) {
 	if err := st.CreateTask(tk); err != nil {
 		t.Fatal(err)
 	}
-	rj := &runningJob{task: tk, dirty: true, status: store.TaskStatus.Downloading}
+	rj := &runningJob{task: tk, status: store.TaskStatus.Downloading}
+	rj.dirty.Store(true)
 	sc.jobs[tk.ID] = rj
 	sc.flushAll()
 
@@ -358,6 +359,9 @@ func TestFlushKeepsBtChunkProgress(t *testing.T) {
 	}
 	if got.Downloaded != 0 && got.Downloaded != 120 {
 		t.Fatalf("persisted Downloaded = %d, want 0 or 120", got.Downloaded)
+	}
+	if rj.dirty.Load() {
+		t.Fatal("flush left a persisted BT job marked dirty")
 	}
 }
 

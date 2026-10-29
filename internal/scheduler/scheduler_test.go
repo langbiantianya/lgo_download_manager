@@ -1159,7 +1159,10 @@ func TestPauseDuringPrepare(t *testing.T) {
 	// 关闭 channel,确保 Start 在探测返回前一直处于准备阶段。
 	releaseProbe := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-releaseProbe
+		select {
+		case <-releaseProbe:
+		case <-r.Context().Done():
+		}
 	}))
 	defer srv.Close()
 
@@ -1249,7 +1252,10 @@ func TestPauseDuringPrepare(t *testing.T) {
 func TestPauseAllDuringPrepare(t *testing.T) {
 	releaseProbe := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-releaseProbe
+		select {
+		case <-releaseProbe:
+		case <-r.Context().Done():
+		}
 	}))
 	defer srv.Close()
 
@@ -1333,7 +1339,11 @@ func TestPauseAllDuringPrepare(t *testing.T) {
 func blockingServer(t *testing.T, releaseProbe <-chan struct{}) (*httptest.Server, string) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		<-releaseProbe
+		select {
+		case <-releaseProbe:
+		case <-r.Context().Done():
+			return
+		}
 		w.Header().Set("Content-Length", "1")
 		w.WriteHeader(200)
 		_, _ = w.Write([]byte{0})

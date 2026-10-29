@@ -574,8 +574,9 @@ func (s *Scheduler) markBittorrentProgress(taskID string, rj *runningJob, snap b
 	}
 	progress := btChunkProgress(snap.Files)
 	ranges := btChunkRanges(snap.Files)
+	notify := s.hasSubscribers()
 	rj.dirtyMu.Lock()
-	rj.dirty = true
+	rj.dirty.Store(true)
 	rj.status = store.TaskStatus.Downloading
 	rj.lastSnapshot = engine.Progress{
 		TaskID:          taskID,
@@ -584,6 +585,7 @@ func (s *Scheduler) markBittorrentProgress(taskID string, rj *runningJob, snap b
 		SpeedBPS:        snap.SpeedBPS,
 	}
 	if rj.task == nil {
+		rj.dirty.Store(false)
 		rj.dirtyMu.Unlock()
 		return
 	}
@@ -594,9 +596,14 @@ func (s *Scheduler) markBittorrentProgress(taskID string, rj *runningJob, snap b
 	rj.task.Status = store.TaskStatus.Downloading
 	rj.task.ChunkRanges = ranges
 	rj.task.ChunkProgress = progress
-	clone := rj.task.Clone()
+	var clone *store.Task
+	if notify {
+		clone = rj.task.Clone()
+	}
 	rj.dirtyMu.Unlock()
-	s.publish(Event{Why: "progress", Task: clone, SpeedBPS: snap.SpeedBPS})
+	if clone != nil {
+		s.publish(Event{Why: "progress", Task: clone, SpeedBPS: snap.SpeedBPS})
+	}
 }
 
 // completeBittorrent 收尾一个下载完成的 BT 任务:落盘终态、发布完成事件,

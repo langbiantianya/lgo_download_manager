@@ -574,10 +574,8 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		if backoff < 30*time.Second {
 			backoff *= 2
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
+		if waitErr := waitRetry(ctx, wait); waitErr != nil {
+			return waitErr
 		}
 	}
 }
@@ -651,10 +649,8 @@ func (j *Job) downloadChunk(ctx context.Context, idx int, bytesDone *atomic.Int6
 		if backoff < 30*time.Second {
 			backoff *= 2
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(wait):
+		if waitErr := waitRetry(ctx, wait); waitErr != nil {
+			return waitErr
 		}
 	}
 }
@@ -725,10 +721,8 @@ func downloadFallbackWithRetry(ctx context.Context, j *Job, c *chunk, bytesDone 
 			return err
 		}
 		j.log.Warn("streaming chunk error backing off", "err", err, "backoff", backoff, "fails", consecutiveFails, "maxFails", maxChunkRetries)
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(retryDelay(err, backoff)):
+		if waitErr := waitRetry(ctx, retryDelay(err, backoff)); waitErr != nil {
+			return waitErr
 		}
 		backoff *= 2
 		if backoff > 30*time.Second {
@@ -748,6 +742,19 @@ func retryDelay(err error, backoff time.Duration) time.Duration {
 		return hint
 	}
 	return backoff + jitter(backoff)
+}
+
+// waitRetry 使用可停止的 Timer；暂停时 time.After 留下的定时器会一直
+// 存活到原定触发时间，高并发分片同时取消时会制造一批无意义堆对象。
+func waitRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 func (j *Job) sanityCheck() error {

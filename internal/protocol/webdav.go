@@ -64,8 +64,14 @@ func (d *webdavDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 		`<propfind xmlns="DAV:"><prop><getcontentlength xmlns="DAV:"/>` +
 		`<getetag xmlns="DAV:"/><getlastmodified xmlns="DAV:"/>` +
 		`<displayname xmlns="DAV:"/><resourcetype xmlns="DAV:"/></prop></propfind>`)
-	req, err := http.NewRequestWithContext(ctx, "PROPFIND", d.url, body)
+	probeCtx := ctx
+	cancelProbe := func() {}
+	if d.probeTimeout > 0 {
+		probeCtx, cancelProbe = context.WithTimeout(ctx, d.probeTimeout)
+	}
+	req, err := http.NewRequestWithContext(probeCtx, "PROPFIND", d.url, body)
 	if err != nil {
+		cancelProbe()
 		return nil, fmt.Errorf("webdav probe build: %w", err)
 	}
 	d.decorate(req)
@@ -74,8 +80,13 @@ func (d *webdavDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 
 	resp, err := d.cli.Do(req)
 	if err != nil {
+		cancelProbe()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		return nil, fmt.Errorf("webdav probe do: %w", err)
 	}
+	defer cancelProbe()
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {

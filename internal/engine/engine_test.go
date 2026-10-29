@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1011,5 +1012,17 @@ func TestRetryDelayHonorsServerHint(t *testing.T) {
 	err := protocol.NewStatusErrorWithRetryAfter(429, nil, hint)
 	if got := retryDelay(err, time.Second); got != hint {
 		t.Fatalf("retryDelay=%v, want server hint %v", got, hint)
+	}
+}
+
+func TestWaitRetryCancelsPromptly(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if err := waitRetry(ctx, time.Hour); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitRetry err=%v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("waitRetry took %v after cancellation", elapsed)
 	}
 }

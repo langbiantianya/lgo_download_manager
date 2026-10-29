@@ -41,6 +41,9 @@ type taskList struct {
 	// rowMap 将 taskID 映射到活动的 taskRow，以便 O(1) 地派发事件。
 	rowMu  sync.Mutex
 	rowMap map[string]*taskRow
+	// rowTask 是 rowMap 的反向索引。Fyne 复用行控件时可直接找到旧
+	// taskID 并删除映射，避免为了修复陈旧 ID 扫描整个 rowMap。
+	rowTask map[*taskRow]string
 
 	// cacheMu 保护过滤结果缓存。Length()/UpdateItem()/空状态判断都会
 	// 查询过滤结果，没有缓存时每个事件、每一个可见行都要走一次
@@ -57,6 +60,7 @@ func newTaskList(svc Service, filter binding.String) *taskList {
 		filter:  filter,
 		searchQ: binding.NewString(),
 		rowMap:  map[string]*taskRow{},
+		rowTask: map[*taskRow]string{},
 	}
 	tl.panel = tl.build()
 	return tl
@@ -247,14 +251,19 @@ func (tl *taskList) buildHeaderRow() fyne.CanvasObject {
 // bindRow 在 rowMap 中以 taskID 注册 row。
 func (tl *taskList) bindRow(row *taskRow, taskID string) {
 	tl.rowMu.Lock()
-	// Fyne 会复用已滚出视口的 row 对象。若保留旧 ID 映射，旧任务的
-	// progress 事件会刷新一个已绑定到新任务、甚至当前不可见的 row。
-	for id, bound := range tl.rowMap {
-		if bound == row && id != taskID {
-			delete(tl.rowMap, id)
-		}
+	if tl.rowMap == nil {
+		tl.rowMap = map[string]*taskRow{}
+	}
+	if tl.rowTask == nil {
+		tl.rowTask = map[*taskRow]string{}
+	}
+	// Fyne 会复用已滚出视口的 row 对象。反向索引让旧 ID 清理保持 O(1)，
+	// 防止旧任务的 progress 事件刷新已经绑定到新任务的行。
+	if oldID, ok := tl.rowTask[row]; ok && oldID != taskID {
+		delete(tl.rowMap, oldID)
 	}
 	tl.rowMap[taskID] = row
+	tl.rowTask[row] = taskID
 	tl.rowMu.Unlock()
 }
 

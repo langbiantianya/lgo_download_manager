@@ -48,6 +48,9 @@ type Scheduler struct {
 	// 加入任务留在 Pending(等于「等待中」),直到有 slot 释放再 promote。
 	// 0 表示尚未初始化;SetMaxConcurrent 负责套用默认值并触发 promote。
 	maxConcurrent int
+	// promoteMu 串行化 Pending 提升，避免多个任务同时完成时反复并发
+	// 扫描同一批 Pending 行并争抢 Start。
+	promoteMu sync.Mutex
 	// prealloc 控制新任务是否在建连前按完整大小预留磁盘空间。
 	prealloc atomic.Bool
 
@@ -89,6 +92,8 @@ type Scheduler struct {
 	// 退订正好在那个窗口里 close 掉通道)。
 	subMu sync.Mutex
 	subs  []chan Event
+	// subCount 让高频进度回调无需获取 subMu 就能判断是否需要构造事件。
+	subCount atomic.Int32
 }
 
 // seedEntry 是一个已完成后保留在 BT 客户端里的做种句柄。
@@ -107,13 +112,17 @@ type runningJob struct {
 	// 任务。该阶段 cancel 仍为 nil，因此 Pause/PauseAll/Cancel/Delete 必须
 	// 同时调用 prepareCancel，否则准备中的任务无法被中止，只能等其跑完
 	// 探测后变成 Downloading 才能停。
+	// prepareCancel/cancel 由 Scheduler.mu 保护；job 也随 cancel 在同一
+	// 临界区发布给进度与暂停路径。
 	prepareCtx    context.Context
 	prepareCancel context.CancelFunc
 	cancel        context.CancelFunc
 	job           *engine.Job
 
 	// dirtyMu 保护 task 的易变字段（Downloaded/ChunkProgress/Status/
-	// ErrorMessage/ChunkRanges）以及 dirty/status/lastSnapshot。
+	// ErrorMessage/ChunkRanges）以及 status/lastSnapshot。dirty 独立使用
+	// 原子量，让 2 秒 tick 能无锁跳过没有新进度的任务，不必每轮先取
+	// 引擎分片锁。
 	// 访问这些字段的三条路径——engine 的进度回调、2 秒刷盘 ticker、
 	// Pause/Fail/Complete 收尾——都必须持锁。
 	//
@@ -121,7 +130,7 @@ type runningJob struct {
 	// engine 自己的 mu，而 engine 回调 OnPlanChanged/Progress 时会反过来取
 	// dirtyMu，形成 ABBA 死锁）。因此所有 Chunks() 调用都在加锁之前完成。
 	dirtyMu      sync.Mutex
-	dirty        bool
+	dirty        atomic.Bool
 	status       store.Status
 	lastSnapshot engine.Progress // 用于追赶式刷新
 
@@ -239,6 +248,9 @@ func (s *Scheduler) btJobsLocked() int {
 // 候选集合由 SQL 层按 status 过滤后一次取回（此前是每个候选做一次
 // 全表 ListTasks，在历史任务多时是 O(N²) 的扫描 + JSON 解码）。
 func (s *Scheduler) promotePending() {
+	s.promoteMu.Lock()
+	defer s.promoteMu.Unlock()
+
 	s.mu.Lock()
 	limit := s.maxConcurrent
 	s.mu.Unlock()
@@ -894,50 +906,62 @@ func (s *Scheduler) ReclaimDownloadingTasks() error {
 // runningJob)同样会被取消:同时调用 prepareCancel 与 cancel,并由
 // startAsync 的检查点把状态落盘为 Paused 后通过事件总线通知 UI。
 func (s *Scheduler) PauseAll(ctx context.Context) error {
-	s.mu.Lock()
-	jobs := make([]*runningJob, 0, len(s.jobs))
-	for _, rj := range s.jobs {
-		jobs = append(jobs, rj)
+	stopAllJobs := func() {
+		s.mu.Lock()
+		jobs := make([]*runningJob, 0, len(s.jobs))
+		for _, rj := range s.jobs {
+			jobs = append(jobs, rj)
+		}
+		s.mu.Unlock()
+		for _, rj := range jobs {
+			s.stopJob(rj)
+		}
 	}
-	s.mu.Unlock()
-
-	for _, rj := range jobs {
-		stopJob(rj)
-	}
+	stopAllJobs()
 
 	done := make(chan struct{})
 	go func() {
-		waited := make(chan struct{})
-		go func() {
-			s.wg.Wait()
-			close(waited)
-		}()
-		// 同时监听 ctx：否则超时返回后这个 goroutine 会一直挂在
-		// wg.Wait() 上（每个超时一次泄漏）。
-		select {
-		case <-waited:
-			close(done)
-		case <-ctx.Done():
-		}
+		s.wg.Wait()
+		close(done)
 	}()
-	select {
-	case <-done:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	// 某个 slot 释放时 promotePending 可能在同一时刻启动新任务；持续
+	// 补发取消可覆盖这层竞争，避免 PauseAll 只取消到最初快照。
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-done:
+			return nil
+		case <-ticker.C:
+			stopAllJobs()
+		case <-ctx.Done():
+			// 若 wg 与 deadline 同时完成，select 可能随机选中 ctx；
+			// 再检查一次，避免把已经完成的暂停误报为超时。
+			select {
+			case <-done:
+				return nil
+			default:
+				return ctx.Err()
+			}
+		}
 	}
 }
 
 // stopJob 取消一个 job 的两个上下文（准备阶段与 engine 阶段）。
-func stopJob(rj *runningJob) {
+// cancel 字段由 s.mu 保护，这里在锁内取出函数后立即释放锁再调用。
+func (s *Scheduler) stopJob(rj *runningJob) {
 	if rj == nil {
 		return
 	}
-	if rj.prepareCancel != nil {
-		rj.prepareCancel()
+	s.mu.Lock()
+	prepareCancel := rj.prepareCancel
+	cancel := rj.cancel
+	s.mu.Unlock()
+	if prepareCancel != nil {
+		prepareCancel()
 	}
-	if rj.cancel != nil {
-		rj.cancel()
+	if cancel != nil {
+		cancel()
 	}
 }
 
@@ -962,7 +986,7 @@ func (s *Scheduler) Pause(taskID string) error {
 	if !ok {
 		return errors.New("scheduler: task not running")
 	}
-	stopJob(rj)
+	s.stopJob(rj)
 	return nil
 }
 
@@ -977,7 +1001,7 @@ func (s *Scheduler) Cancel(taskID string) error {
 	rj, ok := s.jobs[taskID]
 	s.mu.Unlock()
 	if ok {
-		stopJob(rj)
+		s.stopJob(rj)
 		waitCtx, cancelWait := context.WithTimeout(context.Background(), stopWait)
 		_ = waitStopped(waitCtx, rj)
 		cancelWait()
@@ -1002,7 +1026,7 @@ func (s *Scheduler) Delete(taskID string) error {
 	rj, ok := s.jobs[taskID]
 	s.mu.Unlock()
 	if ok {
-		stopJob(rj)
+		s.stopJob(rj)
 		// 与 Cancel 同理：等写者停止后再删文件/删行，避免引擎收尾
 		// 路径在行被删后仍去写状态。
 		waitCtx, cancelWait := context.WithTimeout(context.Background(), stopWait)
@@ -1109,6 +1133,7 @@ func (s *Scheduler) Subscribe() (<-chan Event, func()) {
 	ch := make(chan Event, 64)
 	s.subMu.Lock()
 	s.subs = append(s.subs, ch)
+	s.subCount.Add(1)
 	s.subMu.Unlock()
 	return ch, func() {
 		// 退订与 publish 互斥:持 subMu 关闭通道,保证不会有人正往
@@ -1118,11 +1143,16 @@ func (s *Scheduler) Subscribe() (<-chan Event, func()) {
 		for i, c := range s.subs {
 			if c == ch {
 				s.subs = append(s.subs[:i], s.subs[i+1:]...)
+				s.subCount.Add(-1)
 				close(ch)
 				return
 			}
 		}
 	}
+}
+
+func (s *Scheduler) hasSubscribers() bool {
+	return s.subCount.Load() > 0
 }
 
 // publish 向所有订阅者发送事件;通道已满时丢弃。
@@ -1151,9 +1181,10 @@ func (s *Scheduler) markProgress(taskID string, p engine.Progress) {
 	// 先取引擎的权威分片快照，再进 dirtyMu：锁序要求持 dirtyMu 时
 	// 不得调用引擎方法（engine.Chunks() 会取引擎自身的锁）。
 	cs := rj.job.Chunks()
+	notify := s.hasSubscribers()
 
 	rj.dirtyMu.Lock()
-	rj.dirty = true
+	rj.dirty.Store(true)
 	rj.lastSnapshot = p
 	rj.status = store.TaskStatus.Downloading
 
@@ -1166,9 +1197,14 @@ func (s *Scheduler) markProgress(taskID string, p engine.Progress) {
 	if cp := chunkProgressFrom(cs); cp != nil {
 		rj.task.ChunkProgress = cp
 	}
-	snapshot := rj.task.Clone()
+	var snapshot *store.Task
+	if notify {
+		snapshot = rj.task.Clone()
+	}
 	rj.dirtyMu.Unlock()
-	s.publish(Event{Why: "progress", Task: snapshot, SpeedBPS: p.SpeedBPS})
+	if snapshot != nil {
+		s.publish(Event{Why: "progress", Task: snapshot, SpeedBPS: p.SpeedBPS})
+	}
 }
 
 // markStatus(Paused/Completed/Failed)把最新的内存任务状态写入
@@ -1352,11 +1388,12 @@ func (s *Scheduler) abortPrepare(taskID string, tk *store.Task) {
 func (s *Scheduler) IsPreparing(taskID string) bool {
 	s.mu.Lock()
 	rj, ok := s.jobs[taskID]
+	preparing := ok && rj != nil && rj.cancel == nil && rj.prepareCancel != nil
 	s.mu.Unlock()
-	if !ok || rj == nil {
+	if !preparing {
 		return false
 	}
-	return rj.cancel == nil && rj.prepareCancel != nil
+	return true
 }
 
 // Run 启动批量刷新 goroutine。请在启动时调用一次;它会一直运行
@@ -1390,6 +1427,9 @@ func (s *Scheduler) flushAll() {
 	}
 	dirty := make([]dirtyJob, 0, len(jobs))
 	for _, rj := range jobs {
+		if !rj.dirty.Load() {
+			continue
+		}
 		// 先取引擎快照（锁序：不得持 dirtyMu 调引擎）。
 		var cs []engine.ChunkSnapshot
 		if rj.job != nil {
@@ -1397,7 +1437,7 @@ func (s *Scheduler) flushAll() {
 		}
 
 		rj.dirtyMu.Lock()
-		if !rj.dirty || rj.task == nil {
+		if !rj.dirty.Load() || rj.task == nil {
 			rj.dirtyMu.Unlock()
 			continue
 		}
@@ -1410,7 +1450,7 @@ func (s *Scheduler) flushAll() {
 		if rj.job == nil {
 			taskProgress = append([]int64(nil), rj.task.ChunkProgress...)
 		}
-		rj.dirty = false
+		rj.dirty.Store(false)
 		rj.dirtyMu.Unlock()
 
 		progress := chunkProgressFrom(cs)
@@ -1443,16 +1483,18 @@ func (s *Scheduler) flushAll() {
 		logging.Printf("flush: %v", err)
 		// 整批失败：全部标记回 dirty，下个周期重试。
 		for _, d := range dirty {
-			d.rj.dirtyMu.Lock()
-			d.rj.dirty = true
-			d.rj.dirtyMu.Unlock()
+			d.rj.dirty.Store(true)
 		}
 		return
 	}
 	for _, d := range dirty {
 		d.rj.dirtyMu.Lock()
-		d.rj.task.ChunkProgress = d.progress
-		d.rj.task.Downloaded = d.update.Downloaded
+		// 数据库提交期间可能已有更新进度；此时 dirty 会重新为 true，
+		// 不能再用旧快照覆盖内存中的新值，留给下一轮刷盘。
+		if !d.rj.dirty.Load() {
+			d.rj.task.ChunkProgress = d.progress
+			d.rj.task.Downloaded = d.update.Downloaded
+		}
 		d.rj.dirtyMu.Unlock()
 	}
 }

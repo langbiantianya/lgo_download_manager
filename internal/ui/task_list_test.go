@@ -128,4 +128,7 @@ func TestTaskListBindRowRemovesStaleID(t *testing.T) {
 	if got := tl.rowMap["new-task"]; got != row {
 		t.Fatalf("new task mapping=%p, want %p", got, row)
 	}
+	if got := tl.rowTask[row]; got != "new-task" {
+		t.Fatalf("reverse row mapping=%q, want new-task", got)
+	}
 }

@@ -949,6 +949,42 @@ func TestHTTPProbeCapturesValidatorsAndUsesIfRange(t *testing.T) {
 	_ = d.Close()
 }
 
+func TestHTTPProbeFallsBackAfterHeadTimeout(t *testing.T) {
+	const size = 1024
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			<-r.Context().Done()
+			return
+		}
+		if r.Header.Get("Range") == "bytes=0-0" {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", size))
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte{0})
+			return
+		}
+		http.Error(w, "unexpected", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	d := makeHTTPDriver(srv.URL).(*httpDriver)
+	d.probeTimeout = 50 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	start := time.Now()
+	caps, err := d.Probe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !caps.SupportRange || caps.TotalSize != size {
+		t.Fatalf("caps=%+v, want range size %d", caps, size)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("HEAD fallback took %v, want under 1s", elapsed)
+	}
+	_ = d.Close()
+}
+
 func TestHTTPDownloadChunkRejectsChangedValidator(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Range", "bytes 0-1023/2048")

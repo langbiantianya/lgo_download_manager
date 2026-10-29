@@ -64,6 +64,7 @@ type httpBase struct {
 	transport    *transportLease
 	etag         string
 	lastModified string
+	probeTimeout time.Duration
 }
 
 type transportKey struct {
@@ -85,7 +86,10 @@ type transportLease struct {
 	once sync.Once
 }
 
-const maxCachedTransports = 2
+const (
+	maxCachedTransports    = 2
+	defaultProbeRequestTTL = 10 * time.Second
+)
 
 var (
 	transportPoolMu sync.Mutex
@@ -191,11 +195,12 @@ func newHTTPBase(kind, raw string, auth AuthOptions) (httpBase, error) {
 	}
 	tr, lease := acquireHTTPTransport(auth)
 	return httpBase{
-		kind:      kind,
-		url:       raw,
-		auth:      auth,
-		cli:       &http.Client{Transport: tr, Timeout: 0},
-		transport: lease,
+		kind:         kind,
+		url:          raw,
+		auth:         auth,
+		cli:          &http.Client{Transport: tr, Timeout: 0},
+		transport:    lease,
+		probeTimeout: defaultProbeRequestTTL,
 	}, nil
 }
 
@@ -454,17 +459,28 @@ func newHTTPDriver(raw string, auth AuthOptions) (ProtocolDriver, error) {
 // Probe 发起 HEAD 请求（失败时回退为 1 字节的 Range GET）以探测
 // 文件大小以及服务器是否支持字节区间（Range）。
 func (d *httpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, d.url, nil)
+	headCtx := ctx
+	cancelHead := func() {}
+	if d.probeTimeout > 0 {
+		headCtx, cancelHead = context.WithTimeout(ctx, d.probeTimeout)
+	}
+	req, err := http.NewRequestWithContext(headCtx, http.MethodHead, d.url, nil)
 	if err != nil {
+		cancelHead()
 		return nil, fmt.Errorf("http probe build: %w", err)
 	}
 	d.decorate(req)
 
 	resp, err := d.cli.Do(req)
 	if err != nil {
+		cancelHead()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		// 部分服务器屏蔽 HEAD；改用最小的区间 GET 重试。
 		return d.probeWithRange(ctx)
 	}
+	defer cancelHead()
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
