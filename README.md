@@ -694,18 +694,21 @@ Unix socket（其它平台）把 URL 转发给主实例后退出，转发失败�
 
 设置对话框的 **HTTP/HTTPS 代理模式** 提供三个选项：
 
-- **使用系统代理**（默认）：进程级缓存优先读取 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` 等环境变量，
-  未命中则调用平台原生 API 探测（Linux GNOME/KDE/macOS `scutil`/Windows WinINET）。
-  切换选项会自动让缓存失效，下次请求重新探测。
+- **使用系统代理**（默认）：优先读取 `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` /
+  `NO_PROXY` 等环境变量；当前协议没有环境代理时，再读取桌面会话设置
+  （Linux GNOME/KDE/macOS `scutil`/Windows WinINET）。HTTP 与 HTTPS 会分别选择
+  各自的代理端点，系统 bypass / `NO_PROXY` 同时生效。桌面代理快照缓存 30 秒，
+  系统设置或应用代理模式变化后无需重启客户端即可重新探测。
 - **不使用代理**：始终直连，忽略所有环境变量与系统设置。
 - **手动设置代理**：填写完整 URL（支持 `http://`、`https://`、`socks5://`）+ 可选绕过列表
-  （逗号分隔主机名，glob 模式 `*.lan`、`192.168.*`）。
+  （逗号分隔主机名、CIDR 或通配符，如 `*.lan`、`192.168.*`、`10.0.0.0/8`）。
 
 PAC / WPAD 自动配置脚本不在支持范围内。
 
 BitTorrent 任务的 tracker 公告、webseed 与 `.torrent` 文件的 HTTP 抓取
 同样走这套设置（`internal/protocol.HTTPProxyFunc`）；BT 的 peer 连接不是
-HTTP，因此不受这里的代理影响。
+HTTP，因此不受这里的代理影响。BT 侧的代理解析函数是动态的，修改代理后
+无需重建正在运行的 BT 客户端。
 
 ## 开机自启
 

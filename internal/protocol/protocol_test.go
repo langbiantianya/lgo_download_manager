@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"lgo_download_manager/internal/protocol/sysproxy"
 )
 
 // ---------------------------------------------------------------------------
@@ -461,6 +464,182 @@ func TestProxyFuncSystemEnvTakesPrecedence(t *testing.T) {
 	}
 	if got == nil || got.Host != "127.0.0.1:9999" {
 		t.Errorf("env should win, got %v", got)
+	}
+}
+
+func clearProxyEnvironment(t *testing.T) {
+	t.Helper()
+	for _, name := range []string{
+		"HTTP_PROXY", "http_proxy",
+		"HTTPS_PROXY", "https_proxy",
+		"ALL_PROXY", "all_proxy",
+		"NO_PROXY", "no_proxy",
+	} {
+		t.Setenv(name, "")
+	}
+	InvalidateSystemProxyCache()
+}
+
+func stubSystemProxy(t *testing.T, cfg sysproxy.Config, ok bool) *atomic.Int32 {
+	t.Helper()
+	calls := &atomic.Int32{}
+	previous := detectSystemProxy
+	detectSystemProxy = func() (sysproxy.Config, bool) {
+		calls.Add(1)
+		return cfg, ok
+	}
+	t.Cleanup(func() {
+		detectSystemProxy = previous
+		InvalidateSystemProxyCache()
+	})
+	InvalidateSystemProxyCache()
+	return calls
+}
+
+func proxyFor(t *testing.T, fn func(*http.Request) (*url.URL, error), raw string) *url.URL {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, raw, nil)
+	got, err := fn(req)
+	if err != nil {
+		t.Fatalf("proxy resolver: %v", err)
+	}
+	return got
+}
+
+func TestSystemProxyHonorsEnvNoProxyWithoutDesktopFallback(t *testing.T) {
+	clearProxyEnvironment(t)
+	t.Setenv("HTTP_PROXY", "http://env-proxy:1111")
+	t.Setenv("NO_PROXY", "example.com")
+	calls := stubSystemProxy(t, sysproxy.Config{
+		ProxyURL: "http://desktop-proxy:2222",
+	}, true)
+
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeSystem})
+	if got := proxyFor(t, fn, "http://api.example.com/file"); got != nil {
+		t.Fatalf("NO_PROXY host used %v; environment bypass must not fall through to desktop proxy", got)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("desktop proxy was probed %d times despite an environment proxy with NO_PROXY", calls.Load())
+	}
+}
+
+func TestSystemProxyUsesAllProxyForHTTPAndHTTPS(t *testing.T) {
+	clearProxyEnvironment(t)
+	t.Setenv("ALL_PROXY", "socks5://127.0.0.1:1080")
+	stubSystemProxy(t, sysproxy.Config{
+		ProxyURL: "http://desktop-proxy:2222",
+	}, true)
+
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeSystem})
+	for _, target := range []string{
+		"http://public.example/file",
+		"https://public.example/file",
+	} {
+		got := proxyFor(t, fn, target)
+		if got == nil || got.Scheme != "socks5" || got.Host != "127.0.0.1:1080" {
+			t.Fatalf("ALL_PROXY for %s = %v", target, got)
+		}
+	}
+}
+
+func TestSystemProxyUsesDesktopBypass(t *testing.T) {
+	clearProxyEnvironment(t)
+	stubSystemProxy(t, sysproxy.Config{
+		ProxyURL: "http://desktop-proxy:7890",
+		Bypass:   "direct.example,10.0.0.0/8,192.168.*,<local>",
+	}, true)
+
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeSystem})
+	if got := proxyFor(t, fn, "https://direct.example/file"); got != nil {
+		t.Fatalf("desktop bypass used proxy %v", got)
+	}
+	if got := proxyFor(t, fn, "https://10.2.3.4/file"); got != nil {
+		t.Fatalf("desktop CIDR bypass used proxy %v", got)
+	}
+	if got := proxyFor(t, fn, "https://192.168.1.20/file"); got != nil {
+		t.Fatalf("desktop wildcard bypass used proxy %v", got)
+	}
+	if got := proxyFor(t, fn, "http://nas/file"); got != nil {
+		t.Fatalf("<local> hostname used proxy %v", got)
+	}
+	got := proxyFor(t, fn, "https://public.example/file")
+	if got == nil || got.Host != "desktop-proxy:7890" {
+		t.Fatalf("non-bypassed host proxy = %v", got)
+	}
+}
+
+func TestSystemProxySeparatesHTTPAndHTTPS(t *testing.T) {
+	clearProxyEnvironment(t)
+	stubSystemProxy(t, sysproxy.Config{
+		HTTPProxyURL:  "http://http-proxy:8080",
+		HTTPSProxyURL: "http://https-proxy:8443",
+	}, true)
+
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeSystem})
+	httpProxy := proxyFor(t, fn, "http://public.example/file")
+	httpsProxy := proxyFor(t, fn, "https://public.example/file")
+	if httpProxy == nil || httpProxy.Host != "http-proxy:8080" {
+		t.Fatalf("HTTP proxy = %v", httpProxy)
+	}
+	if httpsProxy == nil || httpsProxy.Host != "https-proxy:8443" {
+		t.Fatalf("HTTPS proxy = %v", httpsProxy)
+	}
+}
+
+func TestSystemProxyCacheRefreshesAfterExpiry(t *testing.T) {
+	clearProxyEnvironment(t)
+	current := "http://proxy-one:1111"
+	calls := &atomic.Int32{}
+	previous := detectSystemProxy
+	detectSystemProxy = func() (sysproxy.Config, bool) {
+		calls.Add(1)
+		return sysproxy.Config{ProxyURL: current}, true
+	}
+	t.Cleanup(func() {
+		detectSystemProxy = previous
+		InvalidateSystemProxyCache()
+	})
+	InvalidateSystemProxyCache()
+
+	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeSystem})
+	if got := proxyFor(t, fn, "http://one.example/file"); got == nil || got.Host != "proxy-one:1111" {
+		t.Fatalf("first proxy = %v", got)
+	}
+	current = "http://proxy-two:2222"
+	if got := proxyFor(t, fn, "http://cached.example/file"); got == nil || got.Host != "proxy-one:1111" {
+		t.Fatalf("cached proxy = %v", got)
+	}
+
+	systemProxyMu.Lock()
+	systemProxyExpires = time.Now().Add(-time.Second)
+	systemProxyMu.Unlock()
+	if got := proxyFor(t, fn, "http://two.example/file"); got == nil || got.Host != "proxy-two:2222" {
+		t.Fatalf("refreshed proxy = %v", got)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("detector calls = %d, want 2", calls.Load())
+	}
+}
+
+func TestHTTPProxyFuncUsesLatestGlobalConfig(t *testing.T) {
+	previous := GetProxyConfig()
+	t.Cleanup(func() { SetProxyConfig(previous) })
+
+	SetProxyConfig(ProxyConfig{
+		Mode:     ProxyModeManual,
+		ProxyURL: "http://proxy-one:1111",
+	})
+	fn := HTTPProxyFunc()
+	if got := proxyFor(t, fn, "https://example.com/a"); got == nil || got.Host != "proxy-one:1111" {
+		t.Fatalf("first global proxy = %v", got)
+	}
+
+	SetProxyConfig(ProxyConfig{
+		Mode:     ProxyModeManual,
+		ProxyURL: "http://proxy-two:2222",
+	})
+	if got := proxyFor(t, fn, "https://example.com/a"); got == nil || got.Host != "proxy-two:2222" {
+		t.Fatalf("updated global proxy = %v", got)
 	}
 }
 

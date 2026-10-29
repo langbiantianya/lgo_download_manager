@@ -36,6 +36,9 @@ func TestParseScutilHTTPS(t *testing.T) {
 	if cfg.Source != "darwin-scutil" {
 		t.Errorf("Source = %q, want darwin-scutil", cfg.Source)
 	}
+	if cfg.Bypass != "localhost,127.0.0.1" {
+		t.Errorf("Bypass = %q, want parsed ExceptionsList", cfg.Bypass)
+	}
 }
 
 func TestParseScutilSOCKS(t *testing.T) {
@@ -48,6 +51,42 @@ SOCKSPort : 1080
 	cfg, ok := parseScutil(sample)
 	if !ok || cfg.ProxyURL != "socks5://127.0.0.1:1080" {
 		t.Errorf("SOCKS proxy parse failed: %+v ok=%v", cfg, ok)
+	}
+}
+
+func TestParseScutilKeepsHTTPSAndHTTPEndpoints(t *testing.T) {
+	const sample = `HTTPEnable : 1
+HTTPProxy : 127.0.0.1
+HTTPPort : 8080
+HTTPSEnable : 1
+HTTPSProxy : 127.0.0.1
+HTTPSPort : 8443
+SOCKSEnable : 0
+`
+	cfg, ok := parseScutil(sample)
+	if !ok {
+		t.Fatal("parseScutil returned ok=false")
+	}
+	if cfg.HTTPProxyURL != "http://127.0.0.1:8080" {
+		t.Errorf("HTTPProxyURL = %q", cfg.HTTPProxyURL)
+	}
+	if cfg.HTTPSProxyURL != "http://127.0.0.1:8443" {
+		t.Errorf("HTTPSProxyURL = %q", cfg.HTTPSProxyURL)
+	}
+}
+
+func TestParseScutilSimpleHostnamesUseLocalMarker(t *testing.T) {
+	const sample = `HTTPEnable : 1
+HTTPProxy : 127.0.0.1
+HTTPPort : 8080
+ExcludeSimpleHostnames : 1
+`
+	cfg, ok := parseScutil(sample)
+	if !ok {
+		t.Fatal("parseScutil returned ok=false")
+	}
+	if cfg.Bypass != "<local>" {
+		t.Errorf("Bypass = %q, want <local>", cfg.Bypass)
 	}
 }
 

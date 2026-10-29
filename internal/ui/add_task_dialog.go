@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -219,6 +220,9 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 	// 关闭窗口的工具函数——确认和取消两条路径共用，避免重复 SetOnClosed 链。
 	var closeWin func()
 	var startDownload func()
+	var confirmBtn *widget.Button
+	var cancelBtn *widget.Button
+	var submitting atomic.Bool
 
 	// autoSavePath 记录「对话框自动推导出来的保存路径」。用户一旦手动改过,
 	// 后续 URL 变化不再覆盖用户输入——这既保住了人工选择,也让 BT/BT 之间
@@ -310,9 +314,34 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 
 	// 「开始下载」回调——校验 + 创建任务 + 关闭窗口。
 	startDownload = func() {
+		// AddTask/Start 是同步 IPC 调用；窗口要等它们返回后才真正关闭。
+		// Fyne 在 UI 线程阻塞期间仍可排队后续点击/回车事件，若只靠窗口
+		// 关闭来去重，这些事件会在关闭后继续执行并创建多个相同任务。
+		// 每个对话框用独立原子门闩，第一次提交后立即禁用按钮并吞掉
+		// 其它排队事件；失败时恢复，允许用户修正后重试。
+		if !submitting.CompareAndSwap(false, true) {
+			return
+		}
+		if confirmBtn != nil {
+			confirmBtn.Disable()
+		}
+		if cancelBtn != nil {
+			cancelBtn.Disable()
+		}
+		resetSubmit := func() {
+			submitting.Store(false)
+			if confirmBtn != nil {
+				confirmBtn.Enable()
+			}
+			if cancelBtn != nil {
+				cancelBtn.Enable()
+			}
+		}
+
 		url := urlEntry.Text
 		savePath := uniqueSavePath(savePathEntry.Text)
 		if url == "" || savePath == "" {
+			resetSubmit()
 			return
 		}
 		// 用 GlobalSettings 预填默认 UA/Cookie:用户改设置后再开对话框,
@@ -348,10 +377,12 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 			Auth:         taskAuth,
 		})
 		if err != nil {
+			resetSubmit()
 			showError(parent, err)
 			return
 		}
 		if err := svc.Start(tk.ID); err != nil {
+			resetSubmit()
 			showError(parent, err)
 			return
 		}
@@ -360,9 +391,9 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 		}
 	}
 
-	confirmBtn := widget.NewButtonWithIcon(ilocale.T("addTask.start"), theme.ConfirmIcon(), startDownload)
+	confirmBtn = widget.NewButtonWithIcon(ilocale.T("addTask.start"), theme.ConfirmIcon(), startDownload)
 	confirmBtn.Importance = widget.HighImportance
-	cancelBtn := widget.NewButtonWithIcon(ilocale.T("addTask.cancel"), theme.CancelIcon(), func() {
+	cancelBtn = widget.NewButtonWithIcon(ilocale.T("addTask.cancel"), theme.CancelIcon(), func() {
 		if closeWin != nil {
 			closeWin()
 		}
@@ -412,5 +443,3 @@ var errEmpty = errEmptyField{}
 type errEmptyField struct{}
 
 func (errEmptyField) Error() string { return ilocale.T("addTask.required") }
-
-

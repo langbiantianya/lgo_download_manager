@@ -40,17 +40,23 @@ func detectWindows() (Config, bool) {
 	}
 	override, _, _ := k.GetStringValue("ProxyOverride")
 
-	// ProxyServer 两种格式：
-	//   a) "host:port"             ← 单一代理，所有协议共享
-	//   b) "http=h:p;https=h:p;..." ← 按协议拆分
-	proxyURL := parseWinINETProxyServer(server)
-	if proxyURL == "" {
+	httpProxy, httpsProxy, socksProxy := parseWinINETProxyURLs(server)
+	if httpProxy == "" && httpsProxy == "" && socksProxy == "" {
 		return Config{Source: "wininet"}, true
 	}
+	proxyURL := httpsProxy
+	if proxyURL == "" {
+		proxyURL = httpProxy
+	}
+	if proxyURL == "" {
+		proxyURL = socksProxy
+	}
 	return Config{
-		ProxyURL: proxyURL,
-		Bypass:   NormalizeBypass(override),
-		Source:   "wininet",
+		ProxyURL:      proxyURL,
+		HTTPProxyURL:  httpProxy,
+		HTTPSProxyURL: httpsProxy,
+		Bypass:        NormalizeBypass(override),
+		Source:        "wininet",
 	}, true
 }
 
@@ -64,15 +70,30 @@ func detectWindows() (Config, bool) {
 // 策略：优先级固定为 https > http > socks，与条目在字符串中的
 // 出现顺序无关（Windows 写入的顺序并不稳定）。没有可用条目时返回 ""。
 func parseWinINETProxyServer(s string) string {
+	httpProxy, httpsProxy, socksProxy := parseWinINETProxyURLs(s)
+	switch {
+	case httpsProxy != "":
+		return httpsProxy
+	case httpProxy != "":
+		return httpProxy
+	default:
+		return socksProxy
+	}
+}
+
+// parseWinINETProxyURLs 保留 WinINET 的协议级代理划分。浏览器允许
+// HTTP 与 HTTPS 指向不同端口，若只取其中一个，另一个协议的请求就会
+// 发到错误的代理端点。
+func parseWinINETProxyURLs(s string) (httpProxy, httpsProxy, socksProxy string) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return ""
+		return "", "", ""
 	}
 	if !strings.Contains(s, "=") {
-		// 形式 (a)：host:port —— 默认 HTTP 代理。
-		return "http://" + s
+		// 形式 (a)：host:port —— 单一代理，所有协议共享。
+		proxy := normalizeWinINETProxyURL(s, "http")
+		return proxy, proxy, ""
 	}
-	var httpsHost, httpHost, socksHost string
 	for _, kv := range strings.Split(s, ";") {
 		eq := strings.IndexByte(kv, '=')
 		if eq < 0 {
@@ -85,27 +106,33 @@ func parseWinINETProxyServer(s string) string {
 		}
 		switch k {
 		case "https":
-			if httpsHost == "" {
-				httpsHost = v
+			if httpsProxy == "" {
+				httpsProxy = normalizeWinINETProxyURL(v, "http")
 			}
 		case "http":
-			if httpHost == "" {
-				httpHost = v
+			if httpProxy == "" {
+				httpProxy = normalizeWinINETProxyURL(v, "http")
 			}
 		case "socks":
-			if socksHost == "" {
-				socksHost = v
+			if socksProxy == "" {
+				socksProxy = normalizeWinINETProxyURL(v, "socks5")
 			}
 		}
 	}
-	// Go 的 Transport 对 http/https 代理都使用 http:// 形式的代理地址。
-	switch {
-	case httpsHost != "":
-		return "http://" + httpsHost
-	case httpHost != "":
-		return "http://" + httpHost
-	case socksHost != "":
-		return "socks5://" + socksHost
+	return httpProxy, httpsProxy, socksProxy
+}
+
+func normalizeWinINETProxyURL(raw, defaultScheme string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
 	}
-	return ""
+	lower := strings.ToLower(raw)
+	if strings.HasPrefix(lower, "http://") ||
+		strings.HasPrefix(lower, "https://") ||
+		strings.HasPrefix(lower, "socks5://") ||
+		strings.HasPrefix(lower, "socks://") {
+		return raw
+	}
+	return defaultScheme + "://" + raw
 }

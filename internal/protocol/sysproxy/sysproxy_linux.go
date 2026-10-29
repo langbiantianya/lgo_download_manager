@@ -10,6 +10,8 @@ package sysproxy
 
 import (
 	"context"
+	"net"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -48,13 +50,16 @@ func detectGNOME() (Config, bool) {
 	if !ok {
 		return Config{}, false
 	}
+	// gsettings 的字符串/enum 输出带单引号，例如 'manual'、'none'。
+	// 不去引号会把 manual 误判成“未知”，最终整套系统代理都被跳过。
+	mode = stripQuotes(mode)
 	switch mode {
 	case "manual":
 		return gnomeManual()
 	case "auto":
 		// PAC/WPAD 不在支持范围内；回退到 direct。
 		return Config{Source: "gnome-pac-unsupported"}, true
-	case "'none'":
+	case "none":
 		return Config{Source: "gnome"}, true
 	default:
 		return Config{}, false
@@ -62,47 +67,54 @@ func detectGNOME() (Config, bool) {
 }
 
 func gnomeManual() (Config, bool) {
-	// http 优先；缺失则降级到 https；再降级到 socks。
-	for _, scheme := range []struct {
-		schemaKey string
-		scheme    string
-	}{
-		{"org.gnome.system.proxy.http", "http"},
-		{"org.gnome.system.proxy.https", "http"},
-		{"org.gnome.system.proxy.socks", "socks5"},
-	} {
-		host, hok := gsettingsGet(scheme.schemaKey, "host", 5*time.Second)
-		port, pok := gsettingsGet(scheme.schemaKey, "port", 5*time.Second)
-		if !hok || !pok || host == "" {
-			continue
-		}
-		// gsettings 输出常常带引号，例如 '127.0.0.1' 或 7890
-		host = stripQuotes(host)
-		port = stripQuotes(port)
-		if host == "" || port == "" {
-			continue
-		}
-		auth, _ := gsettingsGet(scheme.schemaKey, "authentication-user", 5*time.Second)
-		pass, _ := gsettingsGet(scheme.schemaKey, "authentication-password", 5*time.Second)
-		auth = stripQuotes(auth)
-		pass = stripQuotes(pass)
-		userInfo := ""
-		if auth != "" {
-			userInfo = auth
-			if pass != "" {
-				userInfo += ":" + pass
-			}
-			userInfo += "@"
-		}
-		bypass, _ := gsettingsGet("org.gnome.system.proxy", "ignore-hosts", 5*time.Second)
-		bypass = stripQuotesAndBrackets(bypass)
-		return Config{
-			ProxyURL: scheme.scheme + "://" + userInfo + host + ":" + port,
-			Bypass:   NormalizeBypass(bypass),
-			Source:   "gnome",
-		}, true
+	httpProxy := gnomeProxyURL("org.gnome.system.proxy.http", "http")
+	httpsProxy := gnomeProxyURL("org.gnome.system.proxy.https", "http")
+	socksProxy := gnomeProxyURL("org.gnome.system.proxy.socks", "socks5")
+	bypass, _ := gsettingsGet("org.gnome.system.proxy", "ignore-hosts", 5*time.Second)
+
+	cfg := Config{
+		HTTPProxyURL:  httpProxy,
+		HTTPSProxyURL: httpsProxy,
+		Bypass:        NormalizeBypass(stripQuotesAndBrackets(bypass)),
+		Source:        "gnome",
 	}
-	return Config{Source: "gnome"}, true
+	switch {
+	case httpProxy != "":
+		cfg.ProxyURL = httpProxy
+	case httpsProxy != "":
+		cfg.ProxyURL = httpsProxy
+	case socksProxy != "":
+		cfg.ProxyURL = socksProxy
+	}
+	if socksProxy != "" && httpProxy == "" {
+		cfg.HTTPProxyURL = socksProxy
+	}
+	if socksProxy != "" && httpsProxy == "" {
+		cfg.HTTPSProxyURL = socksProxy
+	}
+	return cfg, true
+}
+
+// gnomeProxyURL 读取一个 GNOME 代理 schema。host/port 为空表示该协议
+// 未单独配置；此时上层会回退到其它协议或 ProxyURL。
+func gnomeProxyURL(schema, scheme string) string {
+	host, hok := gsettingsGet(schema, "host", 5*time.Second)
+	port, pok := gsettingsGet(schema, "port", 5*time.Second)
+	host = stripQuotes(host)
+	port = stripQuotes(port)
+	if !hok || !pok || host == "" || port == "" || port == "0" {
+		return ""
+	}
+	auth, _ := gsettingsGet(schema, "authentication-user", 5*time.Second)
+	pass, _ := gsettingsGet(schema, "authentication-password", 5*time.Second)
+	auth = stripQuotes(auth)
+	pass = stripQuotes(pass)
+
+	u := &url.URL{Scheme: scheme, Host: net.JoinHostPort(host, port)}
+	if auth != "" {
+		u.User = url.UserPassword(auth, pass)
+	}
+	return u.String()
 }
 
 // gsettingsGet 在 timeout 内执行 `gsettings get SCHEMA KEY`，返回原始字符串。
@@ -130,6 +142,10 @@ func stripQuotes(s string) string {
 // stripQuotesAndBrackets 把 GNOME 的 ['a','b'] 形式转换成 a,b。
 func stripQuotesAndBrackets(s string) string {
 	s = strings.TrimSpace(s)
+	// gsettings 对空数组会输出 "@as []"；普通数组通常输出 "['a', 'b']"。
+	if strings.HasPrefix(s, "@as ") {
+		s = strings.TrimSpace(strings.TrimPrefix(s, "@as "))
+	}
 	if len(s) >= 2 && s[0] == '[' && s[len(s)-1] == ']' {
 		s = s[1 : len(s)-1]
 	}
@@ -164,7 +180,9 @@ func detectKDE() (Config, bool) {
 	case "0":
 		return Config{Source: "kde"}, true
 	case "1":
-		// 手动
+		// 手动。和 GNOME 一样保留 HTTP/HTTPS 各自独立的代理地址；
+		// SOCKS 仅在对应协议未单独配置时兜底。
+		var httpProxy, httpsProxy, socksProxy string
 		for _, kv := range []struct {
 			key    string
 			scheme string
@@ -181,13 +199,39 @@ func detectKDE() (Config, bool) {
 			if host == "" || port == "" {
 				continue
 			}
-			return Config{
-				ProxyURL: kv.scheme + "://" + host + ":" + port,
-				Bypass:   NormalizeBypass(section["NoProxyFor"]),
-				Source:   "kde",
-			}, true
+			proxyURL := (&url.URL{
+				Scheme: kv.scheme,
+				Host:   net.JoinHostPort(host, port),
+			}).String()
+			switch kv.key {
+			case "httpProxy":
+				httpProxy = proxyURL
+			case "httpsProxy":
+				httpsProxy = proxyURL
+			case "socksProxy":
+				socksProxy = proxyURL
+			}
 		}
-		return Config{Source: "kde"}, true
+		cfg := Config{
+			HTTPProxyURL:  httpProxy,
+			HTTPSProxyURL: httpsProxy,
+			Bypass:        NormalizeBypass(section["NoProxyFor"]),
+			Source:        "kde",
+		}
+		if httpProxy != "" {
+			cfg.ProxyURL = httpProxy
+		} else if httpsProxy != "" {
+			cfg.ProxyURL = httpsProxy
+		} else {
+			cfg.ProxyURL = socksProxy
+		}
+		if socksProxy != "" && httpProxy == "" {
+			cfg.HTTPProxyURL = socksProxy
+		}
+		if socksProxy != "" && httpsProxy == "" {
+			cfg.HTTPSProxyURL = socksProxy
+		}
+		return cfg, true
 	default:
 		// 2=PAC, 3=WPAD, 4=use env（后者由 httpproxy.FromEnvironment 处理）
 		return Config{}, false
@@ -195,6 +239,14 @@ func detectKDE() (Config, bool) {
 }
 
 func kioslavercPath() string {
+	// Flatpak 把 XDG_CONFIG_HOME 改写到应用私有目录，而 finish-args
+	// 通过 --filesystem=home 保留了宿主 ~/.config。必须直接读宿主
+	// 路径，否则 KDE 用户系统里明明有代理，沙箱内却永远探测不到。
+	if os.Getenv("FLATPAK_ID") != "" {
+		if home, err := os.UserHomeDir(); err == nil && home != "" {
+			return filepath.Join(home, ".config", "kioslaverc")
+		}
+	}
 	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
 		return filepath.Join(xdg, "kioslaverc")
 	}
@@ -283,25 +335,27 @@ func detectEtcEnvironment() (Config, bool) {
 			bypass = val
 		}
 	}
-	chosen := httpURL
-	scheme := "http"
-	if chosen == "" {
-		chosen = httpsURL
-	}
-	if chosen == "" {
+	if httpURL == "" && httpsURL == "" {
 		return Config{}, false
 	}
-	if strings.HasPrefix(strings.ToLower(chosen), "socks5://") || strings.HasPrefix(strings.ToLower(chosen), "socks://") {
-		scheme = "socks5"
+	cfg := Config{
+		HTTPProxyURL:  normalizeScheme(httpURL, "http"),
+		HTTPSProxyURL: normalizeScheme(httpsURL, "http"),
+		Bypass:        NormalizeBypass(bypass),
+		Source:        "/etc/environment",
 	}
-	return Config{
-		ProxyURL: normalizeScheme(chosen, scheme),
-		Bypass:   NormalizeBypass(bypass),
-		Source:   "/etc/environment",
-	}, true
+	if httpURL != "" {
+		cfg.ProxyURL = cfg.HTTPProxyURL
+	} else {
+		cfg.ProxyURL = cfg.HTTPSProxyURL
+	}
+	return cfg, true
 }
 
 func normalizeScheme(raw, defaultScheme string) string {
+	if raw == "" {
+		return ""
+	}
 	lower := strings.ToLower(raw)
 	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") ||
 		strings.HasPrefix(lower, "socks5://") || strings.HasPrefix(lower, "socks://") {

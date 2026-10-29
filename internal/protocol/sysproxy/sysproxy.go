@@ -33,9 +33,29 @@ import (
 //
 // Source 用于诊断输出（UI 中可显示"当前来源：GNOME"）。
 type Config struct {
-	ProxyURL string
-	Bypass   string
-	Source   string
+	// ProxyURL 是兼容旧调用方的默认代理；HTTPProxyURL/HTTPSProxyURL
+	// 在系统为不同协议配置了不同代理时提供更精确的选择。
+	ProxyURL      string
+	HTTPProxyURL  string
+	HTTPSProxyURL string
+	Bypass        string
+	Source        string
+}
+
+// ProxyForScheme 返回 request scheme 对应的系统代理。没有协议专属
+// 配置时回退到 ProxyURL，使单一代理设置仍同时适用于 HTTP 和 HTTPS。
+func (c Config) ProxyForScheme(scheme string) string {
+	switch strings.ToLower(strings.TrimSpace(scheme)) {
+	case "http":
+		if c.HTTPProxyURL != "" {
+			return c.HTTPProxyURL
+		}
+	case "https":
+		if c.HTTPSProxyURL != "" {
+			return c.HTTPSProxyURL
+		}
+	}
+	return c.ProxyURL
 }
 
 // String 返回便于日志/UI 展示的简短字符串。

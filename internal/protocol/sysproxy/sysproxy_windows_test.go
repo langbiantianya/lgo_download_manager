@@ -43,3 +43,25 @@ func TestParseWinINETProxyServerEmpty(t *testing.T) {
 		t.Errorf("empty = %q, want empty", got)
 	}
 }
+
+func TestParseWinINETProxyURLsKeepsSchemeSpecificEndpoints(t *testing.T) {
+	httpProxy, httpsProxy, socksProxy := parseWinINETProxyURLs(
+		"http=h:80;https=p:8080;socks=s:1080",
+	)
+	if httpProxy != "http://h:80" {
+		t.Errorf("HTTP proxy = %q", httpProxy)
+	}
+	if httpsProxy != "http://p:8080" {
+		t.Errorf("HTTPS proxy = %q", httpsProxy)
+	}
+	if socksProxy != "socks5://s:1080" {
+		t.Errorf("SOCKS proxy = %q", socksProxy)
+	}
+}
+
+func TestParseWinINETProxyURLsSimpleSharesProxy(t *testing.T) {
+	httpProxy, httpsProxy, socksProxy := parseWinINETProxyURLs("127.0.0.1:7890")
+	if httpProxy != "http://127.0.0.1:7890" || httpsProxy != httpProxy || socksProxy != "" {
+		t.Fatalf("simple proxy = (%q,%q,%q)", httpProxy, httpsProxy, socksProxy)
+	}
+}

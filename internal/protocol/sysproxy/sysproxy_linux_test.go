@@ -79,6 +79,57 @@ func TestDetectKDEMissingFile(t *testing.T) {
 	}
 }
 
+func TestDetectGNOMEManualModeWithQuotedOutput(t *testing.T) {
+	binDir := t.TempDir()
+	script := `#!/bin/sh
+case "$2:$3" in
+  org.gnome.system.proxy:mode) echo "'manual'" ;;
+  org.gnome.system.proxy:ignore-hosts) echo "@as []" ;;
+  org.gnome.system.proxy.http:host) echo "'127.0.0.1'" ;;
+  org.gnome.system.proxy.http:port) echo "7890" ;;
+  org.gnome.system.proxy.http:authentication-user) echo "''" ;;
+  org.gnome.system.proxy.http:authentication-password) echo "''" ;;
+  org.gnome.system.proxy.https:host) echo "''" ;;
+  org.gnome.system.proxy.https:port) echo "0" ;;
+  org.gnome.system.proxy.socks:host) echo "''" ;;
+  org.gnome.system.proxy.socks:port) echo "0" ;;
+  *) exit 1 ;;
+esac
+`
+	path := filepath.Join(binDir, "gsettings")
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir)
+
+	cfg, ok := detectGNOME()
+	if !ok {
+		t.Fatal("detectGNOME rejected quoted manual mode")
+	}
+	if cfg.HTTPProxyURL != "http://127.0.0.1:7890" {
+		t.Fatalf("HTTPProxyURL = %q, want quoted manual proxy", cfg.HTTPProxyURL)
+	}
+	if cfg.ProxyForScheme("https") != cfg.HTTPProxyURL {
+		t.Fatalf("HTTPS should fall back to the shared HTTP proxy, got %q", cfg.ProxyForScheme("https"))
+	}
+}
+
+func TestKioslavercPathUsesHostConfigInFlatpak(t *testing.T) {
+	home := t.TempDir()
+	privateConfig := filepath.Join(home, ".var", "app", "org.langbiantianya.LGDM", "config")
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", privateConfig)
+	t.Setenv("FLATPAK_ID", "org.langbiantianya.LGDM")
+	t.Cleanup(func() {
+		os.Unsetenv("FLATPAK_ID")
+	})
+
+	want := filepath.Join(home, ".config", "kioslaverc")
+	if got := kioslavercPath(); got != want {
+		t.Fatalf("kioslavercPath() = %q, want host path %q", got, want)
+	}
+}
+
 func TestDetectKDEWithManualHTTP(t *testing.T) {
 	tmp := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", tmp)
@@ -148,6 +199,8 @@ func TestStripQuotesAndBrackets(t *testing.T) {
 		{"['localhost', '127.0.0.0/8']", "localhost,127.0.0.0/8"},
 		{"['a']", "a"},
 		{"[]", ""},
+		{"@as []", ""},
+		{"@as ['a', 'b']", "a,b"},
 		{"nothing", "nothing"},
 	}
 	for _, tt := range tests {

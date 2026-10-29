@@ -43,3 +43,22 @@ func TestConfigString(t *testing.T) {
 		t.Errorf("gnome Config.String() = %q", got)
 	}
 }
+
+func TestConfigProxyForScheme(t *testing.T) {
+	cfg := Config{
+		ProxyURL:      "http://fallback:9999",
+		HTTPProxyURL:  "http://http-only:8080",
+		HTTPSProxyURL: "http://https-only:8443",
+	}
+	if got := cfg.ProxyForScheme("http"); got != cfg.HTTPProxyURL {
+		t.Errorf("HTTP proxy = %q, want %q", got, cfg.HTTPProxyURL)
+	}
+	if got := cfg.ProxyForScheme("HTTPS"); got != cfg.HTTPSProxyURL {
+		t.Errorf("HTTPS proxy = %q, want %q", got, cfg.HTTPSProxyURL)
+	}
+
+	cfg.HTTPProxyURL = ""
+	if got := cfg.ProxyForScheme("http"); got != cfg.ProxyURL {
+		t.Errorf("HTTP fallback = %q, want %q", got, cfg.ProxyURL)
+	}
+}

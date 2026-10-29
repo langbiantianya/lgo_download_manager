@@ -20,8 +20,8 @@ import (
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 
-	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/bittorrent"
+	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
@@ -239,6 +239,84 @@ func TestAddTaskDialog_AddAndStart(t *testing.T) {
 	}
 }
 
+// TestAddTaskDialog_RapidDoubleClickAddsOneTask 回归快速双击：
+// AddTask/Start 的同步 IPC 尚未返回时，Fyne 仍会排队后续点击/回车；
+// 第一次提交必须立刻关门闩并禁用按钮，不能让排队事件再创建同 URL、
+// 同保存路径的任务。
+func TestAddTaskDialog_RapidDoubleClickAddsOneTask(t *testing.T) {
+	a := test.NewApp()
+	defer test.NewApp()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
+	if err != nil {
+		t.Fatalf("store.Open: %v", err)
+	}
+	defer st.Close()
+
+	saveDir := filepath.Join(dir, "dl")
+	if err := st.SaveSettings(store.Settings{
+		DefaultSaveDir: saveDir,
+		DefaultThreads: 2,
+		MinChunkSize:   1 << 20,
+	}); err != nil {
+		t.Fatalf("SaveSettings: %v", err)
+	}
+	GlobalSettings, _ = st.LoadSettings()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, 1024))
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sc := scheduler.New(st)
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		<-done
+	}()
+	go func() {
+		sc.Run(ctx)
+		close(done)
+	}()
+
+	svc := &localServiceAdapter{sc: sc, st: st}
+	showAddTaskDialog(a.NewWindow("main"), svc)
+	wAdd := findAppWindow(a, "新建下载任务")
+	if wAdd == nil {
+		t.Fatal("showAddTaskDialog did not open a window")
+	}
+	content := wAdd.Content()
+	findNthEntry(content, 0).SetText(srv.URL + "/same.bin")
+	findNthEntry(content, 1).SetText(filepath.Join(saveDir, "same.bin"))
+	confirmBtn := findButtonByText(content, "开始下载")
+	if confirmBtn == nil {
+		t.Fatal("could not find 开始下载 button")
+	}
+
+	// Fyne 的测试点击是同步调用，与原问题中快速输入/点击产生排队事件
+	// 的最终效果一致：第一次提交返回后继续触发同一个按钮。
+	for range 6 {
+		test.Tap(confirmBtn)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	tasks, err := st.ListTasks("", store.SortCreatedDesc)
+	if err != nil {
+		t.Fatalf("ListTasks: %v", err)
+	}
+	if len(tasks) != 1 {
+		t.Fatalf("rapid submissions created %d tasks, want exactly 1", len(tasks))
+	}
+	if tasks[0].URL != srv.URL+"/same.bin" || tasks[0].SavePath != filepath.Join(saveDir, "same.bin") {
+		t.Fatalf("unexpected task: url=%q savePath=%q", tasks[0].URL, tasks[0].SavePath)
+	}
+}
+
 // TestAddTaskDialog_PicksUpConfiguredUA 回归测试:用户在「设置」里把默认
 // UA 改成非默认值之后,「新建下载任务」对话框提交的任务必须继承该 UA。
 // 之前 ui.AddTaskInput 没有 Auth 字段,所以持久化下来的 AuthData 是 "{}",
@@ -321,8 +399,6 @@ func TestAddTaskDialog_PicksUpConfiguredUA(t *testing.T) {
 			got.Cookies, GlobalSettings.Cookies)
 	}
 }
-
-
 
 // TestAddTaskDialog_StartError_KeepsWindowOpen 验证 Start 失败时窗口不关闭。
 func TestAddTaskDialog_StartError_KeepsWindowOpen(t *testing.T) {
@@ -418,6 +494,7 @@ func (e *errStartService) BTTaskDetail(id string) (*bittorrent.Detail, error) {
 func (e *errStartService) Settings() store.Settings            { return e.inner.Settings() }
 func (e *errStartService) SaveSettings(s store.Settings) error { return e.inner.SaveSettings(s) }
 func (e *errStartService) Close() error                        { return e.inner.Close() }
+
 type startErr string
 
 func (s startErr) Error() string { return string(s) }
