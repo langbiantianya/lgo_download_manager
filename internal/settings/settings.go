@@ -14,10 +14,9 @@ package settings
 import (
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 
 	"lgo_download_manager/internal/autostart"
+	"lgo_download_manager/internal/downloaddir"
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
@@ -43,8 +42,7 @@ func Load(st *store.Store, forceLight bool) (store.Settings, error) {
 	}
 	firstRun := !saved
 	if firstRun {
-		home, _ := os.UserHomeDir()
-		persisted.DefaultSaveDir = filepath.Join(home, "Downloads")
+		persisted.DefaultSaveDir = downloaddir.Default()
 		persisted.DefaultThreads = 4
 		persisted.MinChunkSize = 10 * mib
 		persisted.UserAgent = "Wget/1.21.3"
@@ -99,8 +97,7 @@ func Load(st *store.Store, forceLight bool) (store.Settings, error) {
 	// 一旦目录被清空就会把整套设置重置——这里只做最小修复。
 	dirFallback := false
 	if persisted.DefaultSaveDir == "" {
-		home, _ := os.UserHomeDir()
-		persisted.DefaultSaveDir = filepath.Join(home, "Downloads")
+		persisted.DefaultSaveDir = downloaddir.Default()
 		dirFallback = true
 		logging.Printf("settings: save dir was empty, fallback to %q", persisted.DefaultSaveDir)
 	}

@@ -765,7 +765,7 @@ macOS 上 `ProcessType=Background` 标记为后台进程，不进入前台应用
 
 | 字段                | 默认值           | 说明                                       |
 | ------------------- | ---------------- | ------------------------------------------ |
-| Default save dir    | `~/Downloads`    | 「新建任务」对话框默认使用                 |
+| Default save dir    | 系统默认下载目录 | 按当前用户的 Windows Known Folder / Linux XDG / macOS 下载目录解析；「新建任务」对话框默认使用 |
 | Default threads     | 4                | 单任务允许的最大并发连接数                 |
 | Min chunk size      | 10 MiB           | 引擎对分片尺寸的下限                       |
 | Max concurrent      | 3                | 同时下载任务数上限（超额任务 FIFO 排队）   |

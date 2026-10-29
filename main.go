@@ -27,6 +27,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"lgo_download_manager/internal/downloaddir"
 	"lgo_download_manager/internal/handoff"
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
@@ -387,7 +388,7 @@ func main() {
 func savePathFor(s store.Settings, rawURL, name string) string {
 	saveDir := s.DefaultSaveDir
 	if saveDir == "" {
-		saveDir = defaultSaveDir()
+		saveDir = downloaddir.Default()
 	}
 	if protocol.IsBitTorrent(rawURL) {
 		if name == "" {
@@ -475,12 +476,6 @@ func pickLogTarget(stderr bool, logDir string) string {
 		return ""
 	}
 	return logDir
-}
-
-// defaultSaveDir 返回当前平台合适的下载目录。
-func defaultSaveDir() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, "Downloads")
 }
 
 // defaultChunks 根据用户配置的默认线程数推导分块数；并发上下限与

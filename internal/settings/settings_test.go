@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"lgo_download_manager/internal/downloaddir"
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/store"
 )
@@ -33,6 +34,9 @@ func TestLoad_FirstRunDefaults(t *testing.T) {
 	}
 	if !got.LightMode {
 		t.Errorf("LightMode default = %v, want true (so X on main window exits the UI child)", got.LightMode)
+	}
+	if want := downloaddir.Default(); got.DefaultSaveDir != want {
+		t.Errorf("DefaultSaveDir = %q, want system default %q", got.DefaultSaveDir, want)
 	}
 }
 

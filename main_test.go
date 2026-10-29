@@ -6,7 +6,13 @@
 
 package main
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+
+	"lgo_download_manager/internal/downloaddir"
+	"lgo_download_manager/internal/store"
+)
 
 func TestStartupModeAutostartOnlyHidesInitialWindow(t *testing.T) {
 	mode := startupMode{autostart: true}
@@ -25,5 +31,13 @@ func TestStartupModeNoGUIDirectlyAddsURL(t *testing.T) {
 	}
 	if !mode.addURLDirectly() {
 		t.Fatal("no-gui should add URL hand-offs without a dialog")
+	}
+}
+
+func TestSavePathForUsesSystemDownloadDirWhenUnset(t *testing.T) {
+	got := savePathFor(store.Settings{}, "https://example.com/archive.zip", "")
+	want := filepath.Join(downloaddir.Default(), "archive.zip")
+	if got != want {
+		t.Fatalf("savePathFor = %q, want %q", got, want)
 	}
 }
