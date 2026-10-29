@@ -117,6 +117,44 @@ func TestHTTPIfRangeValidatorSelection(t *testing.T) {
 	}
 }
 
+func TestHTTPTransportPoolReuseAndIsolation(t *testing.T) {
+	a, err := newHTTPBase("http", "https://example.com/a", AuthOptions{ProxyMode: ProxyModeDisabled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := newHTTPBase("webdav", "https://example.com/b", AuthOptions{ProxyMode: ProxyModeDisabled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.cli.Transport != b.cli.Transport {
+		t.Fatal("same proxy config did not share an HTTP transport")
+	}
+	a.Close()
+	b.Close()
+
+	// 引用归零后仍保留热连接池，顺序执行的下一任务可以继续复用。
+	c, err := newHTTPBase("http", "https://example.com/c", AuthOptions{ProxyMode: ProxyModeDisabled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.cli.Transport != a.cli.Transport {
+		t.Fatal("idle transport was not reused for a subsequent task")
+	}
+	defer c.Close()
+
+	d, err := newHTTPBase("http", "https://example.com/d", AuthOptions{
+		ProxyMode: ProxyModeManual,
+		ProxyURL:  "http://127.0.0.1:7890",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d.Close()
+	if d.cli.Transport == c.cli.Transport {
+		t.Fatal("different proxy configs incorrectly shared a transport")
+	}
+}
+
 func TestParseTotalFromContentRange(t *testing.T) {
 	tests := []struct {
 		input string

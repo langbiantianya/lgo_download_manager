@@ -470,10 +470,25 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		s.releaseSlot(taskID)
 		return
 	}
+	// 旧版本直接写最终文件；第一次恢复时先迁到 .part，后续的恢复数据
+	// 完整性检查与重置都只面对一个确定的文件路径。
+	if err := migrateLegacyDownloadToPart(tk); err != nil {
+		_ = driver.Close()
+		s.fail(tk, err)
+		s.releaseSlot(taskID)
+		return
+	}
+	resumeDataMissing, err := resumeDownloadDataMissing(tk, downloadPath)
+	if err != nil {
+		_ = driver.Close()
+		s.fail(tk, err)
+		s.releaseSlot(taskID)
+		return
+	}
 	sourceSizeChanged := tk.TotalSize > 0 && caps.TotalSize > 0 && tk.TotalSize != caps.TotalSize
 	validatorChanged := taskHasResumeState(tk) &&
 		resourceValidatorsChanged(tk.ETag, tk.LastModified, caps.ETag, caps.LastModified)
-	sourceChanged := sourceSizeChanged || validatorChanged
+	sourceChanged := sourceSizeChanged || validatorChanged || resumeDataMissing
 	// 准备阶段失败统一经过 fail()/releaseSlot,此处继续走预分配/启动 engine 流程。
 	if caps.TotalSize > 0 {
 		metaAllocated := tk.IsAllocated && !sourceChanged
@@ -485,20 +500,13 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		}
 		tk.TotalSize = caps.TotalSize
 		tk.SupportRange = caps.SupportRange
-		// 暂时保留内存中的旧 IsAllocated/Downloaded，让紧接着的
-		// legacy 迁移仍能识别旧版本尚未改名的部分文件。
-	}
-	// 旧版本直接写最终文件；第一次恢复时把已有部分数据迁移到 .part，
-	// 避免下载中的文件以最终文件名暴露给用户。
-	if err := migrateLegacyDownloadToPart(tk); err != nil {
-		_ = driver.Close()
-		s.fail(tk, err)
-		s.releaseSlot(taskID)
-		return
+		// 暂时保留内存中的旧 IsAllocated/Downloaded，让 sourceChanged
+		// 分支统一完成文件截断、进度清零和分配位更新。
 	}
 
 	if sourceChanged {
-		// 总大小或 ETag/Last-Modified 变化意味着远端内容已经变化。
+		// 总大小、资源版本或本地恢复数据完整性变化意味着旧偏移不能
+		// 再作为续传依据。
 		// 不能把旧文件中的偏移继续当作同一份内容；保留旧字节只会造成
 		// 新旧版本拼接。把进度清零并删除旧数据，安全地从头下载。
 		tk.IsAllocated = false
@@ -529,10 +537,6 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	}
 
 	// 若尚未预分配文件则进行预分配(恢复场景:文件已具有正确大小)。
-	// 若文件不存在（被删除）则强制重新预分配，即使 IsAllocated 为 true
-	if _, statErr := os.Stat(downloadPath); statErr != nil {
-		tk.IsAllocated = false
-	}
 	preallocEnabled := s.prealloc.Load()
 	needAlloc := preallocEnabled && !tk.IsAllocated && caps.TotalSize > 0
 	if needAlloc {
@@ -697,9 +701,10 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 			return
 		}
 		if err := syncParentDir(tk.SavePath); err != nil {
-			rjRef.setError(fmt.Errorf("sync completed file directory: %w", err))
-			s.markStatusFromJob(tk.ID, store.TaskStatus.Failed, rjRef)
-			return
+			// 文件本身已 Sync 成功，正式名称也已原子发布。部分 FUSE/
+			// 网络文件系统拒绝对目录执行 fsync；此时记为告警而不是在
+			// 文件已经可用后把任务改成 Failed。
+			logging.Printf("scheduler: sync completed directory: %v", err)
 		}
 		s.completeFromEngine(tk.ID, rjRef)
 	}()
@@ -719,6 +724,12 @@ func probeWithRetry(ctx context.Context, driver protocol.ProtocolDriver) (*proto
 			return caps, nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			// 某些 Transport 包装错误不会稳定地兼容 errors.Is(err,
+			// context.Canceled)；准备阶段取消必须立即退出，不能把 Pause
+			// 误判成网络失败后继续退避重试。
+			return nil, ctx.Err()
+		}
 		if protocol.IsTerminal(err) || attempt == maxProbeAttempts {
 			return nil, err
 		}
@@ -766,6 +777,38 @@ func taskHasResumeState(tk *store.Task) bool {
 		}
 	}
 	return false
+}
+
+// resumeDownloadDataMissing 检查恢复所依赖的本地文件是否仍覆盖已记录
+// 的最高写入位置。仅看“文件存在”不够：用户截断文件或文件系统恢复出
+// 一个空壳时，继续按旧偏移下载会在前面留下零洞。
+func resumeDownloadDataMissing(tk *store.Task, path string) (bool, error) {
+	if !taskHasResumeState(tk) {
+		return false, nil
+	}
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("inspect partial download: %w", err)
+	}
+	if info.Size() == 0 && tk.Downloaded > 0 {
+		return true, nil
+	}
+	if len(tk.ChunkRanges) < 2*len(tk.ChunkProgress) {
+		return false, nil
+	}
+	var required int64
+	for i, progress := range tk.ChunkProgress {
+		if progress <= 0 {
+			continue
+		}
+		if writtenThrough := tk.ChunkRanges[2*i] + progress; writtenThrough > required {
+			required = writtenThrough
+		}
+	}
+	return required > 0 && info.Size() < required, nil
 }
 
 // resourceValidatorsChanged 判断两次探测是否仍指向同一资源。只要有
@@ -999,18 +1042,11 @@ func (s *Scheduler) ValidateFileExistence() {
 		return
 	}
 	for _, tk := range tasks {
-		if tk.Status != store.TaskStatus.Completed && tk.Status != store.TaskStatus.Downloading {
+		path, check := taskExistingDataPath(tk, s.running(tk.ID))
+		if !check || path == "" {
 			continue
 		}
-		if tk.SavePath == "" {
-			continue
-		}
-		// 正在下载的任务其文件必然存在（引擎持有句柄），不要因为
-		// 短时的 stat 失败（杀软扫描/占用）把它误判为 FileLost。
-		if s.running(tk.ID) {
-			continue
-		}
-		if _, err := os.Stat(tk.SavePath); os.IsNotExist(err) {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
 			if err := s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.FileLost, "文件已丢失"); err != nil {
 				continue
 			}
@@ -1021,6 +1057,31 @@ func (s *Scheduler) ValidateFileExistence() {
 			s.publish(Event{Why: "updated", Task: tk})
 		}
 	}
+}
+
+// taskExistingDataPath 返回任务当前应该存在的磁盘路径。运行中的任务由
+// 引擎持有文件句柄，短暂 stat 失败不能据此误报 FileLost，因此直接跳过。
+func taskExistingDataPath(tk *store.Task, running bool) (string, bool) {
+	if tk == nil || tk.SavePath == "" || running {
+		return "", false
+	}
+	switch tk.Status {
+	case store.TaskStatus.Completed:
+		return tk.SavePath, true
+	case store.TaskStatus.Paused:
+		if !taskHasResumeState(tk) {
+			return "", false
+		}
+	case store.TaskStatus.Downloading:
+		// 非运行中的 Downloading 是异常退出残留，交给 Reclaim 兜底，
+		// 但文件检查仍可提前反映数据是否存在。
+	default:
+		return "", false
+	}
+	if protocol.ProtocolKind(tk.Protocol) == protocol.ProtoBT {
+		return tk.SavePath, true
+	}
+	return tk.SavePath + ".part", true
 }
 
 // ResetTask 将任务进度清零、状态重置为 Pending，用于文件丢失后重新下载。

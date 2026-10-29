@@ -491,6 +491,118 @@ doneETag:
 	}
 }
 
+func TestSchedulerResetsProgressWhenPartFileWasDeleted(t *testing.T) {
+	const size = 2 * 1024 * 1024
+	payload := make([]byte, size)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		if rng := r.Header.Get("Range"); rng != "" {
+			start, end := parseBytesRange(t, rng, size)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			if r.Method != http.MethodHead {
+				_, _ = w.Write(payload[start : end+1])
+			}
+			return
+		}
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(payload)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sc := New(st)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sc.Run(ctx)
+
+	tk, err := sc.Add(AddTaskInput{
+		URL: srv.URL, SavePath: filepath.Join(dir, "out.bin"),
+		Protocol: protocol.ProtoHTTP, ChunkCount: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTaskMeta(tk.ID, size, true, true, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTaskProgress(tk.ID, size, []int64{size / 2, size / 2}, store.TaskStatus.Paused, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTaskChunkRanges(tk.ID, []int64{0, size/2 - 1, size / 2, size - 1}); err != nil {
+		t.Fatal(err)
+	}
+	// .part 被用户或清理工具删除，但数据库仍记录旧分片已完成。
+
+	ch, unsub := sc.Subscribe()
+	defer unsub()
+	if err := sc.Start(tk.ID); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case ev := <-ch:
+			if ev.Task != nil && ev.Task.ID == tk.ID && (ev.Why == "completed" || ev.Why == "failed") {
+				goto doneMissingPart
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("missing-part download did not finish")
+
+doneMissingPart:
+	got, err := os.ReadFile(tk.SavePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("resume after deleting .part produced holes or stale bytes")
+	}
+}
+
+func TestValidateFileExistenceMarksPausedMissingPart(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	tk := &store.Task{
+		ID: "paused-missing", URL: "https://example/file",
+		SavePath: filepath.Join(dir, "out.bin"), Protocol: string(protocol.ProtoHTTP),
+		ChunkCount: 1, TotalSize: 1024, Downloaded: 512,
+		ChunkProgress: []int64{512}, IsAllocated: true,
+		Status: store.TaskStatus.Paused,
+	}
+	if err := st.CreateTask(tk); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, tk.Status, ""); err != nil {
+		t.Fatal(err)
+	}
+	sc := New(st)
+	sc.ValidateFileExistence()
+	got, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != store.TaskStatus.FileLost {
+		t.Fatalf("status=%s, want FileLost", got.Status)
+	}
+}
+
 func TestResourceValidatorsChanged(t *testing.T) {
 	tests := []struct {
 		name           string

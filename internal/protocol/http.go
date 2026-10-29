@@ -61,23 +61,41 @@ type httpBase struct {
 	url          string
 	auth         AuthOptions
 	cli          *http.Client
+	transport    *transportLease
 	etag         string
 	lastModified string
 }
 
-// newHTTPBase 构造两个 HTTP 语义驱动共用的客户端。kind 仅用于错误信息前缀。
-//
-// 这里刻意不设置 http.Client.Timeout——整体时限由引擎传入的 ctx 控制，
-// 客户端级超时会在慢速大文件下载中途无差别掐断连接。但 Transport 必须
-// 自带拨号与响应头超时：否则服务器接受 TCP 连接却迟迟不发响应头时，
-// 任务会永久挂住（ctx 只有在引擎主动取消时才生效）。
-func newHTTPBase(kind, raw string, auth AuthOptions) (httpBase, error) {
-	if raw == "" {
-		return httpBase{}, fmt.Errorf("%s: empty url", kind)
-	}
+type transportKey struct {
+	proxyMode   ProxyMode
+	proxyURL    string
+	proxyBypass string
+}
+
+type pooledTransport struct {
+	tr       *http.Transport
+	refs     int
+	lastUsed time.Time
+}
+
+// transportLease 让每个驱动独占地“持有”一次共享 Transport。Close
+// 只归还引用，不关闭仍被其它任务使用的连接池。
+type transportLease struct {
+	key  transportKey
+	once sync.Once
+}
+
+const maxCachedTransports = 2
+
+var (
+	transportPoolMu sync.Mutex
+	transportPool   = make(map[transportKey]*pooledTransport)
+)
+
+func newHTTPTransport(auth AuthOptions) *http.Transport {
 	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
-	tr := &http.Transport{
-		Proxy:                 proxyFunc(effectiveAuth(auth)),
+	return &http.Transport{
+		Proxy:                 proxyFunc(auth),
 		DialContext:           dialer.DialContext,
 		MaxIdleConns:          maxHTTPConnections,
 		MaxIdleConnsPerHost:   maxHTTPConnections,
@@ -93,11 +111,91 @@ func newHTTPBase(kind, raw string, auth AuthOptions) (httpBase, error) {
 		// gzip/br 响应，否则 Range 偏移和 Content-Length 都会失真。
 		DisableCompression: true,
 	}
+}
+
+func acquireHTTPTransport(rawAuth AuthOptions) (*http.Transport, *transportLease) {
+	auth := effectiveAuth(rawAuth)
+	key := transportKey{
+		proxyMode:   auth.ProxyMode,
+		proxyURL:    strings.TrimSpace(auth.ProxyURL),
+		proxyBypass: strings.TrimSpace(auth.ProxyBypass),
+	}
+	now := time.Now()
+
+	transportPoolMu.Lock()
+	defer transportPoolMu.Unlock()
+	entry := transportPool[key]
+	if entry == nil {
+		entry = &pooledTransport{tr: newHTTPTransport(auth)}
+		transportPool[key] = entry
+	}
+	entry.refs++
+	entry.lastUsed = now
+	evictIdleTransportsLocked()
+	return entry.tr, &transportLease{key: key}
+}
+
+func releaseHTTPTransport(lease *transportLease) {
+	if lease == nil {
+		return
+	}
+	lease.once.Do(func() {
+		transportPoolMu.Lock()
+		defer transportPoolMu.Unlock()
+		entry := transportPool[lease.key]
+		if entry == nil {
+			return
+		}
+		if entry.refs > 0 {
+			entry.refs--
+		}
+		entry.lastUsed = time.Now()
+		evictIdleTransportsLocked()
+	})
+}
+
+// evictIdleTransportsLocked 最多保留少量常见代理配置。代理设置每次
+// 变更都会产生新 key；无界缓存会让旧连接池长期占用 fd 和内存。
+func evictIdleTransportsLocked() {
+	for len(transportPool) > maxCachedTransports {
+		var (
+			oldestKey transportKey
+			oldest    *pooledTransport
+		)
+		for key, entry := range transportPool {
+			if entry.refs != 0 {
+				continue
+			}
+			if oldest == nil || entry.lastUsed.Before(oldest.lastUsed) {
+				oldestKey = key
+				oldest = entry
+			}
+		}
+		if oldest == nil {
+			return
+		}
+		delete(transportPool, oldestKey)
+		oldest.tr.CloseIdleConnections()
+	}
+}
+
+// newHTTPBase 构造两个 HTTP 语义驱动共用的客户端。kind 仅用于错误信息前缀。
+//
+// 这里刻意不设置 http.Client.Timeout——整体时限由引擎传入的 ctx 控制，
+// 客户端级超时会在慢速大文件下载中途无差别掐断连接。但 Transport 必须
+// 自带拨号与响应头超时：否则服务器接受 TCP 连接却迟迟不发响应头时，
+// 任务会永久挂住（ctx 只有在引擎主动取消时才生效）。
+func newHTTPBase(kind, raw string, auth AuthOptions) (httpBase, error) {
+	if raw == "" {
+		return httpBase{}, fmt.Errorf("%s: empty url", kind)
+	}
+	tr, lease := acquireHTTPTransport(auth)
 	return httpBase{
-		kind: kind,
-		url:  raw,
-		auth: auth,
-		cli:  &http.Client{Transport: tr, Timeout: 0},
+		kind:      kind,
+		url:       raw,
+		auth:      auth,
+		cli:       &http.Client{Transport: tr, Timeout: 0},
+		transport: lease,
 	}, nil
 }
 
@@ -332,11 +430,9 @@ func copyResponseBody(r io.Reader, file *os.File, off, limit int64, onData func(
 	return written, nil
 }
 
-// Close 关闭底层 http.Client 的空闲连接。可以重复调用。
+// Close 归还共享 Transport 引用。可以重复调用。
 func (d *httpBase) Close() error {
-	if tr, ok := d.cli.Transport.(*http.Transport); ok {
-		tr.CloseIdleConnections()
-	}
+	releaseHTTPTransport(d.transport)
 	return nil
 }
 
