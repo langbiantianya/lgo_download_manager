@@ -92,6 +92,83 @@ func TestStoreRoundtrip(t *testing.T) {
 	}
 }
 
+func TestListPendingTasksLimitAndFIFO(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	base := time.Now().UTC()
+	for i, id := range []string{"old", "middle", "new"} {
+		if err := s.CreateTask(&Task{
+			ID: id, URL: "https://example.com/" + id, SavePath: "/tmp/" + id,
+			Protocol: "HTTPS", Status: TaskStatus.Pending,
+			ChunkProgress: []int64{}, CreatedAt: base.Add(time.Duration(i) * time.Second),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.UpdateTaskProgress("middle", 0, nil, TaskStatus.Downloading, ""); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListPendingTasks(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "old" {
+		t.Fatalf("ListPendingTasks(1) = %v, want oldest pending task", got)
+	}
+}
+
+func TestListPendingTasksByProtocolKeepsHTTPVisibleBehindBT(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	base := time.Now().UTC()
+	for i, tk := range []*Task{
+		{ID: "bt-old", URL: "magnet:?xt=urn:btih:old", SavePath: "/tmp/bt", Protocol: "BT", Status: TaskStatus.Pending, CreatedAt: base},
+		{ID: "http-new", URL: "https://example.com/file", SavePath: "/tmp/file", Protocol: "HTTPS", Status: TaskStatus.Pending, CreatedAt: base.Add(time.Second)},
+	} {
+		tk.ChunkProgress = []int64{}
+		if err := s.CreateTask(tk); err != nil {
+			t.Fatalf("CreateTask %d: %v", i, err)
+		}
+	}
+	got, err := s.ListPendingTasksByProtocol(1, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].ID != "http-new" {
+		t.Fatalf("non-BT pending = %v, want http-new", got)
+	}
+}
+
+func TestSettingsRoundtripPACAndDownloadLimit(t *testing.T) {
+	s, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	want := Settings{
+		DefaultSaveDir:     "/tmp/downloads",
+		ProxyAutoConfigURL: "http://config.example/proxy.pac",
+		DownloadLimitKiB:   4096,
+	}
+	if err := s.SaveSettings(want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.LoadSettings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ProxyAutoConfigURL != want.ProxyAutoConfigURL || got.DownloadLimitKiB != want.DownloadLimitKiB {
+		t.Fatalf("advanced settings = %q / %d", got.ProxyAutoConfigURL, got.DownloadLimitKiB)
+	}
+}
+
 func TestStoreReopen(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "state.db")

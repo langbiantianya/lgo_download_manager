@@ -20,8 +20,6 @@ import (
 // 这是 Internet Explorer / Edge / 大多数桌面应用共享的代理存储位置；
 // 用户在 Internet Options → Connections → LAN settings 中的修改会
 // 立即被此函数读取。
-//
-// 暂不实现 PAC/WPAD 脚本解析（需要 JS 引擎）。
 func detectWindows() (Config, bool) {
 	k, err := registry.OpenKey(registry.CURRENT_USER,
 		`Software\Microsoft\Windows\CurrentVersion\Internet Settings`,
@@ -30,6 +28,17 @@ func detectWindows() (Config, bool) {
 		return Config{}, false
 	}
 	defer k.Close()
+	autoConfigURL, _, _ := k.GetStringValue("AutoConfigURL")
+	autoDetect, _, _ := k.GetIntegerValue("AutoDetect")
+	if autoConfigURL != "" || autoDetect != 0 {
+		override, _, _ := k.GetStringValue("ProxyOverride")
+		return Config{
+			Source:        "wininet-auto",
+			AutoConfigURL: strings.TrimSpace(autoConfigURL),
+			AutoDiscover:  autoConfigURL == "" && autoDetect != 0,
+			Bypass:        NormalizeBypass(override),
+		}, true
+	}
 	enabled, _, err := k.GetIntegerValue("ProxyEnable")
 	if err != nil || enabled == 0 {
 		return Config{Source: "wininet"}, true

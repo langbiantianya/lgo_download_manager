@@ -15,7 +15,14 @@ package protocol
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -31,6 +38,13 @@ var (
 	// ErrResumeUnavailable 表示当前来源无法从指定偏移恢复，但可以从 0
 	// 重新开始。引擎收到它时应清零该流式分片，而不是制造文件空洞。
 	ErrResumeUnavailable = errors.New("protocol: source cannot resume from offset")
+	// ErrBodyStalled 表示响应头已到达，但响应体超过 stall timeout 没有
+	// 返回任何新字节。它属于可重试的网络故障，而不是服务器业务错误。
+	ErrBodyStalled = errors.New("protocol: response body stalled")
+	// ErrDigestMismatch 表示完整下载文件与来源声明的摘要不一致。
+	ErrDigestMismatch = errors.New("protocol: content digest mismatch")
+	// ErrInsufficientDiskSpace 由调度器在创建/预分配文件前返回。
+	ErrInsufficientDiskSpace = errors.New("protocol: insufficient disk space")
 )
 
 // StatusError 携带驱动产生的 HTTP/WebDAV 状态码,供 engine 区分
@@ -117,6 +131,9 @@ func IsTerminal(err error) bool {
 	if errors.Is(err, ErrRangeUnavailable) {
 		return true
 	}
+	if errors.Is(err, ErrDigestMismatch) {
+		return true
+	}
 	if os.IsNotExist(err) || os.IsPermission(err) {
 		return true
 	}
@@ -139,11 +156,146 @@ var ErrUnexpectedEOF = io.ErrUnexpectedEOF
 // DriverCapabilities 是 Probe 成功执行后的结果——包含足够多的元数据，
 // 供引擎规划下载方式。
 type DriverCapabilities struct {
-	TotalSize    int64  // 总字节长度；未知时为 -1
-	SupportRange bool   // 服务器是否支持 Range / FTP REST
-	ServerInfo   string // 自由形式的 banner / 服务器响应头
-	ETag         string // HTTP 响应 ETag，用于跨会话校验资源版本
-	LastModified string // HTTP Last-Modified，用于没有强 ETag 时的版本校验
+	TotalSize       int64  // 总字节长度；未知时为 -1
+	SupportRange    bool   // 服务器是否支持 Range / FTP REST
+	ServerInfo      string // 自由形式的 banner / 服务器响应头
+	ETag            string // HTTP 响应 ETag，用于跨会话校验资源版本
+	LastModified    string // HTTP Last-Modified / FTP MDTM，用于没有强 ETag 时的版本校验
+	DigestAlgorithm string // 规范化后的摘要算法：sha256、sha512 或 md5
+	Digest          string // 原始摘要头中的 base64/hex 编码值
+}
+
+// ParseDigestHeader 从常见 HTTP 摘要头中选择优先级最高的可用摘要。
+// 支持 RFC 9530 的 Content-Digest/Repr-Digest、旧版 Digest 与
+// Content-MD5。未知算法会被忽略；多个算法同时出现时按 sha512、sha256、
+// md5 的强度顺序选择。
+func ParseDigestHeader(values ...string) (algorithm, digest string) {
+	candidates := map[string]string{}
+	for _, value := range values {
+		for _, part := range splitDigestFields(value) {
+			eq := strings.IndexByte(part, '=')
+			if eq <= 0 {
+				continue
+			}
+			alg := normalizeDigestAlgorithm(part[:eq])
+			if alg == "" {
+				continue
+			}
+			encoded := strings.Trim(strings.TrimSpace(part[eq+1:]), `:"`)
+			if encoded != "" {
+				candidates[alg] = encoded
+			}
+		}
+	}
+	for _, alg := range []string{"sha512", "sha256", "md5"} {
+		if value := candidates[alg]; value != "" {
+			return alg, value
+		}
+	}
+	return "", ""
+}
+
+func splitDigestFields(value string) []string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil
+	}
+	parts := strings.Split(value, ",")
+	out := parts[:0]
+	for _, part := range parts {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func normalizeDigestAlgorithm(raw string) string {
+	alg := strings.ToLower(strings.TrimSpace(raw))
+	alg = strings.Trim(alg, `"`)
+	switch alg {
+	case "sha-256", "sha256":
+		return "sha256"
+	case "sha-512", "sha512":
+		return "sha512"
+	case "md5":
+		return "md5"
+	default:
+		return ""
+	}
+}
+
+// VerifyFileDigest 流式校验本地文件。仅在来源明确声明了完整表示摘要时
+// 调用；不认识的算法或无法解码的摘要会安全地跳过，避免误拦正常下载。
+func VerifyFileDigest(path, algorithm, expected string) error {
+	alg := normalizeDigestAlgorithm(algorithm)
+	expected = strings.TrimSpace(expected)
+	if alg == "" || expected == "" {
+		return nil
+	}
+	var h hash.Hash
+	switch alg {
+	case "sha256":
+		h = sha256.New()
+	case "sha512":
+		h = sha512.New()
+	case "md5":
+		h = md5.New()
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("verify %s digest: %w", alg, err)
+	}
+	defer f.Close()
+	if _, err := io.Copy(h, f); err != nil {
+		return fmt.Errorf("verify %s digest read: %w", alg, err)
+	}
+	want, err := decodeDigestValue(expected, alg)
+	if err != nil {
+		return nil
+	}
+	if !equalBytes(h.Sum(nil), want) {
+		return fmt.Errorf("%w: %s", ErrDigestMismatch, alg)
+	}
+	return nil
+}
+
+func decodeDigestValue(value, algorithm string) ([]byte, error) {
+	value = strings.Trim(strings.TrimSpace(value), `:"`)
+	hexLength := 0
+	switch algorithm {
+	case "sha512":
+		hexLength = sha512.Size * 2
+	case "sha256":
+		hexLength = sha256.Size * 2
+	case "md5":
+		hexLength = md5.Size * 2
+	}
+	// 十六进制摘要常常也满足 base64 字符集。先按算法对应的十六进制
+	// 长度解码，避免把合法的 hex 值误解成另一种编码。
+	if len(value) == hexLength {
+		if decoded, err := hex.DecodeString(value); err == nil {
+			return decoded, nil
+		}
+	}
+	if decoded, err := base64.StdEncoding.DecodeString(value); err == nil {
+		return decoded, nil
+	}
+	if decoded, err := base64.RawStdEncoding.DecodeString(value); err == nil {
+		return decoded, nil
+	}
+	return hex.DecodeString(value)
+}
+
+func equalBytes(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	var diff byte
+	for i := range a {
+		diff |= a[i] ^ b[i]
+	}
+	return diff == 0
 }
 
 // AuthOptions 封装凭据以及驱动能够遵循的请求修饰开关。
@@ -169,6 +321,10 @@ type AuthOptions struct {
 	// ProxyBypass 是逗号分隔的主机/域名后缀列表，这些目标直连而不
 	// 经过代理。空字符串表示不绕过任何目标。
 	ProxyBypass string
+
+	// ProxyAutoConfigURL 是显式 PAC 脚本地址；特殊值 "wpad" 表示
+	// 尝试标准 WPAD 主机地址 http://wpad/wpad.dat。仅 System 模式使用。
+	ProxyAutoConfigURL string
 }
 
 // ProtocolDriver 是每个传输实现必须满足的接口。所有方法都必须

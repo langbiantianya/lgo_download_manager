@@ -75,9 +75,20 @@ func parseScutil(s string) (Config, bool) {
 		vals[key] = val
 	}
 
-	// PAC 启用但我们不解析 JS 脚本 —— 标记为不支持并直接返回。
+	// PAC 脚本交给上层执行；URL 为空时按 WPAD 自动发现处理。
 	if vals["ProxyAutoConfigEnable"] == "1" && vals["ProxyAutoConfigURLString"] != "" {
-		return Config{Source: "darwin-pac-unsupported"}, true
+		return Config{
+			Source:        "darwin-pac",
+			AutoConfigURL: strings.Trim(vals["ProxyAutoConfigURLString"], `"`),
+			Bypass:        NormalizeBypass(strings.Join(exceptions, ",")),
+		}, true
+	}
+	if vals["ProxyAutoDiscoveryEnable"] == "1" {
+		return Config{
+			Source:       "darwin-wpad",
+			AutoDiscover: true,
+			Bypass:       NormalizeBypass(strings.Join(exceptions, ",")),
+		}, true
 	}
 	bypassParts := exceptions
 	if vals["ExcludeSimpleHostnames"] == "1" {

@@ -7,6 +7,7 @@
 package ui
 
 import (
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -162,7 +163,8 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 		lbl.TextStyle.Bold = true
 		return container.NewBorder(nil, nil, lbl, nil, w)
 	}
-	urlEntry := widget.NewEntry()
+	urlEntry := widget.NewMultiLineEntry()
+	urlEntry.SetMinRowsVisible(3)
 	urlEntry.SetPlaceHolder(ilocale.T("addTask.url.placeholder"))
 	urlEntry.Validator = notEmptyValidator()
 
@@ -274,6 +276,27 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 
 	// 从 URL 提取文件名并更新保存路径，同时异步探测文件大小
 	updateFromURL := func(rawURL string) {
+		urls := parseDownloadURLs(rawURL)
+		if len(urls) > 1 {
+			savePathLabel.SetText(ilocale.T("addTask.saveDir.label"))
+			btHint.Hide()
+			nextDefault := GlobalSettings.DefaultSaveDir
+			// 单任务输入框表示文件路径；切到批量后改为目录。若用户此前
+			// 手选过文件，保留它所在的目录而不是把文件名当成目录名。
+			if current := strings.TrimSpace(savePathEntry.Text); current != "" && current != autoSavePath {
+				if dir := filepath.Dir(current); dir != "" && dir != "." {
+					nextDefault = dir
+				}
+			}
+			savePathEntry.SetText(nextDefault)
+			autoSavePath = nextDefault
+			sizeLabel.SetText(ilocale.TF("addTask.multiple", "{{ .Count }} 个链接",
+				map[string]any{"Count": len(urls)}))
+			return
+		}
+		if len(urls) == 1 {
+			rawURL = urls[0]
+		}
 		nextDefault := filepath.Join(GlobalSettings.DefaultSaveDir, defaultName)
 		if protocol.IsBitTorrent(rawURL) {
 			// BT 任务的保存路径是「任务目录」:磁力链接用 dn 参数
@@ -302,14 +325,19 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 
 	// URL 变化时触发
 	urlEntry.OnChanged = func(s string) {
-		if s == "" {
+		urls := parseDownloadURLs(s)
+		if len(urls) == 0 {
 			sizeLabel.SetText("")
 			return
 		}
 		updateFromURL(s)
+		if len(urls) > 1 {
+			probe.Stop()
+			return
+		}
 		// 探测合并:连续键击时只探最后一次,免得每敲一个字就发一次请求。
 		probe.Trigger(func(seq uint64) {
-			fyne.Do(func() { probeSize(s, seq) })
+			fyne.Do(func() { probeSize(urls[0], seq) })
 		})
 	}
 
@@ -350,9 +378,9 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 			}
 		}
 
-		url := urlEntry.Text
+		urls := parseDownloadURLs(urlEntry.Text)
 		savePath := uniqueSavePath(savePathEntry.Text)
-		if url == "" || savePath == "" {
+		if len(urls) == 0 || savePath == "" {
 			resetSubmit()
 			return
 		}
@@ -377,25 +405,37 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 			UserAgent: ua,
 			Cookies:   cookies,
 		}
-		// 协议由对话框显式给出(magnet:/.torrent → BT),业务进程据此
-		// 走 BT 引擎;识别失败时留空,由业务进程按 URL 兜底判定。
-		kind, _ := protocol.DetectKind(url, "")
-		tk, err := svc.AddTask(AddTaskInput{
-			URL:          url,
-			SavePath:     savePath,
-			Protocol:     kind,
-			ChunkCount:   GlobalSettings.DefaultThreads,
-			MinChunkSize: GlobalSettings.MinChunkSize,
-			Auth:         taskAuth,
-		})
-		if err != nil {
-			resetSubmit()
-			showError(parent, err)
-			return
+		directory := len(urls) > 1 || savePath == GlobalSettings.DefaultSaveDir
+		usedPaths := make(map[string]struct{}, len(urls))
+		var failures []string
+		var failedURLs []string
+		for _, rawURL := range urls {
+			kind, _ := protocol.DetectKind(rawURL, "")
+			taskPath := savePath
+			if directory {
+				taskPath = batchTaskPath(rawURL, savePath, usedPaths)
+				usedPaths[taskPath] = struct{}{}
+			}
+			tk, err := svc.AddTask(AddTaskInput{
+				URL:          rawURL,
+				SavePath:     taskPath,
+				Protocol:     kind,
+				ChunkCount:   GlobalSettings.DefaultThreads,
+				MinChunkSize: GlobalSettings.MinChunkSize,
+				Auth:         taskAuth,
+			})
+			if err == nil {
+				err = svc.Start(tk.ID)
+			}
+			if err != nil {
+				failures = append(failures, fmt.Sprintf("%s: %v", rawURL, err))
+				failedURLs = append(failedURLs, rawURL)
+			}
 		}
-		if err := svc.Start(tk.ID); err != nil {
+		if len(failures) > 0 {
 			resetSubmit()
-			showError(parent, err)
+			showError(parent, fmt.Errorf("%s", strings.Join(failures, "\n")))
+			urlEntry.SetText(strings.Join(failedURLs, "\n"))
 			return
 		}
 		if closeWin != nil {
@@ -446,6 +486,49 @@ func notEmptyValidator() fyne.StringValidator {
 		}
 		return nil
 	}
+}
+
+// parseDownloadURLs 支持一次粘贴多行链接，过滤空行并去重。重复链接
+// 不应在一次批量提交中创建两个完全相同的任务。
+func parseDownloadURLs(raw string) []string {
+	seen := make(map[string]struct{})
+	var urls []string
+	for _, line := range strings.Split(raw, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if _, ok := seen[line]; ok {
+			continue
+		}
+		seen[line] = struct{}{}
+		urls = append(urls, line)
+	}
+	return urls
+}
+
+func batchTaskPath(rawURL, directory string, used map[string]struct{}) string {
+	var name string
+	if protocol.IsBitTorrent(rawURL) {
+		name = scheduler.BittorrentDefaultDir(rawURL)
+	} else if u, err := url.Parse(rawURL); err == nil {
+		name = filepath.Base(u.Path)
+	}
+	if name == "" || name == "." || name == "/" {
+		name = "download.bin"
+	}
+	candidate := uniqueSavePath(filepath.Join(directory, name))
+	if _, exists := used[candidate]; !exists {
+		return candidate
+	}
+	stem, ext := splitExt(name)
+	for n := 1; n < 10000; n++ {
+		candidate = filepath.Join(directory, stem+"("+strconv.Itoa(n)+")"+ext)
+		if _, exists := used[candidate]; !exists && !downloadPathExists(candidate) {
+			return candidate
+		}
+	}
+	return filepath.Join(directory, name)
 }
 
 // errEmpty 在每次 Error() 时取 ilocale 当前翻译——切语言后下一次校验

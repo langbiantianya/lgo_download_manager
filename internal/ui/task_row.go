@@ -93,6 +93,7 @@ type rowState struct {
 	// 状态部分
 	status    store.Status
 	preparing bool
+	errorKind string
 }
 
 func newTaskRow(_ *store.Task) *taskRow {
@@ -238,7 +239,11 @@ func (r *taskRow) refresh() {
 	eff, preparing := r.effectiveStatus(t)
 	// 进度部分逐值短路；状态部分只在 effective status / 准备中判定变化时执行。
 	r.refreshProgress(t, eff)
-	r.refreshStatus(eff, preparing)
+	errKind := ""
+	if t != nil {
+		errKind = t.ErrorKind
+	}
+	r.refreshStatus(eff, preparing, errKind)
 }
 
 // effectiveStatus 返回实际用于渲染的状态：乐观覆盖优先于后端快照。
@@ -288,13 +293,14 @@ func (r *taskRow) refreshProgress(t *store.Task, eff store.Status) {
 
 // refreshStatus 只在 effective status（或「准备中」判定）变化时更新状态标签、
 // 按钮可见性与图标——这些操作会触发布局与图标绘制，是每个 tick 里最贵的部分。
-func (r *taskRow) refreshStatus(eff store.Status, preparing bool) {
+func (r *taskRow) refreshStatus(eff store.Status, preparing bool, errorKind string) {
 	s := &r.st
-	if s.valid && s.status == eff && s.preparing == preparing {
+	if s.valid && s.status == eff && s.preparing == preparing && s.errorKind == errorKind {
 		return
 	}
 	s.status = eff
 	s.preparing = preparing
+	s.errorKind = errorKind
 	s.valid = true
 
 	switch eff {
@@ -341,7 +347,13 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool) {
 		r.setVis(r.openFolderBtn, showFolder, false)
 		r.setVis(r.openFileBtn, showFile, false)
 	case store.TaskStatus.Failed:
-		r.statusLbl.SetText(ilocale.T("taskRow.status.failed"))
+		reason := errorKindText(errorKind)
+		if reason == "" {
+			r.statusLbl.SetText(ilocale.T("taskRow.status.failed"))
+		} else {
+			r.statusLbl.SetText(ilocale.TF("taskRow.status.failedWith",
+				"失败：{{ .Reason }}", map[string]any{"Reason": reason}))
+		}
 		r.startBtn.SetIcon(theme.MediaReplayIcon())
 		r.startBtn.Importance = widget.LowImportance
 		r.setVis(r.startBtn, showStart, true)
@@ -352,6 +364,18 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool) {
 		r.setVis(r.openFolderBtn, showFolder, false)
 		r.setVis(r.openFileBtn, showFile, false)
 	}
+}
+
+func errorKindText(kind string) string {
+	if kind == "" || kind == "unknown" {
+		return ""
+	}
+	key := "taskRow.error." + kind
+	text := ilocale.T(key)
+	if text == key {
+		return ""
+	}
+	return text
 }
 
 // confirmDelete 删除任务前先问一句。
@@ -450,7 +474,6 @@ func formatTime(t time.Time) string {
 	}
 	return t.Local().Format("2006-01-02 15:04:05")
 }
-
 
 // formatBPS 以字节/秒为单位格式化速度。
 // 单位后缀 "/s" 与 formatBytes 一样是固定的英文缩写,数值部分才随

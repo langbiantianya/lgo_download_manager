@@ -12,8 +12,12 @@
 
 - 基于 Range 的并发下载（HTTP、HTTPS、FTP、WebDAV）。
 - 支持断点续传：暂停/恢复后会从已下载的字节偏移处继续，已完成的分片不会重新下载；
-  Range 响应会经过严格校验，ETag/Last-Modified 会参与跨会话一致性检查，
+  Range 响应会经过严格校验，HTTP ETag/Last-Modified 与 FTP MDTM 会参与跨会话一致性检查，
   不支持 Range 的来源会安全地从 0 重新下载。
+- HTTP 层会检测“响应头已到、响应体长时间无数据”的半开连接；来源提供
+  `Content-Digest`/`Repr-Digest`/`Digest`/`Content-MD5` 时会在发布文件前做整文件校验。
+- 大文件按 worker 数量的 4 倍生成逻辑切片，单个连接变慢时其它 worker 可直接接手后续
+  切片；失败重规划会保留原分片边界和已完成偏移。
 - 下载中的数据写入 `<目标文件>.part`，同步完成后才原子重命名为正式文件，避免把
   半成品暴露成可用文件。
 - BitTorrent 下载：`magnet:` 磁力链接与 `.torrent` 种子（本地路径或 HTTP 链接），
@@ -26,10 +30,12 @@
   的新任务保持 `Pending`（UI 显示为「等待中」），按 FIFO 顺序在有 slot 释放时自动启动；
   上限调小不会强制暂停正在运行的任务（仅影响后续新增）。BT 任务另有独立并发上限，
   默认同时下载 2 个。
-- HTTP/HTTPS 代理三种模式：系统代理（自动检测桌面会话代理设置）、
+- HTTP/HTTPS 代理三种模式：系统代理（自动检测桌面会话代理设置，支持 PAC/WPAD）、
   不使用代理（始终直连）、手动设置代理（自定义 URL + 绕过列表）。
   自动按平台检测：Linux (GNOME `gsettings` / KDE `kioslaverc` / `/etc/environment`)、
-  macOS (`scutil --proxy`)、Windows (WinINET 注册表)。
+  macOS (`scutil --proxy`)、Windows (WinINET 注册表)。系统 PAC 会自动求值；
+  也可在设置中填写 PAC 地址，或用 `wpad` 使用标准 `http://wpad/wpad.dat` 自动发现。
+- 「新建任务」支持粘贴多行 URL 批量添加；空行与重复 URL 会过滤，保存路径冲突会自动编号。
 - 浏览器扩展接力：业务进程在 `127.0.0.1` 的候选端口（`17821`+）上收扩展的 JSON
   交接请求（`internal/handoff`），不弹确认框、不开标签页、也不需要额外安装——
   扩展侧按「本地端口 → `lgom://` URL」顺序尝试，URL 协议是最后手段；
@@ -707,7 +713,11 @@ Unix socket（其它平台）把 URL 转发给主实例后退出，转发失败�
 - **手动设置代理**：填写完整 URL（支持 `http://`、`https://`、`socks5://`）+ 可选绕过列表
   （逗号分隔主机名、CIDR 或通配符，如 `*.lan`、`192.168.*`、`10.0.0.0/8`）。
 
-PAC / WPAD 自动配置脚本不在支持范围内。
+**系统代理**模式会执行桌面会话提供的 PAC 脚本（`FindProxyForURL`），支持
+`PROXY`/`HTTPS`/`SOCKS5`/`DIRECT` 指令与常见 PAC helper。系统只报告自动发现、
+没有给出脚本 URL 时会尝试标准 WPAD 地址 `http://wpad/wpad.dat`。也可以直接在
+「PAC/WPAD 脚本地址」中填写 HTTP(S) URL 或 `wpad`；脚本获取失败时安全回退直连，
+并做短时间负缓存，避免每个分片重复等待。
 
 BitTorrent 任务的 tracker 公告、webseed 与 `.torrent` 文件的 HTTP 抓取
 同样走这套设置（`internal/protocol.HTTPProxyFunc`）；BT 的 peer 连接不是
@@ -759,6 +769,7 @@ macOS 上 `ProcessType=Background` 标记为后台进程，不进入前台应用
 | Default threads     | 4                | 单任务允许的最大并发连接数                 |
 | Min chunk size      | 10 MiB           | 引擎对分片尺寸的下限                       |
 | Max concurrent      | 3                | 同时下载任务数上限（超额任务 FIFO 排队）   |
+| HTTP/FTP limit      | 0（不限）        | 所有 HTTP/HTTPS/WebDAV/FTP 任务共享限速（KiB/s） |
 | User-Agent          | `Wget/1.21.3`    | 每次请求都会附带                           |
 | Cookies             | ""               | Cookie 请求头字符串                        |
 | FTP passive mode    | true             | FTP 被动模式 / 主动模式                    |
@@ -766,6 +777,7 @@ macOS 上 `ProcessType=Background` 标记为后台进程，不进入前台应用
 | Proxy mode          | system           | 系统 / 禁用 / 手动                         |
 | Proxy URL           | ""               | 手动模式下的代理 URL                       |
 | Proxy bypass        | ""               | 手动模式下的绕过列表（逗号分隔）           |
+| PAC/WPAD script URL | ""               | 系统模式下的 PAC URL；留空用系统配置，`wpad` 自动发现 |
 | Light mode          | true             | 关闭主窗口时释放 widget 树                 |
 | Auto start          | false            | 操作系统登录后是否静默自启（详见「开机自启」） |
 | BT listen port      | 首次启动自动选择 | BT 客户端监听端口（TCP/uTP）；选择后持久化，0 = 每次启动由系统随机分配 |
@@ -804,6 +816,12 @@ BT 并发/做种数 ≤ 64、BT peer 数 ≤ 1000）：超上限的输入不采�
   的临时故障不会立即取消其它健康分片，已完成的数据会保留并参与后续重规划。
 - HTTP/WebDAV 会持久化 ETag 与 Last-Modified，并在分片请求中发送 `If-Range`；
   资源版本变化时自动丢弃旧偏移并重下，而不是把新旧文件拼接在一起。
+- FTP 探测会读取 `MDTM` 并持久化为 UTC RFC3339 版本校验器；远程文件时间变化时
+  同样会放弃旧偏移，避免把不同版本拼接起来。
+- 探测到标准完整摘要头时会保存算法与摘要，最终文件发布前流式校验；不匹配则保留
+  `.part` 作为诊断并清空进度，下一次重试从 0 开始。
+- 响应体连续 60 秒没有新字节会取消该分片并按可重试网络错误处理；磁盘写入与
+  限速造成的处理停顿不计入网络停滞时间。
 - 429、408、425 和临时 `5xx` 会退避重试；服务端提供 `Retry-After` 时优先遵循其
   建议等待时间，探测阶段同样会进行有限重试。
 - 暂停、失败和进程异常退出时保留 `.part`；成功下载先 `Sync` 文件，再重命名并同步
@@ -816,6 +834,10 @@ BT 并发/做种数 ≤ 64、BT peer 数 ≤ 1000）：超上限的输入不采�
 - HTTP/WebDAV 在相同代理配置下跨任务共享连接池，并以最多 4 路启动；每主机连接数
   有统一上限。出现网络错误时会先降低并发，退避后再逐步恢复，避免故障期间继续
   放大连接压力。
+- 下载前会按来源总大小检查目标文件系统可用空间；预分配时检查完整文件，普通续传
+  只检查剩余字节。空间不足会在创建/预分配前给出可操作错误分类。
+- HTTP/HTTPS/WebDAV/FTP 使用共享全局限速器，设置修改对运行中的分片立即生效；
+  通过阻塞协议读取回调形成背压，不会把未限速的数据继续堆在内存里。
 
 ## BitTorrent 下载
 
@@ -1083,9 +1105,9 @@ store 里保持 `Pending`（UI 渲染为「等待中」），不占 slot、不�
 `promotePending` 拉起。
 
 `releaseSlot` 与 `startAsync` 的清理 defer 都会触发 `promotePending`：
-扫 store 中所有 `Pending` 且无 slot 的任务，按 `created_at ASC` 顺序，
-逐个 `Start` 提升到 `Downloading`，直到 `len(jobs) == MaxConcurrent` 或
-没有候选。任一 slot 释放都会让排队中的最早一个任务自动接上。
+按 `created_at ASC` 通过 SQL `LIMIT` 只读取足够填满当前空闲 slot 的一小批 Pending
+候选，不再扫描并 JSON 解码全部历史任务；被 BT 专用上限跳过的候选不会阻断后面的
+HTTP/FTP 任务。任一 slot 释放都会让排队中的最早可用任务自动接上。
 
 `SetMaxConcurrent(n)` 是运行时调入口：用户在「设置」调大上限时立即
 触发 promote，把累积的 Pending 任务按 FIFO 拉起；调小上限只影响后续
@@ -1100,9 +1122,10 @@ store 里保持 `Pending`（UI 渲染为「等待中」），不占 slot、不�
 ### 代理配置层
 
 `protocol.SetProxyConfig()` 在进程内设置全局代理模式；每个任务可通过
-`AuthOptions{ProxyMode, ProxyURL, ProxyBypass}` 覆盖。`effectiveAuth()`
+`AuthOptions{ProxyMode, ProxyURL, ProxyBypass, ProxyAutoConfigURL}` 覆盖。`effectiveAuth()`
 合并 per-call 与全局配置；`proxyFunc()` 根据模式选择：
-`ProxyFromEnvironment` → `cachedSystemProxy()`（平台 API 探测）→ 手动 URL。
+`ProxyFromEnvironment` → 系统 PAC/WPAD → `cachedSystemProxy()`（平台 API 探测）
+→ 手动 URL。PAC 脚本按 URL 缓存并限制脚本大小与执行时间。
 
 ## 测试
 

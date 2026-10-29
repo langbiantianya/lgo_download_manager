@@ -90,16 +90,16 @@ ExcludeSimpleHostnames : 1
 	}
 }
 
-func TestParseScutilPACUnsupported(t *testing.T) {
+func TestParseScutilPACURL(t *testing.T) {
 	const sample = `ProxyAutoConfigEnable : 1
 ProxyAutoConfigURLString : http://example.com/proxy.pac
 `
 	cfg, ok := parseScutil(sample)
-	if !ok || cfg.Source != "darwin-pac-unsupported" {
-		t.Errorf("PAC should be reported as unsupported: %+v ok=%v", cfg, ok)
+	if !ok || cfg.Source != "darwin-pac" {
+		t.Errorf("PAC should be reported as configured: %+v ok=%v", cfg, ok)
 	}
-	if cfg.ProxyURL != "" {
-		t.Errorf("PAC mode should not surface a ProxyURL, got %q", cfg.ProxyURL)
+	if cfg.AutoConfigURL != "http://example.com/proxy.pac" {
+		t.Errorf("AutoConfigURL = %q", cfg.AutoConfigURL)
 	}
 }
 

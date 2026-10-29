@@ -10,8 +10,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -855,6 +858,7 @@ func makeHTTPDriver(url string) ProtocolDriver {
 
 func TestHTTPProbeHEAD(t *testing.T) {
 	const size int64 = 12345
+	const digest = "YWJj"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.Header.Get("Range") == "bytes=0-0" {
 			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", size))
@@ -866,6 +870,7 @@ func TestHTTPProbeHEAD(t *testing.T) {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("Server", "test")
+		w.Header().Set("Content-Digest", `sha-256=:`+digest+`:`)
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -880,6 +885,9 @@ func TestHTTPProbeHEAD(t *testing.T) {
 	}
 	if !caps.SupportRange {
 		t.Errorf("SupportRange=false, want true")
+	}
+	if caps.DigestAlgorithm != "sha256" || caps.Digest != digest {
+		t.Errorf("digest = %q / %q, want sha256 / %q", caps.DigestAlgorithm, caps.Digest, digest)
 	}
 	d.Close()
 }
@@ -1033,6 +1041,122 @@ func TestHTTPRateLimitErrorCarriesRetryAfter(t *testing.T) {
 		t.Fatal("429 must be retryable")
 	}
 	_ = d.Close()
+}
+
+func TestHTTPDownloadChunkStopsStalledResponseBody(t *testing.T) {
+	oldTimeout := bodyStallTimeout
+	bodyStallTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { bodyStallTimeout = oldTimeout })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-1023/1024")
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write([]byte{7})
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	d := makeHTTPDriver(srv.URL)
+	defer d.Close()
+	f, err := os.Create(filepath.Join(t.TempDir(), "stalled.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err = d.DownloadChunk(ctx, 0, 1023, f, nil)
+	if !errors.Is(err, ErrBodyStalled) {
+		t.Fatalf("DownloadChunk err=%v, want ErrBodyStalled", err)
+	}
+	if IsTerminal(err) {
+		t.Fatal("stalled body must remain retryable")
+	}
+}
+
+func TestParseDigestHeaderPrefersStrongestAlgorithm(t *testing.T) {
+	alg, digest := ParseDigestHeader(
+		`sha-256=:YWJj:`,
+		`sha-512=:ZGVm:, md5=:Z2hp:`,
+	)
+	if alg != "sha512" || digest != "ZGVm" {
+		t.Fatalf("ParseDigestHeader = %q/%q, want sha512/ZGVm", alg, digest)
+	}
+}
+
+func TestVerifyFileDigestDetectsCorruption(t *testing.T) {
+	payload := []byte("verified payload")
+	sum := sha256.Sum256(payload)
+	encoded := base64.StdEncoding.EncodeToString(sum[:])
+	path := filepath.Join(t.TempDir(), "digest.bin")
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyFileDigest(path, "sha-256", encoded); err != nil {
+		t.Fatalf("VerifyFileDigest(valid): %v", err)
+	}
+	if err := os.WriteFile(path, []byte("corrupted payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := VerifyFileDigest(path, "sha256", encoded); !errors.Is(err, ErrDigestMismatch) {
+		t.Fatalf("VerifyFileDigest(corrupt) err=%v, want ErrDigestMismatch", err)
+	}
+}
+
+func TestPACResolverEvaluatesCommonDirectives(t *testing.T) {
+	const script = `function FindProxyForURL(url, host) {
+		if (shExpMatch(host, "*.internal")) return "DIRECT";
+		return "PROXY proxy.example:8080; DIRECT";
+	}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, script)
+	}))
+	defer srv.Close()
+
+	target, _ := url.Parse("https://cdn.example/file.bin")
+	req, _ := http.NewRequest(http.MethodGet, target.String(), nil)
+	proxyURL, err := resolvePACForRequest(req, srv.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if proxyURL == nil || proxyURL.String() != "http://proxy.example:8080" {
+		t.Fatalf("PAC proxy = %v, want http://proxy.example:8080", proxyURL)
+	}
+
+	internal, _ := url.Parse("https://mirror.internal/file.bin")
+	req, _ = http.NewRequest(http.MethodGet, internal.String(), nil)
+	proxyURL, err = resolvePACForRequest(req, srv.URL, nil)
+	if err != nil || proxyURL != nil {
+		t.Fatalf("PAC direct result = %v, err=%v", proxyURL, err)
+	}
+
+	socks, err := parsePACResult("SOCKS5 socks.example", target)
+	if err != nil || socks == nil || socks.String() != "socks5://socks.example:1080" {
+		t.Fatalf("PAC SOCKS result = %v, err=%v", socks, err)
+	}
+}
+
+func TestClassifyErrorActionableKinds(t *testing.T) {
+	tests := []struct {
+		err  error
+		kind string
+	}{
+		{fmt.Errorf("%w: need 10", ErrInsufficientDiskSpace), "disk_full"},
+		{fmt.Errorf("%w: sha256", ErrDigestMismatch), "checksum_mismatch"},
+		{NewStatusError(http.StatusUnauthorized, nil), "authentication"},
+		{NewStatusError(http.StatusNotFound, nil), "not_found"},
+		{NewStatusError(http.StatusTooManyRequests, nil), "rate_limited"},
+		{ErrBodyStalled, "source_stalled"},
+	}
+	for _, tt := range tests {
+		if got := ClassifyError(tt.err).Kind; got != tt.kind {
+			t.Errorf("ClassifyError(%v) = %q, want %q", tt.err, got, tt.kind)
+		}
+	}
 }
 
 func TestHTTPProbeHEADNoAcceptRanges(t *testing.T) {
@@ -1816,6 +1940,9 @@ func TestFTPLiveProbe(t *testing.T) {
 	// pyftpdlib 支持 REST，即支持续传
 	if !caps.SupportRange {
 		t.Errorf("SupportRange=false, want true")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, caps.LastModified); err != nil {
+		t.Errorf("LastModified=%q is not RFC3339: %v", caps.LastModified, err)
 	}
 }
 

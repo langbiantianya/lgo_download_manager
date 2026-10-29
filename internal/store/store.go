@@ -162,26 +162,29 @@ func (s TaskSort) String() string { return string(s) }
 
 // Task 是数据库行的内存表示，便于 JSON 序列化。
 type Task struct {
-	ID            string    `json:"id"`
-	URL           string    `json:"url"`
-	SavePath      string    `json:"save_path"`
-	Protocol      string    `json:"protocol"`
-	TotalSize     int64     `json:"total_size"`
-	Downloaded    int64     `json:"downloaded"`
-	SupportRange  bool      `json:"support_range"`
-	ETag          string    `json:"etag"`
-	LastModified  string    `json:"last_modified"`
-	IsAllocated   bool      `json:"is_allocated"`
-	ChunkCount    int       `json:"chunk_count"`
-	MinChunkSize  int64     `json:"min_chunk_size"` // engine 分块下界（字节）
-	ChunkProgress []int64   `json:"chunk_progress"` // 每个分块从起点开始的偏移量
-	ChunkRanges   []int64   `json:"chunk_ranges"`   // [start0,end0,start1,end1,...] — 实际的 engine 分块布局
-	Status        Status    `json:"status"`
-	AuthData      string    `json:"auth_data"` // JSON：{username,password,...}
-	ErrorMessage  string    `json:"error_message"`
-	CreatedAt     time.Time `json:"created_at"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	CompletedAt   time.Time `json:"completed_at"` // 零值表示尚未完成
+	ID              string    `json:"id"`
+	URL             string    `json:"url"`
+	SavePath        string    `json:"save_path"`
+	Protocol        string    `json:"protocol"`
+	TotalSize       int64     `json:"total_size"`
+	Downloaded      int64     `json:"downloaded"`
+	SupportRange    bool      `json:"support_range"`
+	ETag            string    `json:"etag"`
+	LastModified    string    `json:"last_modified"`
+	DigestAlgorithm string    `json:"digest_algorithm,omitempty"`
+	Digest          string    `json:"digest,omitempty"`
+	IsAllocated     bool      `json:"is_allocated"`
+	ChunkCount      int       `json:"chunk_count"`
+	MinChunkSize    int64     `json:"min_chunk_size"` // engine 分块下界（字节）
+	ChunkProgress   []int64   `json:"chunk_progress"` // 每个分块从起点开始的偏移量
+	ChunkRanges     []int64   `json:"chunk_ranges"`   // [start0,end0,start1,end1,...] — 实际的 engine 分块布局
+	Status          Status    `json:"status"`
+	AuthData        string    `json:"auth_data"` // JSON：{username,password,...}
+	ErrorMessage    string    `json:"error_message"`
+	ErrorKind       string    `json:"error_kind,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
+	UpdatedAt       time.Time `json:"updated_at"`
+	CompletedAt     time.Time `json:"completed_at"` // 零值表示尚未完成
 
 	// BTFile 是 BT 任务在「种子只有一个文件」时该文件相对任务目录的路径
 	// (例如 "ubuntu.iso");多文件种子为空——UI 据此决定「打开文件」按钮
@@ -267,6 +270,8 @@ func (s *Store) migrate() error {
 		support_range   INTEGER NOT NULL DEFAULT 0,
 		etag            TEXT NOT NULL DEFAULT '',
 		last_modified   TEXT NOT NULL DEFAULT '',
+		digest_algorithm TEXT NOT NULL DEFAULT '',
+		digest          TEXT NOT NULL DEFAULT '',
 		is_allocated    INTEGER NOT NULL DEFAULT 0,
 		chunk_count     INTEGER NOT NULL DEFAULT 4,
 		min_chunk_size  INTEGER NOT NULL DEFAULT 1048576,
@@ -274,6 +279,7 @@ func (s *Store) migrate() error {
 		status          TEXT NOT NULL DEFAULT 'Pending',
 		auth_data       TEXT NOT NULL DEFAULT '{}',
 		error_message   TEXT NOT NULL DEFAULT '',
+		error_kind      TEXT NOT NULL DEFAULT '',
 		bt_file         TEXT NOT NULL DEFAULT '',
 		created_at      DATETIME NOT NULL,
 		updated_at      DATETIME NOT NULL
@@ -315,6 +321,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_save_path    ON tasks(save_path ASC, id ASC
 	if err := s.addColumnIfMissing("tasks", "last_modified", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
+	if err := s.addColumnIfMissing("tasks", "digest_algorithm", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("tasks", "digest", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
 	if err := s.addColumnIfMissing("tasks", "chunk_ranges", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
 		return err
 	}
@@ -322,6 +334,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_save_path    ON tasks(save_path ASC, id ASC
 		return err
 	}
 	if err := s.addColumnIfMissing("tasks", "bt_file", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("tasks", "error_kind", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	if err := s.addColumnIfMissing("settings", "task_sort", `TEXT NOT NULL DEFAULT ''`); err != nil {
@@ -334,6 +349,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_save_path    ON tasks(save_path ASC, id ASC
 		return err
 	}
 	if err := s.addColumnIfMissing("settings", "proxy_mode", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "proxy_pac_url", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("settings", "download_limit", `INTEGER NOT NULL DEFAULT 0`); err != nil {
 		return err
 	}
 	if err := s.addColumnIfMissing("settings", "light_mode", `INTEGER NOT NULL DEFAULT 1`); err != nil {
@@ -484,15 +505,16 @@ func (s *Store) CreateTask(t *Task) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO tasks (
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		etag,last_modified,is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
-		auth_data,error_message,created_at,updated_at,completed_at,bt_file
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		etag,last_modified,digest_algorithm,digest,is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
+		auth_data,error_message,error_kind,created_at,updated_at,completed_at,bt_file
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		t.ID, t.URL, t.SavePath, t.Protocol, t.TotalSize, t.Downloaded,
 		boolToInt(t.SupportRange), t.ETag, t.LastModified,
+		t.DigestAlgorithm, t.Digest,
 		boolToInt(t.IsAllocated), t.ChunkCount,
 		t.MinChunkSize,
 		string(cpJSON), string(rgJSON), string(t.Status), t.AuthData,
-		t.ErrorMessage, t.CreatedAt, t.UpdatedAt, nil, t.BTFile,
+		t.ErrorMessage, t.ErrorKind, t.CreatedAt, t.UpdatedAt, nil, t.BTFile,
 	)
 	if err != nil {
 		return fmt.Errorf("store insert: %w", err)
@@ -607,12 +629,33 @@ func (s *Store) UpdateTaskValidators(id, etag, lastModified string) error {
 	return err
 }
 
+// UpdateTaskIntegrity 持久化来源声明的完整内容摘要。摘要与 ETag/
+// Last-Modified 分开更新，避免旧 HTTP 资源在服务器不再返回摘要时
+// 继续使用过期校验值。
+func (s *Store) UpdateTaskIntegrity(id, algorithm, digest string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE tasks SET digest_algorithm=?, digest=?, updated_at=? WHERE id=?`,
+		algorithm, digest, time.Now().UTC(), id)
+	return err
+}
+
+// UpdateTaskErrorKind 持久化面向 UI 的错误分类。原始错误仍保留在
+// ErrorMessage，供日志和高级排障使用。
+func (s *Store) UpdateTaskErrorKind(id, kind string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE tasks SET error_kind=?, updated_at=? WHERE id=?`,
+		kind, time.Now().UTC(), id)
+	return err
+}
+
 // GetTask 按 ID 获取任务。若不存在则返回 sql.ErrNoRows。
 func (s *Store) GetTask(id string) (*Task, error) {
 	row := s.db.QueryRow(`SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		etag,last_modified,is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
-		auth_data,error_message,created_at,updated_at,completed_at,bt_file
+		etag,last_modified,digest_algorithm,digest,is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
+		auth_data,error_message,error_kind,created_at,updated_at,completed_at,bt_file
 		FROM tasks WHERE id=?`, id)
 	return scanTask(row)
 }
@@ -624,8 +667,8 @@ func (s *Store) ListTasks(filter StatusFilter, sort TaskSort) ([]*Task, error) {
 	statusVal, useWhere := filter.filterStatus()
 	query := `SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		etag,last_modified,is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
-		auth_data,error_message,created_at,updated_at,completed_at,bt_file
+		etag,last_modified,digest_algorithm,digest,is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
+		auth_data,error_message,error_kind,created_at,updated_at,completed_at,bt_file
 		FROM tasks`
 	if useWhere {
 		query += ` WHERE status = ?`
@@ -646,6 +689,67 @@ func (s *Store) ListTasks(filter StatusFilter, sort TaskSort) ([]*Task, error) {
 	}
 	defer rows.Close()
 	var out []*Task
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ListPendingTasks 按 FIFO 返回最多 limit 条 Pending 任务。调度器有
+// slot 释放时只需解码这一小批候选，而不是把全部历史任务加载进内存。
+func (s *Store) ListPendingTasks(limit int) ([]*Task, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	rows, err := s.db.Query(`SELECT
+		id,url,save_path,protocol,total_size,downloaded,support_range,
+		etag,last_modified,digest_algorithm,digest,is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
+		auth_data,error_message,error_kind,created_at,updated_at,completed_at,bt_file
+		FROM tasks WHERE status=? ORDER BY created_at ASC, id ASC LIMIT ?`,
+		string(TaskStatus.Pending), limit)
+	if err != nil {
+		return nil, fmt.Errorf("store list pending: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*Task, 0, limit)
+	for rows.Next() {
+		t, err := scanTask(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// ListPendingTasksByProtocol 在增量 Pending 查询上增加 BT/非 BT 过滤。
+// 调度器分别取少量两类候选再合并 FIFO，避免 BT 专用名额已满时，队列
+// 前部的大量 BT 任务把后面的 HTTP/FTP 候选挡在单次 LIMIT 之外。
+func (s *Store) ListPendingTasksByProtocol(limit int, bittorrent bool) ([]*Task, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	condition := `protocol=?`
+	arg := string(protocol.ProtoBT)
+	if !bittorrent {
+		condition = `protocol<>?`
+	}
+	rows, err := s.db.Query(`SELECT
+		id,url,save_path,protocol,total_size,downloaded,support_range,
+		etag,last_modified,digest_algorithm,digest,is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
+		auth_data,error_message,error_kind,created_at,updated_at,completed_at,bt_file
+		FROM tasks WHERE status=? AND `+condition+`
+		ORDER BY created_at ASC, id ASC LIMIT ?`,
+		string(TaskStatus.Pending), arg, limit)
+	if err != nil {
+		return nil, fmt.Errorf("store list pending by protocol: %w", err)
+	}
+	defer rows.Close()
+	out := make([]*Task, 0, limit)
 	for rows.Next() {
 		t, err := scanTask(rows)
 		if err != nil {
@@ -756,9 +860,10 @@ func scanTask(s scanner) (*Task, error) {
 		completedAtNS sql.NullTime
 	)
 	err := s.Scan(&t.ID, &t.URL, &t.SavePath, &t.Protocol, &total, &dwn,
-		&support, &t.ETag, &t.LastModified, &alloc, &t.ChunkCount, &t.MinChunkSize,
+		&support, &t.ETag, &t.LastModified, &t.DigestAlgorithm, &t.Digest,
+		&alloc, &t.ChunkCount, &t.MinChunkSize,
 		&cp, &rg, &t.Status, &t.AuthData,
-		&t.ErrorMessage, &t.CreatedAt, &t.UpdatedAt, &completedAtNS, &t.BTFile)
+		&t.ErrorMessage, &t.ErrorKind, &t.CreatedAt, &t.UpdatedAt, &completedAtNS, &t.BTFile)
 	if err != nil {
 		return nil, err
 	}
@@ -792,8 +897,13 @@ type Settings struct {
 	ProxyMode      protocol.ProxyMode
 
 	// ProxyURL 是 Manual 模式下使用的代理地址；其他模式忽略。
-	ProxyURL    string
-	ProxyBypass string
+	ProxyURL           string
+	ProxyBypass        string
+	ProxyAutoConfigURL string
+
+	// DownloadLimitKiB 是所有 HTTP/HTTPS/WebDAV/FTP 任务共享的下载
+	// 限速（KiB/s）；0 表示不限速。BT 使用独立的 BTDownloadLimitKiB。
+	DownloadLimitKiB int
 
 	// LightMode 为 true 时，关闭主窗口会同时销毁窗口内的 widget 树，
 	// 释放任务行、磁盘条等占用的内存，仅保留调度器和系统托盘。
@@ -938,6 +1048,8 @@ func (s *Store) LoadSettingsEx() (Settings, bool, error) {
 		proxyMode       string
 		proxyURL        string
 		proxyBypass     string
+		proxyPACURL     string
+		downloadLimit   int
 		lightMode       int
 		maxConc         int
 		autoStart       int
@@ -957,6 +1069,7 @@ func (s *Store) LoadSettingsEx() (Settings, bool, error) {
 	err := s.db.QueryRow(`SELECT default_save_dir, default_threads, min_chunk_size,
 		user_agent, cookies, ftp_passive, prealloc, task_sort,
 		COALESCE(proxy_mode, ''), COALESCE(proxy_url, ''), COALESCE(proxy_bypass, ''),
+		COALESCE(proxy_pac_url, ''), COALESCE(download_limit, 0),
 		COALESCE(light_mode, 1),
 		COALESCE(max_concurrent, 0),
 		COALESCE(auto_start, 0),
@@ -974,7 +1087,8 @@ func (s *Store) LoadSettingsEx() (Settings, bool, error) {
 		COALESCE(initialized, 0)
 		FROM settings WHERE id=1`,
 	).Scan(&saveDir, &threads, &minChunk, &ua, &cookies, &passive, &prealloc, &taskSort,
-		&proxyMode, &proxyURL, &proxyBypass, &lightMode, &maxConc, &autoStart, &language,
+		&proxyMode, &proxyURL, &proxyBypass, &proxyPACURL, &downloadLimit,
+		&lightMode, &maxConc, &autoStart, &language,
 		&btPort, &btMaxPeers, &btDlLimit, &btUlLimit, &btDHT, &btPEX, &btSeedRatio, &btMaxSeeding, &btMaxConcurrent, &btTrackers,
 		&initialized)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -1012,15 +1126,17 @@ func (s *Store) LoadSettingsEx() (Settings, bool, error) {
 		}
 	}
 	return Settings{
-		DefaultSaveDir: saveDir,
-		DefaultThreads: threads,
-		MinChunkSize:   minChunk,
-		UserAgent:      ua,
-		Cookies:        cookies,
-		FTPPassive:     passive != 0,
-		Prealloc:       prealloc != 0,
-		TaskSort:       TaskSort(taskSort),
-		ProxyMode:      mode,
+		DefaultSaveDir:     saveDir,
+		DefaultThreads:     threads,
+		MinChunkSize:       minChunk,
+		UserAgent:          ua,
+		Cookies:            cookies,
+		FTPPassive:         passive != 0,
+		Prealloc:           prealloc != 0,
+		TaskSort:           TaskSort(taskSort),
+		ProxyMode:          mode,
+		ProxyAutoConfigURL: proxyPACURL,
+		DownloadLimitKiB:   downloadLimit,
 		// light_mode 列缺省值为 1（轻量模式为新用户的默认）；
 		// 老数据库在迁移后会得到这个缺省，无需特别处理。
 		LightMode: lightMode != 0,
@@ -1057,11 +1173,12 @@ func (s *Store) SaveSettings(s2 Settings) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO settings (id, default_save_dir, default_threads,
 		min_chunk_size, user_agent, cookies, ftp_passive, prealloc, task_sort,
-		proxy_mode, proxy_url, proxy_bypass, light_mode, max_concurrent, auto_start,
+		proxy_mode, proxy_url, proxy_bypass, proxy_pac_url, download_limit,
+		light_mode, max_concurrent, auto_start,
 		language, bt_port, bt_max_peers, bt_download_limit, bt_upload_limit,
 		bt_dht, bt_pex, bt_seeding, bt_seed_ratio, bt_max_seeding, bt_max_concurrent, bt_trackers,
 		initialized)
-	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+	VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
 	ON CONFLICT(id) DO UPDATE SET
 			default_save_dir=excluded.default_save_dir,
 			default_threads=excluded.default_threads,
@@ -1074,6 +1191,8 @@ func (s *Store) SaveSettings(s2 Settings) error {
 			proxy_mode=excluded.proxy_mode,
 			proxy_url=excluded.proxy_url,
 			proxy_bypass=excluded.proxy_bypass,
+			proxy_pac_url=excluded.proxy_pac_url,
+			download_limit=excluded.download_limit,
 			light_mode=excluded.light_mode,
 			max_concurrent=excluded.max_concurrent,
 			auto_start=excluded.auto_start,
@@ -1094,6 +1213,7 @@ func (s *Store) SaveSettings(s2 Settings) error {
 		s2.UserAgent, s2.Cookies, boolToInt(s2.FTPPassive), boolToInt(s2.Prealloc),
 		string(s2.TaskSort),
 		string(protocol.ProxyMode(s2.ProxyMode).String()), s2.ProxyURL, s2.ProxyBypass,
+		s2.ProxyAutoConfigURL, s2.DownloadLimitKiB,
 		boolToInt(s2.LightMode),
 		s2.MaxConcurrent,
 		boolToInt(s2.AutoStart),

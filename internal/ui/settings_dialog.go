@@ -37,6 +37,7 @@ const (
 	maxBTConcurrent = 64
 	maxBTSeeding    = 64
 	maxBTPeers      = 1000
+	maxDownloadKiB  = 10 * 1024 * 1024
 )
 
 // GlobalSettings 是 UI 侧持有的设置镜像，供“新建任务”预填、状态栏
@@ -158,6 +159,18 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		}
 	}
 
+	httpLimitEntry := widget.NewEntry()
+	httpLimitEntry.SetText(fmt.Sprintf("%d", GlobalSettings.DownloadLimitKiB))
+	httpLimitEntry.SetPlaceHolder(ilocale.T("settings.downloadLimit.placeholder"))
+	httpLimitEntry.OnChanged = func(s string) {
+		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n >= 0 && n <= maxDownloadKiB {
+			GlobalSettings.DownloadLimitKiB = n
+			persist()
+		}
+	}
+	httpLimitRow := container.NewBorder(nil, nil, nil,
+		widget.NewLabel(ilocale.T("settings.downloadLimitUnit")), httpLimitEntry)
+
 	// 代理相关控件
 	proxyURLEntry := widget.NewEntry()
 	proxyURLEntry.SetText(GlobalSettings.ProxyURL)
@@ -172,6 +185,13 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	proxyBypassEntry.SetPlaceHolder(ilocale.T("settings.proxyBypass.placeholder"))
 	proxyBypassEntry.OnChanged = func(s string) {
 		GlobalSettings.ProxyBypass = strings.TrimSpace(s)
+		persist()
+	}
+	pacURLEntry := widget.NewEntry()
+	pacURLEntry.SetText(GlobalSettings.ProxyAutoConfigURL)
+	pacURLEntry.SetPlaceHolder(ilocale.T("settings.proxyPAC.placeholder"))
+	pacURLEntry.OnChanged = func(s string) {
+		GlobalSettings.ProxyAutoConfigURL = strings.TrimSpace(s)
 		persist()
 	}
 
@@ -197,12 +217,18 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		}
 		GlobalSettings.ProxyMode = mode
 		manual := mode == protocol.ProxyModeManual
+		system := mode == protocol.ProxyModeSystem
 		if manual {
 			proxyURLEntry.Show()
 			proxyBypassEntry.Show()
 		} else {
 			proxyURLEntry.Hide()
 			proxyBypassEntry.Hide()
+		}
+		if system {
+			pacURLEntry.Show()
+		} else {
+			pacURLEntry.Hide()
 		}
 		persist()
 	})
@@ -214,6 +240,9 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	if initialMode != protocol.ProxyModeManual {
 		proxyURLEntry.Hide()
 		proxyBypassEntry.Hide()
+	}
+	if initialMode != protocol.ProxyModeSystem {
+		pacURLEntry.Hide()
 	}
 
 	ftpPassive := widget.NewCheck(ilocale.T("settings.ftp.pasv"), func(checked bool) {
@@ -444,6 +473,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		widget.NewFormItem(ilocale.T("settings.label.saveDir"), container.NewBorder(nil, nil, nil, browseBtn, dirEntry)),
 		widget.NewFormItem(ilocale.T("settings.label.threads"), threadsEntry),
 		widget.NewFormItem(ilocale.T("settings.label.maxConcurrent"), maxConcEntry),
+		widget.NewFormItem(ilocale.T("settings.label.downloadLimit"), httpLimitRow),
 		widget.NewFormItem(ilocale.T("settings.label.minChunk"), chunkSizeRow),
 		widget.NewFormItem(ilocale.T("settings.label.ftp"), ftpPassive),
 		widget.NewFormItem(ilocale.T("settings.label.prealloc"), prealloc),
@@ -452,6 +482,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		widget.NewFormItem(ilocale.T("settings.label.ua"), uaEntry),
 		widget.NewFormItem(ilocale.T("settings.label.cookies"), cookiesEntry),
 		widget.NewFormItem(ilocale.T("settings.label.proxyMode"), proxyModeSelect),
+		widget.NewFormItem(ilocale.T("settings.label.proxyPAC"), pacURLEntry),
 		widget.NewFormItem(ilocale.T("settings.label.proxyURL"), proxyURLEntry),
 		widget.NewFormItem(ilocale.T("settings.label.proxyBypass"), proxyBypassEntry),
 	)
@@ -563,7 +594,6 @@ func diskSpaceAt(path string) string {
 		"Total": formatBytes(total),
 	})
 }
-
 
 // formatRemainingTime 将剩余秒数渲染为简短的中文字符串。
 func formatRemainingTime(secs int) string {

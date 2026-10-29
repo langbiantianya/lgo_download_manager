@@ -65,9 +65,10 @@ func ParseProxyMode(s string) ProxyMode {
 // 读写由 SetProxyConfig / GetProxyConfig 提供，并允许设置页与正在
 // 下载的请求并发访问。
 type ProxyConfig struct {
-	Mode        ProxyMode // 代理模式：System / Disabled / Manual
-	ProxyURL    string    // 仅在 Mode == Manual 时生效
-	ProxyBypass string    // 始终生效（即便走系统/直连路径）
+	Mode               ProxyMode // 代理模式：System / Disabled / Manual
+	ProxyURL           string    // 仅在 Mode == Manual 时生效
+	ProxyBypass        string    // 始终生效（即便走系统/直连路径）
+	ProxyAutoConfigURL string    // System 模式下显式 PAC URL 或 "wpad"
 }
 
 var (
@@ -97,7 +98,8 @@ func GetProxyConfig() ProxyConfig {
 // 采用全局模式；最终得到的模式决定 ProxyURL/ProxyBypass 的解释方式。
 func effectiveAuth(auth AuthOptions) AuthOptions {
 	global := GetProxyConfig()
-	if auth.ProxyMode != 0 || strings.TrimSpace(auth.ProxyURL) != "" || strings.TrimSpace(auth.ProxyBypass) != "" {
+	if auth.ProxyMode != 0 || strings.TrimSpace(auth.ProxyURL) != "" ||
+		strings.TrimSpace(auth.ProxyBypass) != "" || strings.TrimSpace(auth.ProxyAutoConfigURL) != "" {
 		if auth.ProxyMode == 0 {
 			auth.ProxyMode = global.Mode
 		}
@@ -107,11 +109,15 @@ func effectiveAuth(auth AuthOptions) AuthOptions {
 		if strings.TrimSpace(auth.ProxyBypass) == "" {
 			auth.ProxyBypass = global.ProxyBypass
 		}
+		if strings.TrimSpace(auth.ProxyAutoConfigURL) == "" {
+			auth.ProxyAutoConfigURL = global.ProxyAutoConfigURL
+		}
 		return auth
 	}
 	auth.ProxyMode = global.Mode
 	auth.ProxyURL = global.ProxyURL
 	auth.ProxyBypass = global.ProxyBypass
+	auth.ProxyAutoConfigURL = global.ProxyAutoConfigURL
 	return auth
 }
 
@@ -172,7 +178,8 @@ func proxyFunc(opt AuthOptions) func(*http.Request) (*url.URL, error) {
 		// System 模式：先看 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY，
 		// 再回退到桌面会话的代理设置。用户 bypass 与系统 bypass 会合并。
 		return func(req *http.Request) (*url.URL, error) {
-			return systemProxyCall(req, bypassRaw)
+			pacOverride := strings.TrimSpace(opt.ProxyAutoConfigURL)
+			return systemProxyCall(req, bypassRaw, pacOverride)
 		}
 	}
 }
@@ -180,12 +187,20 @@ func proxyFunc(opt AuthOptions) func(*http.Request) (*url.URL, error) {
 // systemProxyCall 按请求解析系统代理。环境变量配置了当前协议的代理时
 // 以环境为准；若当前请求被 NO_PROXY 命中，不会错误地继续落到桌面代理。
 // 环境没有该协议的代理时才读取桌面会话设置。
-func systemProxyCall(req *http.Request, configuredBypass string) (*url.URL, error) {
+func systemProxyCall(req *http.Request, configuredBypass string, pacOverride ...string) (*url.URL, error) {
 	env := environmentProxyConfig()
 	env.NoProxy = joinNoProxy(env.NoProxy, configuredBypass)
 	env.CGI = false
 	if bypassesHost(req.URL, env.NoProxy) {
 		return nil, nil
+	}
+	override := ""
+	if len(pacOverride) > 0 {
+		override = strings.TrimSpace(pacOverride[0])
+	}
+	if override != "" {
+		// 用户显式填写的 PAC 比进程环境变量更具体，优先执行。
+		return resolvePACForRequest(req, override, nil)
 	}
 	envFn := env.ProxyFunc()
 	u, err := envFn(req.URL)
@@ -199,18 +214,21 @@ func systemProxyCall(req *http.Request, configuredBypass string) (*url.URL, erro
 	}
 
 	system := cachedSystemProxy()
-	if system == nil {
+	if system != nil && bypassesHost(req.URL, joinNoProxy(system.noProxy, env.NoProxy)) {
 		return nil, nil
 	}
-	cfg := &httpproxy.Config{
-		HTTPProxy:  system.httpProxy,
-		HTTPSProxy: system.httpsProxy,
-		NoProxy:    joinNoProxy(system.noProxy, env.NoProxy),
+	if system != nil && (system.httpProxy != "" || system.httpsProxy != "") {
+		cfg := &httpproxy.Config{
+			HTTPProxy:  system.httpProxy,
+			HTTPSProxy: system.httpsProxy,
+			NoProxy:    joinNoProxy(system.noProxy, env.NoProxy),
+		}
+		if bypassesHost(req.URL, cfg.NoProxy) {
+			return nil, nil
+		}
+		return cfg.ProxyFunc()(req.URL)
 	}
-	if bypassesHost(req.URL, cfg.NoProxy) {
-		return nil, nil
-	}
-	return cfg.ProxyFunc()(req.URL)
+	return resolvePACForRequest(req, "", system)
 }
 
 // HTTPProxyFunc 返回一个可直接赋给 http.Transport.Proxy 或
@@ -240,6 +258,8 @@ type systemProxySnapshot struct {
 	httpProxy  string
 	httpsProxy string
 	noProxy    string
+	pacURL     string
+	wpads      bool
 }
 
 var (
@@ -264,12 +284,12 @@ func cachedSystemProxy() *systemProxySnapshot {
 	if ok {
 		httpProxy := cfg.ProxyForScheme("http")
 		httpsProxy := cfg.ProxyForScheme("https")
-		if httpProxy != "" || httpsProxy != "" {
-			systemProxyValue = &systemProxySnapshot{
-				httpProxy:  httpProxy,
-				httpsProxy: httpsProxy,
-				noProxy:    cfg.Bypass,
-			}
+		systemProxyValue = &systemProxySnapshot{
+			httpProxy:  httpProxy,
+			httpsProxy: httpsProxy,
+			noProxy:    cfg.Bypass,
+			pacURL:     cfg.AutoConfigURL,
+			wpads:      cfg.AutoDiscover,
 		}
 	}
 	systemProxyExpires = time.Now().Add(systemProxyCacheTTL)

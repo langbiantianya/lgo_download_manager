@@ -23,6 +23,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"lgo_download_manager/internal/prealloc"
 	"lgo_download_manager/internal/protocol"
 )
@@ -242,9 +244,10 @@ func TestPlanFileAboveMinChunkSize(t *testing.T) {
 			wantChunks: 4,
 		},
 		{
-			// 10 MiB / 2 MiB min = 5，ChunkCount=4 限制为 4
+			// 10 MiB / 2 MiB min = 5；每个 worker 可偷取 4 个逻辑切片，
+			// 因此 5 个自然切片全部保留。
 			name: "10MiB_min2MiB_chunk4_cap", total: 10 * oneMiB, minChunk: 2 * oneMiB, chunkCount: 4,
-			wantChunks: 4,
+			wantChunks: 5,
 		},
 		{
 			// 9 MiB / 3 MiB min = 3，ChunkCount=10 不限制
@@ -257,9 +260,9 @@ func TestPlanFileAboveMinChunkSize(t *testing.T) {
 			wantChunks: 4,
 		},
 		{
-			// 20 MiB / 1 MiB min = 20，ChunkCount=4 上限为 4
+			// 20 MiB / 1 MiB min = 20；最多 4 workers × 4 个逻辑切片。
 			name: "20MiB_min1MiB_chunk4_cap", total: 20 * oneMiB, minChunk: 1 * oneMiB, chunkCount: 4,
-			wantChunks: 4,
+			wantChunks: 16,
 		},
 		{
 			// 单 chunk：文件等于 MinChunkSize
@@ -385,15 +388,41 @@ func TestPlanLargeFile(t *testing.T) {
 	const giB = int64(1 << 30)
 	job := makeJob(giB, Options{MinChunkSize: 8 << 20, ChunkCount: 16})
 	cs := chunksOf(job)
-	// 1 GiB / 8 MiB = 128，ChunkCount=16 不限制
-	if len(cs) != 16 {
-		t.Fatalf("got %d chunks, want 128", len(cs))
+	// 1 GiB / 8 MiB = 128；16 workers × 4 个可偷取切片 = 64。
+	if len(cs) != 64 {
+		t.Fatalf("got %d chunks, want 64", len(cs))
 	}
 	if cs[0].Start != 0 {
 		t.Fatalf("first start=%d, want 0", cs[0].Start)
 	}
 	if cs[len(cs)-1].End != giB-1 {
 		t.Fatalf("last end=%d, want %d", cs[len(cs)-1].End, giB-1)
+	}
+}
+
+func TestReplanPreservesWorkStealingChunksAndProgress(t *testing.T) {
+	job := makeJob(20*oneMiB, Options{MinChunkSize: oneMiB, ChunkCount: 4})
+	before := chunksOf(job)
+	if len(before) != 16 {
+		t.Fatalf("initial chunks = %d, want 16", len(before))
+	}
+	job.mu.Lock()
+	atomic.StoreInt64(&job.chunks[3].progress, job.chunks[3].start+12345)
+	job.mu.Unlock()
+
+	ranges := job.replan()
+	after := chunksOf(job)
+	if len(after) != len(before) || len(ranges) != 2*len(before) {
+		t.Fatalf("replan chunks=%d ranges=%d, want %d/%d", len(after), len(ranges), len(before), 2*len(before))
+	}
+	if after[3].Progress != before[3].Start+12345 {
+		t.Fatalf("chunk 3 progress=%d, want %d", after[3].Progress, before[3].Start+12345)
+	}
+	for i := range after {
+		if after[i].Start != before[i].Start || after[i].End != before[i].End {
+			t.Fatalf("chunk %d moved from [%d,%d] to [%d,%d]", i,
+				before[i].Start, before[i].End, after[i].Start, after[i].End)
+		}
 	}
 }
 
@@ -1086,5 +1115,17 @@ func TestWaitRetryCancelsPromptly(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > time.Second {
 		t.Fatalf("waitRetry took %v after cancellation", elapsed)
+	}
+}
+
+func TestJobThrottleAppliesSharedLimiter(t *testing.T) {
+	limiter := rate.NewLimiter(rate.Limit(64*1024), 16*1024)
+	job := &Job{opts: Options{RateLimiter: limiter}}
+	start := time.Now()
+	if err := job.throttle(context.Background(), 48*1024); err != nil {
+		t.Fatal(err)
+	}
+	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
+		t.Fatalf("48 KiB at 64 KiB/s completed in %v; limiter was bypassed", elapsed)
 	}
 }

@@ -20,6 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/time/rate"
+
 	"lgo_download_manager/internal/protocol"
 )
 
@@ -48,6 +50,9 @@ type Options struct {
 	// (例如当服务器不支持字节区间时,引擎回退到单个流式分片)。
 	// 该回调以新的 [start0,end0,start1,end1,...] 区间对作为参数调用。
 	OnPlanChanged func(ranges []int64)
+	// RateLimiter 是所有 HTTP/FTP 任务共享的下载限速器。限速在已读取
+	// 数据写入后、进度上报前执行，通过阻塞 protocol 回调形成背压。
+	RateLimiter *rate.Limiter
 	// Logger 是 engine 内部的诊断输出通道(分片重规划/错误等);
 	// 业务侧应传 internal/logging.L() 以统一进入 lgdm 日志系统。
 	// 留空时静默,不向任何 handler 写。
@@ -88,6 +93,11 @@ type Job struct {
 }
 
 const oneMiB = 1 << 20
+
+// workStealingPartsPerWorker 为每个并发 worker 规划多个逻辑切片。
+// 单个连接变慢时，先完成的 worker 会直接领取后续切片，而不是陪慢连接
+// 等同一个大区间。实际并发仍由 ChunkCount 限制。
+const workStealingPartsPerWorker = 4
 
 type chunk struct {
 	idx      int
@@ -132,7 +142,17 @@ func (j *Job) planLocked() {
 		for i := 0; i+1 < len(j.opts.ChunkSizes); i += 2 {
 			start := j.opts.ChunkSizes[i]
 			end := j.opts.ChunkSizes[i+1]
-			j.chunks = append(j.chunks, chunk{idx: i / 2, start: start, end: end, progress: start})
+			progress := start
+			if i/2 < len(j.opts.ResumeFrom) {
+				progress += j.opts.ResumeFrom[i/2]
+				if progress < start {
+					progress = start
+				}
+				if progress > end {
+					progress = end + 1
+				}
+			}
+			j.chunks = append(j.chunks, chunk{idx: i / 2, start: start, end: end, progress: progress})
 		}
 		return
 	}
@@ -194,8 +214,16 @@ func (j *Job) planLocked() {
 	if j.total%j.opts.MinChunkSize != 0 {
 		n++
 	}
-	if j.chunkCount > 0 && n > j.chunkCount {
-		n = j.chunkCount
+	logicalLimit := max(j.chunkCount, 1) * workStealingPartsPerWorker
+	// 兼容旧版本任务：没有持久化 ChunkRanges 时，历史 ChunkProgress
+	// 是按 ChunkCount 个等分块记录的。此时保持旧切分，避免把偏移套到
+	// 另一套边界上；新任务以及已有范围快照仍使用可在 worker 间偷取的
+	// 细粒度逻辑切片。
+	if len(j.opts.ResumeFrom) > 0 {
+		logicalLimit = max(j.chunkCount, 1)
+	}
+	if n > logicalLimit {
+		n = logicalLimit
 	}
 	if n < 1 {
 		n = 1
@@ -276,16 +304,19 @@ func (j *Job) replan() []int64 {
 	j.mu.Lock()
 	defer j.mu.Unlock()
 	resume := make([]int64, len(j.chunks))
+	ranges := make([]int64, 0, 2*len(j.chunks))
 	for i := range j.chunks {
 		d := atomic.LoadInt64(&j.chunks[i].progress) - j.chunks[i].start
 		if d < 0 {
 			d = 0
 		}
 		resume[i] = d
+		ranges = append(ranges, j.chunks[i].start, j.chunks[i].end)
 	}
+	j.opts.ChunkSizes = ranges
 	j.opts.ResumeFrom = resume
 	j.planLocked()
-	ranges := make([]int64, 0, 2*len(j.chunks))
+	ranges = ranges[:0]
 	for i := range j.chunks {
 		ranges = append(ranges, j.chunks[i].start, j.chunks[i].end)
 	}
@@ -640,12 +671,20 @@ func (j *Job) downloadChunk(ctx context.Context, idx int, bytesDone *atomic.Int6
 		}
 
 		chunkCtx, cancel := context.WithCancel(ctx)
+		var throttleErr error
 		err := j.driver.DownloadChunk(chunkCtx, start, c.end, j.dest, func(n int) {
+			if throttleErr = j.throttle(chunkCtx, n); throttleErr != nil {
+				cancel()
+				return
+			}
 			bytesDone.Add(int64(n))
 			atomic.AddInt64(&c.progress, int64(n))
 			emit(idx)
 		})
 		cancel()
+		if throttleErr != nil {
+			err = throttleErr
+		}
 		if err == nil && atomic.LoadInt64(&c.progress) <= c.end {
 			err = fmt.Errorf("chunk stopped at %d, want through %d: %w",
 				atomic.LoadInt64(&c.progress)-1, c.end, protocol.ErrUnexpectedEOF)
@@ -709,11 +748,21 @@ func downloadFallbackWithRetry(ctx context.Context, j *Job, c *chunk, bytesDone 
 			return ctx.Err()
 		}
 		start := atomic.LoadInt64(&c.progress)
-		err := j.driver.DownloadFallback(ctx, start, j.dest, func(n int) {
+		readCtx, readCancel := context.WithCancel(ctx)
+		var throttleErr error
+		err := j.driver.DownloadFallback(readCtx, start, j.dest, func(n int) {
+			if throttleErr = j.throttle(readCtx, n); throttleErr != nil {
+				readCancel()
+				return
+			}
 			bytesDone.Add(int64(n))
 			atomic.AddInt64(&c.progress, int64(n))
 			emit(chunkIdx)
 		})
+		readCancel()
+		if throttleErr != nil {
+			err = throttleErr
+		}
 		if errors.Is(err, protocol.ErrResumeUnavailable) {
 			delta := atomic.LoadInt64(&c.progress) - c.start
 			if delta > 0 {
@@ -752,6 +801,27 @@ func downloadFallbackWithRetry(ctx context.Context, j *Job, c *chunk, bytesDone 
 			backoff = 30 * time.Second
 		}
 	}
+}
+
+// throttle 在当前任务共享限速器上等待 n 个字节的令牌。rate.Limiter
+// 要求单次 WaitN 不超过 burst；这里按 burst 拆分，调用方无需关心设置。
+func (j *Job) throttle(ctx context.Context, n int) error {
+	limiter := j.opts.RateLimiter
+	if limiter == nil || n <= 0 || limiter.Limit() == rate.Inf {
+		return nil
+	}
+	burst := limiter.Burst()
+	if burst <= 0 {
+		return nil
+	}
+	for n > 0 {
+		step := min(n, burst)
+		if err := limiter.WaitN(ctx, step); err != nil {
+			return err
+		}
+		n -= step
+	}
+	return nil
 }
 
 // retryDelay 优先遵循服务端的 Retry-After；没有提示时使用带抖动的

@@ -45,13 +45,13 @@ func main() {
 }
 
 type session struct {
-	mu          sync.Mutex
-	loggedIn    bool
-	renameFrom  string
-	restOffset  int64
-	currentPath string
-	dataConn    net.Conn
-	dataReady   *sync.Cond
+	mu           sync.Mutex
+	loggedIn     bool
+	renameFrom   string
+	restOffset   int64
+	currentPath  string
+	dataConn     net.Conn
+	dataReady    *sync.Cond
 	dataListener net.Listener
 }
 
@@ -97,7 +97,7 @@ func handleConn(conn net.Conn) {
 		case strings.HasPrefix(code, "SYST"):
 			fmt.Fprintf(writer, "215 UNIX Type: L8\r\n")
 		case strings.HasPrefix(code, "FEAT"):
-			fmt.Fprintf(writer, "211-Features:\r\n REST\r\n211 End\r\n")
+			fmt.Fprintf(writer, "211-Features:\r\n REST\r\n MDTM\r\n211 End\r\n")
 		case strings.HasPrefix(code, "TYPE"):
 			fmt.Fprintf(writer, "200 Type set to I\r\n")
 		case strings.HasPrefix(code, "PWD"), cmd == "XPWD":
@@ -265,6 +265,24 @@ func handleConn(conn net.Conn) {
 				continue
 			}
 			fmt.Fprintf(writer, "213 %d\r\n", info.Size())
+		case strings.HasPrefix(code, "MDTM"):
+			s.mu.Lock()
+			if !s.loggedIn {
+				s.mu.Unlock()
+				fmt.Fprintf(writer, "530 Not logged in.\r\n")
+				continue
+			}
+			path := strings.TrimSpace(line[5:])
+			s.mu.Unlock()
+			if strings.HasPrefix(path, "/") {
+				path = path[1:]
+			}
+			info, err := os.Stat(filepath.Join(rootDir, path))
+			if err != nil {
+				fmt.Fprintf(writer, "550 Could not get file time.\r\n")
+				continue
+			}
+			fmt.Fprintf(writer, "213 %s\r\n", info.ModTime().UTC().Format("20060102150405"))
 		case strings.HasPrefix(code, "REST"):
 			s.mu.Lock()
 			offset, _ := strconv.ParseInt(strings.TrimSpace(line[5:]), 10, 64)

@@ -16,15 +16,21 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // chunkSize 是将响应体字节流式写入磁盘时使用的读取缓冲区大小。
 // 256 KiB 在顺序吞吐与系统调用开销之间取得较好的折中。
 const (
-	chunkSize          = 256 * 1024
-	maxHTTPConnections = 64
+	chunkSize               = 256 * 1024
+	maxHTTPConnections      = 64
+	defaultBodyStallTimeout = 60 * time.Second
 )
+
+// bodyStallTimeout 可在测试中缩短；生产环境允许 60 秒完全没有新字节，
+// 足以容忍慢速链路和代理抖动，同时避免半开连接永久占用分片。
+var bodyStallTimeout = defaultBodyStallTimeout
 
 // bufPool 复用 chunkSize 大小的读缓冲。每个 DownloadChunk /
 // DownloadFallback（以及引擎的每一次重试）都需要一块这样的缓冲，
@@ -71,6 +77,7 @@ type transportKey struct {
 	proxyMode   ProxyMode
 	proxyURL    string
 	proxyBypass string
+	proxyPACURL string
 }
 
 type pooledTransport struct {
@@ -123,6 +130,7 @@ func acquireHTTPTransport(rawAuth AuthOptions) (*http.Transport, *transportLease
 		proxyMode:   auth.ProxyMode,
 		proxyURL:    strings.TrimSpace(auth.ProxyURL),
 		proxyBypass: strings.TrimSpace(auth.ProxyBypass),
+		proxyPACURL: strings.TrimSpace(auth.ProxyAutoConfigURL),
 	}
 	now := time.Now()
 
@@ -270,6 +278,21 @@ func captureValidators(caps *DriverCapabilities, header http.Header) {
 	caps.LastModified = strings.TrimSpace(header.Get("Last-Modified"))
 }
 
+func captureDigest(caps *DriverCapabilities, header http.Header) {
+	alg, digest := ParseDigestHeader(
+		header.Get("Content-Digest"),
+		header.Get("Repr-Digest"),
+		header.Get("Digest"),
+	)
+	if alg == "" {
+		if legacyMD5 := strings.TrimSpace(header.Get("Content-MD5")); legacyMD5 != "" {
+			alg, digest = "md5", legacyMD5
+		}
+	}
+	caps.DigestAlgorithm = alg
+	caps.Digest = digest
+}
+
 // newHTTPStatusError 把响应状态和 Retry-After 一起传给引擎，避免 429/503
 // 只能按固定指数退避撞服务器。
 func newHTTPStatusError(action string, resp *http.Response) error {
@@ -340,7 +363,9 @@ func (d *httpBase) DownloadChunk(ctx context.Context, start, end int64, file *os
 	}
 
 	off := start
-	n, err := copyResponseBody(resp.Body, file, off, expected, onData)
+	body := newBodyStallGuard(ctx, resp.Body, bodyStallTimeout)
+	defer body.Close()
+	n, err := copyResponseBody(body, file, off, expected, onData)
 	if err != nil {
 		return fmt.Errorf("%s chunk read: %w", d.kind, err)
 	}
@@ -393,7 +418,9 @@ func (d *httpBase) DownloadFallback(ctx context.Context, offset int64, file *os.
 		return newHTTPStatusError(d.kind+" fallback", resp)
 	}
 
-	n, err := copyResponseBody(resp.Body, file, writeOffset, -1, onData)
+	body := newBodyStallGuard(ctx, resp.Body, bodyStallTimeout)
+	defer body.Close()
+	n, err := copyResponseBody(body, file, writeOffset, -1, onData)
 	if err != nil {
 		return fmt.Errorf("%s fallback read: %w", d.kind, err)
 	}
@@ -436,6 +463,58 @@ func copyResponseBody(r io.Reader, file *os.File, off, limit int64, onData func(
 		}
 	}
 	return written, nil
+}
+
+// bodyStallGuard 同时监听响应体空闲时长和调用方 context。Read 阻塞时
+// 无法靠循环里的 select 检查定时器，因此定时器触发后会取消请求并关闭
+// body，把阻塞 Read 唤醒；任何成功读到的字节都会重置计时器。
+type bodyStallGuard struct {
+	body    io.ReadCloser
+	cancel  context.CancelFunc
+	timer   *time.Timer
+	timeout time.Duration
+	stalled atomic.Bool
+	reading atomic.Bool
+}
+
+func newBodyStallGuard(parent context.Context, body io.ReadCloser, timeout time.Duration) *bodyStallGuard {
+	_, cancel := context.WithCancel(parent)
+	g := &bodyStallGuard{body: body, cancel: cancel, timeout: timeout}
+	if timeout > 0 {
+		g.timer = time.AfterFunc(timeout, func() {
+			// 数据处理、磁盘写入和限速等待不属于“网络响应停滞”。
+			// 定时器在调用方处理上一块数据时到期，只放弃这一轮计时；
+			// 下一次 Read 会重新启动。
+			if !g.reading.CompareAndSwap(true, false) {
+				return
+			}
+			g.stalled.Store(true)
+			cancel()
+			_ = body.Close()
+		})
+	}
+	return g
+}
+
+func (g *bodyStallGuard) Read(p []byte) (int, error) {
+	if g.timer != nil && !g.stalled.Load() {
+		g.timer.Reset(g.timeout)
+	}
+	g.reading.Store(true)
+	n, err := g.body.Read(p)
+	g.reading.Store(false)
+	if g.stalled.Load() {
+		return n, ErrBodyStalled
+	}
+	return n, err
+}
+
+func (g *bodyStallGuard) Close() error {
+	if g.timer != nil {
+		g.timer.Stop()
+	}
+	g.cancel()
+	return g.body.Close()
 }
 
 // Close 归还共享 Transport 引用。可以重复调用。
@@ -496,6 +575,7 @@ func (d *httpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 		TotalSize:    parseInt64(resp.Header.Get("Content-Length")),
 	}
 	captureValidators(caps, resp.Header)
+	captureDigest(caps, resp.Header)
 	// 用最小的实际 Range GET 验证能力。部分服务器会错误声明
 	// Accept-Ranges，或由代理吞掉 Range；仅看 HEAD 头不足以保证安全。
 	rangeCaps, rangeErr := d.probeWithRange(ctx)
@@ -517,6 +597,8 @@ func (d *httpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	if rangeCaps.LastModified != "" {
 		caps.LastModified = rangeCaps.LastModified
 	}
+	// 只有 HEAD 的 200 响应才可信地代表完整表示摘要。1 字节 Range
+	// 响应上的 Content-Digest 可能只是该分片的摘要，不能用于整文件校验。
 	d.setValidators(caps.ETag, caps.LastModified)
 	return caps, nil
 }

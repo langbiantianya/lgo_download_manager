@@ -152,7 +152,7 @@ func pickAvailableBTPort() int {
 func Save(st *store.Store, s store.Settings) error {
 	ApplyProxy(s)
 	if s.ProxyMode == protocol.ProxyModeSystem {
-		protocol.InvalidateSystemProxyCache()
+		protocol.InvalidateProxyCache()
 	}
 	if err := ApplyAutoStart(s.AutoStart); err != nil {
 		// 真实注册失败只记日志:避免 UI 提交整笔失败、
@@ -166,9 +166,10 @@ func Save(st *store.Store, s store.Settings) error {
 // 立即生效。不访问磁盘。
 func ApplyProxy(s store.Settings) {
 	protocol.SetProxyConfig(protocol.ProxyConfig{
-		Mode:        s.ProxyMode,
-		ProxyURL:    s.ProxyURL,
-		ProxyBypass: s.ProxyBypass,
+		Mode:               s.ProxyMode,
+		ProxyURL:           s.ProxyURL,
+		ProxyBypass:        s.ProxyBypass,
+		ProxyAutoConfigURL: s.ProxyAutoConfigURL,
 	})
 }
 

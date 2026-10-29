@@ -57,8 +57,9 @@ func detectGNOME() (Config, bool) {
 	case "manual":
 		return gnomeManual()
 	case "auto":
-		// PAC/WPAD 不在支持范围内；回退到 direct。
-		return Config{Source: "gnome-pac-unsupported"}, true
+		pacURL, _ := gsettingsGet("org.gnome.system.proxy", "autoconfig-url", 5*time.Second)
+		pacURL = stripQuotes(pacURL)
+		return Config{Source: "gnome-pac", AutoConfigURL: pacURL, AutoDiscover: pacURL == ""}, true
 	case "none":
 		return Config{Source: "gnome"}, true
 	default:
@@ -233,8 +234,20 @@ func detectKDE() (Config, bool) {
 		}
 		return cfg, true
 	default:
-		// 2=PAC, 3=WPAD, 4=use env（后者由 httpproxy.FromEnvironment 处理）
-		return Config{}, false
+		switch proxyType {
+		case "2":
+			return Config{
+				Source:        "kde-pac",
+				AutoConfigURL: strings.TrimSpace(section["Proxy Config Script"]),
+			}, true
+		case "3":
+			return Config{Source: "kde-wpad", AutoDiscover: true}, true
+		case "4":
+			// 使用环境变量；上层 httpproxy 已单独处理。
+			return Config{}, false
+		default:
+			return Config{}, false
+		}
 	}
 }
 

@@ -121,6 +121,11 @@ func (d *ftpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 		// 不支持 SIZE 的情况较为罕见；视为未知。
 		caps.TotalSize = -1
 	}
+	// MDTM 是 FTP 唯一的通用内容版本校验器。统一转成 UTC RFC3339，
+	// 确保跨会话和跨服务器时不会因为本地时区/列表格式不同而误判。
+	if modified, err := conn.GetTime(d.path); err == nil {
+		caps.LastModified = modified.UTC().Format(time.RFC3339Nano)
+	}
 	// 探测 RESUME：发送一条 REST 0。jlaffaye/ftp 的 ServerConn 不暴露
 	// 发送裸控制命令的入口（RetrFrom 会顺带拉起数据连接），因此这里
 	// 必须另开一条短控制连接。它带 10s 读写超时，并在本函数返回前

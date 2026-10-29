@@ -18,10 +18,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/time/rate"
 
 	"lgo_download_manager/internal/bittorrent"
 	"lgo_download_manager/internal/engine"
@@ -53,6 +56,10 @@ type Scheduler struct {
 	promoteMu sync.Mutex
 	// prealloc 控制新任务是否在建连前按完整大小预留磁盘空间。
 	prealloc atomic.Bool
+	// downloadLimiter 是 HTTP/HTTPS/WebDAV/FTP 全局限速器。指针在
+	// scheduler 生命周期内保持稳定，设置变化会原地 SetLimit/SetBurst，
+	// 因而运行中的任务也会立即采用新速率。
+	downloadLimiter *rate.Limiter
 
 	// wg 跟踪所有由 startAsync 启动的 per-job goroutine。PauseAll 通过
 	// wg.Wait() 确保每个 job 都已落盘 Paused 后再返回,避免"已 cancel 但
@@ -133,6 +140,9 @@ type runningJob struct {
 	dirty        atomic.Bool
 	status       store.Status
 	lastSnapshot engine.Progress // 用于追赶式刷新
+	// resetProgressOnFail 让摘要不匹配的收尾忽略引擎“所有分片已完成”
+	// 快照，改用调用方已清零的进度，确保下一次 Start 从头下载。
+	resetProgressOnFail bool
 
 	// sess 是任务级会话：engine goroutine 彻底退出（槽位已释放、终态已
 	// 落盘、文件句柄已关闭）后关闭其 done，Cancel/Delete 借此等待写者
@@ -164,6 +174,7 @@ func (rj *runningJob) setError(err error) {
 	}
 	rj.dirtyMu.Lock()
 	rj.task.ErrorMessage = err.Error()
+	rj.task.ErrorKind = protocol.ClassifyError(err).Kind
 	rj.dirtyMu.Unlock()
 }
 
@@ -198,8 +209,31 @@ func New(s *store.Store) *Scheduler {
 			EnablePEX:          true,
 		},
 	}
+	sc.downloadLimiter = rate.NewLimiter(rate.Inf, 1)
 	sc.prealloc.Store(true)
 	return sc
+}
+
+// SetDownloadLimitKiB 设置所有非 BT 任务共享的下载限速；0 表示不限速。
+func (s *Scheduler) SetDownloadLimitKiB(kib int) {
+	s.mu.Lock()
+	limiter := s.downloadLimiter
+	s.mu.Unlock()
+	if limiter == nil {
+		return
+	}
+	if kib <= 0 {
+		limiter.SetLimit(rate.Inf)
+		limiter.SetBurst(1)
+		return
+	}
+	bytesPerSecond := rate.Limit(kib * 1024)
+	burst := int(bytesPerSecond)
+	if burst < 32*1024 {
+		burst = 32 * 1024
+	}
+	limiter.SetBurst(burst)
+	limiter.SetLimit(bytesPerSecond)
 }
 
 // SetPrealloc 把用户的磁盘预分配开关应用到后续 Start。关闭时仍会创建
@@ -252,17 +286,41 @@ func (s *Scheduler) promotePending() {
 	defer s.promoteMu.Unlock()
 
 	s.mu.Lock()
-	limit := s.maxConcurrent
+	free := s.maxConcurrent - len(s.jobs)
+	btsRunning := s.btJobsLocked()
+	btFree := s.effectiveBTMaxConcurrentLocked() - btsRunning
 	s.mu.Unlock()
+	if free <= 0 {
+		return
+	}
+	// 一次只取足够填满当前空闲 slot 的一小批候选。BT 与非 BT 分开取，
+	// 防止队列前部大量 BT 任务在专用名额已满时挡住后面的 HTTP/FTP。
+	batch := max(free*4, 16)
+	if batch > 256 {
+		batch = 256
+	}
 
-	pending, err := s.st.ListTasks(store.FilterPending, store.SortCreatedAsc)
+	httpPending, err := s.st.ListPendingTasksByProtocol(batch, false)
 	if err != nil {
 		return
+	}
+	pending := httpPending
+	if btFree > 0 {
+		btPending, err := s.st.ListPendingTasksByProtocol(min(btFree, free), true)
+		if err == nil && len(btPending) > 0 {
+			pending = append(pending, btPending...)
+			sort.SliceStable(pending, func(i, j int) bool {
+				if pending[i].CreatedAt.Equal(pending[j].CreatedAt) {
+					return pending[i].ID < pending[j].ID
+				}
+				return pending[i].CreatedAt.Before(pending[j].CreatedAt)
+			})
+		}
 	}
 	for _, tk := range pending {
 		s.mu.Lock()
 		_, busy := s.jobs[tk.ID]
-		full := len(s.jobs) >= limit
+		full := len(s.jobs) >= s.maxConcurrent
 		btFull := protocol.ProtocolKind(tk.Protocol) == protocol.ProtoBT &&
 			s.btJobsLocked() >= s.effectiveBTMaxConcurrentLocked()
 		s.mu.Unlock()
@@ -326,7 +384,7 @@ func (s *Scheduler) Add(in AddTaskInput) (*store.Task, error) {
 		ChunkCount:    in.ChunkCount,
 		MinChunkSize:  in.MinChunkSize,
 		Status:        store.TaskStatus.Pending,
-		ChunkProgress: make([]int64, in.ChunkCount),
+		ChunkProgress: []int64{},
 		AuthData:      string(authBlob),
 	}
 	if err := s.st.CreateTask(tk); err != nil {
@@ -500,7 +558,9 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	sourceSizeChanged := tk.TotalSize > 0 && caps.TotalSize > 0 && tk.TotalSize != caps.TotalSize
 	validatorChanged := taskHasResumeState(tk) &&
 		resourceValidatorsChanged(tk.ETag, tk.LastModified, caps.ETag, caps.LastModified)
-	sourceChanged := sourceSizeChanged || validatorChanged || resumeDataMissing
+	digestChanged := taskHasResumeState(tk) &&
+		resourceDigestChanged(tk.DigestAlgorithm, tk.Digest, caps.DigestAlgorithm, caps.Digest)
+	sourceChanged := sourceSizeChanged || validatorChanged || digestChanged || resumeDataMissing
 	// 准备阶段失败统一经过 fail()/releaseSlot,此处继续走预分配/启动 engine 流程。
 	if caps.TotalSize > 0 {
 		metaAllocated := tk.IsAllocated && !sourceChanged
@@ -523,7 +583,7 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		// 新旧版本拼接。把进度清零并删除旧数据，安全地从头下载。
 		tk.IsAllocated = false
 		tk.Downloaded = 0
-		tk.ChunkProgress = make([]int64, tk.ChunkCount)
+		tk.ChunkProgress = []int64{}
 		if err := s.st.UpdateTaskProgress(tk.ID, 0, tk.ChunkProgress, tk.Status, ""); err != nil {
 			_ = driver.Close()
 			s.fail(tk, err)
@@ -547,10 +607,32 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		tk.ETag = caps.ETag
 		tk.LastModified = caps.LastModified
 	}
+	if tk.DigestAlgorithm != "" || tk.Digest != "" || caps.DigestAlgorithm != "" || caps.Digest != "" {
+		if err := s.st.UpdateTaskIntegrity(tk.ID, caps.DigestAlgorithm, caps.Digest); err != nil {
+			_ = driver.Close()
+			s.fail(tk, err)
+			s.releaseSlot(taskID)
+			return
+		}
+		tk.DigestAlgorithm = caps.DigestAlgorithm
+		tk.Digest = caps.Digest
+	}
 
 	// 若尚未预分配文件则进行预分配(恢复场景:文件已具有正确大小)。
 	preallocEnabled := s.prealloc.Load()
 	needAlloc := preallocEnabled && !tk.IsAllocated && caps.TotalSize > 0
+	required := caps.TotalSize
+	if !needAlloc {
+		required -= sumInts(tk.ChunkProgress)
+	}
+	if required > 0 {
+		if err := checkAvailableDiskSpace(downloadPath, required); err != nil {
+			_ = driver.Close()
+			s.fail(tk, err)
+			s.releaseSlot(taskID)
+			return
+		}
+	}
 	if needAlloc {
 		dest, err := prealloc.Preallocate(downloadPath, caps.TotalSize)
 		if err != nil {
@@ -587,11 +669,17 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	// 恢复偏移取自 chunk_progress(每个值表示对应 chunk 已写入的字节数)。
 	resume := make([]int64, len(tk.ChunkProgress))
 	copy(resume, tk.ChunkProgress)
+	var resumeRanges []int64
+	if !sourceChanged && len(tk.ChunkRanges) == 2*len(tk.ChunkProgress) {
+		resumeRanges = tk.ChunkRanges
+	}
 
 	job := engine.NewJob(driver, caps.TotalSize, dest, engine.Options{
 		ChunkCount:    tk.ChunkCount,
+		ChunkSizes:    resumeRanges,
 		MinChunkSize:  tk.MinChunkSize, // 0 表示使用 engine 的默认值
 		ResumeFrom:    resume,
+		RateLimiter:   s.downloadLimiter,
 		ProgressEvery: 250 * time.Millisecond,
 		Progress: func(p engine.Progress) {
 			s.markProgress(tk.ID, p)
@@ -645,12 +733,14 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	rj.dirtyMu.Lock()
 	rj.status = store.TaskStatus.Downloading
 	tk.Status = store.TaskStatus.Downloading
+	tk.ErrorKind = ""
 	startedSnapshot := tk.Clone()
 	rj.dirtyMu.Unlock()
 
 	if err := s.st.UpdateTaskProgress(tk.ID, sumInts(tk.ChunkProgress), tk.ChunkProgress, store.TaskStatus.Downloading, ""); err != nil {
 		// 非致命错误——稍后的批量刷新会追赶上来。
 	}
+	_ = s.st.UpdateTaskErrorKind(tk.ID, "")
 	s.publish(Event{Why: "started", Task: startedSnapshot})
 
 	// 在 goroutine 内同步运行 job;该 goroutine 会一直存活到
@@ -659,6 +749,7 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer job.Close()
 		// rjRef 在整个 goroutine 生命周期内持有运行中 job 的引用,
 		// 以便状态/收尾调用能读取最新的 ChunkProgress。
 		rjRef := rj
@@ -684,6 +775,22 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		}
 		if ctx.Err() != nil {
 			s.markStatusFromJob(tk.ID, store.TaskStatus.Paused, rjRef)
+			return
+		}
+		if err := protocol.VerifyFileDigest(downloadPath, tk.DigestAlgorithm, tk.Digest); err != nil {
+			// 已完整写入但摘要不符，说明现有分片进度不可作为重试起点。
+			// 清空 .part 与内存进度，下一次 Start 会从 0 安全重下，而不是
+			// 立即对同一份损坏文件重复校验。
+			_ = dest.Truncate(0)
+			rjRef.dirtyMu.Lock()
+			tk.Downloaded = 0
+			tk.ChunkProgress = make([]int64, len(rjRef.task.ChunkProgress))
+			rjRef.task.Downloaded = 0
+			rjRef.task.ChunkProgress = append([]int64(nil), tk.ChunkProgress...)
+			rjRef.resetProgressOnFail = true
+			rjRef.dirtyMu.Unlock()
+			rjRef.setError(err)
+			s.markStatusFromJob(tk.ID, store.TaskStatus.Failed, rjRef)
 			return
 		}
 		// Completed 是对用户的持久性承诺。先把数据文件同步到存储设备，
@@ -841,6 +948,22 @@ func resourceValidatorsChanged(oldETag, oldLastModified, newETag, newLastModifie
 		return oldLastModified != newLastModified
 	}
 	return true
+}
+
+// resourceDigestChanged 仅在两侧都对同一算法给出版本时才直接比较；
+// 来源从“有摘要”变为“无摘要”同样视为不可继续拼接。
+func resourceDigestChanged(oldAlg, oldDigest, newAlg, newDigest string) bool {
+	oldAlg = strings.ToLower(strings.TrimSpace(oldAlg))
+	newAlg = strings.ToLower(strings.TrimSpace(newAlg))
+	oldDigest = strings.TrimSpace(oldDigest)
+	newDigest = strings.TrimSpace(newDigest)
+	if oldAlg == "" && oldDigest == "" {
+		return false
+	}
+	if oldAlg != newAlg || oldDigest == "" || newDigest == "" {
+		return true
+	}
+	return oldDigest != newDigest
 }
 
 // migrateLegacyDownloadToPart 把旧版本直接写在最终路径上的部分文件迁移
@@ -1122,6 +1245,7 @@ func (s *Scheduler) ResetTask(taskID string) error {
 	if err := s.st.UpdateTaskProgress(tk.ID, 0, nil, store.TaskStatus.Pending, ""); err != nil {
 		return err
 	}
+	_ = s.st.UpdateTaskErrorKind(tk.ID, "")
 	// 重新获取最新状态的任务用于发布事件
 	tk, _ = s.st.GetTask(taskID)
 	s.publish(Event{Why: "updated", Task: tk})
@@ -1265,7 +1389,10 @@ func (s *Scheduler) markStatusFromJob(taskID string, st store.Status, rj *runnin
 	}
 	// 先取引擎快照，再进 dirtyMu（锁序）。
 	var cs []engine.ChunkSnapshot
-	if rj.job != nil {
+	rj.dirtyMu.Lock()
+	ignoreSnapshot := rj.resetProgressOnFail
+	rj.dirtyMu.Unlock()
+	if rj.job != nil && !ignoreSnapshot {
 		cs = rj.job.Chunks()
 	}
 	rj.dirtyMu.Lock()
@@ -1275,6 +1402,10 @@ func (s *Scheduler) markStatusFromJob(taskID string, st store.Status, rj *runnin
 	}
 	downloaded := rj.task.Downloaded
 	errMsg := rj.task.ErrorMessage
+	errKind := rj.task.ErrorKind
+	if errKind == "" && errMsg != "" {
+		errKind = protocol.ClassifyError(errors.New(errMsg)).Kind
+	}
 	rj.task.Status = st
 	if errMsg != "" {
 		rj.task.ErrorMessage = errMsg
@@ -1283,6 +1414,11 @@ func (s *Scheduler) markStatusFromJob(taskID string, st store.Status, rj *runnin
 
 	if err := s.st.UpdateTaskProgress(taskID, downloaded, progress, st, errMsg); err != nil {
 		logging.Printf("scheduler markStatusFromJob: %v", err)
+	}
+	if st == store.TaskStatus.Failed {
+		if err := s.st.UpdateTaskErrorKind(taskID, errKind); err != nil {
+			logging.Printf("scheduler markStatusFromJob error kind: %v", err)
+		}
 	}
 	if tk2, err := s.st.GetTask(taskID); err == nil {
 		s.publish(Event{Why: statusWhy(st), Task: tk2})
@@ -1328,8 +1464,13 @@ func (s *Scheduler) completeFromEngine(taskID string, rj *runningJob) {
 // 此时引擎尚未运行，直接使用 store 中的快照即可。
 // 引擎运行期间失败走 markStatusFromJob，以便落盘引擎权威的 chunk 偏移。
 func (s *Scheduler) fail(tk *store.Task, err error) {
+	kind := protocol.ClassifyError(err).Kind
+	tk.ErrorKind = kind
 	if writeErr := s.st.UpdateTaskProgress(tk.ID, tk.Downloaded, tk.ChunkProgress, store.TaskStatus.Failed, err.Error()); writeErr != nil {
 		logging.Printf("scheduler fail: %v", writeErr)
+	}
+	if writeErr := s.st.UpdateTaskErrorKind(tk.ID, kind); writeErr != nil {
+		logging.Printf("scheduler fail error kind: %v", writeErr)
 	}
 	if tk2, err := s.st.GetTask(tk.ID); err == nil {
 		s.publish(Event{Why: "failed", Task: tk2})

@@ -11,7 +11,7 @@
 //   - macOS（通过 scutil 读取系统设置）
 //   - Windows（通过注册表读取 WinINET 设置）
 //
-// 不支持：PAC / WPAD 自动配置代理脚本解析（涉及 JS 引擎，超出本项目范围）。
+// PAC/WPAD 配置会以脚本 URL 返回，由上层代理解析器负责执行。
 //
 // Detect() 每次调用都会重新查询系统；若桌面代理在程序运行期间被修改，
 // 调用方需要主动重新读取（例如监听设置变化事件）。
@@ -40,6 +40,10 @@ type Config struct {
 	HTTPSProxyURL string
 	Bypass        string
 	Source        string
+	// AutoConfigURL 是操作系统配置的 PAC 脚本地址。AutoDiscover 表示
+	// 系统启用了 WPAD 自动发现但没有给出具体 URL。
+	AutoConfigURL string
+	AutoDiscover  bool
 }
 
 // ProxyForScheme 返回 request scheme 对应的系统代理。没有协议专属
@@ -92,7 +96,7 @@ func NormalizeBypass(s string) string {
 // Detect 读取当前桌面会话的系统代理设置并返回归一化结果。
 //
 // 返回 (cfg, true) 表示找到系统代理配置（即便 ProxyURL 为空 —— 此时
-// 表示"系统明确禁用了代理"或"PAC 不在支持范围"）。返回 (_, false) 表示
+// 表示"系统明确禁用了代理"或返回了 PAC/WPAD 配置）。返回 (_, false) 表示
 // 当前平台/会话无任何已知代理来源，调用方应回退到环境变量。
 //
 // 实现按平台分派到 detectLinux / detectDarwin / detectWindows，

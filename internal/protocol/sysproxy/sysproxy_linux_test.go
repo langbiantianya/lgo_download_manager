@@ -173,6 +173,27 @@ func TestDetectKDEType0MeansDisabled(t *testing.T) {
 	}
 }
 
+func TestDetectKDEPACAndWPAD(t *testing.T) {
+	tmp := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", tmp)
+	path := filepath.Join(tmp, "kioslaverc")
+	if err := os.WriteFile(path, []byte("[Proxy Settings]\nProxyType=2\nProxy Config Script=http://config.example/proxy.pac\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, ok := detectKDE()
+	if !ok || cfg.AutoConfigURL != "http://config.example/proxy.pac" || cfg.AutoDiscover {
+		t.Fatalf("KDE PAC config = %+v, ok=%v", cfg, ok)
+	}
+
+	if err := os.WriteFile(path, []byte("[Proxy Settings]\nProxyType=3\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, ok = detectKDE()
+	if !ok || !cfg.AutoDiscover || cfg.AutoConfigURL != "" {
+		t.Fatalf("KDE WPAD config = %+v, ok=%v", cfg, ok)
+	}
+}
+
 func TestStripQuotes(t *testing.T) {
 	tests := []struct {
 		in, want string

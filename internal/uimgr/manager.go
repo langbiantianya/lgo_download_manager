@@ -89,6 +89,7 @@ func (m *Manager) SetSettings(s store.Settings) {
 	// 排队的 Pending 任务。
 	m.sc.SetMaxConcurrent(s.EffectiveMaxConcurrent())
 	m.sc.SetPrealloc(s.Prealloc)
+	m.sc.SetDownloadLimitKiB(s.DownloadLimitKiB)
 	// BitTorrent 设置同步:限速立即生效,端口/DHT/PEX 等在客户端可安全
 	// 重建时生效(见 scheduler.SetBittorrentConfig)。
 	m.sc.SetBittorrentConfig(scheduler.BittorrentConfigFrom(s))
@@ -529,12 +530,13 @@ func (m *Manager) probe(raw string) (int64, error) {
 	}
 	s := m.Settings()
 	driver, err := protocol.New(raw, kind, protocol.Auth{AuthOptions: protocol.AuthOptions{
-		UserAgent:   s.UserAgent,
-		Cookies:     s.Cookies,
-		FTPPassive:  s.FTPPassive,
-		ProxyMode:   s.ProxyMode,
-		ProxyURL:    s.ProxyURL,
-		ProxyBypass: s.ProxyBypass,
+		UserAgent:          s.UserAgent,
+		Cookies:            s.Cookies,
+		FTPPassive:         s.FTPPassive,
+		ProxyMode:          s.ProxyMode,
+		ProxyURL:           s.ProxyURL,
+		ProxyBypass:        s.ProxyBypass,
+		ProxyAutoConfigURL: s.ProxyAutoConfigURL,
 	}})
 	if err != nil {
 		return 0, err
