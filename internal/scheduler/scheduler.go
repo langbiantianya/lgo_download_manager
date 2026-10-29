@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -456,7 +457,7 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	}
 
 	probeCtx, probeCancel := context.WithTimeout(prepareCtx, 30*time.Second)
-	caps, err := driver.Probe(probeCtx)
+	caps, err := probeWithRetry(probeCtx, driver)
 	probeCancel()
 	if s.prepareCancelled(taskID) {
 		_ = driver.Close()
@@ -470,9 +471,12 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		return
 	}
 	sourceSizeChanged := tk.TotalSize > 0 && caps.TotalSize > 0 && tk.TotalSize != caps.TotalSize
+	validatorChanged := taskHasResumeState(tk) &&
+		resourceValidatorsChanged(tk.ETag, tk.LastModified, caps.ETag, caps.LastModified)
+	sourceChanged := sourceSizeChanged || validatorChanged
 	// 准备阶段失败统一经过 fail()/releaseSlot,此处继续走预分配/启动 engine 流程。
 	if caps.TotalSize > 0 {
-		metaAllocated := tk.IsAllocated && !sourceSizeChanged
+		metaAllocated := tk.IsAllocated && !sourceChanged
 		if err := s.st.UpdateTaskMeta(tk.ID, caps.TotalSize, caps.SupportRange, metaAllocated, tk.ChunkCount); err != nil {
 			_ = driver.Close()
 			s.fail(tk, err)
@@ -481,9 +485,9 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		}
 		tk.TotalSize = caps.TotalSize
 		tk.SupportRange = caps.SupportRange
-		tk.IsAllocated = metaAllocated
+		// 暂时保留内存中的旧 IsAllocated/Downloaded，让紧接着的
+		// legacy 迁移仍能识别旧版本尚未改名的部分文件。
 	}
-
 	// 旧版本直接写最终文件；第一次恢复时把已有部分数据迁移到 .part，
 	// 避免下载中的文件以最终文件名暴露给用户。
 	if err := migrateLegacyDownloadToPart(tk); err != nil {
@@ -493,8 +497,8 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		return
 	}
 
-	if sourceSizeChanged {
-		// 总大小变化意味着远端内容已经变化。没有 ETag 校验的情况下，
+	if sourceChanged {
+		// 总大小或 ETag/Last-Modified 变化意味着远端内容已经变化。
 		// 不能把旧文件中的偏移继续当作同一份内容；保留旧字节只会造成
 		// 新旧版本拼接。把进度清零并删除旧数据，安全地从头下载。
 		tk.IsAllocated = false
@@ -512,6 +516,16 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 			s.releaseSlot(taskID)
 			return
 		}
+	}
+	if tk.ETag != "" || tk.LastModified != "" || caps.ETag != "" || caps.LastModified != "" {
+		if err := s.st.UpdateTaskValidators(tk.ID, caps.ETag, caps.LastModified); err != nil {
+			_ = driver.Close()
+			s.fail(tk, err)
+			s.releaseSlot(taskID)
+			return
+		}
+		tk.ETag = caps.ETag
+		tk.LastModified = caps.LastModified
 	}
 
 	// 若尚未预分配文件则进行预分配(恢复场景:文件已具有正确大小)。
@@ -691,6 +705,40 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 	}()
 }
 
+const maxProbeAttempts = 3
+
+// probeWithRetry 处理限流/临时网络错误。探测发生在 engine 启动之前，
+// 若直接返回会把可恢复的 429/503 变成一次失败；这里使用有限重试，并
+// 优先遵循服务端 Retry-After，等待期间仍响应 Pause/Delete 的 ctx。
+func probeWithRetry(ctx context.Context, driver protocol.ProtocolDriver) (*protocol.DriverCapabilities, error) {
+	backoff := 500 * time.Millisecond
+	var lastErr error
+	for attempt := 1; attempt <= maxProbeAttempts; attempt++ {
+		caps, err := driver.Probe(ctx)
+		if err == nil {
+			return caps, nil
+		}
+		lastErr = err
+		if protocol.IsTerminal(err) || attempt == maxProbeAttempts {
+			return nil, err
+		}
+		wait := protocol.RetryAfter(err)
+		if wait <= 0 {
+			wait = backoff
+		}
+		if wait > 5*time.Minute {
+			wait = 5 * time.Minute
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+		backoff *= 2
+	}
+	return nil, lastErr
+}
+
 // syncParentDir 持久化目录项，确保崩溃或掉电后已重命名完成的文件仍然
 // 可见。Windows 不支持对目录句柄执行 Sync，文件本身已在上方完成 Sync。
 func syncParentDir(path string) error {
@@ -703,6 +751,41 @@ func syncParentDir(path string) error {
 	}
 	defer dir.Close()
 	return dir.Sync()
+}
+
+func taskHasResumeState(tk *store.Task) bool {
+	if tk == nil {
+		return false
+	}
+	if tk.IsAllocated || tk.Downloaded > 0 {
+		return true
+	}
+	for _, progress := range tk.ChunkProgress {
+		if progress > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// resourceValidatorsChanged 判断两次探测是否仍指向同一资源。只要有
+// 一个可信校验器可用就优先使用；旧记录有校验器而新响应完全无法比较时
+// 按“已变化”处理，宁可重下也不拼接未知版本。
+func resourceValidatorsChanged(oldETag, oldLastModified, newETag, newLastModified string) bool {
+	oldETag = strings.TrimSpace(oldETag)
+	oldLastModified = strings.TrimSpace(oldLastModified)
+	newETag = strings.TrimSpace(newETag)
+	newLastModified = strings.TrimSpace(newLastModified)
+	if oldETag == "" && oldLastModified == "" {
+		return false
+	}
+	if oldETag != "" && newETag != "" {
+		return oldETag != newETag
+	}
+	if oldLastModified != "" && newLastModified != "" {
+		return oldLastModified != newLastModified
+	}
+	return true
 }
 
 // migrateLegacyDownloadToPart 把旧版本直接写在最终路径上的部分文件迁移

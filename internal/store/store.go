@@ -169,6 +169,8 @@ type Task struct {
 	TotalSize     int64     `json:"total_size"`
 	Downloaded    int64     `json:"downloaded"`
 	SupportRange  bool      `json:"support_range"`
+	ETag          string    `json:"etag"`
+	LastModified  string    `json:"last_modified"`
 	IsAllocated   bool      `json:"is_allocated"`
 	ChunkCount    int       `json:"chunk_count"`
 	MinChunkSize  int64     `json:"min_chunk_size"` // engine 分块下界（字节）
@@ -263,6 +265,8 @@ func (s *Store) migrate() error {
 		total_size      INTEGER NOT NULL DEFAULT -1,
 		downloaded      INTEGER NOT NULL DEFAULT 0,
 		support_range   INTEGER NOT NULL DEFAULT 0,
+		etag            TEXT NOT NULL DEFAULT '',
+		last_modified   TEXT NOT NULL DEFAULT '',
 		is_allocated    INTEGER NOT NULL DEFAULT 0,
 		chunk_count     INTEGER NOT NULL DEFAULT 4,
 		min_chunk_size  INTEGER NOT NULL DEFAULT 1048576,
@@ -303,6 +307,12 @@ CREATE INDEX IF NOT EXISTS idx_tasks_save_path    ON tasks(save_path ASC, id ASC
 	}
 	// 幂等的列迁移：向已存在的 tasks 表新增列，且不丢数据。
 	if err := s.addColumnIfMissing("tasks", "min_chunk_size", "INTEGER NOT NULL DEFAULT 1048576"); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("tasks", "etag", `TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if err := s.addColumnIfMissing("tasks", "last_modified", `TEXT NOT NULL DEFAULT ''`); err != nil {
 		return err
 	}
 	if err := s.addColumnIfMissing("tasks", "chunk_ranges", "TEXT NOT NULL DEFAULT '[]'"); err != nil {
@@ -474,11 +484,12 @@ func (s *Store) CreateTask(t *Task) error {
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO tasks (
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
+		etag,last_modified,is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
 		auth_data,error_message,created_at,updated_at,completed_at,bt_file
-	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		t.ID, t.URL, t.SavePath, t.Protocol, t.TotalSize, t.Downloaded,
-		boolToInt(t.SupportRange), boolToInt(t.IsAllocated), t.ChunkCount,
+		boolToInt(t.SupportRange), t.ETag, t.LastModified,
+		boolToInt(t.IsAllocated), t.ChunkCount,
 		t.MinChunkSize,
 		string(cpJSON), string(rgJSON), string(t.Status), t.AuthData,
 		t.ErrorMessage, t.CreatedAt, t.UpdatedAt, nil, t.BTFile,
@@ -586,11 +597,21 @@ func (s *Store) UpdateTaskMeta(id string, totalSize int64, supportRange, isAlloc
 	return err
 }
 
+// UpdateTaskValidators 持久化 HTTP 资源版本元数据。ETag/Last-Modified
+// 不参与高频进度刷盘，只在 Probe 结果变化时更新。
+func (s *Store) UpdateTaskValidators(id, etag, lastModified string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE tasks SET etag=?, last_modified=?, updated_at=? WHERE id=?`,
+		etag, lastModified, time.Now().UTC(), id)
+	return err
+}
+
 // GetTask 按 ID 获取任务。若不存在则返回 sql.ErrNoRows。
 func (s *Store) GetTask(id string) (*Task, error) {
 	row := s.db.QueryRow(`SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
+		etag,last_modified,is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
 		auth_data,error_message,created_at,updated_at,completed_at,bt_file
 		FROM tasks WHERE id=?`, id)
 	return scanTask(row)
@@ -603,7 +624,7 @@ func (s *Store) ListTasks(filter StatusFilter, sort TaskSort) ([]*Task, error) {
 	statusVal, useWhere := filter.filterStatus()
 	query := `SELECT
 		id,url,save_path,protocol,total_size,downloaded,support_range,
-		is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
+		etag,last_modified,is_allocated,chunk_count,min_chunk_size,chunk_progress,chunk_ranges,status,
 		auth_data,error_message,created_at,updated_at,completed_at,bt_file
 		FROM tasks`
 	if useWhere {
@@ -735,7 +756,8 @@ func scanTask(s scanner) (*Task, error) {
 		completedAtNS sql.NullTime
 	)
 	err := s.Scan(&t.ID, &t.URL, &t.SavePath, &t.Protocol, &total, &dwn,
-		&support, &alloc, &t.ChunkCount, &t.MinChunkSize, &cp, &rg, &t.Status, &t.AuthData,
+		&support, &t.ETag, &t.LastModified, &alloc, &t.ChunkCount, &t.MinChunkSize,
+		&cp, &rg, &t.Status, &t.AuthData,
 		&t.ErrorMessage, &t.CreatedAt, &t.UpdatedAt, &completedAtNS, &t.BTFile)
 	if err != nil {
 		return nil, err

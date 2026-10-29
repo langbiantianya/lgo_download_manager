@@ -73,6 +73,50 @@ func TestParseInt64(t *testing.T) {
 	}
 }
 
+func TestParseRetryAfter(t *testing.T) {
+	now := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		input string
+		want  time.Duration
+	}{
+		{"120", 2 * time.Minute},
+		{"0", 0},
+		{"-1", 0},
+		{"invalid", 0},
+		{now.Add(90 * time.Second).Format(http.TimeFormat), 90 * time.Second},
+		{now.Add(-time.Minute).Format(http.TimeFormat), 0},
+	}
+	for _, tt := range tests {
+		if got := parseRetryAfter(tt.input, now); got != tt.want {
+			t.Errorf("parseRetryAfter(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestTransientHTTPStatusesAreRetryable(t *testing.T) {
+	for _, code := range []int{http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests} {
+		if IsTerminal(NewStatusError(code, nil)) {
+			t.Errorf("status %d marked terminal, want retryable", code)
+		}
+	}
+	for _, code := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusNotFound} {
+		if !IsTerminal(NewStatusError(code, nil)) {
+			t.Errorf("status %d marked retryable, want terminal", code)
+		}
+	}
+}
+
+func TestHTTPIfRangeValidatorSelection(t *testing.T) {
+	d := &httpBase{etag: `"strong"`, lastModified: "Thu, 29 Oct 2026 04:00:00 GMT"}
+	if got := d.ifRangeValue(); got != `"strong"` {
+		t.Fatalf("strong ETag selection=%q", got)
+	}
+	d.etag = `W/"weak"`
+	if got := d.ifRangeValue(); got != d.lastModified {
+		t.Fatalf("weak ETag selection=%q, want Last-Modified %q", got, d.lastModified)
+	}
+}
+
 func TestParseTotalFromContentRange(t *testing.T) {
 	tests := []struct {
 		input string
@@ -800,6 +844,121 @@ func TestHTTPProbeHEAD(t *testing.T) {
 		t.Errorf("SupportRange=false, want true")
 	}
 	d.Close()
+}
+
+func TestHTTPProbeCapturesValidatorsAndUsesIfRange(t *testing.T) {
+	const (
+		size         = 4096
+		etag         = `"resource-v1"`
+		lastModified = "Thu, 29 Oct 2026 04:00:00 GMT"
+	)
+	payload := make([]byte, size)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Last-Modified", lastModified)
+		switch {
+		case r.Method == http.MethodHead:
+			w.Header().Set("Content-Length", strconv.Itoa(size))
+			w.Header().Set("Accept-Ranges", "bytes")
+			w.WriteHeader(http.StatusOK)
+		case r.Header.Get("Range") == "bytes=0-0":
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", size))
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(payload[:1])
+		case r.Header.Get("Range") == "bytes=1024-2047":
+			if got := r.Header.Get("If-Range"); got != etag {
+				http.Error(w, "bad If-Range: "+got, http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 1024-2047/%d", size))
+			w.Header().Set("Content-Length", "1024")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(payload[1024:2048])
+		default:
+			http.Error(w, "unexpected request", http.StatusBadRequest)
+		}
+	}))
+	defer srv.Close()
+
+	d := makeHTTPDriver(srv.URL)
+	caps, err := d.Probe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if caps.ETag != etag || caps.LastModified != lastModified {
+		t.Fatalf("validators = %q / %q, want %q / %q", caps.ETag, caps.LastModified, etag, lastModified)
+	}
+
+	f, err := os.Create(filepath.Join(t.TempDir(), "if-range.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := d.DownloadChunk(context.Background(), 1024, 2047, f, nil); err != nil {
+		t.Fatalf("DownloadChunk: %v", err)
+	}
+	got, err := os.ReadFile(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got[1024:2048], payload[1024:2048]) {
+		t.Fatal("chunk bytes mismatch")
+	}
+	_ = d.Close()
+}
+
+func TestHTTPDownloadChunkRejectsChangedValidator(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-1023/2048")
+		w.Header().Set("Content-Length", "1024")
+		w.Header().Set("ETag", `"v2"`)
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, 1024))
+	}))
+	defer srv.Close()
+
+	d := makeHTTPDriver(srv.URL).(*httpDriver)
+	d.setValidators(`"v1"`, "")
+	f, err := os.Create(filepath.Join(t.TempDir(), "changed-validator.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	err = d.DownloadChunk(context.Background(), 0, 1023, f, nil)
+	if !errors.Is(err, ErrRangeUnavailable) {
+		t.Fatalf("DownloadChunk err=%v, want ErrRangeUnavailable", err)
+	}
+	_ = d.Close()
+}
+
+func TestHTTPRateLimitErrorCarriesRetryAfter(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "slow down", http.StatusTooManyRequests)
+	}))
+	defer srv.Close()
+
+	d := makeHTTPDriver(srv.URL)
+	f, err := os.Create(filepath.Join(t.TempDir(), "rate-limited.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	err = d.DownloadChunk(context.Background(), 0, 9, f, nil)
+	if err == nil {
+		t.Fatal("DownloadChunk returned nil")
+	}
+	if got := RetryAfter(err); got != 2*time.Second {
+		t.Fatalf("RetryAfter=%v, want 2s", got)
+	}
+	if IsTerminal(err) {
+		t.Fatal("429 must be retryable")
+	}
+	_ = d.Close()
 }
 
 func TestHTTPProbeHEADNoAcceptRanges(t *testing.T) {

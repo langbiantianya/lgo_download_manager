@@ -1005,3 +1005,11 @@ func TestFallback404Propagates(t *testing.T) {
 		t.Errorf("Run blocked for %v on 404; want near-instant", elapsed)
 	}
 }
+
+func TestRetryDelayHonorsServerHint(t *testing.T) {
+	hint := 25 * time.Millisecond
+	err := protocol.NewStatusErrorWithRetryAfter(429, nil, hint)
+	if got := retryDelay(err, time.Second); got != hint {
+		t.Fatalf("retryDelay=%v, want server hint %v", got, hint)
+	}
+}

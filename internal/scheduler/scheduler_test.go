@@ -387,6 +387,133 @@ doneChanged:
 	}
 }
 
+func TestSchedulerResetsChangedETagWithSameSize(t *testing.T) {
+	const size = 2 * 1024 * 1024
+	oldPayload := bytes.Repeat([]byte{0xaa}, size)
+	newPayload := make([]byte, size)
+	if _, err := rand.Read(newPayload); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v2"`)
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		if rng := r.Header.Get("Range"); rng != "" {
+			start, end := parseBytesRange(t, rng, size)
+			if r.Header.Get("If-Range") != "" && r.Header.Get("If-Range") != `"v2"` {
+				w.WriteHeader(http.StatusOK)
+				if r.Method != http.MethodHead {
+					_, _ = w.Write(newPayload)
+				}
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			if r.Method != http.MethodHead {
+				_, _ = w.Write(newPayload[start : end+1])
+			}
+			return
+		}
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(newPayload)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sc := New(st)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sc.Run(ctx)
+
+	tk, err := sc.Add(AddTaskInput{
+		URL: srv.URL, SavePath: filepath.Join(dir, "out.bin"),
+		Protocol: protocol.ProtoHTTP, ChunkCount: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTaskMeta(tk.ID, size, true, true, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTaskValidators(tk.ID, `"v1"`, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTaskProgress(tk.ID, size, []int64{size / 2, size / 2}, store.TaskStatus.Paused, ""); err != nil {
+		t.Fatal(err)
+	}
+	part, err := prealloc.Preallocate(tk.SavePath+".part", size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.WriteAt(oldPayload, 0); err != nil {
+		t.Fatal(err)
+	}
+	part.Close()
+
+	ch, unsub := sc.Subscribe()
+	defer unsub()
+	if err := sc.Start(tk.ID); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case ev := <-ch:
+			if ev.Task != nil && ev.Task.ID == tk.ID && (ev.Why == "completed" || ev.Why == "failed") {
+				goto doneETag
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("ETag-reset download did not finish")
+
+doneETag:
+	got, err := os.ReadFile(tk.SavePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, newPayload) {
+		t.Fatal("output reused bytes from the old ETag")
+	}
+	persisted, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.ETag != `"v2"` {
+		t.Fatalf("persisted ETag=%q, want v2", persisted.ETag)
+	}
+}
+
+func TestResourceValidatorsChanged(t *testing.T) {
+	tests := []struct {
+		name           string
+		oldETag, oldLM string
+		newETag, newLM string
+		want           bool
+	}{
+		{"no old validator", "", "", `"v1"`, "", false},
+		{"same etag", `"v1"`, "a", `"v1"`, "b", false},
+		{"changed etag", `"v1"`, "a", `"v2"`, "a", true},
+		{"same last modified", "", "a", `"v1"`, "a", false},
+		{"changed last modified", "", "a", "", "b", true},
+		{"old validator disappeared", `"v1"`, "", "", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := resourceValidatorsChanged(tt.oldETag, tt.oldLM, tt.newETag, tt.newLM); got != tt.want {
+				t.Fatalf("resourceValidatorsChanged()=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestMigrateLegacyDownloadToPart(t *testing.T) {
 	t.Run("partial task", func(t *testing.T) {
 		dir := t.TempDir()
@@ -517,6 +644,83 @@ func TestStartIsAsync(t *testing.T) {
 	}
 	if persisted.ErrorMessage == "" {
 		t.Error("Failed task has empty ErrorMessage; UI cannot show reason")
+	}
+}
+
+func TestSchedulerRetriesRateLimitedProbe(t *testing.T) {
+	const size = 256 * 1024
+	payload := bytes.Repeat([]byte{0x5a}, size)
+	var headCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead && headCalls.Add(1) == 1 {
+			w.Header().Set("Retry-After", "0")
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("ETag", `"rate-test"`)
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		if rng := r.Header.Get("Range"); rng != "" {
+			start, end := parseBytesRange(t, rng, size)
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			if r.Method != http.MethodHead {
+				_, _ = w.Write(payload[start : end+1])
+			}
+			return
+		}
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(payload)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sc := New(st)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sc.Run(ctx)
+
+	tk, err := sc.Add(AddTaskInput{
+		URL: srv.URL, SavePath: filepath.Join(dir, "out.bin"),
+		Protocol: protocol.ProtoHTTP, ChunkCount: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch, unsub := sc.Subscribe()
+	defer unsub()
+	if err := sc.Start(tk.ID); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case ev := <-ch:
+			if ev.Task != nil && ev.Task.ID == tk.ID && (ev.Why == "completed" || ev.Why == "failed") {
+				goto doneRateLimit
+			}
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	t.Fatal("rate-limited probe was not retried")
+
+doneRateLimit:
+	persisted, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.Status != store.TaskStatus.Completed {
+		t.Fatalf("status=%s, want Completed", persisted.Status)
+	}
+	if headCalls.Load() < 2 {
+		t.Fatalf("HEAD calls=%d, want at least 2", headCalls.Load())
 	}
 }
 

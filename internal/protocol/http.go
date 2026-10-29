@@ -57,10 +57,12 @@ func putBuf(b *[]byte) {
 // Close。两个驱动只在各自的 Probe 上有差异（HEAD + Range GET 对比
 // PROPFIND）。
 type httpBase struct {
-	kind string // 错误信息前缀："http" 或 "webdav"
-	url  string
-	auth AuthOptions
-	cli  *http.Client
+	kind         string // 错误信息前缀："http" 或 "webdav"
+	url          string
+	auth         AuthOptions
+	cli          *http.Client
+	etag         string
+	lastModified string
 }
 
 // newHTTPBase 构造两个 HTTP 语义驱动共用的客户端。kind 仅用于错误信息前缀。
@@ -117,6 +119,81 @@ func (d *httpBase) decorate(req *http.Request) {
 	}
 }
 
+// setValidators 记录探测阶段拿到的资源校验器。后续 Range 请求使用
+// If-Range，把“文件在下载途中发生了变化”交给服务器原子判断。
+func (d *httpBase) setValidators(etag, lastModified string) {
+	d.etag = strings.TrimSpace(etag)
+	d.lastModified = strings.TrimSpace(lastModified)
+}
+
+// ifRangeValue 优先使用强 ETag；弱 ETag 不能用于 If-Range，此时退回
+// Last-Modified。Weak/strong 判断遵循 HTTP 的 W/ 前缀约定。
+func (d *httpBase) ifRangeValue() string {
+	etag := strings.TrimSpace(d.etag)
+	if etag != "" && !strings.HasPrefix(strings.ToUpper(etag), "W/") {
+		return etag
+	}
+	return strings.TrimSpace(d.lastModified)
+}
+
+func (d *httpBase) applyIfRange(req *http.Request) {
+	if validator := d.ifRangeValue(); validator != "" {
+		req.Header.Set("If-Range", validator)
+	}
+}
+
+// responseValidatorsMatch 防守式校验 206 响应携带的版本元数据。
+// 部分代理会破坏 If-Range 语义；若响应明确带了不同的 ETag，宁可触发
+// 安全的全量重下，也不能把新旧资源的字节拼在一起。
+func (d *httpBase) responseValidatorsMatch(resp *http.Response) bool {
+	expectedETag := strings.TrimSpace(d.etag)
+	responseETag := strings.TrimSpace(resp.Header.Get("ETag"))
+	if expectedETag != "" && responseETag != "" {
+		return responseETag == expectedETag
+	}
+	expectedLM := strings.TrimSpace(d.lastModified)
+	responseLM := strings.TrimSpace(resp.Header.Get("Last-Modified"))
+	if expectedLM != "" && responseLM != "" {
+		return responseLM == expectedLM
+	}
+	return true
+}
+
+func captureValidators(caps *DriverCapabilities, header http.Header) {
+	caps.ETag = strings.TrimSpace(header.Get("ETag"))
+	caps.LastModified = strings.TrimSpace(header.Get("Last-Modified"))
+}
+
+// newHTTPStatusError 把响应状态和 Retry-After 一起传给引擎，避免 429/503
+// 只能按固定指数退避撞服务器。
+func newHTTPStatusError(action string, resp *http.Response) error {
+	return NewStatusErrorWithRetryAfter(resp.StatusCode,
+		fmt.Errorf("%s: status %d", action, resp.StatusCode),
+		parseRetryAfter(resp.Header.Get("Retry-After"), time.Now()))
+}
+
+func parseRetryAfter(value string, now time.Time) time.Duration {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return 0
+	}
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil {
+		if seconds <= 0 {
+			return 0
+		}
+		const maxSeconds = int64(24 * time.Hour / time.Second)
+		if seconds > maxSeconds {
+			seconds = maxSeconds
+		}
+		return time.Duration(seconds) * time.Second
+	}
+	when, err := http.ParseTime(value)
+	if err != nil || !when.After(now) {
+		return 0
+	}
+	return when.Sub(now)
+}
+
 // DownloadChunk 以 "Range: bytes=start-end" 发起 GET，
 // 并将响应体从 `start` 偏移处开始写入 file。每次 Read 后，
 // 都会以本次追加的字节数调用 onData（便于实时进度展示）。
@@ -130,6 +207,7 @@ func (d *httpBase) DownloadChunk(ctx context.Context, start, end int64, file *os
 	}
 	d.decorate(req)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	d.applyIfRange(req)
 
 	resp, err := d.cli.Do(req)
 	if err != nil {
@@ -140,7 +218,10 @@ func (d *httpBase) DownloadChunk(ctx context.Context, start, end int64, file *os
 		return fmt.Errorf("%s chunk: %w", d.kind, ErrRangeUnavailable)
 	}
 	if resp.StatusCode != http.StatusPartialContent {
-		return NewStatusError(resp.StatusCode, fmt.Errorf("%s chunk: status %d", d.kind, resp.StatusCode))
+		return newHTTPStatusError(d.kind+" chunk", resp)
+	}
+	if !d.responseValidatorsMatch(resp) {
+		return fmt.Errorf("%s chunk: resource validator changed: %w", d.kind, ErrRangeUnavailable)
 	}
 	rangeStart, rangeEnd, _, ok := parseContentRange(resp.Header.Get("Content-Range"))
 	if !ok || rangeStart != start || rangeEnd != end {
@@ -175,6 +256,7 @@ func (d *httpBase) DownloadFallback(ctx context.Context, offset int64, file *os.
 		// 无 Range 的流式回退本应从 0 开始。先尝试标准续传；如果服务端
 		// 返回 200，调用方必须显式重置，而不能把响应开头写到 offset。
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		d.applyIfRange(req)
 	}
 
 	resp, err := d.cli.Do(req)
@@ -188,6 +270,9 @@ func (d *httpBase) DownloadFallback(ctx context.Context, offset int64, file *os.
 		if offset == 0 {
 			return fmt.Errorf("%s fallback: unexpected partial response", d.kind)
 		}
+		if !d.responseValidatorsMatch(resp) {
+			return fmt.Errorf("%s fallback: resource validator changed: %w", d.kind, ErrResumeUnavailable)
+		}
 		start, _, _, ok := parseContentRange(resp.Header.Get("Content-Range"))
 		if !ok || start != offset {
 			return fmt.Errorf("%s fallback: invalid Content-Range %q for offset %d",
@@ -199,7 +284,7 @@ func (d *httpBase) DownloadFallback(ctx context.Context, offset int64, file *os.
 			return fmt.Errorf("%s fallback: %w", d.kind, ErrResumeUnavailable)
 		}
 	default:
-		return NewStatusError(resp.StatusCode, fmt.Errorf("%s fallback: status %d", d.kind, resp.StatusCode))
+		return newHTTPStatusError(d.kind+" fallback", resp)
 	}
 
 	n, err := copyResponseBody(resp.Body, file, writeOffset, -1, onData)
@@ -287,7 +372,7 @@ func (d *httpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return nil, NewStatusError(resp.StatusCode, fmt.Errorf("http probe: status %d", resp.StatusCode))
+		return nil, newHTTPStatusError("http probe", resp)
 	}
 
 	caps := &DriverCapabilities{
@@ -295,6 +380,7 @@ func (d *httpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 		SupportRange: supportsRanges(resp),
 		TotalSize:    parseInt64(resp.Header.Get("Content-Length")),
 	}
+	captureValidators(caps, resp.Header)
 	// 用最小的实际 Range GET 验证能力。部分服务器会错误声明
 	// Accept-Ranges，或由代理吞掉 Range；仅看 HEAD 头不足以保证安全。
 	rangeCaps, rangeErr := d.probeWithRange(ctx)
@@ -303,12 +389,20 @@ func (d *httpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 			return nil, rangeErr
 		}
 		caps.SupportRange = false
+		d.setValidators(caps.ETag, caps.LastModified)
 		return caps, nil
 	}
 	caps.SupportRange = rangeCaps.SupportRange
 	if caps.TotalSize < 0 {
 		caps.TotalSize = rangeCaps.TotalSize
 	}
+	if rangeCaps.ETag != "" {
+		caps.ETag = rangeCaps.ETag
+	}
+	if rangeCaps.LastModified != "" {
+		caps.LastModified = rangeCaps.LastModified
+	}
+	d.setValidators(caps.ETag, caps.LastModified)
 	return caps, nil
 }
 
@@ -328,12 +422,14 @@ func (d *httpBase) probeWithRange(ctx context.Context) (*DriverCapabilities, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return nil, NewStatusError(resp.StatusCode, fmt.Errorf("http probe range: status %d", resp.StatusCode))
+		return nil, newHTTPStatusError("http probe range", resp)
 	}
 	caps := &DriverCapabilities{
 		SupportRange: resp.StatusCode == http.StatusPartialContent,
 		ServerInfo:   strings.Join(resp.Header["Server"], ", "),
 	}
+	captureValidators(caps, resp.Header)
+	d.setValidators(caps.ETag, caps.LastModified)
 	if caps.SupportRange {
 		start, end, total, ok := parseContentRange(resp.Header.Get("Content-Range"))
 		if !ok || start != 0 || end != 0 {

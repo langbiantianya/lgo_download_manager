@@ -570,7 +570,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		if j.opts.OnPlanChanged != nil {
 			j.opts.OnPlanChanged(ranges)
 		}
-		wait := backoff + jitter(backoff)
+		wait := retryDelay(lastErr, backoff)
 		if backoff < 30*time.Second {
 			backoff *= 2
 		}
@@ -728,13 +728,26 @@ func downloadFallbackWithRetry(ctx context.Context, j *Job, c *chunk, bytesDone 
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff + jitter(backoff)):
+		case <-time.After(retryDelay(err, backoff)):
 		}
 		backoff *= 2
 		if backoff > 30*time.Second {
 			backoff = 30 * time.Second
 		}
 	}
+}
+
+// retryDelay 优先遵循服务端的 Retry-After；没有提示时使用带抖动的
+// 指数退避。对异常的超长提示设置上限，同时保持 ctx 可取消。
+func retryDelay(err error, backoff time.Duration) time.Duration {
+	const maxServerHint = 5 * time.Minute
+	if hint := protocol.RetryAfter(err); hint > 0 {
+		if hint > maxServerHint {
+			hint = maxServerHint
+		}
+		return hint
+	}
+	return backoff + jitter(backoff)
 }
 
 func (j *Job) sanityCheck() error {

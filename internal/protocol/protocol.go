@@ -17,9 +17,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var (
@@ -36,8 +38,9 @@ var (
 // 驱动应通过 fmt.Errorf("...: %w", &StatusError{Code: 401}) 包装,
 // 或调用 NewStatusError 直接构造。
 type StatusError struct {
-	Code   int
-	Reason string // 底层驱动原始错误信息,用于诊断;非空时 Wrap 后仍会打印。
+	Code       int
+	Reason     string        // 底层驱动原始错误信息,用于诊断;非空时 Wrap 后仍会打印。
+	RetryAfter time.Duration // 服务端建议的退避时间；0 表示没有提示。
 }
 
 func (e *StatusError) Error() string {
@@ -54,6 +57,24 @@ func NewStatusError(code int, reason error) error {
 		se.Reason = reason.Error()
 	}
 	return se
+}
+
+// NewStatusErrorWithRetryAfter 构造一个带 Retry-After 提示的状态错误。
+func NewStatusErrorWithRetryAfter(code int, reason error, retryAfter time.Duration) error {
+	se := &StatusError{Code: code, RetryAfter: retryAfter}
+	if reason != nil {
+		se.Reason = reason.Error()
+	}
+	return se
+}
+
+// RetryAfter 返回错误链中 StatusError 携带的退避提示。
+func RetryAfter(err error) time.Duration {
+	var se *StatusError
+	if errors.As(err, &se) && se.RetryAfter > 0 {
+		return se.RetryAfter
+	}
+	return 0
 }
 
 // HTTPStatus 返回错误链中第一个 StatusError 的状态码;若不存在则返回 -1。
@@ -103,6 +124,12 @@ func IsTerminal(err error) bool {
 	if code < 0 {
 		return false
 	}
+	// 这些 4xx 明确表示临时限流/请求超时，继续退避重试比直接失败
+	// 更符合用户预期。其余 4xx 仍视为 URL/认证/权限等永久错误。
+	switch code {
+	case http.StatusRequestTimeout, http.StatusTooEarly, http.StatusTooManyRequests:
+		return false
+	}
 	return code >= 400 && code < 500
 }
 
@@ -115,6 +142,8 @@ type DriverCapabilities struct {
 	TotalSize    int64  // 总字节长度；未知时为 -1
 	SupportRange bool   // 服务器是否支持 Range / FTP REST
 	ServerInfo   string // 自由形式的 banner / 服务器响应头
+	ETag         string // HTTP 响应 ETag，用于跨会话校验资源版本
+	LastModified string // HTTP Last-Modified，用于没有强 ETag 时的版本校验
 }
 
 // AuthOptions 封装凭据以及驱动能够遵循的请求修饰开关。

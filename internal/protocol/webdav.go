@@ -36,6 +36,8 @@ type propfindRespItem struct {
 	PropStat []struct {
 		Prop struct {
 			GetContentLength string `xml:"getcontentlength"`
+			GetETag          string `xml:"getetag"`
+			GetLastModified  string `xml:"getlastmodified"`
 			DisplayName      string `xml:"displayname"`
 			ResourceType     struct {
 				Collection string `xml:"collection"`
@@ -60,6 +62,7 @@ func newWebDAVDriver(raw string, auth AuthOptions) (ProtocolDriver, error) {
 func (d *webdavDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	body := strings.NewReader(`<?xml version="1.0" encoding="utf-8"?>` +
 		`<propfind xmlns="DAV:"><prop><getcontentlength xmlns="DAV:"/>` +
+		`<getetag xmlns="DAV:"/><getlastmodified xmlns="DAV:"/>` +
 		`<displayname xmlns="DAV:"/><resourcetype xmlns="DAV:"/></prop></propfind>`)
 	req, err := http.NewRequestWithContext(ctx, "PROPFIND", d.url, body)
 	if err != nil {
@@ -86,6 +89,7 @@ func (d *webdavDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	}
 
 	caps := &DriverCapabilities{SupportRange: true, TotalSize: -1}
+	captureValidators(caps, resp.Header)
 	for _, r := range parsed.Responses {
 		for _, ps := range r.PropStat {
 			if ps.Status != "" && !strings.Contains(ps.Status, "200") {
@@ -93,6 +97,12 @@ func (d *webdavDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 			}
 			if n, err := strconv.ParseInt(strings.TrimSpace(ps.Prop.GetContentLength), 10, 64); err == nil {
 				caps.TotalSize = n
+			}
+			if caps.ETag == "" {
+				caps.ETag = strings.TrimSpace(ps.Prop.GetETag)
+			}
+			if caps.LastModified == "" {
+				caps.LastModified = strings.TrimSpace(ps.Prop.GetLastModified)
 			}
 		}
 	}
@@ -107,7 +117,14 @@ func (d *webdavDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 		caps.SupportRange = false
 	} else {
 		caps.SupportRange = rangeCaps.SupportRange
+		if rangeCaps.ETag != "" {
+			caps.ETag = rangeCaps.ETag
+		}
+		if rangeCaps.LastModified != "" {
+			caps.LastModified = rangeCaps.LastModified
+		}
 	}
+	d.setValidators(caps.ETag, caps.LastModified)
 	return caps, nil
 }
 
@@ -124,12 +141,14 @@ func (d *webdavDriver) fallbackProbe(ctx context.Context) (*DriverCapabilities, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return nil, NewStatusError(resp.StatusCode, fmt.Errorf("webdav probe: status %d", resp.StatusCode))
+		return nil, newHTTPStatusError("webdav probe", resp)
 	}
 	caps := &DriverCapabilities{
 		TotalSize:    parseInt64(resp.Header.Get("Content-Length")),
 		SupportRange: strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes"),
 		ServerInfo:   strings.Join(resp.Header["Server"], ", "),
 	}
+	captureValidators(caps, resp.Header)
+	d.setValidators(caps.ETag, caps.LastModified)
 	return caps, nil
 }

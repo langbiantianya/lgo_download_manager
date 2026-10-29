@@ -7,6 +7,7 @@
 package store
 
 import (
+	"database/sql"
 	"path/filepath"
 	"testing"
 	"time"
@@ -29,6 +30,8 @@ func TestStoreRoundtrip(t *testing.T) {
 		TotalSize:    1234,
 		ChunkCount:   4,
 		SupportRange: true,
+		ETag:         `"v1"`,
+		LastModified: "Thu, 29 Oct 2026 04:00:00 GMT",
 		IsAllocated:  true,
 		Status:       TaskStatus.Pending,
 		AuthData:     `{"username":""}`,
@@ -48,8 +51,21 @@ func TestStoreRoundtrip(t *testing.T) {
 	if got.URL != tk.URL || got.Status != TaskStatus.Downloading || got.Downloaded != 512 {
 		t.Fatalf("unexpected row: %+v", got)
 	}
+	if got.ETag != tk.ETag || got.LastModified != tk.LastModified {
+		t.Fatalf("validators = %q / %q, want %q / %q", got.ETag, got.LastModified, tk.ETag, tk.LastModified)
+	}
 	if len(got.ChunkProgress) != 4 || got.ChunkProgress[0] != 128 {
 		t.Fatalf("chunk progress mismatch: %v", got.ChunkProgress)
+	}
+	if err := s.UpdateTaskValidators("task-1", `"v2"`, "Fri, 30 Oct 2026 04:00:00 GMT"); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.GetTask("task-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ETag != `"v2"` || got.LastModified != "Fri, 30 Oct 2026 04:00:00 GMT" {
+		t.Fatalf("updated validators = %q / %q", got.ETag, got.LastModified)
 	}
 	if got.CreatedAt.IsZero() || got.UpdatedAt.IsZero() {
 		t.Fatal("timestamps should be set")
@@ -607,5 +623,52 @@ func TestLoadSettingsEx_EmptyDirStillSaved(t *testing.T) {
 	}
 	if got.DefaultThreads != 16 {
 		t.Fatalf("DefaultThreads = %d, want 16", got.DefaultThreads)
+	}
+}
+
+func TestMigrateAddsDownloadValidatorColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = raw.Exec(`CREATE TABLE tasks (
+		id TEXT PRIMARY KEY,
+		url TEXT NOT NULL,
+		save_path TEXT NOT NULL,
+		protocol TEXT NOT NULL,
+		total_size INTEGER NOT NULL DEFAULT -1,
+		downloaded INTEGER NOT NULL DEFAULT 0,
+		support_range INTEGER NOT NULL DEFAULT 0,
+		is_allocated INTEGER NOT NULL DEFAULT 0,
+		chunk_count INTEGER NOT NULL DEFAULT 4,
+		chunk_progress TEXT NOT NULL DEFAULT '[]',
+		status TEXT NOT NULL DEFAULT 'Pending',
+		auth_data TEXT NOT NULL DEFAULT '{}',
+		error_message TEXT NOT NULL DEFAULT '',
+		created_at DATETIME NOT NULL,
+		updated_at DATETIME NOT NULL
+	);
+	INSERT INTO tasks (id,url,save_path,protocol,created_at,updated_at)
+	VALUES ('legacy','https://example/file','/tmp/file','HTTP',CURRENT_TIMESTAMP,CURRENT_TIMESTAMP);`)
+	if err != nil {
+		raw.Close()
+		t.Fatal(err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	tk, err := s.GetTask("legacy")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tk.ETag != "" || tk.LastModified != "" {
+		t.Fatalf("legacy validators = %q / %q, want empty", tk.ETag, tk.LastModified)
 	}
 }
