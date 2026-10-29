@@ -99,6 +99,13 @@ export const HEADER_CACHE_LIMIT = 1000;
 /** storage.session key holding the header-cache snapshot. */
 export const HEADER_CACHE_KEY = 'lgom_header_cache';
 
+/**
+ * storage.session key recording when the extension started observing downloads
+ * in the current browser session. Chrome clears storage.session on browser
+ * restart, which lets us distinguish restored downloads from new ones.
+ */
+export const DOWNLOAD_SESSION_STARTED_KEY = 'lgom_download_session_started_at';
+
 /** Filename fallback when nothing better is known. */
 export const UNKNOWN_FILENAME = 'unknown';
 

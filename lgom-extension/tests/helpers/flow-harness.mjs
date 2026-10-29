@@ -47,7 +47,7 @@ export async function createFlow(platform) {
  * 触发一次下载，等扩展处理完，返回最近拦截日志。
  *
  * @param {ReturnType<typeof createBrowserStub>} stub
- * @param {{ url: string, filename?: string, id?: number, config?: object }} download
+ * @param {{ url: string, filename?: string, id?: number, startTime?: string, config?: object }} download
  * @returns {Promise<{ recent: any[], calls: any }>}
  */
 export async function runDownload(stub, download) {
@@ -56,7 +56,8 @@ export async function runDownload(stub, download) {
 	await stub.emitDownload({
 		id: download.id ?? 7,
 		url: download.url,
-		filename: download.filename
+		filename: download.filename,
+		startTime: download.startTime
 	});
 	return {
 		recent: stub.local.get('lgom_recent') ?? [],

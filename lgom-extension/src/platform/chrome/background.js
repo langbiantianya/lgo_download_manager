@@ -3,6 +3,7 @@ import { normalizeMetadata, shouldIntercept } from '$lib/metadata.js';
 import { getConfig } from '$lib/storage.js';
 import { appendRecent } from '$lib/recent.js';
 import { handoffReason } from '$lib/channels.js';
+import { getDownloadSessionStartedAt, isRestoredDownload } from '$lib/download-session.js';
 import { registerHeaderListener, getCachedHeaders, warmHeaderCache } from './headers.js';
 import { triggerProtocol } from './protocol.js';
 
@@ -18,6 +19,9 @@ const FALLBACK_UA =
  */
 globalThis.chrome.downloads.onCreated.addListener(async (downloadItem) => {
 	const browser = globalThis.chrome;
+	const sessionStartedAt = await getDownloadSessionStartedAt();
+	if (isRestoredDownload(downloadItem, sessionStartedAt)) return;
+
 	const config = await getConfig();
 	if (!config.enabled) return;
 

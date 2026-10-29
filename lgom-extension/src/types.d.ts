@@ -22,6 +22,8 @@ interface WebExtensionDownloadItem {
 	filename: string;
 	referrer: string;
 	mime: string;
+	/** ISO 8601 timestamp supplied by Chrome. */
+	startTime?: string;
 }
 
 interface WebExtensionTab {

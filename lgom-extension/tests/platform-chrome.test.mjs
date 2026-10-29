@@ -8,6 +8,27 @@ const URL_UNDER_TEST = 'https://example.com/files/a.zip';
 const FILE_NAME = 'a.zip';
 
 describe('Chrome 平台的拦截流程', () => {
+	it('浏览器启动时恢复的积压下载不会转发给客户端', async () => {
+		const stub = await createFlow('chrome');
+		const client = installLiveClientStub();
+		const previousSessionStart = new Date(Date.now() - 60_000).toISOString();
+
+		try {
+			const { recent, calls } = await runDownload(stub, {
+				url: URL_UNDER_TEST,
+				filename: FILE_NAME,
+				startTime: previousSessionStart
+			});
+
+			assert.deepEqual(calls.cancelled, [], '不该取消浏览器恢复的下载');
+			assert.deepEqual(calls.erased, [], '不该擦除浏览器恢复的下载');
+			assert.deepEqual(calls.tabsCreated, [], '不该为浏览器恢复的下载开标签页');
+			assert.deepEqual(recent, [], '恢复旧下载不算一次新的拦截');
+		} finally {
+			client.restore();
+		}
+	});
+
 	it('客户端在跑时走端口通道，不开标签页', async () => {
 		const stub = await createFlow('chrome');
 		const client = installLiveClientStub();
@@ -15,7 +36,8 @@ describe('Chrome 平台的拦截流程', () => {
 		try {
 			const { recent, calls } = await runDownload(stub, {
 				url: URL_UNDER_TEST,
-				filename: FILE_NAME
+				filename: FILE_NAME,
+				startTime: new Date().toISOString()
 			});
 
 			assert.deepEqual(calls.cancelled, [7], '浏览器下载应被取消');

@@ -155,6 +155,9 @@ Chrome manifest 中用 `key` 固定（CI 用的是 `CHROME_EXTENSION_KEY` 对应
    Chrome 需要 `extraHeaders` 才能获取 `Cookie`/`User-Agent`。
 2. `downloads.onCreated` 事件触发。如拦截已禁用或 URL 不匹配当前过滤模式，
    则不处理。
+   Chrome / Firefox 启动或恢复下载队列时，可能再次为上次未完成的下载触发
+   该事件；扩展以 `storage.session` 记录当前浏览器会话的启动边界，
+   `startTime` 早于该边界的旧下载会被直接忽略，不会再次发送给客户端。
 3. 下载任务被取消并擦除。
 4. 缓存的请求头经 `normalizeMetadata` 转为元数据。同时生成两种表示：
    `buildPortPayload` 的 JSON 正文（端口通道用）与 `buildLgomUrl` 的
@@ -307,7 +310,9 @@ LGOM IPC 帧限制内（`MAX_FRAME_LEN`，64 KiB）。
 拦截除匹配项外的所有。
 
 存储键：`lgom_config`（`storage.local`）、`lgom_recent`
-（`storage.local`）、`lgom_header_cache`（`storage.session`）。
+（`storage.local`）、`lgom_header_cache` 和
+`lgom_download_session_started_at`（`storage.session`）。后者在当前浏览器
+会话内区分新下载与浏览器启动时恢复的旧下载。
 
 ## 权限
 

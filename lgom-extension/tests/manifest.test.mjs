@@ -85,6 +85,16 @@ describe('manifest', () => {
 		assert.equal(chrome.background.scripts, undefined);
 	});
 
+	it('Firefox Android 最低版本支持数据收集声明', async () => {
+		const firefox = await readManifest('firefox');
+
+		assert.equal(
+			firefox.browser_specific_settings.gecko_android.strict_min_version,
+			'142.0',
+			'data_collection_permissions 从 Firefox Android 142 开始支持'
+		);
+	});
+
 	it('版本号两个平台一致', async () => {
 		const chrome = await readManifest('chrome');
 		const firefox = await readManifest('firefox');

@@ -6,6 +6,7 @@ import { getConfig } from '$lib/storage.js';
 import { appendRecent } from '$lib/recent.js';
 import { browser } from '$lib/platform-api.js';
 import { handoffReason } from '$lib/channels.js';
+import { getDownloadSessionStartedAt, isRestoredDownload } from '$lib/download-session.js';
 
 registerHeaderListener();
 
@@ -18,6 +19,9 @@ const FALLBACK_UA =
  * before being handed to LGOM.
  */
 browser.downloads.onCreated.addListener(async (downloadItem) => {
+	const sessionStartedAt = await getDownloadSessionStartedAt();
+	if (isRestoredDownload(downloadItem, sessionStartedAt)) return;
+
 	const config = await getConfig();
 	if (!config.enabled) return;
 

@@ -41,9 +41,9 @@ function toHeaderRecord(headers) {
 }
 
 /**
- * Firefox background scripts persist for the browser session, so the cache can
- * live in memory; storage.session is still written so a restarted background
- * keeps the tail.
+ * Firefox MV3 background scripts run as event pages and can be suspended, so
+ * keep a storage.session mirror. The in-memory map still serves the hot path
+ * while the background page remains alive.
  *
  * @param {string} url
  * @returns {Promise<Record<string, string | string[]> | undefined>}
