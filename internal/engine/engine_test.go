@@ -119,8 +119,8 @@ func TestPlanFileBelowOneMiBWithResume(t *testing.T) {
 	if cs[0].Start != 0 || cs[0].End != size-1 {
 		t.Fatalf("chunk=[%d,%d], want [0,%d]", cs[0].Start, cs[0].End, size-1)
 	}
-	if cs[0].Progress != 0 {
-		t.Fatalf("progress=%d, want 0 (ResumeFrom 在 <1MiB 时被忽略)", cs[0].Progress)
+	if cs[0].Progress != 100*1024 {
+		t.Fatalf("progress=%d, want 100KiB", cs[0].Progress)
 	}
 }
 
@@ -135,8 +135,7 @@ func TestPlanFileBelowOneMiBResumeExceedsFile(t *testing.T) {
 	if len(cs) != 1 {
 		t.Fatalf("got %d chunks, want 1", len(cs))
 	}
-	// < 1MiB 路径忽略 ResumeFrom，故 progress 始终为 0
-	if cs[0].Progress != 0 {
+	if cs[0].Progress != cs[0].End+1 {
 		t.Fatalf("progress=%d, want end+1=%d", cs[0].Progress, cs[0].End+1)
 	}
 }
@@ -525,6 +524,72 @@ func TestChunkedDownload(t *testing.T) {
 	}
 }
 
+// TestRangeIgnoredFallsBackFromZero 验证探测结果与真实响应不一致时，
+// 引擎不会把 200 响应写到分片偏移，而是自动降级为从 0 开始的完整流。
+func TestRangeIgnoredFallsBackFromZero(t *testing.T) {
+	const size = 2 * 1024 * 1024
+	payload := make([]byte, size)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	var rangedRequests atomic.Int32
+	var fullRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", itoa(size))
+		if r.Header.Get("Range") != "" {
+			rangedRequests.Add(1)
+		} else {
+			fullRequests.Add(1)
+		}
+		// 故意忽略 Range，并返回完整的 200 响应。
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	destPath := filepath.Join(dir, "out.bin")
+	dest, err := prealloc.Preallocate(destPath, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dest.Close()
+
+	driver, err := protocol.New(srv.URL, protocol.ProtoHTTP, protocol.Auth{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driver.Close()
+
+	job := NewJob(driver, size, dest, Options{
+		ChunkCount: 4,
+		Progress: func(p Progress) {
+			if p.DownloadedBytes < 0 {
+				t.Errorf("negative progress: %+v", p)
+			}
+		},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := job.Run(ctx, true); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("fallback wrote a full response at a non-zero offset")
+	}
+	if rangedRequests.Load() == 0 || fullRequests.Load() == 0 {
+		t.Fatalf("requests ranged=%d full=%d, want both paths", rangedRequests.Load(), fullRequests.Load())
+	}
+	chunks := job.Chunks()
+	if len(chunks) != 1 || chunks[0].Start != 0 || chunks[0].Progress != size {
+		t.Fatalf("fallback chunks=%+v, want one completed full-range chunk", chunks)
+	}
+}
+
 // TestFallback 通过 fallback 路径（无 range）下载一个较小的文件。
 func TestFallback(t *testing.T) {
 	const size = 256 * 1024
@@ -567,6 +632,51 @@ func TestFallback(t *testing.T) {
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatal("mismatch")
+	}
+}
+
+// TestFallbackTruncatesStaleTail 验证从头重下会清除旧文件尾部，避免
+// 远端文件变短后留下本不属于该文件的字节。
+func TestFallbackTruncatesStaleTail(t *testing.T) {
+	const size = 256 * 1024
+	payload := make([]byte, size)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", itoa(size))
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	destPath := filepath.Join(dir, "out.bin")
+	if err := os.WriteFile(destPath, bytes.Repeat([]byte{0xff}, 2*size), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dest, err := os.OpenFile(destPath, os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dest.Close()
+
+	driver, err := protocol.New(srv.URL, protocol.ProtoHTTP, protocol.Auth{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driver.Close()
+	job := NewJob(driver, size, dest, Options{})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := job.Run(ctx, false); err != nil {
+		t.Fatalf("Run fallback: %v", err)
+	}
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("fallback output has len=%d or stale tail, want exactly %d source bytes", len(got), size)
 	}
 }
 

@@ -74,7 +74,7 @@ func splitExt(base string) (string, string) {
 // uniqueSavePath 若 path 指向的文件已存在，则在扩展名前插入 (N) 直到
 // 找到不存在的名字（N 从 1 开始）。目录不存在或 IO 错误时返回原 path。
 func uniqueSavePath(path string) string {
-	if _, err := os.Stat(path); err != nil {
+	if !downloadPathExists(path) {
 		// 不存在或无法访问——直接返回原 path，由调用方按需处理错误。
 		return path
 	}
@@ -92,11 +92,23 @@ func uniqueSavePath(path string) string {
 	}
 	for n := start; n < 10000; n++ {
 		candidate := filepath.Join(dir, stem+"("+strconv.Itoa(n)+")"+ext)
-		if _, err := os.Stat(candidate); err != nil {
+		if !downloadPathExists(candidate) {
 			return candidate
 		}
 	}
 	return path
+}
+
+// downloadPathExists 同时检查最终路径与下载中的 ".part" 路径，避免
+// 桌面上的可视文件已删除、但崩溃残留的分片文件仍被新任务误用。
+func downloadPathExists(path string) bool {
+	if _, err := os.Stat(path); err == nil {
+		return true
+	}
+	if _, err := os.Stat(path + ".part"); err == nil {
+		return true
+	}
+	return false
 }
 
 // showAddTaskDialog 打开"新建下载任务"窗口，并预填全局设置中的内容。

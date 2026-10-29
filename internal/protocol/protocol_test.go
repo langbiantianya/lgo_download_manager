@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -79,7 +80,7 @@ func TestParseTotalFromContentRange(t *testing.T) {
 	}{
 		{"bytes 0-0/12345", 12345},
 		{"bytes 0-99/100", 100},
-		{"bytes 0-0/0", 0},
+		{"bytes 0-0/0", -1},
 		{"bytes 500-999/123456", 123456},
 		{"bytes 0-0/-1", -1},
 		{"invalid", -1},
@@ -90,6 +91,29 @@ func TestParseTotalFromContentRange(t *testing.T) {
 	for _, tt := range tests {
 		if got := parseTotalFromContentRange(tt.input); got != tt.want {
 			t.Errorf("parseTotalFromContentRange(%q) = %v, want %v", tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestParseContentRange(t *testing.T) {
+	tests := []struct {
+		input             string
+		start, end, total int64
+		ok                bool
+	}{
+		{"bytes 0-0/12345", 0, 0, 12345, true},
+		{"bytes 10-19/100", 10, 19, 100, true},
+		{"BYTES 0-9/*", 0, 9, -1, true},
+		{"bytes 0-0/0", 0, 0, 0, false},
+		{"bytes 0-0/-1", 0, 0, 0, false},
+		{"bytes 10-9/100", 0, 0, 0, false},
+		{"items 0-0/100", 0, 0, 0, false},
+	}
+	for _, tt := range tests {
+		start, end, total, ok := parseContentRange(tt.input)
+		if start != tt.start || end != tt.end || total != tt.total || ok != tt.ok {
+			t.Errorf("parseContentRange(%q) = (%d,%d,%d,%v), want (%d,%d,%d,%v)",
+				tt.input, start, end, total, ok, tt.start, tt.end, tt.total, tt.ok)
 		}
 	}
 }
@@ -750,8 +774,16 @@ func makeHTTPDriver(url string) ProtocolDriver {
 func TestHTTPProbeHEAD(t *testing.T) {
 	const size int64 = 12345
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && r.Header.Get("Range") == "bytes=0-0" {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", size))
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte{0})
+			return
+		}
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Server", "test")
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer srv.Close()
@@ -940,6 +972,78 @@ func TestHTTPDownloadChunkNon206(t *testing.T) {
 	d.Close()
 }
 
+func TestHTTPDownloadChunkRejectsIgnoredRange(t *testing.T) {
+	const size = 4096
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(make([]byte, size))
+	}))
+	defer srv.Close()
+
+	f, err := os.Create(filepath.Join(t.TempDir(), "ignored-range.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+
+	d := makeHTTPDriver(srv.URL)
+	err = d.DownloadChunk(context.Background(), 1024, 2047, f, nil)
+	if !errors.Is(err, ErrRangeUnavailable) {
+		t.Fatalf("DownloadChunk err=%v, want ErrRangeUnavailable", err)
+	}
+	_ = d.Close()
+}
+
+func TestHTTPDownloadChunkRejectsWrongContentRange(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-1023/4096")
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, 1024))
+	}))
+	defer srv.Close()
+
+	f, err := os.Create(filepath.Join(t.TempDir(), "wrong-range.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	d := makeHTTPDriver(srv.URL)
+	err = d.DownloadChunk(context.Background(), 1024, 2047, f, nil)
+	if err == nil || !strings.Contains(err.Error(), "invalid Content-Range") {
+		t.Fatalf("DownloadChunk err=%v, want invalid Content-Range", err)
+	}
+	_ = d.Close()
+}
+
+func TestHTTPDownloadChunkRejectsShortBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-1023/4096")
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(make([]byte, 512))
+	}))
+	defer srv.Close()
+
+	f, err := os.Create(filepath.Join(t.TempDir(), "short-range.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	d := makeHTTPDriver(srv.URL)
+	err = d.DownloadChunk(context.Background(), 0, 1023, f, nil)
+	if !errors.Is(err, ErrUnexpectedEOF) {
+		t.Fatalf("DownloadChunk err=%v, want ErrUnexpectedEOF", err)
+	}
+	_ = d.Close()
+}
+
 func TestHTTPDownloadFallback(t *testing.T) {
 	const size = 32 * 1024
 	payload := make([]byte, size)
@@ -996,17 +1100,53 @@ func TestHTTPDownloadFallbackOffset(t *testing.T) {
 	d := makeHTTPDriver(srv.URL)
 	err := d.DownloadFallback(context.Background(), 4096, f, nil)
 	f.Close()
+	if !errors.Is(err, ErrResumeUnavailable) {
+		t.Fatalf("DownloadFallback err=%v, want ErrResumeUnavailable", err)
+	}
+	d.Close()
+}
+
+func TestHTTPDownloadFallbackResumesWithRange(t *testing.T) {
+	const size = 8192
+	const offset = 4096
+	payload := make([]byte, size)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") == fmt.Sprintf("bytes=%d-", offset) {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, size-1, size))
+			w.Header().Set("Content-Length", strconv.Itoa(size-offset))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(payload[offset:])
+			return
+		}
+		http.Error(w, "range required", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+
+	destPath := filepath.Join(t.TempDir(), "resume.bin")
+	f, err := os.Create(destPath)
 	if err != nil {
-		t.Fatalf("DownloadFallback: %v", err)
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
 	}
 
-	got, _ := os.ReadFile(destPath)
-	if !bytes.Equal(got[:4096], make([]byte, 4096)) {
-		t.Errorf("offset area not zero")
+	d := makeHTTPDriver(srv.URL)
+	if err := d.DownloadFallback(context.Background(), offset, f, nil); err != nil {
+		t.Fatalf("DownloadFallback resume: %v", err)
 	}
-	// DownloadFallback 从服务器 offset 0 读取，但写入 file 的 offset 4096。
-	// 字节 0..4095 保持为零（从未写入）。
-	d.Close()
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got[offset:], payload[offset:]) {
+		t.Fatal("resumed fallback wrote incorrect bytes")
+	}
+	_ = d.Close()
 }
 
 func TestHTTPClose(t *testing.T) {
@@ -1043,6 +1183,12 @@ func TestWebDAVProbePROPFIND(t *testing.T) {
 					`<status>HTTP/1.1 200 OK</status></propstat></response></multistatus>`, size)
 			w.Write([]byte(body))
 			return
+		}
+		if r.Method == http.MethodGet && r.Header.Get("Range") == "bytes=0-0" {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", size))
+			w.Header().Set("Content-Length", "1")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte{0})
 		}
 	}))
 	defer srv.Close()

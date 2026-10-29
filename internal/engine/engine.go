@@ -137,7 +137,17 @@ func (j *Job) planLocked() {
 	}
 	// 文件小于 1 MiB：不分块，单个流式 chunk。
 	if j.total < oneMiB {
-		j.chunks = append(j.chunks, chunk{idx: 0, start: 0, end: j.total - 1, progress: 0})
+		progress := int64(0)
+		if len(j.opts.ResumeFrom) > 0 {
+			progress = j.opts.ResumeFrom[0]
+			if progress < 0 {
+				progress = 0
+			}
+			if progress > j.total {
+				progress = j.total
+			}
+		}
+		j.chunks = append(j.chunks, chunk{idx: 0, start: 0, end: j.total - 1, progress: progress})
 		return
 	}
 
@@ -333,6 +343,13 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 	)
 	lastTickAt.Store(time.Now().UnixNano())
 	resumedBytes := j.resumedBytes()
+	j.mu.Lock()
+	for i := range j.chunks {
+		if j.chunks[i].progress > j.chunks[i].end {
+			chunksDone.Add(1)
+		}
+	}
+	j.mu.Unlock()
 
 	emit := func(activeIdx int) {
 		now := time.Now().UnixNano()
@@ -347,6 +364,11 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		}
 		cur := bytesDone.Load()
 		diff := cur - lastTickVal.Load()
+		if diff < 0 {
+			// Range 不可用时会把本次会话已写入但即将被全量覆盖的
+			// 计数清零，速度不能显示成负数。
+			diff = 0
+		}
 		lastTickVal.Store(cur)
 		var bps float64
 		if dt := float64(now-prev) / float64(time.Second); dt > 0 {
@@ -368,23 +390,34 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 	isStreaming := j.total <= 0 || !useRange || (len(j.chunks) == 1 && j.chunks[0].end == -1)
 	j.mu.Unlock()
 
-	if isStreaming {
-		// 将计划合并为覆盖整个文件的单个分片，这样 Chunks() 只在一个
-		// 分片上报告进度，而不是 N 个分片中只有 chunks[0] 真正被写入。
-		// 否则调度器会从不声明 Accept-Ranges 的服务器上读到类似
-		// [N, 0, 0, 0] 的进度——UI 只会点亮第一块马赛克。
+	// runStreaming 从字节 0 全量覆盖为单个流式分片。它同时用于没有
+	// Range 的来源，以及服务端在真实分片请求中临时忽略 Range 的降级路径。
+	// 不论磁盘上是否留有旧进度，都必须从头写入；否则会把响应开头写到
+	// 中途偏移，制造不可恢复的空洞。
+	runStreaming := func(progress int64) error {
 		j.mu.Lock()
-		var progress int64
-		if len(j.chunks) > 0 {
-			progress = j.chunks[0].progress
-		}
 		end := int64(-1)
 		if j.total > 0 {
 			end = j.total - 1
 		}
+		if progress > 0 {
+			// 不支持 Range 的来源不能从半途继续：响应一定从字节 0
+			// 开始，旧偏移只会制造空洞和错位文件。从头覆盖是唯一安全
+			// 的回退方式；支持 Range 时会在重试阶段返回 206 续传。
+			progress = 0
+		}
 		j.chunks = []chunk{{idx: 0, start: progress, end: end, progress: progress}}
 		plan := [2]int64{progress, end}
 		j.mu.Unlock()
+
+		bytesDone.Store(0)
+		chunksDone.Store(0)
+		resumedBytes = 0
+		lastTickAt.Store(time.Now().UnixNano())
+		lastTickVal.Store(0)
+		if err := j.dest.Truncate(0); err != nil {
+			return fmt.Errorf("engine: truncate before streaming restart: %w", err)
+		}
 
 		// 回调不持锁调用：调度器会在回调里访问引擎与数据库。
 		if j.opts.OnPlanChanged != nil {
@@ -392,26 +425,46 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		}
 		stopErr := downloadFallbackWithRetry(ctx, j, j.streamingChunk(), &bytesDone, emit, 0)
 		if j.opts.Progress != nil {
+			total := j.total
+			completedChunks := 0
+			if stopErr == nil {
+				completedChunks = 1
+			}
+			if total <= 0 && stopErr == nil {
+				total = bytesDone.Load()
+			}
 			j.opts.Progress(Progress{
 				TaskID:          j.opts.TaskID,
-				TotalSize:       bytesDone.Load() + resumedBytes,
+				TotalSize:       total,
 				DownloadedBytes: bytesDone.Load() + resumedBytes,
-				CompletedChunks: 1,
+				CompletedChunks: completedChunks,
 			})
 		}
 		return stopErr
 	}
 
+	if isStreaming {
+		// 将计划合并为覆盖整个文件的单个分片，这样 Chunks() 只在一个
+		// 分片上报告进度，而不是 N 个分片中只有 chunks[0] 真正被写入。
+		j.mu.Lock()
+		var progress int64
+		if len(j.chunks) > 0 {
+			progress = j.chunks[0].progress
+		}
+		j.mu.Unlock()
+		return runStreaming(progress)
+	}
+
 	// ---- 分片路径：worker 池 ----
 	//
-	// 目标并发从 1 开始，每有一个分片成功完成就 +1（上限为配置的
-	// ChunkCount）；一旦出现非终态失败就减半，重试预算用尽则整体失败。
+	// 以温和的并行度起步（最多 4 路），避免大分片场景前半程完全串行；
+	// 出现非终态失败时立即减半，成功后再逐步恢复。
 	//
 	// 关键：重新规划必须在所有在跑的分片退出之后进行。此前实现收到第一个
 	// 错误就立刻重规划并重启分片，旧 goroutine 仍在写同一区间，导致重复
 	// 下载与 bytesDone 重复计数。
 	maxConc := j.chunkConcurrencyLimit()
-	target := 1
+	target := min(4, maxConc)
 	backoff := time.Second
 	rounds := 0
 
@@ -483,6 +536,13 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 		if lastErr == nil {
 			// 本轮队列已空且无错误：回到外层判断是否全部完成。
 			continue
+		}
+		if errors.Is(lastErr, protocol.ErrRangeUnavailable) {
+			// 探测阶段可能被代理或短暂的服务端行为误导。已经退出的分片
+			// 可能留下零散字节，但全量流从 0 开始并覆盖到 EOF 后仍是
+			// 完整文件；此时绝不能把后续 200 响应当作 206 续写。
+			j.log.Warn("server stopped honoring byte ranges; restarting as a stream", "err", lastErr)
+			return runStreaming(0)
 		}
 		if protocol.IsTerminal(lastErr) {
 			return lastErr
@@ -565,6 +625,10 @@ func (j *Job) downloadChunk(ctx context.Context, idx int, bytesDone *atomic.Int6
 			emit(idx)
 		})
 		cancel()
+		if err == nil && atomic.LoadInt64(&c.progress) <= c.end {
+			err = fmt.Errorf("chunk stopped at %d, want through %d: %w",
+				atomic.LoadInt64(&c.progress)-1, c.end, protocol.ErrUnexpectedEOF)
+		}
 
 		if err == nil {
 			chunksDone.Add(1)
@@ -631,6 +695,22 @@ func downloadFallbackWithRetry(ctx context.Context, j *Job, c *chunk, bytesDone 
 			atomic.AddInt64(&c.progress, int64(n))
 			emit(chunkIdx)
 		})
+		if errors.Is(err, protocol.ErrResumeUnavailable) {
+			delta := atomic.LoadInt64(&c.progress) - c.start
+			if delta > 0 {
+				bytesDone.Add(-delta)
+			}
+			// 无法续传时必须明确回到绝对字节 0，而不是“当前 chunk 的
+			// 起点”；否则调用方若传入非零 c.start，会反复触发同一次失败。
+			c.start = 0
+			atomic.StoreInt64(&c.progress, 0)
+			consecutiveFails = 0
+			continue
+		}
+		if err == nil && c.end >= 0 && atomic.LoadInt64(&c.progress) <= c.end {
+			err = fmt.Errorf("stream stopped at %d, want through %d: %w",
+				atomic.LoadInt64(&c.progress)-1, c.end, protocol.ErrUnexpectedEOF)
+		}
 		if err == nil {
 			return nil
 		}
@@ -658,12 +738,6 @@ func downloadFallbackWithRetry(ctx context.Context, j *Job, c *chunk, bytesDone 
 }
 
 func (j *Job) sanityCheck() error {
-	stat, err := j.dest.Stat()
-	if err != nil {
-		return err
-	}
-	if stat.Size() < j.total {
-		return fmt.Errorf("engine: dest file size %d < expected total %d", stat.Size(), j.total)
-	}
-	return nil
+	_, err := j.dest.Stat()
+	return err
 }

@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -103,6 +104,9 @@ done:
 	}
 	if !bytes.Equal(got, payload) {
 		t.Fatal("file mismatch")
+	}
+	if _, err := os.Stat(tk.SavePath + ".part"); !os.IsNotExist(err) {
+		t.Fatalf("partial file still exists after completion: %v", err)
 	}
 }
 
@@ -199,6 +203,241 @@ doneResume:
 	if !bytes.Equal(got, payload) {
 		t.Fatal("resumed file mismatch")
 	}
+}
+
+// TestSchedulerDisabledPreallocKeepsPartialSmall 验证关闭预分配后，暂停时
+// 的 .part 只保留实际写入到的高低水位，而不是提前占满完整文件大小。
+func TestSchedulerDisabledPreallocKeepsPartialSmall(t *testing.T) {
+	const size = 4 * 1024 * 1024
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		rng := r.Header.Get("Range")
+		if rng == "" {
+			if r.Method == http.MethodHead {
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		start, end := parseBytesRange(t, rng, size)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		flusher, _ := w.(http.Flusher)
+		for off := start; off <= end; off += 16 * 1024 {
+			next := min(off+16*1024, end+1)
+			if _, err := w.Write(make([]byte, next-off)); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			time.Sleep(4 * time.Millisecond)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sc := New(st)
+	sc.SetPrealloc(false)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sc.Run(ctx)
+
+	tk, err := sc.Add(AddTaskInput{
+		URL: srv.URL, SavePath: filepath.Join(dir, "out.bin"),
+		Protocol: protocol.ProtoHTTP, ChunkCount: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.Start(tk.ID); err != nil {
+		t.Fatal(err)
+	}
+	ch, unsub := sc.Subscribe()
+	defer unsub()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case ev := <-ch:
+			if ev.Task != nil && ev.Task.ID == tk.ID && ev.Why == "progress" && ev.Task.Downloaded > 0 {
+				goto pause
+			}
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	t.Fatal("did not observe download progress")
+
+pause:
+	pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer pauseCancel()
+	if err := sc.PauseAll(pauseCtx); err != nil {
+		t.Fatalf("PauseAll: %v", err)
+	}
+	part, err := os.Stat(tk.SavePath + ".part")
+	if err != nil {
+		t.Fatalf("partial file: %v", err)
+	}
+	if part.Size() <= 0 || part.Size() >= size {
+		t.Fatalf("partial size=%d, want between 1 and %d with preallocation disabled", part.Size(), size-1)
+	}
+	if _, err := os.Stat(tk.SavePath); !os.IsNotExist(err) {
+		t.Fatalf("final path exists before completion: %v", err)
+	}
+}
+
+// TestSchedulerResetsChangedSourceSize 验证远端大小变化时不会将新旧版本
+// 按旧 chunk 偏移拼接，而是清零后重新下载。
+func TestSchedulerResetsChangedSourceSize(t *testing.T) {
+	const oldSize = 4 * 1024 * 1024
+	const newSize = 2 * 1024 * 1024
+	payload := make([]byte, newSize)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	var sawSecondChunk atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(newSize))
+		if rng := r.Header.Get("Range"); rng != "" {
+			start, end := parseBytesRange(t, rng, newSize)
+			if start == newSize/2 {
+				sawSecondChunk.Store(true)
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, newSize))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			if r.Method != http.MethodHead {
+				_, _ = w.Write(payload[start : end+1])
+			}
+			return
+		}
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(payload)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sc := New(st)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sc.Run(ctx)
+
+	tk, err := sc.Add(AddTaskInput{
+		URL: srv.URL, SavePath: filepath.Join(dir, "out.bin"),
+		Protocol: protocol.ProtoHTTP, ChunkCount: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTaskMeta(tk.ID, oldSize, true, true, 4); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpdateTaskProgress(tk.ID, oldSize/2, []int64{oldSize / 4, oldSize / 4, 0, 0}, store.TaskStatus.Paused, ""); err != nil {
+		t.Fatal(err)
+	}
+	part, err := prealloc.Preallocate(tk.SavePath+".part", oldSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.WriteAt(bytes.Repeat([]byte{0xee}, oldSize), 0); err != nil {
+		t.Fatal(err)
+	}
+	part.Close()
+
+	ch, unsub := sc.Subscribe()
+	defer unsub()
+	if err := sc.Start(tk.ID); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		select {
+		case ev := <-ch:
+			if ev.Task != nil && ev.Task.ID == tk.ID && (ev.Why == "completed" || ev.Why == "failed") {
+				goto doneChanged
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	t.Fatal("resize download did not finish")
+
+doneChanged:
+	got, err := os.ReadFile(tk.SavePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("resized output mismatch: len=%d want=%d", len(got), len(payload))
+	}
+	if !sawSecondChunk.Load() {
+		t.Fatal("engine did not request the fresh second chunk after source size changed")
+	}
+}
+
+func TestMigrateLegacyDownloadToPart(t *testing.T) {
+	t.Run("partial task", func(t *testing.T) {
+		dir := t.TempDir()
+		final := filepath.Join(dir, "out.bin")
+		payload := []byte("legacy partial bytes")
+		if err := os.WriteFile(final, payload, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		tk := &store.Task{SavePath: final, IsAllocated: true, Downloaded: int64(len(payload))}
+		if err := migrateLegacyDownloadToPart(tk); err != nil {
+			t.Fatal(err)
+		}
+		got, err := os.ReadFile(final + ".part")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(got, payload) {
+			t.Fatalf("migrated bytes=%q, want %q", got, payload)
+		}
+		if _, err := os.Stat(final); !os.IsNotExist(err) {
+			t.Fatalf("legacy final path still exists: %v", err)
+		}
+	})
+
+	t.Run("unrelated file", func(t *testing.T) {
+		dir := t.TempDir()
+		final := filepath.Join(dir, "keep.bin")
+		if err := os.WriteFile(final, []byte("user data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		tk := &store.Task{SavePath: final}
+		if err := migrateLegacyDownloadToPart(tk); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(final); err != nil {
+			t.Fatalf("unrelated final file was moved: %v", err)
+		}
+	})
+
+	t.Run("target collision", func(t *testing.T) {
+		dir := t.TempDir()
+		final := filepath.Join(dir, "out.bin")
+		for _, path := range []string{final, final + ".part"} {
+			if err := os.WriteFile(path, []byte("data"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := migrateLegacyDownloadToPart(&store.Task{SavePath: final, Downloaded: 1}); err == nil {
+			t.Fatal("target collision was not reported")
+		}
+	})
 }
 
 // TestStartIsAsync 验证 Start 在探测/预分配期间不会阻塞调用方。
@@ -758,7 +997,7 @@ func TestPauseAllDuringPrepare(t *testing.T) {
 
 	for _, id := range ids {
 		cur, err := st.GetTask(id)
-	if err != nil {
+		if err != nil {
 			t.Fatal(err)
 		}
 		if cur.Status != store.TaskStatus.Paused {
@@ -801,6 +1040,7 @@ func newTestScheduler(t *testing.T, st *store.Store, cap int) (sc *Scheduler, cl
 		sc.PauseAll(context.Background())
 	}
 }
+
 // TestMaxConcurrent_QueuesNewTasksBeyondCap 验证:占住 slot 后,新加入的
 // Start 在 cap 已达时静默排队,不报错、不占 slot,任务保持 Pending。
 func TestMaxConcurrent_QueuesNewTasksBeyondCap(t *testing.T) {
@@ -911,33 +1151,33 @@ func TestMaxConcurrent_PromotesFIFOOnCompletion(t *testing.T) {
 	if err := sc.Start(c); err != nil {
 		t.Fatalf("Start C at cap: %v", err)
 	}
-// 解锁 probe: A 完成/失败 → promotePending 应按 FIFO 拉 B 而不是 C。
-close(releaseProbe)
+	// 解锁 probe: A 完成/失败 → promotePending 应按 FIFO 拉 B 而不是 C。
+	close(releaseProbe)
 
-// 订阅事件流;等 B 收到 started,而不是 C——证明 FIFO 顺序。
-ch, unsub := sc.Subscribe()
-defer unsub()
-bStartedFirst := false
-timeoutCh := time.After(3 * time.Second)
-for !bStartedFirst {
-	select {
-	case ev := <-ch:
-		if ev.Task == nil {
-			continue
+	// 订阅事件流;等 B 收到 started,而不是 C——证明 FIFO 顺序。
+	ch, unsub := sc.Subscribe()
+	defer unsub()
+	bStartedFirst := false
+	timeoutCh := time.After(3 * time.Second)
+	for !bStartedFirst {
+		select {
+		case ev := <-ch:
+			if ev.Task == nil {
+				continue
+			}
+			if ev.Task.ID == c && ev.Why == "started" {
+				t.Fatalf("C was promoted before B — promote is not FIFO")
+			}
+			if ev.Task.ID == b && ev.Why == "started" {
+				bStartedFirst = true
+			}
+		case <-timeoutCh:
+			t.Fatalf("B was never promoted within 3s; FIFO broken")
 		}
-		if ev.Task.ID == c && ev.Why == "started" {
-			t.Fatalf("C was promoted before B — promote is not FIFO")
-		}
-		if ev.Task.ID == b && ev.Why == "started" {
-			bStartedFirst = true
-		}
-	case <-timeoutCh:
-		t.Fatalf("B was never promoted within 3s; FIFO broken")
 	}
-}
 
-// 收尾。
-pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 3*time.Second)
+	// 收尾。
+	pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer pauseCancel()
 	if err := sc.PauseAll(pauseCtx); err != nil {
 		t.Fatalf("PauseAll: %v", err)
@@ -978,7 +1218,7 @@ func TestMaxConcurrent_RaiseCapPromotesPending(t *testing.T) {
 	}
 	a, b, c := mk("a.bin"), mk("b.bin"), mk("c.bin")
 
-// A 占用 slot;B、C 在 cap=1 下保持 Pending。
+	// A 占用 slot;B、C 在 cap=1 下保持 Pending。
 	if err := sc.Start(a); err != nil {
 		t.Fatal(err)
 	}
@@ -1063,7 +1303,7 @@ func TestSubscribeUnsubscribeRace(t *testing.T) {
 
 	const (
 		subscribers = 32
-		rounds     = 200
+		rounds      = 200
 	)
 	for round := 0; round < rounds; round++ {
 		unsubAll := make([]func(), 0, subscribers)

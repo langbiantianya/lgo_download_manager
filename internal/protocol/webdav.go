@@ -99,6 +99,15 @@ func (d *webdavDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	if caps.TotalSize < 0 {
 		return d.fallbackProbe(ctx)
 	}
+	// PROPFIND 成功只证明 WebDAV 可用，并不保证底层服务器支持 Range。
+	// 再发一个 1 字节 Range GET，避免 WebDAV 驱动把不支持区间的服务器
+	// 当成多线程源而写坏文件。
+	rangeCaps, rangeErr := d.probeWithRange(ctx)
+	if rangeErr != nil {
+		caps.SupportRange = false
+	} else {
+		caps.SupportRange = rangeCaps.SupportRange
+	}
 	return caps, nil
 }
 

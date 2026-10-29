@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -46,6 +47,8 @@ type Scheduler struct {
 	// 加入任务留在 Pending(等于「等待中」),直到有 slot 释放再 promote。
 	// 0 表示尚未初始化;SetMaxConcurrent 负责套用默认值并触发 promote。
 	maxConcurrent int
+	// prealloc 控制新任务是否在建连前按完整大小预留磁盘空间。
+	prealloc atomic.Bool
 
 	// wg 跟踪所有由 startAsync 启动的 per-job goroutine。PauseAll 通过
 	// wg.Wait() 确保每个 job 都已落盘 Paused 后再返回,避免"已 cancel 但
@@ -171,7 +174,7 @@ func chunkProgressFrom(cs []engine.ChunkSnapshot) []int64 {
 
 // New 构造一个由给定 Store 支撑的 Scheduler。
 func New(s *store.Store) *Scheduler {
-	return &Scheduler{
+	sc := &Scheduler{
 		st:              s,
 		jobs:            map[string]*runningJob{},
 		maxConcurrent:   store.DefaultMaxConcurrent,
@@ -185,6 +188,14 @@ func New(s *store.Store) *Scheduler {
 			EnablePEX:          true,
 		},
 	}
+	sc.prealloc.Store(true)
+	return sc
+}
+
+// SetPrealloc 把用户的磁盘预分配开关应用到后续 Start。关闭时仍会创建
+// 目标文件，但不会提前占用完整大小；断点写入语义不受影响。
+func (s *Scheduler) SetPrealloc(enabled bool) {
+	s.prealloc.Store(enabled)
 }
 
 // SetMaxConcurrent 设置同时运行的最大任务数。n<=0 时套用默认值。
@@ -436,6 +447,7 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		handedOver = s.startBittorrent(taskID, tk, rj, prepareCtx)
 		return
 	}
+	downloadPath := tk.SavePath + ".part"
 	driver, err := protocol.New(tk.URL, kind, protocol.Auth{AuthOptions: auth})
 	if err != nil {
 		s.fail(tk, err)
@@ -457,9 +469,11 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		s.releaseSlot(taskID)
 		return
 	}
+	sourceSizeChanged := tk.TotalSize > 0 && caps.TotalSize > 0 && tk.TotalSize != caps.TotalSize
 	// 准备阶段失败统一经过 fail()/releaseSlot,此处继续走预分配/启动 engine 流程。
 	if caps.TotalSize > 0 {
-		if err := s.st.UpdateTaskMeta(tk.ID, caps.TotalSize, caps.SupportRange, tk.IsAllocated, tk.ChunkCount); err != nil {
+		metaAllocated := tk.IsAllocated && !sourceSizeChanged
+		if err := s.st.UpdateTaskMeta(tk.ID, caps.TotalSize, caps.SupportRange, metaAllocated, tk.ChunkCount); err != nil {
 			_ = driver.Close()
 			s.fail(tk, err)
 			s.releaseSlot(taskID)
@@ -467,16 +481,48 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		}
 		tk.TotalSize = caps.TotalSize
 		tk.SupportRange = caps.SupportRange
+		tk.IsAllocated = metaAllocated
+	}
+
+	// 旧版本直接写最终文件；第一次恢复时把已有部分数据迁移到 .part，
+	// 避免下载中的文件以最终文件名暴露给用户。
+	if err := migrateLegacyDownloadToPart(tk); err != nil {
+		_ = driver.Close()
+		s.fail(tk, err)
+		s.releaseSlot(taskID)
+		return
+	}
+
+	if sourceSizeChanged {
+		// 总大小变化意味着远端内容已经变化。没有 ETag 校验的情况下，
+		// 不能把旧文件中的偏移继续当作同一份内容；保留旧字节只会造成
+		// 新旧版本拼接。把进度清零并删除旧数据，安全地从头下载。
+		tk.IsAllocated = false
+		tk.Downloaded = 0
+		tk.ChunkProgress = make([]int64, tk.ChunkCount)
+		if err := s.st.UpdateTaskProgress(tk.ID, 0, tk.ChunkProgress, tk.Status, ""); err != nil {
+			_ = driver.Close()
+			s.fail(tk, err)
+			s.releaseSlot(taskID)
+			return
+		}
+		if err := os.Truncate(downloadPath, 0); err != nil && !os.IsNotExist(err) {
+			_ = driver.Close()
+			s.fail(tk, err)
+			s.releaseSlot(taskID)
+			return
+		}
 	}
 
 	// 若尚未预分配文件则进行预分配(恢复场景:文件已具有正确大小)。
 	// 若文件不存在（被删除）则强制重新预分配，即使 IsAllocated 为 true
-	if _, statErr := os.Stat(tk.SavePath); statErr != nil {
+	if _, statErr := os.Stat(downloadPath); statErr != nil {
 		tk.IsAllocated = false
 	}
-	needAlloc := !tk.IsAllocated && caps.TotalSize > 0
+	preallocEnabled := s.prealloc.Load()
+	needAlloc := preallocEnabled && !tk.IsAllocated && caps.TotalSize > 0
 	if needAlloc {
-		dest, err := prealloc.Preallocate(tk.SavePath, caps.TotalSize)
+		dest, err := prealloc.Preallocate(downloadPath, caps.TotalSize)
 		if err != nil {
 			_ = driver.Close()
 			s.fail(tk, err)
@@ -499,7 +545,9 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		s.abortPrepare(taskID, tk)
 		return
 	}
-	dest, err := os.OpenFile(tk.SavePath, os.O_RDWR, 0o644)
+	// 关闭预分配时仍要提前创建目标文件，但不会按完整大小占用空间；
+	// 未知总大小时这里也是唯一的建文件路径。
+	dest, err := os.OpenFile(downloadPath, os.O_RDWR|os.O_CREATE, 0o644)
 	if err != nil {
 		_ = driver.Close()
 		s.fail(tk, err)
@@ -608,8 +656,82 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 			s.markStatusFromJob(tk.ID, store.TaskStatus.Paused, rjRef)
 			return
 		}
+		// Completed 是对用户的持久性承诺。先把数据文件同步到存储设备，
+		// 再写数据库状态，避免掉电后数据库显示完成但文件仍有零页。
+		if err := dest.Sync(); err != nil {
+			rjRef.setError(fmt.Errorf("sync completed file: %w", err))
+			s.markStatusFromJob(tk.ID, store.TaskStatus.Failed, rjRef)
+			return
+		}
+		if err := dest.Close(); err != nil {
+			rjRef.setError(fmt.Errorf("close completed file: %w", err))
+			s.markStatusFromJob(tk.ID, store.TaskStatus.Failed, rjRef)
+			return
+		}
+		if _, err := os.Lstat(tk.SavePath); err == nil {
+			rjRef.setError(fmt.Errorf("download target appeared while downloading: %s", tk.SavePath))
+			s.markStatusFromJob(tk.ID, store.TaskStatus.Failed, rjRef)
+			return
+		} else if !os.IsNotExist(err) {
+			rjRef.setError(fmt.Errorf("inspect completed file target: %w", err))
+			s.markStatusFromJob(tk.ID, store.TaskStatus.Failed, rjRef)
+			return
+		}
+		if err := os.Rename(downloadPath, tk.SavePath); err != nil {
+			rjRef.setError(fmt.Errorf("publish completed file: %w", err))
+			s.markStatusFromJob(tk.ID, store.TaskStatus.Failed, rjRef)
+			return
+		}
+		if err := syncParentDir(tk.SavePath); err != nil {
+			rjRef.setError(fmt.Errorf("sync completed file directory: %w", err))
+			s.markStatusFromJob(tk.ID, store.TaskStatus.Failed, rjRef)
+			return
+		}
 		s.completeFromEngine(tk.ID, rjRef)
 	}()
+}
+
+// syncParentDir 持久化目录项，确保崩溃或掉电后已重命名完成的文件仍然
+// 可见。Windows 不支持对目录句柄执行 Sync，文件本身已在上方完成 Sync。
+func syncParentDir(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
+}
+
+// migrateLegacyDownloadToPart 把旧版本直接写在最终路径上的部分文件迁移
+// 到 ".part"。仅在任务确有进度时执行，避免误移动同名的用户文件。
+func migrateLegacyDownloadToPart(tk *store.Task) error {
+	partPath := tk.SavePath + ".part"
+	if _, err := os.Stat(partPath); err == nil {
+		if _, err := os.Stat(tk.SavePath); err == nil {
+			return fmt.Errorf("download target already exists beside partial file: %s", tk.SavePath)
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("inspect completed download target: %w", err)
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("inspect partial download: %w", err)
+	}
+	if !tk.IsAllocated && tk.Downloaded <= 0 {
+		return nil
+	}
+	if _, err := os.Stat(tk.SavePath); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect legacy download: %w", err)
+	}
+	if err := os.Rename(tk.SavePath, partPath); err != nil {
+		return fmt.Errorf("migrate legacy download to .part: %w", err)
+	}
+	return nil
 }
 
 // ReclaimDownloadingTasks 把上次进程异常退出后残留的 Downloading 任务

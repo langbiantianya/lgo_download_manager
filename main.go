@@ -197,6 +197,7 @@ func main() {
 
 	// 调度器。
 	sc := scheduler.New(st)
+	sc.SetPrealloc(cur.Prealloc)
 
 	// 把设置中的并发上限推到 scheduler。SetMaxConcurrent 还会触发一次
 	// promotePending,确保上次进程残留的 Pending 任务在当前 cap 下被

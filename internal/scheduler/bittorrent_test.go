@@ -269,9 +269,15 @@ func TestRemoveTaskData(t *testing.T) {
 	if err := os.WriteFile(target, []byte("data"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(target+".part", []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	removeTaskData(&store.Task{URL: "https://x/a.bin", Protocol: "HTTPS", SavePath: target})
 	if _, err := os.Stat(target); !os.IsNotExist(err) {
 		t.Errorf("file task data still present: %v", err)
+	}
+	if _, err := os.Stat(target + ".part"); !os.IsNotExist(err) {
+		t.Errorf("file task partial data still present: %v", err)
 	}
 	if _, err := os.Stat(file); err != nil {
 		t.Errorf("unrelated neighbour was removed: %v", err)

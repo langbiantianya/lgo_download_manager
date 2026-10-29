@@ -802,5 +802,6 @@ func removeTaskData(tk *store.Task) {
 		_ = os.RemoveAll(tk.SavePath)
 		return
 	}
+	_ = os.Remove(tk.SavePath + ".part")
 	_ = os.Remove(tk.SavePath)
 }

@@ -51,9 +51,9 @@ func (c *countingService) Probe(string) (int64, error)               { return 0,
 func (c *countingService) BTTaskDetail(string) (*bittorrent.Detail, error) {
 	return nil, nil
 }
-func (c *countingService) Settings() store.Settings                  { return store.Settings{} }
-func (c *countingService) SaveSettings(store.Settings) error         { return nil }
-func (c *countingService) Close() error                              { return nil }
+func (c *countingService) Settings() store.Settings          { return store.Settings{} }
+func (c *countingService) SaveSettings(store.Settings) error { return nil }
+func (c *countingService) Close() error                      { return nil }
 
 // TestTaskListEventsDoNotRelist 验证事件派发不会为每个事件重新调用
 // svc.List：事件自带任务快照，就地打补丁即可；只有过滤条件变化或
@@ -113,5 +113,19 @@ func TestTaskListEventsDoNotRelist(t *testing.T) {
 	tl.onEvent(scheduler.Event{Why: "deleted"})
 	if got := svc.listCalls(); got != afterSearch+2 {
 		t.Fatalf("deleted 事件后 List 调用 = %d 次,期望 %d 次", got, afterSearch+2)
+	}
+}
+
+func TestTaskListBindRowRemovesStaleID(t *testing.T) {
+	tl := &taskList{rowMap: map[string]*taskRow{}}
+	row := &taskRow{}
+	tl.bindRow(row, "old-task")
+	tl.bindRow(row, "new-task")
+
+	if _, ok := tl.rowMap["old-task"]; ok {
+		t.Fatal("reused Fyne row retained stale task mapping")
+	}
+	if got := tl.rowMap["new-task"]; got != row {
+		t.Fatalf("new task mapping=%p, want %p", got, row)
 	}
 }

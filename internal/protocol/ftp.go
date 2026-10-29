@@ -63,8 +63,11 @@ func hasPort(s string) bool {
 // dial 使用配置的凭据登录。PASV 由 AuthOptions.FTPPassive 通过
 // DialWithDisabledEPSV 控制（在我们这里，主动模式是 "PASV" 的反面；
 // FTPPassive 为 true（默认值）时保持 EPSV/PASV 开启）。
-func (d *ftpDriver) dial(_ context.Context) (*ftp.ServerConn, error) {
-	opts := []ftp.DialOption{ftp.DialWithTimeout(10 * time.Second)}
+func (d *ftpDriver) dial(ctx context.Context) (*ftp.ServerConn, error) {
+	opts := []ftp.DialOption{
+		ftp.DialWithTimeout(10 * time.Second),
+		ftp.DialWithContext(ctx),
+	}
 	if !d.auth.FTPPassive {
 		// 主动模式：要求客户端禁用所有服务器端的被动模式变体，
 		// 从而让 RETR 触发服务器回连到我们。
@@ -75,6 +78,8 @@ func (d *ftpDriver) dial(_ context.Context) (*ftp.ServerConn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("ftp dial: %w", err)
 	}
+	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Quit() })
+	defer stopCancel()
 	user := d.auth.Username
 	pass := d.auth.Password
 	if user == "" {
@@ -86,6 +91,10 @@ func (d *ftpDriver) dial(_ context.Context) (*ftp.ServerConn, error) {
 	if err := conn.Login(user, pass); err != nil {
 		_ = conn.Quit()
 		return nil, fmt.Errorf("ftp login: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = conn.Quit()
+		return nil, err
 	}
 	return conn, nil
 }
@@ -223,6 +232,9 @@ func (d *ftpDriver) connFor(ctx context.Context) (*ftp.ServerConn, error) {
 // DownloadChunk 打开一条专用的控制连接，发送 REST start，再发 RETR，
 // 然后将响应体从给定偏移开始写入 file。
 func (d *ftpDriver) DownloadChunk(ctx context.Context, start, end int64, file *os.File, onData func(n int)) error {
+	if start < 0 || end < start {
+		return fmt.Errorf("ftp chunk: invalid range [%d,%d]", start, end)
+	}
 	conn, err := d.connFor(ctx)
 	if err != nil {
 		return err
@@ -243,6 +255,8 @@ func (d *ftpDriver) DownloadChunk(ctx context.Context, start, end int64, file *o
 		return fmt.Errorf("ftp RETR/REST: %w", err)
 	}
 	defer r.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = r.Close() })
+	defer stopCancel()
 
 	bufp := getBuf()
 	defer putBuf(bufp)
@@ -252,9 +266,14 @@ func (d *ftpDriver) DownloadChunk(ctx context.Context, start, end int64, file *o
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		n, rerr := r.Read(buf)
+		remaining := end - off + 1
+		readBuf := buf
+		if int64(len(readBuf)) > remaining {
+			readBuf = readBuf[:remaining]
+		}
+		n, rerr := r.Read(readBuf)
 		if n > 0 {
-			if _, werr := file.WriteAt(buf[:n], off); werr != nil {
+			if _, werr := file.WriteAt(readBuf[:n], off); werr != nil {
 				return fmt.Errorf("ftp chunk write: %w", werr)
 			}
 			off += int64(n)
@@ -263,20 +282,29 @@ func (d *ftpDriver) DownloadChunk(ctx context.Context, start, end int64, file *o
 			}
 		}
 		if rerr == io.EOF {
+			if off <= end {
+				return fmt.Errorf("ftp chunk: wrote through %d, want through %d: %w", off-1, end, ErrUnexpectedEOF)
+			}
 			break
 		}
 		if rerr != nil {
 			return fmt.Errorf("ftp chunk read: %w", rerr)
 		}
-		if off > end+1 {
+		if off > end {
 			break
 		}
+	}
+	if off != end+1 {
+		return fmt.Errorf("ftp chunk: stopped at %d, want %d: %w", off, end+1, ErrUnexpectedEOF)
 	}
 	return nil
 }
 
 // DownloadFallback 是一条不带续传的纯 RETR。当服务器不支持 REST 时使用。
 func (d *ftpDriver) DownloadFallback(ctx context.Context, offset int64, file *os.File, onData func(n int)) error {
+	if offset > 0 {
+		return fmt.Errorf("ftp fallback: %w", ErrResumeUnavailable)
+	}
 	conn, err := d.connFor(ctx)
 	if err != nil {
 		return err
@@ -294,6 +322,8 @@ func (d *ftpDriver) DownloadFallback(ctx context.Context, offset int64, file *os
 		return fmt.Errorf("ftp RETR: %w", err)
 	}
 	defer r.Close()
+	stopCancel := context.AfterFunc(ctx, func() { _ = r.Close() })
+	defer stopCancel()
 
 	bufp := getBuf()
 	defer putBuf(bufp)

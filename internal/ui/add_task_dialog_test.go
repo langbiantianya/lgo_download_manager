@@ -58,6 +58,18 @@ func TestUniqueSavePath(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+
+func TestUniqueSavePathTreatsPartialAsOccupied(t *testing.T) {
+	dir := t.TempDir()
+	base := filepath.Join(dir, "download.bin")
+	if err := os.WriteFile(base+".part", []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := uniqueSavePath(base), filepath.Join(dir, "download(1).bin"); got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}
+
 func TestUniqueSavePathCompoundExt(t *testing.T) {
 	dir := t.TempDir()
 

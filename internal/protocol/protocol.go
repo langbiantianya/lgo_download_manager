@@ -16,9 +16,19 @@ package protocol
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"strconv"
 	"strings"
+)
+
+var (
+	// ErrRangeUnavailable 表示服务器收到 Range 请求却返回了完整响应。
+	// 继续按请求偏移写入会把文件写坏，因此调用方必须改用安全回退路径。
+	ErrRangeUnavailable = errors.New("protocol: server ignored byte range")
+	// ErrResumeUnavailable 表示当前来源无法从指定偏移恢复，但可以从 0
+	// 重新开始。引擎收到它时应清零该流式分片，而不是制造文件空洞。
+	ErrResumeUnavailable = errors.New("protocol: source cannot resume from offset")
 )
 
 // StatusError 携带驱动产生的 HTTP/WebDAV 状态码,供 engine 区分
@@ -83,6 +93,9 @@ func IsTerminal(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return true
 	}
+	if errors.Is(err, ErrRangeUnavailable) {
+		return true
+	}
 	if os.IsNotExist(err) || os.IsPermission(err) {
 		return true
 	}
@@ -92,6 +105,10 @@ func IsTerminal(err error) bool {
 	}
 	return code >= 400 && code < 500
 }
+
+// ErrUnexpectedEOF 是驱动与引擎共用的“响应体短于承诺”错误。
+var ErrUnexpectedEOF = io.ErrUnexpectedEOF
+
 // DriverCapabilities 是 Probe 成功执行后的结果——包含足够多的元数据，
 // 供引擎规划下载方式。
 type DriverCapabilities struct {
@@ -99,6 +116,7 @@ type DriverCapabilities struct {
 	SupportRange bool   // 服务器是否支持 Range / FTP REST
 	ServerInfo   string // 自由形式的 banner / 服务器响应头
 }
+
 // AuthOptions 封装凭据以及驱动能够遵循的请求修饰开关。
 // 字段与具体协议无关；驱动会忽略其不理解的字段。
 type AuthOptions struct {

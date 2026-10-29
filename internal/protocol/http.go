@@ -21,7 +21,10 @@ import (
 
 // chunkSize 是将响应体字节流式写入磁盘时使用的读取缓冲区大小。
 // 256 KiB 在顺序吞吐与系统调用开销之间取得较好的折中。
-const chunkSize = 256 * 1024
+const (
+	chunkSize          = 256 * 1024
+	maxHTTPConnections = 64
+)
 
 // bufPool 复用 chunkSize 大小的读缓冲。每个 DownloadChunk /
 // DownloadFallback（以及引擎的每一次重试）都需要一块这样的缓冲，
@@ -74,12 +77,19 @@ func newHTTPBase(kind, raw string, auth AuthOptions) (httpBase, error) {
 	tr := &http.Transport{
 		Proxy:                 proxyFunc(effectiveAuth(auth)),
 		DialContext:           dialer.DialContext,
-		MaxIdleConns:          16,
-		MaxIdleConnsPerHost:   16,
+		MaxIdleConns:          maxHTTPConnections,
+		MaxIdleConnsPerHost:   maxHTTPConnections,
+		MaxConnsPerHost:       maxHTTPConnections,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 		ResponseHeaderTimeout: 60 * time.Second,
+		// 自定义 DialContext 会让 Transport 保守地关闭 HTTP/2 自动协商；
+		// 显式开启后可复用同一 HTTPS 连接承载多个分片请求。
+		ForceAttemptHTTP2: true,
+		// 下载必须保存服务器提供的原始字节，不能让 Transport 自动解压
+		// gzip/br 响应，否则 Range 偏移和 Content-Length 都会失真。
+		DisableCompression: true,
 	}
 	return httpBase{
 		kind: kind,
@@ -126,36 +136,29 @@ func (d *httpBase) DownloadChunk(ctx context.Context, start, end int64, file *os
 		return fmt.Errorf("%s chunk do: %w", d.kind, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+	if resp.StatusCode == http.StatusOK {
+		return fmt.Errorf("%s chunk: %w", d.kind, ErrRangeUnavailable)
+	}
+	if resp.StatusCode != http.StatusPartialContent {
 		return NewStatusError(resp.StatusCode, fmt.Errorf("%s chunk: status %d", d.kind, resp.StatusCode))
 	}
+	rangeStart, rangeEnd, _, ok := parseContentRange(resp.Header.Get("Content-Range"))
+	if !ok || rangeStart != start || rangeEnd != end {
+		return fmt.Errorf("%s chunk: invalid Content-Range %q for requested [%d,%d]",
+			d.kind, resp.Header.Get("Content-Range"), start, end)
+	}
+	expected := end - start + 1
+	if resp.ContentLength >= 0 && resp.ContentLength != expected {
+		return fmt.Errorf("%s chunk: Content-Length %d, want %d", d.kind, resp.ContentLength, expected)
+	}
 
-	bufp := getBuf()
-	defer putBuf(bufp)
-	buf := *bufp
 	off := start
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := file.WriteAt(buf[:n], off); werr != nil {
-				return fmt.Errorf("%s chunk write: %w", d.kind, werr)
-			}
-			off += int64(n)
-			if onData != nil {
-				onData(n)
-			}
-		}
-		if rerr == io.EOF {
-			break
-		}
-		if rerr != nil {
-			return fmt.Errorf("%s chunk read: %w", d.kind, rerr)
-		}
-		if off > end+1 {
-			// 防御性处理：部分服务器会超出请求的 end 边界。
-			// 一旦越过 boundary 即停止写入。
-			break
-		}
+	n, err := copyResponseBody(resp.Body, file, off, expected, onData)
+	if err != nil {
+		return fmt.Errorf("%s chunk read: %w", d.kind, err)
+	}
+	if n != expected {
+		return fmt.Errorf("%s chunk: wrote %d bytes, want %d: %w", d.kind, n, expected, ErrUnexpectedEOF)
 	}
 	return nil
 }
@@ -168,39 +171,80 @@ func (d *httpBase) DownloadFallback(ctx context.Context, offset int64, file *os.
 		return fmt.Errorf("%s fallback build: %w", d.kind, err)
 	}
 	d.decorate(req)
+	if offset > 0 {
+		// 无 Range 的流式回退本应从 0 开始。先尝试标准续传；如果服务端
+		// 返回 200，调用方必须显式重置，而不能把响应开头写到 offset。
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
 
 	resp, err := d.cli.Do(req)
 	if err != nil {
 		return fmt.Errorf("%s fallback do: %w", d.kind, err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+	writeOffset := int64(0)
+	switch resp.StatusCode {
+	case http.StatusPartialContent:
+		if offset == 0 {
+			return fmt.Errorf("%s fallback: unexpected partial response", d.kind)
+		}
+		start, _, _, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		if !ok || start != offset {
+			return fmt.Errorf("%s fallback: invalid Content-Range %q for offset %d",
+				d.kind, resp.Header.Get("Content-Range"), offset)
+		}
+		writeOffset = offset
+	case http.StatusOK:
+		if offset > 0 {
+			return fmt.Errorf("%s fallback: %w", d.kind, ErrResumeUnavailable)
+		}
+	default:
 		return NewStatusError(resp.StatusCode, fmt.Errorf("%s fallback: status %d", d.kind, resp.StatusCode))
 	}
 
+	n, err := copyResponseBody(resp.Body, file, writeOffset, -1, onData)
+	if err != nil {
+		return fmt.Errorf("%s fallback read: %w", d.kind, err)
+	}
+	if resp.ContentLength >= 0 && n != resp.ContentLength {
+		return fmt.Errorf("%s fallback: wrote %d bytes, want %d: %w", d.kind, n, resp.ContentLength, ErrUnexpectedEOF)
+	}
+	return nil
+}
+
+// copyResponseBody 从 off 开始写响应体；limit < 0 表示不限长度。
+// 对分片路径，必须只读取本分片剩余字节，绝不能越过 end 写入相邻分片。
+func copyResponseBody(r io.Reader, file *os.File, off, limit int64, onData func(int)) (int64, error) {
 	bufp := getBuf()
 	defer putBuf(bufp)
 	buf := *bufp
-	off := offset
-	for {
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			if _, werr := file.WriteAt(buf[:n], off); werr != nil {
-				return fmt.Errorf("%s fallback write: %w", d.kind, werr)
+	var written int64
+	for limit < 0 || written < limit {
+		readBuf := buf
+		if limit >= 0 {
+			remaining := limit - written
+			if int64(len(readBuf)) > remaining {
+				readBuf = readBuf[:remaining]
 			}
-			off += int64(n)
+		}
+		n, rerr := r.Read(readBuf)
+		if n > 0 {
+			if _, werr := file.WriteAt(readBuf[:n], off+written); werr != nil {
+				return written, werr
+			}
+			written += int64(n)
 			if onData != nil {
 				onData(n)
 			}
 		}
 		if rerr == io.EOF {
-			break
+			return written, nil
 		}
 		if rerr != nil {
-			return fmt.Errorf("%s fallback read: %w", d.kind, rerr)
+			return written, rerr
 		}
 	}
-	return nil
+	return written, nil
 }
 
 // Close 关闭底层 http.Client 的空闲连接。可以重复调用。
@@ -251,16 +295,26 @@ func (d *httpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 		SupportRange: supportsRanges(resp),
 		TotalSize:    parseInt64(resp.Header.Get("Content-Length")),
 	}
-	// 部分服务器在 HEAD 响应中省略该字段，但在 GET 响应中包含。
+	// 用最小的实际 Range GET 验证能力。部分服务器会错误声明
+	// Accept-Ranges，或由代理吞掉 Range；仅看 HEAD 头不足以保证安全。
+	rangeCaps, rangeErr := d.probeWithRange(ctx)
+	if rangeErr != nil {
+		if caps.TotalSize < 0 {
+			return nil, rangeErr
+		}
+		caps.SupportRange = false
+		return caps, nil
+	}
+	caps.SupportRange = rangeCaps.SupportRange
 	if caps.TotalSize < 0 {
-		return d.probeWithRange(ctx)
+		caps.TotalSize = rangeCaps.TotalSize
 	}
 	return caps, nil
 }
 
 // probeWithRange 发起 1 字节的区间 GET，以促使服务器同时返回
 // Content-Length 与 Accept-Ranges 字段。
-func (d *httpDriver) probeWithRange(ctx context.Context) (*DriverCapabilities, error) {
+func (d *httpBase) probeWithRange(ctx context.Context) (*DriverCapabilities, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, d.url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("http probe range build: %w", err)
@@ -280,13 +334,19 @@ func (d *httpDriver) probeWithRange(ctx context.Context) (*DriverCapabilities, e
 		SupportRange: resp.StatusCode == http.StatusPartialContent,
 		ServerInfo:   strings.Join(resp.Header["Server"], ", "),
 	}
-	if cr := resp.Header.Get("Content-Range"); cr != "" {
-		caps.TotalSize = parseTotalFromContentRange(cr)
+	if caps.SupportRange {
+		start, end, total, ok := parseContentRange(resp.Header.Get("Content-Range"))
+		if !ok || start != 0 || end != 0 {
+			caps.SupportRange = false
+		} else {
+			caps.TotalSize = total
+		}
 	} else {
 		caps.TotalSize = parseInt64(resp.Header.Get("Content-Length"))
 	}
-	// 排掉我们请求的那 1 字节响应体；不需要保留。
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// 最多消费 1 字节。服务端若忽略 Range 返回 200，不能把整个文件
+	// 在“探测”阶段下载到 io.Discard。
+	_, _ = io.CopyN(io.Discard, resp.Body, 1)
 	return caps, nil
 }
 
@@ -315,9 +375,45 @@ func parseInt64(s string) int64 {
 // parseTotalFromContentRange 解析形如 "bytes 0-0/12345" 的 Content-Range，
 // 返回完整的总字节数 12345。
 func parseTotalFromContentRange(s string) int64 {
-	idx := strings.LastIndex(s, "/")
-	if idx < 0 {
+	_, _, total, ok := parseContentRange(s)
+	if !ok {
 		return -1
 	}
-	return parseInt64(strings.TrimSpace(s[idx+1:]))
+	return total
+}
+
+// parseContentRange 解析 "bytes START-END/TOTAL"；TOTAL 为 "*" 时返回 -1。
+func parseContentRange(s string) (start, end, total int64, ok bool) {
+	s = strings.TrimSpace(s)
+	if !strings.HasPrefix(strings.ToLower(s), "bytes ") {
+		return 0, 0, 0, false
+	}
+	s = strings.TrimSpace(s[len("bytes "):])
+	slash := strings.IndexByte(s, '/')
+	if slash < 0 {
+		return 0, 0, 0, false
+	}
+	bounds := strings.TrimSpace(s[:slash])
+	dash := strings.IndexByte(bounds, '-')
+	if dash < 0 {
+		return 0, 0, 0, false
+	}
+	start, err := strconv.ParseInt(strings.TrimSpace(bounds[:dash]), 10, 64)
+	if err != nil || start < 0 {
+		return 0, 0, 0, false
+	}
+	end, err = strconv.ParseInt(strings.TrimSpace(bounds[dash+1:]), 10, 64)
+	if err != nil || end < start {
+		return 0, 0, 0, false
+	}
+	totalText := strings.TrimSpace(s[slash+1:])
+	if totalText == "*" {
+		total = -1
+	} else {
+		total, err = strconv.ParseInt(totalText, 10, 64)
+		if err != nil || total <= end {
+			return 0, 0, 0, false
+		}
+	}
+	return start, end, total, true
 }

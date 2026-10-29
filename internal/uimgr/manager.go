@@ -88,6 +88,7 @@ func (m *Manager) SetSettings(s store.Settings) {
 	// 下次保存就会触发 promotePending——可能提升之前因超出限额而
 	// 排队的 Pending 任务。
 	m.sc.SetMaxConcurrent(s.EffectiveMaxConcurrent())
+	m.sc.SetPrealloc(s.Prealloc)
 	// BitTorrent 设置同步:限速立即生效,端口/DHT/PEX 等在客户端可安全
 	// 重建时生效(见 scheduler.SetBittorrentConfig)。
 	m.sc.SetBittorrentConfig(scheduler.BittorrentConfigFrom(s))

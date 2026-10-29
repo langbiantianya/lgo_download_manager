@@ -247,6 +247,13 @@ func (tl *taskList) buildHeaderRow() fyne.CanvasObject {
 // bindRow 在 rowMap 中以 taskID 注册 row。
 func (tl *taskList) bindRow(row *taskRow, taskID string) {
 	tl.rowMu.Lock()
+	// Fyne 会复用已滚出视口的 row 对象。若保留旧 ID 映射，旧任务的
+	// progress 事件会刷新一个已绑定到新任务、甚至当前不可见的 row。
+	for id, bound := range tl.rowMap {
+		if bound == row && id != taskID {
+			delete(tl.rowMap, id)
+		}
+	}
 	tl.rowMap[taskID] = row
 	tl.rowMu.Unlock()
 }
