@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -522,6 +523,67 @@ func TestChunkedDownload(t *testing.T) {
 	progMu.Unlock()
 	if gotBytes != size {
 		t.Fatalf("last progress DownloadedBytes=%d, want %d", gotBytes, size)
+	}
+}
+
+func TestNonTerminalChunkFailureKeepsHealthyChunksRunning(t *testing.T) {
+	const size = 2 * 1024 * 1024
+	payload := make([]byte, size)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatal(err)
+	}
+	var failOnce atomic.Int32
+	failOnce.Store(1)
+	var secondChunkRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start, end, err := parseRange(r.Header.Get("Range"), size)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if start == 0 && failOnce.CompareAndSwap(1, 0) {
+			http.Error(w, "temporary", http.StatusServiceUnavailable)
+			return
+		}
+		if start == size/2 {
+			secondChunkRequests.Add(1)
+			time.Sleep(250 * time.Millisecond)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, size))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	destPath := filepath.Join(dir, "out.bin")
+	dest, err := prealloc.Preallocate(destPath, size)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dest.Close()
+	driver, err := protocol.New(srv.URL, protocol.ProtoHTTP, protocol.Auth{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer driver.Close()
+
+	job := NewJob(driver, size, dest, Options{ChunkCount: 2, MaxRetries: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := job.Run(ctx, true); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, err := os.ReadFile(destPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatal("payload mismatch")
+	}
+	if got := secondChunkRequests.Load(); got != 1 {
+		t.Fatalf("healthy chunk requested %d times, want 1 (must not be canceled by another chunk failure)", got)
 	}
 }
 

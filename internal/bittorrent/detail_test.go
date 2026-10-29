@@ -8,6 +8,7 @@ package bittorrent
 
 import (
 	"context"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -188,8 +189,8 @@ func TestMeasureUploadSpeedUsesOwnClock(t *testing.T) {
 	// 上传方向独立计时:2 秒内多传 2000 字节 → 1000 B/s。
 	h.lastUpBytes = 1000
 	h.lastUpSample = time.Now().Add(-2 * time.Second)
-	if got := h.measureUploadSpeed(3000); got != 1000 {
-		t.Errorf("upload speed = %v, want 1000", got)
+	if got := h.measureUploadSpeed(3000); math.Abs(got-1000) > 1 {
+		t.Errorf("upload speed = %v, want approximately 1000", got)
 	}
 }
 
@@ -200,11 +201,11 @@ func TestMeasureSpeedKeepsBaselineWhenSampledTooOften(t *testing.T) {
 	h := &Handle{lastSample: time.Now().Add(-2 * time.Second)}
 
 	// 第一次:间隔够长,正常算出速度。
-	if got := h.measureSpeed(2000); got != 1000 {
-		t.Fatalf("first sample = %v, want 1000", got)
+	if got := h.measureSpeed(2000); math.Abs(got-1000) > 1 {
+		t.Fatalf("first sample = %v, want approximately 1000", got)
 	}
 	// 紧接着再采一次:间隔太短,应沿用上次的结果而不是把增量分掉。
-	if got := h.measureSpeed(2500); got != 1000 {
-		t.Errorf("second sample = %v, want the previous 1000", got)
+	if got := h.measureSpeed(2500); math.Abs(got-1000) > 1 {
+		t.Errorf("second sample = %v, want the previous speed of approximately 1000", got)
 	}
 }

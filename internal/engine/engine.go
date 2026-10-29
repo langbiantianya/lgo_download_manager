@@ -34,13 +34,15 @@ type Progress struct {
 }
 
 type Options struct {
-	ChunkCount            int
-	ChunkSizes            []int64
-	ResumeFrom            []int64
-	MinChunkSize          int64
-	Progress              func(Progress)
-	ProgressEvery         time.Duration
-	TaskID                string
+	ChunkCount    int
+	ChunkSizes    []int64
+	ResumeFrom    []int64
+	MinChunkSize  int64
+	Progress      func(Progress)
+	ProgressEvery time.Duration
+	TaskID        string
+	// MaxRetries 是单分片/单流的连续失败预算；0 使用默认值。
+	MaxRetries            int
 	OnChunkCountDecreased func(newCount int)
 	// OnPlanChanged 在引擎合并或重新规划其分片时触发
 	// (例如当服务器不支持字节区间时,引擎回退到单个流式分片)。
@@ -61,6 +63,9 @@ func (o *Options) defaults() {
 	}
 	if o.ProgressEvery <= 0 {
 		o.ProgressEvery = 250 * time.Millisecond
+	}
+	if o.MaxRetries <= 0 {
+		o.MaxRetries = maxChunkRetries
 	}
 }
 
@@ -521,6 +526,24 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 				continue
 			}
 			lastErr = err
+			if !protocol.IsTerminal(err) {
+				// 非终态错误不应打断其它健康分片。停止派发新分片，
+				// 让已在途请求完成并保留其进度，随后再统一重规划。
+				for inflight > 0 {
+					drainErr := <-results
+					inflight--
+					if drainErr == nil {
+						if target < maxConc {
+							target++
+						}
+						continue
+					}
+					if protocol.IsTerminal(drainErr) {
+						lastErr = drainErr
+						roundCancel()
+					}
+				}
+			}
 			break
 		}
 		roundCancel()
@@ -640,8 +663,8 @@ func (j *Job) downloadChunk(ctx context.Context, idx int, bytesDone *atomic.Int6
 			return err
 		}
 		consecutiveFails++
-		j.log.Warn("chunk error backing off", "idx", idx, "err", err, "backoff", backoff, "fails", consecutiveFails, "maxFails", maxChunkRetries)
-		if consecutiveFails >= maxChunkRetries {
+		j.log.Warn("chunk error backing off", "idx", idx, "err", err, "backoff", backoff, "fails", consecutiveFails, "maxFails", j.opts.MaxRetries)
+		if consecutiveFails >= j.opts.MaxRetries {
 			j.log.Warn("chunk giving up after consecutive failures", "idx", idx, "fails", consecutiveFails, "err", err)
 			return err
 		}
@@ -717,10 +740,10 @@ func downloadFallbackWithRetry(ctx context.Context, j *Job, c *chunk, bytesDone 
 			return err
 		}
 		consecutiveFails++
-		if consecutiveFails >= maxChunkRetries {
+		if consecutiveFails >= j.opts.MaxRetries {
 			return err
 		}
-		j.log.Warn("streaming chunk error backing off", "err", err, "backoff", backoff, "fails", consecutiveFails, "maxFails", maxChunkRetries)
+		j.log.Warn("streaming chunk error backing off", "err", err, "backoff", backoff, "fails", consecutiveFails, "maxFails", j.opts.MaxRetries)
 		if waitErr := waitRetry(ctx, retryDelay(err, backoff)); waitErr != nil {
 			return waitErr
 		}

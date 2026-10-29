@@ -1162,6 +1162,33 @@ func TestHTTPDownloadChunk(t *testing.T) {
 	d.Close()
 }
 
+func TestHTTPDownloadRequestsIdentityEncoding(t *testing.T) {
+	const size = 1024
+	payload := bytes.Repeat([]byte{0x42}, size)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Accept-Encoding"); got != "identity" {
+			http.Error(w, "Accept-Encoding="+got, http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-%d/%d", size-1, size))
+		w.Header().Set("Content-Length", strconv.Itoa(size))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload)
+	}))
+	defer srv.Close()
+
+	f, err := os.Create(filepath.Join(t.TempDir(), "identity.bin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	d := makeHTTPDriver(srv.URL)
+	if err := d.DownloadChunk(context.Background(), 0, size-1, f, nil); err != nil {
+		t.Fatal(err)
+	}
+	_ = d.Close()
+}
+
 func TestHTTPDownloadChunkInvalidRange(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer srv.Close()

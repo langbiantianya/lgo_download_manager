@@ -208,6 +208,9 @@ func newHTTPBase(kind, raw string, auth AuthOptions) (httpBase, error) {
 // 以及（可选的）Basic Auth。仅当用户名与密码任一方非空时才会发送
 // Basic Auth。
 func (d *httpBase) decorate(req *http.Request) {
+	// 关闭自动解压还不够：没有显式标识时服务器仍可选择编码后的表示。
+	// Range 偏移必须对应磁盘上的原始字节，因此要求 identity。
+	req.Header.Set("Accept-Encoding", "identity")
 	if d.auth.UserAgent != "" {
 		req.Header.Set("User-Agent", d.auth.UserAgent)
 	}
