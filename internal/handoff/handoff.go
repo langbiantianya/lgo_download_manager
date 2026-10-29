@@ -30,7 +30,8 @@
 //     extension:// / safari-web-extension://），否则 403；不带 Origin 的请求
 //     （curl、脚本）放行 —— 那些进程本来就与业务进程同权限。
 //   - 请求在业务进程里的落地路径与 lgom:// URL 完全一致（弹「新建下载任务」
-//     对话框，无 UI 的 --no-gui / --autostart 形态则直接 Add+Start）。
+//     对话框；只有显式 --no-gui 形态直接 Add+Start）。--autostart 仅控制
+//     登录启动时初始窗口是否显示，不改变后续请求的交互语义。
 package handoff
 
 import (

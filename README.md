@@ -598,7 +598,7 @@ flatpak run --arch=aarch64 org.langbiantianya.LGDM  # 已装了 aarch64 那份�
 | `-open-url` | `""`            | 一条 `lgom://...` URL，加入队列               |
 | `-light`    | `false`         | 强制开启轻量模式（关闭主窗口时释放 widget 树） |
 | `-debug`    | `false`         | 把日志写到 stderr 而不是轮转文件（详见「日志」） |
-| `-autostart`| `false`         | 由 OS 登录启动项触发:静默拉起(只保留调度器 + 托盘,不显示主窗口)。Flatpak 安装下由注册项里的 `flatpak run … --autostart` 触发 |
+| `-autostart`| `false`         | 由 OS 登录启动项触发:初始只保留调度器 + 托盘，不显示主窗口；之后可从托盘打开，或由扩展请求按需拉起 UI。Flatpak 安装下由注册项里的 `flatpak run … --autostart` 触发 |
 
 `-config` 默认值：Windows 上是 `%LOCALAPPDATA%\lgo_download_manager`（绝对路径
 —— 安装后的 lgdm 会被 `lgom://` 协议从任意工作目录拉起，相对路径会因 CWD
@@ -655,8 +655,9 @@ suppress），但它同时把 lgdm 冷启动起来。通道 1 的短板是要求
 
 正文走 JSON 而不是查询串，所以不受 URL 长度限制，Cookie / User-Agent 也不会
 出现在可被导航、会进历史记录的 URL 里。落地路径与 `lgom://` 完全一致：弹
-「新建下载任务」对话框由用户确认；`--no-gui` / `--autostart` 形态则直接
-Add + Start（服务/CLI 语义不变）。
+「新建下载任务」对话框由用户确认；只有显式 `--no-gui` 形态直接 Add + Start
+（服务/CLI 语义不变）。`--autostart` 只控制登录启动时是否立即显示主窗口，
+之后收到扩展请求仍会按需拉起界面并弹出确认对话框。
 
 `url` 同样接受磁力链接与 `.torrent` 链接（正文是 JSON，不需要 URL 编码），
 因此扩展/脚本可以把 BT 任务一并交接给 lgdm。
@@ -687,7 +688,7 @@ Unix socket（其它平台）把 URL 转发给主实例后退出，转发失败�
 `url` 不限协议：`https://…`、`ftp://…`、`webdav://…` 之外，`magnet:?xt=urn:btih:…`
 （需 URL 编码后放进查询串,例如 `lgom://download?url=magnet%3A%3Fxt%3Durn%3Abtih%3A…`）
 与 `.torrent` 链接同样会被识别成 BitTorrent 任务，落到「新建任务」对话框
-（`--no-gui` / `--autostart` 下则直接 Add + Start）。
+（显式 `--no-gui` 下则直接 Add + Start；`--autostart` 只在首次启动时静默）。
 
 ## 代理
 
@@ -721,8 +722,9 @@ HTTP，因此不受这里的代理影响。
 | Linux（Flatpak） | 宿主 `~/.config/autostart/lgo_download_manager.desktop`          | `Exec=flatpak run org.langbiantianya.LGDM --autostart` + `X-Flatpak=org.langbiantianya.LGDM` |
 | macOS  | `~/Library/LaunchAgents/org.langbiantianya.LGDM.plist`                    | `ProgramArguments` 数组形式，`RunAtLoad=true`、`ProcessType=Background` |
 
-`--autostart` 由各平台注册项附加，业务进程读到后跳过 `uim.Start()`，
-保留调度器 + 托盘常驻。Windows / Linux / macOS 三平台行为对齐。
+`--autostart` 由各平台注册项附加，业务进程读到后跳过首次 `uim.Start()`，
+保留调度器 + 托盘常驻；之后用户打开托盘或扩展投递下载请求时，仍会按需拉起
+UI 并弹出「新建下载任务」对话框。Windows / Linux / macOS 三平台行为对齐。
 
 Flatpak 是 Linux 上的例外：沙箱里的 `/app/bin/lgo_download_manager` 在宿主上
 并不存在，注册项必须写成 `flatpak run <app-id> --autostart` 由宿主重新进入

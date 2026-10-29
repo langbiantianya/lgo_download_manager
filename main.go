@@ -27,7 +27,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
 	"lgo_download_manager/internal/handoff"
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/ipc"
@@ -41,6 +40,7 @@ import (
 	"lgo_download_manager/internal/uimgr"
 	"lgo_download_manager/internal/urllauncher"
 	"lgo_download_manager/internal/version"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -61,14 +61,33 @@ const handoffInfoFile = "handoff.json"
 // --debug,则把该信号写进 LGDM_DEBUG,UI 子进程继承同一份配置。
 const envLogDebug = "LGDM_DEBUG"
 
+// startupMode 描述业务进程的启动参数。autostart 决定登录启动时是否立即
+// 展示窗口，不能参与后续 URL 请求的交互决策；只有显式 noGUI 才改变请求
+// 的落地方式。
+type startupMode struct {
+	noGUI     bool
+	autostart bool
+}
+
+// startUIOnLaunch 报告业务进程启动时是否应立即拉起 UI。
+func (m startupMode) startUIOnLaunch() bool {
+	return !m.noGUI && !m.autostart
+}
+
+// addURLDirectly 报告 URL 请求是否应跳过确认对话框直接 Add+Start。
+func (m startupMode) addURLDirectly() bool {
+	return m.noGUI
+}
+
 func main() {
 	configPath := flag.String("config", defaultConfigPath(), "directory for lgdm runtime files (db + logs)")
 	noGUI := flag.Bool("no-gui", false, "start without spawning the Fyne UI child")
 	openURL := flag.String("open-url", "", "download URL (lgom://... format)")
 	light := flag.Bool("light", false, "force lightweight mode (destroy UI on close)")
 	debug := flag.Bool("debug", false, "log to stderr instead of rotating file")
-	autostartSilent := flag.Bool("autostart", false, "invoked by OS login autostart: stay headless (tray only, no main window)")
+	autostartSilent := flag.Bool("autostart", false, "invoked by OS login autostart: start hidden in tray and open the UI on demand")
 	flag.Parse()
+	startup := startupMode{noGUI: *noGUI, autostart: *autostartSilent}
 
 	// 把 --debug 通过环境变量传给即将拉起的 UI 子进程,
 	// 让子进程日志也走 stderr,而不是悄悄落到文件里。
@@ -222,19 +241,19 @@ func main() {
 	// URL/Name/UA/Cookies 上不同。
 	//
 	// --no-gui 模式下没有 UI 实例:此时回退到原先的「业务进程直接 Add+Start」,
-	// 服务/CLI 形态仍可独立工作;其它路径只要 UI 子进程拉起失败就只记录
-	// warning,由用户从托盘或重新转发 URL 触发。
+	// 服务/CLI 形态仍可独立工作;--autostart 只控制首次启动是否展示主窗口,
+	// 不应改变之后交接请求的交互语义,否则登录自启实例会把扩展请求静默入队。
+	// 其它路径只要 UI 子进程拉起失败就只记录 warning,由用户从托盘或重新
+	// 转发 URL 触发。
 	//
 	// 返回错误表示这条请求没有被业务进程接收(例如 UI 弹不出来),本地端口
 	// 通道会把它作为 {"ok":false,…} 回给扩展,扩展据此退到下一个通道。
 	handleRequest := func(req *urllauncher.DownloadRequest) error {
 		logging.Printf("queueing download request: %s", req.URL)
-		// --no-gui 与 --autostart 都没有 UI 实例可弹:都走「业务侧
-		// 直接 Add+Start」。autostart 路径主要处理 lgom:// 转发协议
-		// 在 OS 登录后立即触发 URL 的边角场景(罕见但真实:浏览器
-		// 启动后立刻点链接)。
-		if *noGUI || *autostartSilent {
-			// CLI / 服务 / autostart 场景:业务侧直接创建并启动,无对话框可弹。
+		// 只有显式 --no-gui 才绕过 UI 直接 Add+Start。--autostart 只影响
+		// 本次进程首次拉起的呈现方式;后续扩展/URL 请求仍应拉起 UI 并弹
+		// 出确认对话框。
+		if startup.addURLDirectly() {
 			addAndStartFromURL(sc, cur, req)
 			return nil
 		}
@@ -323,11 +342,11 @@ func main() {
 	// URL 在 uim 起来之前就已经被上面循环处理——SendShowAddTask 内部会
 	// 等待握手,首条消息不会丢失。
 	//
-	// --autostart 是 OS 登录启动项触发的静默拉起:用户没有点托盘菜单就
-	// 不会有 UI 需求;只保留调度器 + 系统托盘,等用户在托盘「显示窗口」。
-	// 这与 Windows 资源管理器/HKCU Run 的「登录后立即拉起」、Linux
-	// XDG autostart、macOS launchd RunAtLoad 的语义对齐。
-	if !*noGUI && !*autostartSilent {
+	// --autostart 是 OS 登录启动项触发的静默拉起:初始只保留调度器 +
+	// 系统托盘,等用户点托盘「显示窗口」或由扩展/URL 请求按需打开 UI。
+	// 与 Windows 资源管理器/HKCU Run 的「登录后立即拉起」、Linux XDG
+	// autostart、macOS launchd RunAtLoad 的语义对齐。
+	if startup.startUIOnLaunch() {
 		if err := uim.Start(); err != nil {
 			logging.Printf("uimgr: cannot start UI child: %v", err)
 		}
@@ -447,6 +466,7 @@ func defaultConfigPath() string {
 // pickLogTarget 把 logging.InitLevel 的 dir 解析出来:
 //   - stderr=true 时传 "",触发 InitLevel 走 stderr handler;
 //   - 否则传 logDir,让日志落到配置目录里的 lgdm.log。
+//
 // 仅作为日志目标的归一化入口,本身没有副作用。
 func pickLogTarget(stderr bool, logDir string) string {
 	if stderr {
