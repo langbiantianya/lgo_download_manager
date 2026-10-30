@@ -2472,25 +2472,65 @@ git commit -m "feat(rpc): 新增传输抽象层、共享客户端与地址解析
 ### Task 5: 实现 `internal/rpc/httpx`（net/http 传输）
 
 **Files:**
-- Create: `internal/rpc/httpx/server.go`
 - Create: `internal/rpc/httpx/client.go`
-- Create: `internal/rpc/httpx/httpx_test.go`
+- Create: `internal/rpc/httpx/server.go`
+- Create: `internal/rpc/httpx/httpx_test.go`（`package httpx`）
+- Create: `internal/rpc/httpx/contract_test.go`（`package httpx_test`，编译期断言）
+- Modify: `internal/rpc/addr/addr.go`（补 `DialContext`）
+- Modify: `internal/rpc/addr/addr_test.go`（补 `DialContext` 的测试）
 
 **Interfaces:**
-- Consumes: `internal/api`、`internal/rpc/addr`、`internal/rpc`（仅用 `api` 与 `addr`；**不得** import `internal/rpc`）
+- Consumes: `internal/api`、`internal/rpc/addr` + 标准库。
+  **不得** import `internal/rpc`（会形成 `rpc → httpx → rpc` 的包环），
+  也不得 import `internal/store`、`internal/scheduler`、`internal/engine`、
+  `internal/ui`、`internal/uimgr`、`internal/appservice`。
 - Produces:
   ```go
   package httpx
   type Client struct { /* ... */ }
   func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error)
-  func Serve(ctx context.Context, a addr.Addr, token string, h rpcHandler) error
-  // rpcHandler 是 httpx 内部定义的最小接口（结构化满足 rpc.Handler）：
+  func Serve(ctx context.Context, a addr.Addr, token string, h Handler) error
+  // Handler 是 httpx 内部定义的最小接口（方法集与 rpc.Handler 逐字一致，
+  // 靠结构化类型与它对接）：
   //   interface { Call(ctx, method string, in, out any) error
   //               Events() (<-chan api.Event, func())
   //               Controls() <-chan api.Message }
   ```
 
-- [ ] **Step 1: 建 `internal/rpc/httpx/client.go`**
+> 线格式：REST 风格路径 `/lgdm.v1.DownloadService/{method}` + JSON 正文；
+> 消息流用 NDJSON 逐行推送；每次请求都带 `Authorization: Bearer <token>`，
+> 服务端每次调用强制校验；只接受 POST。
+> 错误响应体形状固定为 `{"ok":false,"error":"..."}`，客户端按 `error` 字段解析。
+
+> **与控制器补充说明（A1–A11）的对照**：本节代码是按 A1–A11 修正后的最终实现，
+> 与最初的草稿有出入的地方见文末「与初稿的差异」。
+
+- [ ] **Step 1: 给 `internal/rpc/addr` 补 `DialContext`**
+
+传输层要用请求自己的 ctx 建连（A2、A3），addr 包是叶子包，加这个函数不破坏
+任何依赖边界。`Dial` 保留，改成薄封装以兼容已有调用方。
+
+```go
+// Dial 按地址建立连接。它不感知 ctx，等价于用 context.Background() 调用
+// DialContext——保留它是为了兼容已有的调用方（gRPC 传输等）。
+func Dial(a Addr) (net.Conn, error) {
+	return DialContext(context.Background(), a)
+}
+
+// DialContext 按地址建立连接，ctx 取消会中断连接过程。
+//
+// 传输层要用请求自己的 ctx 建连：一次超时的调用不该留下一个还在建连的
+// socket goroutine。
+func DialContext(ctx context.Context, a Addr) (net.Conn, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, a.Network, a.Address)
+	if err != nil {
+		return nil, fmt.Errorf("addr: dial %s %s: %w", a.Network, a.Address, err)
+	}
+	return conn, nil
+}
+```
+
+- [ ] **Step 2: 建 `internal/rpc/httpx/client.go`**
 
 ```go
 // This Source Code Form is subject to the terms of the Mozilla Public
@@ -2510,12 +2550,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"sync"
-	"time"
 
 	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/rpc/addr"
@@ -2523,6 +2563,12 @@ import (
 
 // servicePrefix 是所有业务端点的路径前缀。
 const servicePrefix = "/lgdm.v1.DownloadService/"
+
+// maxErrorBody 是错误响应体最多读取的字节数。
+const maxErrorBody = 4096
+
+// streamBuffer 是消息流 channel 的缓冲条数。
+const streamBuffer = 64
 
 // Client 是 net/http 传输的客户端。
 type Client struct {
@@ -2532,19 +2578,42 @@ type Client struct {
 
 	// transport 是底层的 http.Transport，Close 时用来掐断空闲连接。
 	transport *http.Transport
+
+	// mu 保护 closed 与 streams。
+	mu     sync.Mutex
+	closed bool
+	// streams 是当前活动消息流。Close 靠它们把流停掉。
+	streams map[*stream]struct{}
+
 	closeOnce sync.Once
 }
 
+// stream 是一次活动消息流的状态。cancel 停掉对应的 HTTP 请求。
+type stream struct {
+	cancel context.CancelFunc
+}
+
 // Dial 按地址建立 HTTP 客户端。token 随每次请求发送。
+//
+// Dial 会用 ctx 预连接一次再立刻断开。HTTP 是惰性连接——不预连接的话
+// 「业务进程没起来」要等到第一次调用才暴露，调用方只会看到一个含义模糊的
+// 握手失败。预连接让失败时机与 gRPC 传输一致。
 func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error) {
+	conn, err := addr.DialContext(ctx, a)
+	if err != nil {
+		return nil, fmt.Errorf("httpx: 连接 %s 失败: %w", a.Address, err)
+	}
+	_ = conn.Close()
+
 	host := a.Address
 	if a.Network == "unix" {
 		// unix socket 没有主机名，用一个占位主机名即可。
 		host = "lgdm"
 	}
 	tr := &http.Transport{
+		// 用请求自己的 ctx 建连：一次超时的调用不该留下还在建连的 socket。
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return addr.Dial(a)
+			return addr.DialContext(ctx, a)
 		},
 	}
 	return &Client{
@@ -2557,6 +2626,9 @@ func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error) {
 
 // Call 执行一次调用。
 func (c *Client) Call(ctx context.Context, method string, in, out any) error {
+	if err := c.checkOpen(); err != nil {
+		return err
+	}
 	body, err := json.Marshal(in)
 	if err != nil {
 		return fmt.Errorf("httpx: 编码 %s 请求: %w", method, err)
@@ -2573,14 +2645,8 @@ func (c *Client) Call(ctx context.Context, method string, in, out any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		var e struct {
-			Error string `json:"error"`
-		}
-		if json.Unmarshal(raw, &e) == nil && e.Error != "" {
-			return fmt.Errorf("httpx: %s: %s", method, e.Error)
-		}
-		return fmt.Errorf("httpx: %s: HTTP %d", method, resp.StatusCode)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
+		return fmt.Errorf("httpx: %s: %s", method, describeError(resp.StatusCode, raw))
 	}
 	if out == nil {
 		return nil
@@ -2593,24 +2659,50 @@ func (c *Client) Call(ctx context.Context, method string, in, out any) error {
 
 // Stream 打开消息流。响应是 NDJSON，每行一个 api.Message。
 func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.base+api.MethodStreamMessages, nil)
+	if err := c.checkOpen(); err != nil {
+		return nil, err
+	}
+	// 流的 ctx 单独派生：Close 要能只停掉流而不影响调用方自己的 ctx。
+	streamCtx, cancel := context.WithCancel(ctx)
+	req, err := http.NewRequestWithContext(streamCtx, http.MethodPost, c.base+api.MethodStreamMessages, nil)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("httpx: 构造消息流请求: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("Accept", "application/x-ndjson")
 	resp, err := c.http.Do(req)
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("httpx: 打开消息流: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody))
 		resp.Body.Close()
-		return nil, fmt.Errorf("httpx: 打开消息流: HTTP %d", resp.StatusCode)
+		cancel()
+		return nil, fmt.Errorf("httpx: 打开消息流: %s", describeError(resp.StatusCode, raw))
 	}
-	out := make(chan api.Message, 64)
+
+	st := &stream{cancel: cancel}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		cancel()
+		resp.Body.Close()
+		return nil, errors.New("httpx: 客户端已关闭")
+	}
+	if c.streams == nil {
+		c.streams = make(map[*stream]struct{})
+	}
+	c.streams[st] = struct{}{}
+	c.mu.Unlock()
+
+	out := make(chan api.Message, streamBuffer)
 	go func() {
 		defer close(out)
 		defer resp.Body.Close()
+		defer c.clearStream(st)
+		defer cancel()
 		dec := json.NewDecoder(resp.Body)
 		for {
 			var msg api.Message
@@ -2619,7 +2711,7 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 			}
 			select {
 			case out <- msg:
-			case <-ctx.Done():
+			case <-streamCtx.Done():
 				return
 			}
 		}
@@ -2627,48 +2719,108 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 	return out, nil
 }
 
-// Close 释放底层连接。必须幂等——Close 可能被重复调用。
-// 正在跑的消息流由调用方取消 ctx 收尾（流 goroutine 会在 ctx.Done 时
-// 关闭响应体），这里掐断的是空闲连接池。
+// Close 释放底层连接与流。必须幂等——Close 可能被重复调用。
+//
+// 除了掐断空闲连接，还要取消活动消息流：正在跑的 NDJSON 响应不会因为
+// 连接池被清空而结束，读循环会一直挂着。
 func (c *Client) Close() error {
 	c.closeOnce.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		sts := make([]*stream, 0, len(c.streams))
+		for st := range c.streams {
+			sts = append(sts, st)
+		}
+		c.streams = nil
+		c.mu.Unlock()
+		for _, st := range sts {
+			st.cancel()
+		}
 		if c.transport != nil {
 			c.transport.CloseIdleConnections()
 		}
 	})
 	return nil
 }
+
+// checkOpen 检查客户端是否已关闭。
+func (c *Client) checkOpen() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return errors.New("httpx: 客户端已关闭")
+	}
+	return nil
+}
+
+// clearStream 清掉已结束的活动流，避免 Close 去取消一个已经结束的流。
+func (c *Client) clearStream(st *stream) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.streams, st)
+}
+
+// describeError 把错误响应体翻译成一句人话。服务端的错误体形状固定为
+// {"ok":false,"error":"..."}，这里按 error 字段解析；解析不出来就退回
+// HTTP 状态码。
+func describeError(status int, raw []byte) string {
+	var e struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal(raw, &e) == nil && e.Error != "" {
+		return e.Error
+	}
+	return fmt.Sprintf("HTTP %d", status)
+}
 ```
 
-补上 `"net"` 的 import。
-
-- [ ] **Step 2: 建 `internal/rpc/httpx/server.go`**
+- [ ] **Step 3: 建 `internal/rpc/httpx/server.go`**
 
 ```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package httpx
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/rpc/addr"
 )
 
-// Handler 是 httpx 需要的业务侧能力。结构上与 rpc.Handler 相同，
-// 这里独立声明以避免 httpx → rpc 的包环（rpc → httpx 已经存在）。
+// maxRequestBody 是请求体上限（1 MiB）。本机 socket + token 鉴权之下风险
+// 不高，但限制一下比没有强。
+const maxRequestBody = 1 << 20
+
+// readHeaderTimeout 是读请求头的超时上限。
+const readHeaderTimeout = 10 * time.Second
+
+// Handler 是 httpx 需要的业务侧能力。方法集与 internal/rpc 里的
+// rpc.Handler 逐字一致，靠结构化类型与它对接——这里独立声明是为了避开
+// httpx → rpc 的包环（rpc → httpx 已经存在）。
 type Handler interface {
+	// Call 执行一次调用。method 取 api.Method* 常量；in / out 的具体类型
+	// 由 api.Spec(method) 决定，传输层分配好再传进来。
 	Call(ctx context.Context, method string, in, out any) error
+
+	// Events 返回进度事件流与退订函数。
 	Events() (<-chan api.Event, func())
+
+	// Controls 返回控制消息流（显示窗口 / 弹对话框 / 语言变更 / 退出）。
 	Controls() <-chan api.Message
 }
 
-// Serve 在地址上启动 HTTP 服务。
+// Serve 在地址上启动 HTTP 服务。ctx 取消时服务关闭。
 func Serve(ctx context.Context, a addr.Addr, token string, h Handler) error {
 	ln, cleanup, err := addr.Listen(a)
 	if err != nil {
@@ -2678,14 +2830,22 @@ func Serve(ctx context.Context, a addr.Addr, token string, h Handler) error {
 
 	srv := &http.Server{
 		Handler:           newMux(h, token),
-		ReadHeaderTimeout: 10 * time.Second,
+		ReadHeaderTimeout: readHeaderTimeout,
 	}
+
+	// done 用来收尾监视 goroutine：Serve 返回后它就退出，不留悬挂 goroutine。
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		_ = srv.Close()
+		select {
+		case <-ctx.Done():
+			_ = srv.Close()
+		case <-done:
+		}
 	}()
+
 	err = srv.Serve(ln)
-	if err == http.ErrServerClosed {
+	if errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
 	return err
@@ -2694,10 +2854,17 @@ func Serve(ctx context.Context, a addr.Addr, token string, h Handler) error {
 // newMux 组装路由与中间件。
 func newMux(h Handler, token string) *http.ServeMux {
 	mux := http.NewServeMux()
+	// authed 是鉴权 + 方法检查的中间件。鉴权在前：不该让没 token 的调用方
+	// 知道某个端点存不存在。
 	authed := func(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			if !validToken(r.Header.Get("Authorization"), token) {
 				writeError(w, http.StatusUnauthorized, "无效的 token")
+				return
+			}
+			if r.Method != http.MethodPost {
+				w.Header().Set("Allow", http.MethodPost)
+				writeError(w, http.StatusMethodNotAllowed, "只接受 POST")
 				return
 			}
 			fn(w, r)
@@ -2707,9 +2874,8 @@ func newMux(h Handler, token string) *http.ServeMux {
 		if m == api.MethodStreamMessages {
 			continue
 		}
-		method := m
-		mux.HandleFunc(servicePrefix+method, authed(func(w http.ResponseWriter, r *http.Request) {
-			serveCall(w, r, h, method)
+		mux.HandleFunc(servicePrefix+m, authed(func(w http.ResponseWriter, r *http.Request) {
+			serveCall(w, r, h, m)
 		}))
 	}
 	mux.HandleFunc(servicePrefix+api.MethodStreamMessages, authed(func(w http.ResponseWriter, r *http.Request) {
@@ -2727,6 +2893,7 @@ func serveCall(w http.ResponseWriter, r *http.Request, h Handler, method string)
 	}
 	in := spec.NewIn()
 	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
 		// 没有请求体（空 POST）不算错误：像 get_settings 这样的方法本来就没有参数。
 		if err := json.NewDecoder(r.Body).Decode(in); err != nil && !errors.Is(err, io.EOF) {
 			writeError(w, http.StatusBadRequest, "解码请求: "+err.Error())
@@ -2760,13 +2927,16 @@ func serveStream(w http.ResponseWriter, r *http.Request, h Handler) {
 	flusher.Flush()
 
 	enc := json.NewEncoder(w)
-	for {
+	// 某一侧通道关闭只停掉那一侧：事件流结束不代表控制消息也没了。
+	for events != nil || controls != nil {
 		select {
 		case <-r.Context().Done():
+			// 客户端断开：立刻收手，别让 goroutine 挂着。
 			return
 		case ev, ok := <-events:
 			if !ok {
-				return
+				events = nil
+				continue
 			}
 			if err := enc.Encode(api.Message{Kind: api.MessageKindEvent, Event: &ev}); err != nil {
 				return
@@ -2774,7 +2944,8 @@ func serveStream(w http.ResponseWriter, r *http.Request, h Handler) {
 			flusher.Flush()
 		case ctl, ok := <-controls:
 			if !ok {
-				return
+				controls = nil
+				continue
 			}
 			if err := enc.Encode(ctl); err != nil {
 				return
@@ -2787,13 +2958,14 @@ func serveStream(w http.ResponseWriter, r *http.Request, h Handler) {
 // validToken 校验 Authorization 头里的 Bearer token。
 func validToken(header, token string) bool {
 	const prefix = "Bearer "
-	if len(header) <= len(prefix) || header[:len(prefix)] != prefix {
+	if len(header) <= len(prefix) || !strings.HasPrefix(header, prefix) {
 		return false
 	}
 	return header[len(prefix):] == token
 }
 
-// writeError 写出错误响应。
+// writeError 写出错误响应。错误体形状固定为 {"ok":false,"error":"..."}，
+// 客户端按 error 字段解析。
 func writeError(w http.ResponseWriter, code int, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
@@ -2801,30 +2973,44 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 }
 ```
 
-若 `net` 未被实际使用，删掉那行 `var _ = net.Dial` 与对应 import。
+- [ ] **Step 4: 写测试**
 
-- [ ] **Step 3: 写失败测试**
-
-创建 `internal/rpc/httpx/httpx_test.go`：
+`internal/rpc/httpx/httpx_test.go`（`package httpx`）：
 
 ```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package httpx
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/rpc/addr"
 )
 
 // stubHandler 是最小业务侧实现。
 type stubHandler struct {
 	events   chan api.Event
 	controls chan api.Message
+
+	// unsubed 在退订时被关闭，用来观察服务端有没有收手。
+	unsubed   chan struct{}
+	unsubOnce sync.Once
 }
 
 func (s *stubHandler) Call(ctx context.Context, method string, in, out any) error {
@@ -2835,11 +3021,44 @@ func (s *stubHandler) Call(ctx context.Context, method string, in, out any) erro
 		out.(*api.ListResult).Tasks = []*api.Task{{ID: "t1"}}
 	case api.MethodIsPreparing:
 		out.(*api.BoolResult).Value = true
+	case api.MethodAdd:
+		t := out.(*api.Task)
+		t.ID = "new"
+		t.URL = in.(*api.AddTaskInput).URL
 	}
 	return nil
 }
-func (s *stubHandler) Events() (<-chan api.Event, func()) { return s.events, func() {} }
-func (s *stubHandler) Controls() <-chan api.Message       { return s.controls }
+
+func (s *stubHandler) Events() (<-chan api.Event, func()) {
+	return s.events, func() {
+		s.unsubOnce.Do(func() {
+			if s.unsubed != nil {
+				close(s.unsubed)
+			}
+		})
+	}
+}
+func (s *stubHandler) Controls() <-chan api.Message { return s.controls }
+
+// startServer 在临时目录里的 unix socket 上启动服务，返回监听地址。
+func startServer(t *testing.T, h Handler, token string) addr.Addr {
+	t.Helper()
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "lgdm.sock")}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = Serve(ctx, a, token, h) }()
+	// socket 文件在 net.Listen 绑定成功时创建，文件出现即表示能连。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(a.Address); err == nil {
+			return a
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("服务没有在超时前就绪: %v", a)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 func TestValidToken(t *testing.T) {
 	if !validToken("Bearer secret", "secret") {
@@ -2850,6 +3069,9 @@ func TestValidToken(t *testing.T) {
 	}
 	if validToken("secret", "secret") {
 		t.Fatal("缺少 Bearer 前缀应当被拒")
+	}
+	if validToken("Bearer ", "secret") {
+		t.Fatal("空 token 应当被拒")
 	}
 }
 
@@ -2863,6 +3085,15 @@ func TestServeCallAndAuth(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("缺 token 应当 401, got %d", rec.Code)
+	}
+
+	// 错误 token → 401
+	req = httptest.NewRequest(http.MethodPost, servicePrefix+api.MethodGetSettings, nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("错误 token 应当 401, got %d", rec.Code)
 	}
 
 	// 带 token → 200 + 设置
@@ -2882,54 +3113,407 @@ func TestServeCallAndAuth(t *testing.T) {
 	}
 }
 
-func TestServeStream(t *testing.T) {
-	h := &stubHandler{events: make(chan api.Event, 4), controls: make(chan api.Message, 4)}
+// TestServeRejectsInvalidJSON 验证坏请求体返回 400。
+func TestServeRejectsInvalidJSON(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
 	mux := newMux(h, "secret")
 
-	req := httptest.NewRequest(http.MethodPost, servicePrefix+api.MethodStreamMessages, nil)
+	req := httptest.NewRequest(http.MethodPost, servicePrefix+api.MethodList, strings.NewReader("{"))
 	req.Header.Set("Authorization", "Bearer secret")
 	rec := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		mux.ServeHTTP(rec, req)
-		close(done)
-	}()
-
-	h.events <- api.Event{Why: "progress"}
-	h.controls <- api.Message{Kind: api.MessageKindShow}
-
-	deadline := time.After(3 * time.Second)
-	for {
-		select {
-		case <-deadline:
-			t.Fatal("消息流没有输出")
-		case <-done:
-			t.Fatal("消息流提前结束")
-		default:
-		}
-		if rec.Body.Len() > 0 {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("坏 JSON 应当 400, got %d: %s", rec.Code, rec.Body.String())
 	}
-	body := rec.Body.String()
-	if body == "" {
-		t.Fatal("消息流没有内容")
+	var e struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("错误体不是 JSON: %v (%s)", err, rec.Body.String())
+	}
+	if e.OK || e.Error == "" {
+		t.Fatalf("错误体形状不对: %s", rec.Body.String())
+	}
+}
+
+// TestServeUnknownMethod 验证 api.AllMethods 之外的方法返回 404。
+func TestServeUnknownMethod(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	mux := newMux(h, "secret")
+
+	req := httptest.NewRequest(http.MethodPost, servicePrefix+"nope", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("未知方法应当 404, got %d", rec.Code)
+	}
+}
+
+// TestServeRejectsNonPost 验证只接受 POST。
+func TestServeRejectsNonPost(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	mux := newMux(h, "secret")
+
+	req := httptest.NewRequest(http.MethodGet, servicePrefix+api.MethodGetSettings, nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET 应当 405, got %d", rec.Code)
+	}
+	if got := rec.Header().Get("Allow"); got != http.MethodPost {
+		t.Fatalf("Allow 头不对: %q", got)
+	}
+}
+
+// TestServeStream 用真实 HTTP 服务验证 NDJSON 逐行的线格式。
+//
+// 这里不用 httptest.NewRecorder：它的 Body 是 *bytes.Buffer，不是并发安全的，
+// 在 handler 还在写的时候读会触发数据竞争。
+func TestServeStream(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event, 4), controls: make(chan api.Message, 4)}
+	srv := httptest.NewServer(newMux(h, "secret"))
+	defer srv.Close()
+
+	resp := openStream(t, srv.URL)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("应当 200, got %d", resp.StatusCode)
+	}
+	if ct := resp.Header.Get("Content-Type"); ct != "application/x-ndjson" {
+		t.Fatalf("Content-Type 不对: %q", ct)
+	}
+
+	sc := bufio.NewScanner(resp.Body)
+
+	// 先推事件，客户端读到之后再推控制消息——两个通道同时可读时服务端
+	// 选中哪个是不确定的，测试不能依赖顺序。
+	h.events <- api.Event{Why: "progress"}
+	msg := scanMessage(t, sc)
+	if msg.Kind != api.MessageKindEvent || msg.Event == nil {
+		t.Fatalf("事件消息不对: %+v", msg)
+	}
+	if msg.Event.Why != "progress" {
+		t.Fatalf("事件内容不对: %+v", msg.Event)
+	}
+
+	h.controls <- api.Message{Kind: api.MessageKindShow}
+	msg = scanMessage(t, sc)
+	if msg.Kind != api.MessageKindShow {
+		t.Fatalf("控制消息不对: %+v", msg)
+	}
+}
+
+// TestServeStreamContinuesAfterEventsClosed 验证事件流关闭后控制消息仍然
+// 推送（事件通道结束不该顺带掐掉控制通道）。
+func TestServeStreamContinuesAfterEventsClosed(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message, 4)}
+	close(h.events)
+	srv := httptest.NewServer(newMux(h, "secret"))
+	defer srv.Close()
+
+	resp := openStream(t, srv.URL)
+	defer resp.Body.Close()
+
+	sc := bufio.NewScanner(resp.Body)
+	h.controls <- api.Message{Kind: api.MessageKindShow}
+	msg := scanMessage(t, sc)
+	if msg.Kind != api.MessageKindShow {
+		t.Fatalf("控制消息不对: %+v", msg)
+	}
+}
+
+// TestServeStreamStopsOnClientDisconnect 验证客户端断开后服务端收手：
+// 请求 ctx 取消后消息流处理器要退出并退订事件。
+func TestServeStreamStopsOnClientDisconnect(t *testing.T) {
+	h := &stubHandler{
+		events:   make(chan api.Event),
+		controls: make(chan api.Message),
+		unsubed:  make(chan struct{}),
+	}
+	srv := httptest.NewServer(newMux(h, "secret"))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, srv.URL+servicePrefix+api.MethodStreamMessages, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 断开连接：服务端的请求 ctx 随之取消。
+	cancel()
+	resp.Body.Close()
+
+	select {
+	case <-h.unsubed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("客户端断开后服务端没有退出消息流")
+	}
+}
+
+// TestClientCallRoundTrip 用真实服务验证一次调用的往返。
+func TestClientCallRoundTrip(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	a := startServer(t, h, "secret")
+
+	ctx := context.Background()
+	c, err := Dial(ctx, a, "secret")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	out := &api.Settings{}
+	if err := c.Call(ctx, api.MethodGetSettings, &api.Empty{}, out); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if out.Language != "en" {
+		t.Fatalf("设置不对: %+v", out)
+	}
+
+	list := &api.ListResult{}
+	if err := c.Call(ctx, api.MethodList, &api.ListParams{}, list); err != nil {
+		t.Fatalf("Call: %v", err)
+	}
+	if len(list.Tasks) != 1 || list.Tasks[0].ID != "t1" {
+		t.Fatalf("列表不对: %+v", list.Tasks)
+	}
+}
+
+// TestClientCallRejectsBadToken 验证 token 不对时调用失败。
+func TestClientCallRejectsBadToken(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	a := startServer(t, h, "secret")
+
+	c, err := Dial(context.Background(), a, "wrong")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	err = c.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, &api.Settings{})
+	if err == nil {
+		t.Fatal("错误 token 应当调用失败")
+	}
+	if !strings.Contains(err.Error(), "无效的 token") {
+		t.Fatalf("错误信息应当带上服务端的原因: %v", err)
+	}
+}
+
+// TestClientStreamReceivesMessages 验证客户端能收到事件与控制消息两种。
+func TestClientStreamReceivesMessages(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event, 4), controls: make(chan api.Message, 4)}
+	a := startServer(t, h, "secret")
+
+	c, err := Dial(context.Background(), a, "secret")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	ch, err := c.Stream(context.Background())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	h.events <- api.Event{Why: "progress", SpeedBPS: 10}
+	msg := recvMessage(t, ch)
+	if msg.Kind != api.MessageKindEvent || msg.Event == nil {
+		t.Fatalf("事件消息不对: %+v", msg)
+	}
+	if msg.Event.Why != "progress" || msg.Event.SpeedBPS != 10 {
+		t.Fatalf("事件内容不对: %+v", msg.Event)
+	}
+
+	h.controls <- api.Message{Kind: api.MessageKindShow}
+	msg = recvMessage(t, ch)
+	if msg.Kind != api.MessageKindShow {
+		t.Fatalf("控制消息不对: %+v", msg)
+	}
+}
+
+// TestClientCloseIsIdempotent 验证 Close 可以重复调用。
+func TestClientCloseIsIdempotent(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	a := startServer(t, h, "secret")
+
+	c, err := Dial(context.Background(), a, "secret")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("第一次 Close: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("第二次 Close: %v", err)
+	}
+}
+
+// TestClientCloseStopsStream 验证 Close 能停掉在跑的 NDJSON 流——只关空闲
+// 连接是不够的，读循环会一直挂着。
+func TestClientCloseStopsStream(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	a := startServer(t, h, "secret")
+
+	c, err := Dial(context.Background(), a, "secret")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	ch, err := c.Stream(context.Background())
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case _, ok := <-ch:
+		if ok {
+			t.Fatal("Close 之后不该再收到消息")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close 之后消息流没有结束")
+	}
+}
+
+// TestDialFailsWhenServerAbsent 验证服务端没起来时 Dial 直接失败，而不是
+// 等到第一次调用才炸。
+func TestDialFailsWhenServerAbsent(t *testing.T) {
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "missing.sock")}
+	if _, err := Dial(context.Background(), a, "secret"); err == nil {
+		t.Fatal("服务端没起来时 Dial 应当失败")
+	}
+}
+
+// openStream 打开一条消息流。
+func openStream(t *testing.T, base string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost, base+servicePrefix+api.MethodStreamMessages, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer secret")
+	req.Header.Set("Accept", "application/x-ndjson")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// scanMessage 从 NDJSON 响应里读一行并解析成 api.Message。
+func scanMessage(t *testing.T, sc *bufio.Scanner) api.Message {
+	t.Helper()
+	if !sc.Scan() {
+		t.Fatalf("消息流没有输出: %v", sc.Err())
+	}
+	var msg api.Message
+	if err := json.Unmarshal(sc.Bytes(), &msg); err != nil {
+		t.Fatalf("消息不是合法 JSON: %v (%s)", err, sc.Text())
+	}
+	return msg
+}
+
+// recvMessage 从客户端的消息流里收一条消息。
+func recvMessage(t *testing.T, ch <-chan api.Message) api.Message {
+	t.Helper()
+	select {
+	case msg, ok := <-ch:
+		if !ok {
+			t.Fatal("消息流提前结束")
+		}
+		return msg
+	case <-time.After(5 * time.Second):
+		t.Fatal("没有收到消息")
+	}
+	return api.Message{}
+}
+```
+
+`internal/rpc/httpx/contract_test.go`（`package httpx_test`）：外部测试包可以
+import 被测包的上层包，Go 不会因此成环（A6、A7）。
+
+```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
+// 这是外部测试包：httpx 自己不能 import internal/rpc（会形成
+// rpc → httpx → rpc 的包环），但外部测试包可以 import 上层包，Go 不会
+// 因此成环。用它在这里就把「httpx.Client 满足 rpc.Transport」这件事钉死，
+// 不用等到注册表落地时才发现签名对不上。
+package httpx_test
+
+import (
+	"testing"
+
+	"lgo_download_manager/internal/rpc"
+	"lgo_download_manager/internal/rpc/httpx"
+)
+
+// 编译期断言。
+var (
+	// httpx.Client 满足 rpc.Transport。
+	_ rpc.Transport = (*httpx.Client)(nil)
+	// rpc.Handler 的方法集与 httpx.Handler 结构兼容：业务侧拿 rpc.Handler
+	// 的实现就能直接交给 httpx.Serve。方向是 rpc.Handler → httpx.Handler。
+	_ httpx.Handler = (rpc.Handler)(nil)
+)
+
+// TestTransportContract 是上面断言的运行时版本：接口方法集对得上，零值
+// 客户端的 Close 也不会炸。
+func TestTransportContract(t *testing.T) {
+	var tr rpc.Transport = &httpx.Client{}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("零值客户端 Close 应当返回 nil: %v", err)
 	}
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [ ] **Step 5: 跑测试确认通过**
 
-Run: `go test ./internal/rpc/httpx/`
+Run:
+```bash
+gofmt -l internal/rpc/httpx internal/rpc/addr   # 必须无输出
+go build ./... && go vet ./... && go test ./...
+go test -race ./internal/rpc/...
+```
 Expected: PASS
 
-- [ ] **Step 5: 提交**
+- [ ] **Step 6: 提交**
 
 ```bash
-git add internal/rpc/httpx
+git add internal/rpc/httpx internal/rpc/addr
 git commit -m "feat(httpx): 实现基于 net/http 的传输"
 ```
+
+#### 与初稿的差异（A1–A11 的落法）
+
+| 条目 | 初稿的问题 | 最终实现 |
+| --- | --- | --- |
+| A1 | `Dial` 的 ctx 是死参数，HTTP 惰性连接让「业务进程没起来」拖到第一次调用才暴露 | `Dial` 用 ctx 预连接一次再立刻断开，失败直接返回错误 |
+| A2 | `addr.Dial` 不支持 ctx 取消 | 新增 `addr.DialContext`，`addr.Dial` 变成薄封装 |
+| A3 | `Transport.DialContext` 里丢了请求级 ctx | 闭包改用 `addr.DialContext(ctx, a)` |
+| A4 | `Close()` 只关空闲连接，在跑的 NDJSON 流停不掉 | 客户端自己持有活动流的 cancel，`Close()` 先取消全部活动流，再掐断空闲连接，整体用 `sync.Once` 包住保证幂等 |
+| A5 | `TestServeStream` 裸读 `httptest.ResponseRecorder.Body`，有数据竞争 | 改用真实的 `httptest.NewServer`，按行读 NDJSON，顺带验证了「逐行」的线格式 |
+| A6 | 要等 Task 7 才发现签名对不上 | 新增外部测试包 `contract_test.go`，编译期断言 `var _ rpc.Transport = (*httpx.Client)(nil)` |
+| A7 | 两份 Handler 接口可能对不上 | `httpx.Handler` 与 `rpc.Handler` 方法集逐字一致，断言方向是 `rpc.Handler → httpx.Handler`（`var _ httpx.Handler = (rpc.Handler)(nil)`） |
+| A8 | `Serve` 的 ctx 监视 goroutine 会泄漏 | 加 `done` channel，`Serve` 返回后监视 goroutine 退出 |
+| A9 | 事件通道关闭会顺带掐掉控制消息流 | 某一侧通道关闭只停那一侧（置 nil channel），两侧都结束才收尾 |
+| A10 | 请求体没有上限 | `http.MaxBytesReader` 限制在 1 MiB |
+| A11 | GET 也会命中路由，与 OpenAPI 只声明 POST 对不上 | 中间件里校验方法，不是 POST 一律 405（带 `Allow` 头） |
+
+初稿里的 `client.go` import 了 `"time"` 但没用得到，已删；`"net"` 在
+`DialContext` 闭包的签名里要用到，保留。初稿末尾的 `var _ = net.Dial` 占位
+没有采用——Go 会因未使用的 import 直接编译失败。
 
 ---
 
