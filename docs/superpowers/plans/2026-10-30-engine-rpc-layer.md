@@ -1945,8 +1945,11 @@ type client struct {
 	// 业务进程的 lgom:// 转发可能在 UI 子进程还没注册回调时就发过来了。
 	// 不缓存就直接丢弃，主窗口被拉起后却看不到对话框——这是旧 IPC
 	// 客户端修过的一个坑，契约层必须保住这条保证。
-	showAddTaskMu sync.Mutex
-	showAddTaskQ  []api.ShowAddTaskParams
+	//
+	// 由 hookMu 保护，与 onShowAddTask 同锁：「读钩子/入队」与
+	// 「设钩子/排空」必须互斥，否则会出现「读到钩子为空 → 对方设好
+	// 钩子并排空空队列 → 才入队」的窗口，消息就永远送不出去。
+	showAddTaskQ []api.ShowAddTaskParams
 
 	closed bool
 	once   sync.Once
@@ -2024,16 +2027,18 @@ func (c *client) dispatch(msg api.Message) {
 		if msg.ShowAddTask == nil {
 			return
 		}
-		if h := c.showAddTaskHook(); h != nil {
-			h(*msg.ShowAddTask)
+		// 钩子与队列同锁：读钩子与入队要么一起发生，要么都不发生。
+		c.hookMu.Lock()
+		h := c.onShowAddTask
+		if h == nil {
+			if len(c.showAddTaskQ) < 1 {
+				c.showAddTaskQ = append(c.showAddTaskQ, *msg.ShowAddTask)
+			}
+			c.hookMu.Unlock()
 			return
 		}
-		// 回调还没注册——先缓存，等注册时补发。
-		c.showAddTaskMu.Lock()
-		if len(c.showAddTaskQ) < 1 {
-			c.showAddTaskQ = append(c.showAddTaskQ, *msg.ShowAddTask)
-		}
-		c.showAddTaskMu.Unlock()
+		c.hookMu.Unlock()
+		h(*msg.ShowAddTask)
 	case api.MessageKindLanguage:
 		if h := c.languageHook(); h != nil {
 			h()
@@ -2047,12 +2052,6 @@ func (c *client) showHook() func() {
 	c.hookMu.Lock()
 	defer c.hookMu.Unlock()
 	return c.onShow
-}
-
-func (c *client) showAddTaskHook() func(api.ShowAddTaskParams) {
-	c.hookMu.Lock()
-	defer c.hookMu.Unlock()
-	return c.onShowAddTask
 }
 
 func (c *client) languageHook() func() {
@@ -2100,16 +2099,13 @@ func (c *client) SetOnShow(f func()) {
 }
 
 func (c *client) SetOnShowAddTask(f func(api.ShowAddTaskParams)) {
+	// 钩子与队列同一把锁——与 dispatch 的「读钩子/入队」互斥，
+	// 保证注册前到达的请求要么被立即回调，要么被排空补发，不会丢。
 	c.hookMu.Lock()
 	c.onShowAddTask = f
-	c.hookMu.Unlock()
-
-	// 补发注册之前到达的请求。业务进程的 lgom:// 转发可能在 UI 子进程
-	// 还没注册回调时就发过来了，不补发就丢了。
-	c.showAddTaskMu.Lock()
 	pending := c.showAddTaskQ
 	c.showAddTaskQ = nil
-	c.showAddTaskMu.Unlock()
+	c.hookMu.Unlock()
 	if f != nil {
 		for _, p := range pending {
 			f(p)
@@ -2343,9 +2339,9 @@ func TestClientLateShowAddTaskReplay(t *testing.T) {
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		c.showAddTaskMu.Lock()
+		c.hookMu.Lock()
 		n := len(c.showAddTaskQ)
-		c.showAddTaskMu.Unlock()
+		c.hookMu.Unlock()
 		if n > 0 {
 			break
 		}
@@ -2516,7 +2512,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"sync"
 	"time"
 
 	"lgo_download_manager/internal/api"
@@ -2531,6 +2529,10 @@ type Client struct {
 	base  string
 	token string
 	http  *http.Client
+
+	// transport 是底层的 http.Transport，Close 时用来掐断空闲连接。
+	transport *http.Transport
+	closeOnce sync.Once
 }
 
 // Dial 按地址建立 HTTP 客户端。token 随每次请求发送。
@@ -2546,9 +2548,10 @@ func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error) {
 		},
 	}
 	return &Client{
-		base:  "http://" + host + servicePrefix,
-		token: token,
-		http:  &http.Client{Transport: tr},
+		base:      "http://" + host + servicePrefix,
+		token:     token,
+		http:      &http.Client{Transport: tr},
+		transport: tr,
 	}, nil
 }
 
@@ -2622,6 +2625,18 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 		}
 	}()
 	return out, nil
+}
+
+// Close 释放底层连接。必须幂等——Close 可能被重复调用。
+// 正在跑的消息流由调用方取消 ctx 收尾（流 goroutine 会在 ctx.Done 时
+// 关闭响应体），这里掐断的是空闲连接池。
+func (c *Client) Close() error {
+	c.closeOnce.Do(func() {
+		if c.transport != nil {
+			c.transport.CloseIdleConnections()
+		}
+	})
+	return nil
 }
 ```
 
@@ -4856,6 +4871,14 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 		}
 	}()
 	return out, nil
+}
+
+// Close 关闭底层 gRPC 连接。必须幂等——Close 可能被重复调用。
+func (c *Client) Close() error {
+	if c.conn == nil {
+		return nil
+	}
+	return c.conn.Close()
 }
 ```
 
