@@ -123,8 +123,8 @@ func toStoreProxyMode(m api.ProxyMode) protocol.ProxyMode {
 	return protocol.ParseProxyMode(string(m))
 }
 
-// toAPIAuthOptions 把契约层的凭据转成协议层的凭据。
-func toAPIAuthOptions(a api.AuthOptions) protocol.AuthOptions {
+// toProtocolAuthOptions 把契约层的凭据转成协议层的凭据。
+func toProtocolAuthOptions(a api.AuthOptions) protocol.AuthOptions {
 	return protocol.AuthOptions{
 		Username:           a.Username,
 		Password:           a.Password,
@@ -139,8 +139,9 @@ func toAPIAuthOptions(a api.AuthOptions) protocol.AuthOptions {
 	}
 }
 
-// toStoreAuthOptions 是 toAPIAuthOptions 的逆变换。
-func toStoreAuthOptions(a protocol.AuthOptions) api.AuthOptions {
+// toAPIAuthOptions 是 toProtocolAuthOptions 的逆变换：把协议层的凭据
+// 转成契约层的凭据。
+func toAPIAuthOptions(a protocol.AuthOptions) api.AuthOptions {
 	return api.AuthOptions{
 		Username:           a.Username,
 		Password:           a.Password,

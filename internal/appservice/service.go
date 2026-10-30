@@ -18,6 +18,7 @@ import (
 
 	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/bittorrent"
+	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/settings"
@@ -146,7 +147,7 @@ func (s *Service) Call(ctx context.Context, method string, in, out any) error {
 			URL:          p.URL,
 			SavePath:     p.SavePath,
 			Protocol:     kind,
-			Auth:         toAPIAuthOptions(p.Auth),
+			Auth:         toProtocolAuthOptions(p.Auth),
 			ChunkCount:   p.ChunkCount,
 			MinChunkSize: p.MinChunkSize,
 		})
@@ -292,17 +293,21 @@ func (s *Service) probe(raw string) (int64, error) {
 }
 
 // probeBittorrent 解析 .torrent 种子文件的总体积。磁力链接缺元数据，
-// 返回 0(体积未知)。任何取种子的失败都当作「未知」而不是错误。
+// 返回 0(体积未知)。任何取种子的失败都当作「未知」而不是错误——
+// 体积预览不该拦住用户添加任务；失败原因记日志，便于排障。
 func (s *Service) probeBittorrent(raw string) (int64, error) {
 	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "magnet:") {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		data, err := bittorrent.FetchTorrentFile(ctx, raw, protocol.HTTPProxyFunc())
 		if err != nil {
+			logging.Printf("appservice: probe torrent file: %v", err)
 			return 0, nil
 		}
 		if _, total, perr := bittorrent.TorrentFileInfo(data); perr == nil {
 			return total, nil
+		} else {
+			logging.Printf("appservice: parse torrent file: %v", perr)
 		}
 	}
 	return 0, nil

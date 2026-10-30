@@ -98,6 +98,27 @@ func TestSettingsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestAuthOptionsRoundTrip(t *testing.T) {
+	src := api.AuthOptions{
+		Username: "u", Password: "p", UserAgent: "UA", Cookies: "C",
+		Referer: "r", FTPPassive: true, ProxyMode: api.ProxyModeManual,
+		ProxyURL: "http://p", ProxyBypass: "b", ProxyAutoConfigURL: "u",
+	}
+	// 契约层 → 协议层
+	proto := toProtocolAuthOptions(src)
+	if proto.Username != "u" || proto.Password != "p" || proto.UserAgent != "UA" ||
+		proto.Cookies != "C" || proto.Referer != "r" || !proto.FTPPassive ||
+		proto.ProxyMode != protocol.ProxyModeManual || proto.ProxyURL != "http://p" ||
+		proto.ProxyBypass != "b" || proto.ProxyAutoConfigURL != "u" {
+		t.Fatalf("凭据转协议层不对: %+v", proto)
+	}
+	// 协议层 → 契约层，再回到起点
+	back := toAPIAuthOptions(proto)
+	if back != src {
+		t.Fatalf("凭据往返失败: %+v → %+v", src, back)
+	}
+}
+
 func TestToAPIBTDetail(t *testing.T) {
 	src := &bittorrent.Detail{
 		Name: "n", InfoHash: "h", Total: 10, Downloaded: 5, Uploaded: 1,
