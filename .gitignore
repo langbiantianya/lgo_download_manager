@@ -20,3 +20,7 @@ downloads/
 # (每个任务存储都带 .part 文件语义),理论上不会生成它;留一条以防
 # 受限环境下某个回退路径把它落到仓库里被误提交。
 .torrent.bolt.db
+
+# 本地隔离工作区：git worktree 与 SDD 进度台账，都是临时目录，不要提交
+.worktrees/
+.superpowers/
