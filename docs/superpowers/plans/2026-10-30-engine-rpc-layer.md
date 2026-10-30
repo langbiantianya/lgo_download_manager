@@ -1618,8 +1618,11 @@ git commit -m "feat(appservice): 抽出业务侧应用服务并做 DTO 转换"
 ```go
 package addr
 
-import "testing"
-
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 func TestParse(t *testing.T) {
 	cases := []struct {
 		in      string
@@ -1655,6 +1658,39 @@ func TestParse(t *testing.T) {
 			t.Fatalf("Parse(%q) = %+v, want %s/%s", c.in, got, c.network, c.address)
 		}
 	}
+}
+
+// TestListenUnixAndDial 验证 unix socket 的监听与连接：socket 文件会被创建、
+// 权限收紧到 0600，cleanup 之后文件被删掉。
+func TestListenUnixAndDial(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lgdm.sock")
+	a := Addr{Network: "unix", Address: path}
+	ln, cleanup, err := Listen(a)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("socket 文件没创建: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("socket 权限 = %o, want 600", perm)
+	}
+
+	conn, err := Dial(a)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	_ = conn.Close()
+
+	cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("cleanup 后 socket 文件仍在: %v", err)
+	}
+	// cleanup 幂等：再调一次不能 panic。
+	cleanup()
 }
 ```
 
@@ -1806,6 +1842,11 @@ type Transport interface {
 	// Stream 打开服务端推送的消息流（进度事件与控制消息合并流）。
 	// 返回的 channel 在流结束或 ctx 取消后关闭。
 	Stream(ctx context.Context) (<-chan api.Message, error)
+
+	// Close 释放底层连接与流。实现必须幂等——Close 可能被重复调用。
+	// 没有它，客户端无法关闭连接：读循环会一直挂着，goroutine 与套接字
+	// 都会泄漏。
+	Close() error
 }
 ```
 
@@ -1841,7 +1882,6 @@ package rpc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -1883,8 +1923,10 @@ type Client interface {
 // client 是基于 Transport 的共享客户端实现。两种协议共用它，
 // 因此超时、错误包装、事件扇出等语义只有一处。
 type client struct {
-	tr    Transport
-	token string
+	tr Transport
+
+	// cancel 停掉读循环。由 Close 调用。
+	cancel context.CancelFunc
 
 	settingsMu sync.Mutex
 	settings   api.Settings
@@ -1898,17 +1940,29 @@ type client struct {
 	onLanguage   func()
 	onClose      func()
 
-	quit   chan struct{}
+	// showAddTaskQ 缓存「弹出新建任务对话框」的请求，直到 UI 注册回调。
+	//
+	// 业务进程的 lgom:// 转发可能在 UI 子进程还没注册回调时就发过来了。
+	// 不缓存就直接丢弃，主窗口被拉起后却看不到对话框——这是旧 IPC
+	// 客户端修过的一个坑，契约层必须保住这条保证。
+	showAddTaskMu sync.Mutex
+	showAddTaskQ  []api.ShowAddTaskParams
+
 	closed bool
 	once   sync.Once
 }
 
 var _ Client = (*client)(nil)
 
-// newClient 建立客户端：先用 get_settings 做一次往返，既校验 token 又拿到
-// 初始设置快照，然后拉起消息流。
+// newClient 建立客户端：先用 get_settings 做一次往返完成握手
+// （鉴权由 Transport 负责，握手失败即等同鉴权失败），并拿到初始设置快照，
+// 然后拉起消息流。
+//
+// ctx 应当是**贯穿整个会话**的 ctx。读循环不能直接跟着它走——调用方可能
+// 只给握手或单次调用用一个短超时的 ctx，那会让读循环跟着超时，把
+// 「一次调用超时」误报成「业务进程已退出」。
 func newClient(ctx context.Context, tr Transport) (*client, error) {
-	c := &client{tr: tr, quit: make(chan struct{})}
+	c := &client{tr: tr}
 
 	out := &api.Settings{}
 	if err := c.call(ctx, api.MethodGetSettings, &api.Empty{}, out); err != nil {
@@ -1918,7 +1972,11 @@ func newClient(ctx context.Context, tr Transport) (*client, error) {
 	c.settings = *out
 	c.settingsMu.Unlock()
 
-	go c.readLoop(ctx)
+	// WithoutCancel 摘掉调用方 ctx 的取消传播，再用 WithCancel 拿到一个
+	// 由 client.Close() 控制的 cancel：读循环活到整个会话结束。
+	streamCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	c.cancel = cancel
+	go c.readLoop(streamCtx)
 	return c, nil
 }
 
@@ -1963,9 +2021,19 @@ func (c *client) dispatch(msg api.Message) {
 			h()
 		}
 	case api.MessageKindShowAddTask:
-		if h := c.showAddTaskHook(); h != nil && msg.ShowAddTask != nil {
-			h(*msg.ShowAddTask)
+		if msg.ShowAddTask == nil {
+			return
 		}
+		if h := c.showAddTaskHook(); h != nil {
+			h(*msg.ShowAddTask)
+			return
+		}
+		// 回调还没注册——先缓存，等注册时补发。
+		c.showAddTaskMu.Lock()
+		if len(c.showAddTaskQ) < 1 {
+			c.showAddTaskQ = append(c.showAddTaskQ, *msg.ShowAddTask)
+		}
+		c.showAddTaskMu.Unlock()
 	case api.MessageKindLanguage:
 		if h := c.languageHook(); h != nil {
 			h()
@@ -2035,6 +2103,18 @@ func (c *client) SetOnShowAddTask(f func(api.ShowAddTaskParams)) {
 	c.hookMu.Lock()
 	c.onShowAddTask = f
 	c.hookMu.Unlock()
+
+	// 补发注册之前到达的请求。业务进程的 lgom:// 转发可能在 UI 子进程
+	// 还没注册回调时就发过来了，不补发就丢了。
+	c.showAddTaskMu.Lock()
+	pending := c.showAddTaskQ
+	c.showAddTaskQ = nil
+	c.showAddTaskMu.Unlock()
+	if f != nil {
+		for _, p := range pending {
+			f(p)
+		}
+	}
 }
 
 func (c *client) SetOnLanguage(f func()) {
@@ -2058,7 +2138,6 @@ func (c *client) SetOnClose(f func()) {
 // notifyClose 标记连接已断开并触发一次 onClose 回调。
 func (c *client) notifyClose() {
 	c.once.Do(func() {
-		close(c.quit)
 		c.hookMu.Lock()
 		c.closed = true
 		h := c.onClose
@@ -2149,13 +2228,18 @@ func (c *client) SaveSettings(s api.Settings) error {
 }
 
 // Close 关闭连接。
+// Close 关闭连接：停掉读循环、释放底层传输，并触发一次 onClose 通知。
+// 可以重复调用。
 func (c *client) Close() error {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.tr != nil {
+		_ = c.tr.Close()
+	}
 	c.notifyClose()
 	return nil
 }
-
-// errClosed 表示连接已经断开。
-var errClosed = errors.New("rpc: 连接已关闭")
 ```
 
 - [ ] **Step 7: 写失败测试（共享客户端）**
@@ -2178,6 +2262,12 @@ type fakeTransport struct {
 	calls   []string
 	events  chan api.Message
 	failErr error
+	closed  bool
+}
+
+func (f *fakeTransport) Close() error {
+	f.closed = true
+	return nil
 }
 
 func (f *fakeTransport) Call(ctx context.Context, method string, in, out any) error {
@@ -2218,6 +2308,61 @@ func TestClientList(t *testing.T) {
 	}
 	if c.Settings().Language != "en" {
 		t.Fatalf("握手设置不对: %+v", c.Settings())
+	}
+	// 握手恰好发一次 get_settings，随后才是 list。
+	if len(tr.calls) != 2 || tr.calls[0] != api.MethodGetSettings || tr.calls[1] != api.MethodList {
+		t.Fatalf("调用序列不对: %v", tr.calls)
+	}
+}
+
+func TestClientCloseClosesTransport(t *testing.T) {
+	tr := &fakeTransport{events: make(chan api.Message, 4)}
+	c, err := newClient(context.Background(), tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !tr.closed {
+		t.Fatal("Close 应当关闭底层传输")
+	}
+}
+
+func TestClientLateShowAddTaskReplay(t *testing.T) {
+	tr := &fakeTransport{events: make(chan api.Message, 4)}
+	c, err := newClient(context.Background(), tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 回调还没注册时到达的请求不能丢——业务进程的 lgom:// 转发可能
+	// 在 UI 子进程还在启动时就发过来了。
+	tr.events <- api.Message{
+		Kind:        api.MessageKindShowAddTask,
+		ShowAddTask: &api.ShowAddTaskParams{URL: "https://x/a"},
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.showAddTaskMu.Lock()
+		n := len(c.showAddTaskQ)
+		c.showAddTaskMu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("消息没有进队列")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	got := make(chan api.ShowAddTaskParams, 1)
+	c.SetOnShowAddTask(func(p api.ShowAddTaskParams) { got <- p })
+	select {
+	case p := <-got:
+		if p.URL != "https://x/a" {
+			t.Fatalf("补发的参数不对: %+v", p)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("迟到的 show_add_task 没有被补发")
 	}
 }
 
