@@ -539,6 +539,7 @@ type Settings struct {
 	BTSeedRatio        float64   `json:"bt_seed_ratio"`
 	BTMaxSeeding       int       `json:"bt_max_seeding"`
 	BTMaxConcurrent    int       `json:"bt_max_concurrent"`
+	BTTrackers         string    `json:"bt_trackers"`
 }
 
 // AuthOptions 是随任务一起传递的凭据。字段与 internal/protocol.AuthOptions
@@ -883,15 +884,18 @@ func TestSettingsRoundTrip(t *testing.T) {
 		AutoStart: true, Language: "en", BTPort: 6881, BTMaxPeers: 50,
 		BTDownloadLimitKiB: 100, BTUploadLimitKiB: 50, BTDHT: true, BTPEX: true,
 		BTSeedRatio: 1.5, BTMaxSeeding: 10, BTMaxConcurrent: 2,
+		BTTrackers: "udp://tracker.example:1337",
 	}
 	got := toAPISettings(src)
 	if got.DefaultSaveDir != "/tmp" || got.TaskSort != api.SortNameAsc ||
-		got.ProxyMode != api.ProxyModeManual || got.BTSeedRatio != 1.5 {
+		got.ProxyMode != api.ProxyModeManual || got.BTSeedRatio != 1.5 ||
+		got.BTTrackers != src.BTTrackers {
 		t.Fatalf("设置转换不对: %+v", got)
 	}
 	back := toStoreSettings(got)
 	if back.DefaultSaveDir != src.DefaultSaveDir || back.ProxyMode != src.ProxyMode ||
-		back.TaskSort != src.TaskSort || back.BTMaxPeers != src.BTMaxPeers {
+		back.TaskSort != src.TaskSort || back.BTMaxPeers != src.BTMaxPeers ||
+		back.BTTrackers != src.BTTrackers {
 		t.Fatalf("设置往返失败: %+v", back)
 	}
 }
@@ -998,6 +1002,7 @@ func toAPISettings(s store.Settings) api.Settings {
 		BTSeedRatio:        s.BTSeedRatio,
 		BTMaxSeeding:       s.BTMaxSeeding,
 		BTMaxConcurrent:    s.BTMaxConcurrent,
+		BTTrackers:         s.BTTrackers,
 	}
 }
 
@@ -1030,6 +1035,7 @@ func toStoreSettings(s api.Settings) store.Settings {
 		BTSeedRatio:        s.BTSeedRatio,
 		BTMaxSeeding:       s.BTMaxSeeding,
 		BTMaxConcurrent:    s.BTMaxConcurrent,
+		BTTrackers:         s.BTTrackers,
 	}
 }
 
@@ -3012,6 +3018,7 @@ components:
         bt_seed_ratio: { type: number }
         bt_max_seeding: { type: integer }
         bt_max_concurrent: { type: integer }
+        bt_trackers: { type: string }
     Task:
       type: object
       properties:
@@ -3552,6 +3559,7 @@ message Settings {
   double bt_seed_ratio = 24;
   int32 bt_max_seeding = 25;
   int32 bt_max_concurrent = 26;
+  string bt_trackers = 27;
 }
 
 message GetSettingsResponse {
@@ -3884,6 +3892,7 @@ func settingsToPB(s api.Settings) *pb.Settings {
 		BtSeedRatio:        s.BTSeedRatio,
 		BtMaxSeeding:       int32(s.BTMaxSeeding),
 		BtMaxConcurrent:    int32(s.BTMaxConcurrent),
+		BtTrackers:         s.BTTrackers,
 	}
 }
 
@@ -3918,6 +3927,7 @@ func settingsFromPB(s *pb.Settings) api.Settings {
 		BTSeedRatio:        s.BtSeedRatio,
 		BTMaxSeeding:       int(s.BtMaxSeeding),
 		BTMaxConcurrent:    int(s.BtMaxConcurrent),
+		BTTrackers:         s.BtTrackers,
 	}
 }
 
@@ -4176,6 +4186,7 @@ func TestSettingsRoundTrip(t *testing.T) {
 		AutoStart: true, Language: "en", BTPort: 6881, BTMaxPeers: 50,
 		BTDownloadLimitKiB: 100, BTUploadLimitKiB: 50, BTDHT: true, BTPEX: true,
 		BTSeedRatio: 1.5, BTMaxSeeding: 10, BTMaxConcurrent: 2,
+		BTTrackers: "udp://tracker.example:1337",
 	}
 	got := settingsFromPB(settingsToPB(in))
 	if !reflect.DeepEqual(got, in) {
