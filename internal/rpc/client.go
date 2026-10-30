@@ -8,7 +8,6 @@ package rpc
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -50,8 +49,7 @@ type Client interface {
 // client 是基于 Transport 的共享客户端实现。两种协议共用它，
 // 因此超时、错误包装、事件扇出等语义只有一处。
 type client struct {
-	tr    Transport
-	token string
+	tr Transport
 
 	settingsMu sync.Mutex
 	settings   api.Settings
@@ -65,7 +63,6 @@ type client struct {
 	onLanguage    func()
 	onClose       func()
 
-	quit   chan struct{}
 	closed bool
 	once   sync.Once
 }
@@ -75,7 +72,7 @@ var _ Client = (*client)(nil)
 // newClient 建立客户端：先用 get_settings 做一次往返，既校验 token 又拿到
 // 初始设置快照，然后拉起消息流。
 func newClient(ctx context.Context, tr Transport) (*client, error) {
-	c := &client{tr: tr, quit: make(chan struct{})}
+	c := &client{tr: tr}
 
 	out := &api.Settings{}
 	if err := c.call(ctx, api.MethodGetSettings, &api.Empty{}, out); err != nil {
@@ -225,7 +222,6 @@ func (c *client) SetOnClose(f func()) {
 // notifyClose 标记连接已断开并触发一次 onClose 回调。
 func (c *client) notifyClose() {
 	c.once.Do(func() {
-		close(c.quit)
 		c.hookMu.Lock()
 		c.closed = true
 		h := c.onClose
@@ -320,6 +316,3 @@ func (c *client) Close() error {
 	c.notifyClose()
 	return nil
 }
-
-// errClosed 表示连接已经断开。
-var errClosed = errors.New("rpc: 连接已关闭")
