@@ -812,6 +812,8 @@ git commit -m "feat(api): 新增引擎与 UI 之间的契约 DTO 与词汇表"
 package appservice
 
 import (
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -913,6 +915,45 @@ func TestToAPIBTDetail(t *testing.T) {
 	if got.InfoHash != "h" || got.PieceBuckets[1] != 2 || got.Files[0].Path != "p" {
 		t.Fatalf("BT 详情转换不对: %+v", got)
 	}
+}
+
+// TestDTOFieldParity 用反射逐字段核对契约层 DTO 与来源结构体的字段集合。
+//
+// 这是「静默丢数据」的最后一道护栏：将来给 store.Task 加了字段却忘了在
+// toAPITask 里搬运，契约层就会少一个字段，而其它测试照样全绿——用户
+// 的设置或任务信息就那样消失了，没有任何报错。
+func TestDTOFieldParity(t *testing.T) {
+	cases := []struct {
+		name   string
+		api    any
+		source any
+	}{
+		{"Task", api.Task{}, store.Task{}},
+		{"Settings", api.Settings{}, store.Settings{}},
+		{"BTDetail", api.BTDetail{}, bittorrent.Detail{}},
+		{"AuthOptions", api.AuthOptions{}, protocol.AuthOptions{}},
+	}
+	for _, c := range cases {
+		want := fieldNames(reflect.TypeOf(c.source))
+		got := fieldNames(reflect.TypeOf(c.api))
+		if !reflect.DeepEqual(want, got) {
+			t.Fatalf("%s 的字段集合与来源不一致:\n来源 = %v\n契约 = %v", c.name, want, got)
+		}
+	}
+}
+
+// fieldNames 返回结构体的导出字段名集合（排序）。
+func fieldNames(t reflect.Type) []string {
+	out := make([]string, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue // 非导出字段
+		}
+		out = append(out, f.Name)
+	}
+	sort.Strings(out)
+	return out
 }
 ```
 
@@ -1333,7 +1374,7 @@ func (s *Service) Call(ctx context.Context, method string, in, out any) error {
 		if !ok {
 			return fmt.Errorf("appservice: probe 参数类型不对")
 		}
-		size, err := s.probe(p.URL)
+		size, err := s.probe(ctx, p.URL)
 		if err != nil {
 			return err
 		}
@@ -1375,6 +1416,12 @@ func (s *Service) Call(ctx context.Context, method string, in, out any) error {
 		*res = *toAPIBTDetail(d)
 		return nil
 
+	case api.MethodStreamMessages:
+		// 消息流不走通用分派——传输层直接读 Events() 与 Controls() 两条流。
+		// 这里显式分支，免得它掉进下面的「未知方法」默认分支，让排障时
+		// 误以为契约里没有这个方法。
+		return fmt.Errorf("appservice: 方法 %q 不走通用分派", method)
+
 	default:
 		return fmt.Errorf("appservice: 未知方法 %q", method)
 	}
@@ -1395,13 +1442,15 @@ func (s *Service) saveSettings(in api.Settings) error {
 }
 
 // probe 在业务进程内探测 URL 目标大小（复用业务侧代理配置）。
-func (s *Service) probe(raw string) (int64, error) {
+// ctx 透传给底层驱动：调用方取消后探测要跟着中止，不能占住处理协程
+// 直到自己的超时到点。
+func (s *Service) probe(ctx context.Context, raw string) (int64, error) {
 	kind, err := protocol.DetectKind(raw, "")
 	if err != nil {
 		return 0, err
 	}
 	if kind == protocol.ProtoBT {
-		return s.probeBittorrent(raw)
+		return s.probeBittorrent(ctx, raw)
 	}
 	cur := s.Settings()
 	driver, err := protocol.New(raw, kind, protocol.Auth{AuthOptions: protocol.AuthOptions{
@@ -1417,7 +1466,7 @@ func (s *Service) probe(raw string) (int64, error) {
 		return 0, err
 	}
 	defer driver.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	caps, err := driver.Probe(ctx)
 	if err != nil {
@@ -1430,9 +1479,9 @@ func (s *Service) probe(raw string) (int64, error) {
 // 返回 0(体积未知)。任何取种子的失败都当作「未知」而不是错误——
 // 体积预览不该拦住用户添加任务。但要留下日志，否则用户看到的只是
 // 「体积未知」，无从判断是网络问题还是种子本身损坏。
-func (s *Service) probeBittorrent(raw string) (int64, error) {
+func (s *Service) probeBittorrent(ctx context.Context, raw string) (int64, error) {
 	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "magnet:") {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
 		data, err := bittorrent.FetchTorrentFile(ctx, raw, protocol.HTTPProxyFunc())
 		if err != nil {
