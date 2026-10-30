@@ -8,10 +8,13 @@ package appservice
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
@@ -62,4 +65,54 @@ func TestPushControl(t *testing.T) {
 	default:
 		t.Fatal("控制消息没有送达")
 	}
+}
+
+func TestCallStreamMessages(t *testing.T) {
+	s := New(nil, nil)
+	err := s.Call(context.Background(), api.MethodStreamMessages, &api.Empty{}, &api.Empty{})
+	if err == nil {
+		t.Fatal("stream_messages 不该走通用分派")
+	}
+	// 契约里有这个方法，只是走 Events()/Controls() 两条流——不能报成
+	// 「未知方法」，否则排障时会误判契约缺方法。
+	if strings.Contains(err.Error(), "未知方法") {
+		t.Fatalf("错误文案不应把 stream_messages 说成未知方法: %v", err)
+	}
+}
+
+func TestProbeRespectsContextCancel(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	s := New(st, scheduler.New(st))
+	// 直连：避免代理解析引入额外的网络访问。
+	s.SetSettings(store.Settings{ProxyMode: protocol.ProxyModeDisabled})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 调用方已经取消
+
+	out := &api.ProbeResult{}
+	err = s.Call(ctx, api.MethodProbe, &api.ProbeParams{URL: "http://127.0.0.1:1/x"}, out)
+	if err == nil {
+		t.Fatal("上下文已取消，探测不该成功")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("应当返回 context.Canceled，实际: %v", err)
+	}
+}
+
+func TestEventsUnsubscribeTwice(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "t.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	s := New(st, scheduler.New(st))
+	_, unsub := s.Events()
+	unsub()
+	unsub() // 重复退订不该 panic
 }

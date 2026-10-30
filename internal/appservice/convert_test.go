@@ -7,6 +7,8 @@
 package appservice
 
 import (
+	"reflect"
+	"sort"
 	"testing"
 	"time"
 
@@ -132,4 +134,43 @@ func TestToAPIBTDetail(t *testing.T) {
 	if got.InfoHash != "h" || got.PieceBuckets[1] != 2 || got.Files[0].Path != "p" {
 		t.Fatalf("BT 详情转换不对: %+v", got)
 	}
+}
+
+// TestDTOFieldParity 用反射逐字段核对契约层 DTO 与来源结构体的字段集合。
+//
+// 这是「静默丢数据」的最后一道护栏：将来给 store.Task 加了字段却忘了在
+// toAPITask 里搬运，契约层就会少一个字段，而其它测试照样全绿——用户
+// 的设置或任务信息就那样消失了，没有任何报错。
+func TestDTOFieldParity(t *testing.T) {
+	cases := []struct {
+		name   string
+		api    any
+		source any
+	}{
+		{"Task", api.Task{}, store.Task{}},
+		{"Settings", api.Settings{}, store.Settings{}},
+		{"BTDetail", api.BTDetail{}, bittorrent.Detail{}},
+		{"AuthOptions", api.AuthOptions{}, protocol.AuthOptions{}},
+	}
+	for _, c := range cases {
+		want := fieldNames(reflect.TypeOf(c.source))
+		got := fieldNames(reflect.TypeOf(c.api))
+		if !reflect.DeepEqual(want, got) {
+			t.Fatalf("%s 的字段集合与来源不一致:\n来源 = %v\n契约 = %v", c.name, want, got)
+		}
+	}
+}
+
+// fieldNames 返回结构体的导出字段名集合（排序）。
+func fieldNames(t reflect.Type) []string {
+	out := make([]string, 0, t.NumField())
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		if f.PkgPath != "" {
+			continue // 非导出字段
+		}
+		out = append(out, f.Name)
+	}
+	sort.Strings(out)
+	return out
 }

@@ -199,7 +199,7 @@ func (s *Service) Call(ctx context.Context, method string, in, out any) error {
 		if !ok {
 			return fmt.Errorf("appservice: probe 参数类型不对")
 		}
-		size, err := s.probe(p.URL)
+		size, err := s.probe(ctx, p.URL)
 		if err != nil {
 			return err
 		}
@@ -241,6 +241,12 @@ func (s *Service) Call(ctx context.Context, method string, in, out any) error {
 		*res = *toAPIBTDetail(d)
 		return nil
 
+	case api.MethodStreamMessages:
+		// 消息流不走通用分派——传输层直接读 Events() 与 Controls() 两条流。
+		// 这里显式分支，免得它掉进下面的「未知方法」默认分支，让排障时
+		// 误以为契约里没有这个方法。
+		return fmt.Errorf("appservice: 方法 %q 不走通用分派", method)
+
 	default:
 		return fmt.Errorf("appservice: 未知方法 %q", method)
 	}
@@ -261,13 +267,16 @@ func (s *Service) saveSettings(in api.Settings) error {
 }
 
 // probe 在业务进程内探测 URL 目标大小（复用业务侧代理配置）。
-func (s *Service) probe(raw string) (int64, error) {
+//
+// ctx 由调用方传入：超时以它为基准派生，调用方取消能立即中止探测，
+// 不会让一次已取消的请求继续占住处理协程。
+func (s *Service) probe(ctx context.Context, raw string) (int64, error) {
 	kind, err := protocol.DetectKind(raw, "")
 	if err != nil {
 		return 0, err
 	}
 	if kind == protocol.ProtoBT {
-		return s.probeBittorrent(raw)
+		return s.probeBittorrent(ctx, raw)
 	}
 	cur := s.Settings()
 	driver, err := protocol.New(raw, kind, protocol.Auth{AuthOptions: protocol.AuthOptions{
@@ -283,7 +292,7 @@ func (s *Service) probe(raw string) (int64, error) {
 		return 0, err
 	}
 	defer driver.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	caps, err := driver.Probe(ctx)
 	if err != nil {
@@ -295,9 +304,11 @@ func (s *Service) probe(raw string) (int64, error) {
 // probeBittorrent 解析 .torrent 种子文件的总体积。磁力链接缺元数据，
 // 返回 0(体积未知)。任何取种子的失败都当作「未知」而不是错误——
 // 体积预览不该拦住用户添加任务；失败原因记日志，便于排障。
-func (s *Service) probeBittorrent(raw string) (int64, error) {
+//
+// ctx 与 probe 同理：调用方取消能立即中止种子抓取（否则最坏要等 20s）。
+func (s *Service) probeBittorrent(ctx context.Context, raw string) (int64, error) {
 	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "magnet:") {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 		defer cancel()
 		data, err := bittorrent.FetchTorrentFile(ctx, raw, protocol.HTTPProxyFunc())
 		if err != nil {
