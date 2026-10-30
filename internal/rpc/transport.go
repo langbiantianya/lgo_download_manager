@@ -15,7 +15,7 @@ import (
 	"lgo_download_manager/internal/api"
 )
 
-// Transport 是协议实现需要满足的最小能力面。新增一种协议只需实现这两个
+// Transport 是协议实现需要满足的最小能力面。新增一种协议只需实现这三个
 // 方法，调用语义（超时、错误包装、事件扇出）由本包的共享实现统一处理。
 type Transport interface {
 	// Call 执行一次调用。method 取 api.Method* 常量；in / out 是 api 层的
@@ -25,4 +25,9 @@ type Transport interface {
 	// Stream 打开服务端推送的消息流（进度事件与控制消息合并流）。
 	// 返回的 channel 在流结束或 ctx 取消后关闭。
 	Stream(ctx context.Context) (<-chan api.Message, error)
+
+	// Close 释放底层连接与流。实现必须幂等——Close 可能被重复调用。
+	// 没有它，客户端无法关闭连接：读循环会一直挂着，goroutine 与套接字
+	// 都会泄漏。
+	Close() error
 }

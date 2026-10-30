@@ -51,6 +51,9 @@ type Client interface {
 type client struct {
 	tr Transport
 
+	// cancel 停掉读循环。由 Close 调用。
+	cancel context.CancelFunc
+
 	settingsMu sync.Mutex
 	settings   api.Settings
 
@@ -63,14 +66,27 @@ type client struct {
 	onLanguage    func()
 	onClose       func()
 
+	// showAddTaskQ 缓存「弹出新建任务对话框」的请求，直到 UI 注册回调。
+	//
+	// 业务进程的 lgom:// 转发可能在 UI 子进程还没注册回调时就发过来了。
+	// 不缓存就直接丢弃，主窗口被拉起后却看不到对话框——这是旧 IPC
+	// 客户端修过的一个坑，契约层必须保住这条保证。
+	showAddTaskMu sync.Mutex
+	showAddTaskQ  []api.ShowAddTaskParams
+
 	closed bool
 	once   sync.Once
 }
 
 var _ Client = (*client)(nil)
 
-// newClient 建立客户端：先用 get_settings 做一次往返，既校验 token 又拿到
-// 初始设置快照，然后拉起消息流。
+// newClient 建立客户端：先用 get_settings 做一次往返完成握手
+// （鉴权由 Transport 负责，握手失败即等同鉴权失败），并拿到初始设置快照，
+// 然后拉起消息流。
+//
+// ctx 应当是**贯穿整个会话**的 ctx。读循环不能直接跟着它走——调用方可能
+// 只给握手或单次调用用一个短超时的 ctx，那会让读循环跟着超时，把
+// 「一次调用超时」误报成「业务进程已退出」。
 func newClient(ctx context.Context, tr Transport) (*client, error) {
 	c := &client{tr: tr}
 
@@ -82,7 +98,11 @@ func newClient(ctx context.Context, tr Transport) (*client, error) {
 	c.settings = *out
 	c.settingsMu.Unlock()
 
-	go c.readLoop(ctx)
+	// WithoutCancel 摘掉调用方 ctx 的取消传播，再用 WithCancel 拿到一个
+	// 由 client.Close() 控制的 cancel：读循环活到整个会话结束。
+	streamCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	c.cancel = cancel
+	go c.readLoop(streamCtx)
 	return c, nil
 }
 
@@ -127,9 +147,19 @@ func (c *client) dispatch(msg api.Message) {
 			h()
 		}
 	case api.MessageKindShowAddTask:
-		if h := c.showAddTaskHook(); h != nil && msg.ShowAddTask != nil {
-			h(*msg.ShowAddTask)
+		if msg.ShowAddTask == nil {
+			return
 		}
+		if h := c.showAddTaskHook(); h != nil {
+			h(*msg.ShowAddTask)
+			return
+		}
+		// 回调还没注册——先缓存，等注册时补发。
+		c.showAddTaskMu.Lock()
+		if len(c.showAddTaskQ) < 1 {
+			c.showAddTaskQ = append(c.showAddTaskQ, *msg.ShowAddTask)
+		}
+		c.showAddTaskMu.Unlock()
 	case api.MessageKindLanguage:
 		if h := c.languageHook(); h != nil {
 			h()
@@ -199,6 +229,18 @@ func (c *client) SetOnShowAddTask(f func(api.ShowAddTaskParams)) {
 	c.hookMu.Lock()
 	c.onShowAddTask = f
 	c.hookMu.Unlock()
+
+	// 补发注册之前到达的请求。业务进程的 lgom:// 转发可能在 UI 子进程
+	// 还没注册回调时就发过来了，不补发就丢了。
+	c.showAddTaskMu.Lock()
+	pending := c.showAddTaskQ
+	c.showAddTaskQ = nil
+	c.showAddTaskMu.Unlock()
+	if f != nil {
+		for _, p := range pending {
+			f(p)
+		}
+	}
 }
 
 func (c *client) SetOnLanguage(f func()) {
@@ -311,8 +353,15 @@ func (c *client) SaveSettings(s api.Settings) error {
 	return nil
 }
 
-// Close 关闭连接。
+// Close 关闭连接：停掉读循环、释放底层传输，并触发一次 onClose 通知。
+// 可以重复调用。
 func (c *client) Close() error {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.tr != nil {
+		_ = c.tr.Close()
+	}
 	c.notifyClose()
 	return nil
 }

@@ -6,7 +6,11 @@
 
 package addr
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 func TestParse(t *testing.T) {
 	cases := []struct {
@@ -43,4 +47,37 @@ func TestParse(t *testing.T) {
 			t.Fatalf("Parse(%q) = %+v, want %s/%s", c.in, got, c.network, c.address)
 		}
 	}
+}
+
+// TestListenUnixAndDial 验证 unix socket 的监听与连接：socket 文件会被创建、
+// 权限收紧到 0600，cleanup 之后文件被删掉。
+func TestListenUnixAndDial(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lgdm.sock")
+	a := Addr{Network: "unix", Address: path}
+	ln, cleanup, err := Listen(a)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer ln.Close()
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("socket 文件没创建: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("socket 权限 = %o, want 600", perm)
+	}
+
+	conn, err := Dial(a)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	_ = conn.Close()
+
+	cleanup()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("cleanup 后 socket 文件仍在: %v", err)
+	}
+	// cleanup 幂等：再调一次不能 panic。
+	cleanup()
 }
