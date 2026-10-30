@@ -8,6 +8,9 @@ package rpc
 
 import (
 	"context"
+	"reflect"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -100,9 +103,9 @@ func TestClientLateShowAddTaskReplay(t *testing.T) {
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		c.showAddTaskMu.Lock()
+		c.hookMu.Lock()
 		n := len(c.showAddTaskQ)
-		c.showAddTaskMu.Unlock()
+		c.hookMu.Unlock()
 		if n > 0 {
 			break
 		}
@@ -158,6 +161,41 @@ func TestClientReadLoopSurvivesCallerCtxTimeout(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("读循环已经退出，事件没收到")
+	}
+}
+
+// TestClientShowAddTaskQueueSharesHookLock 断言：show_add_task 队列必须与
+// onShowAddTask 钩子共用 hookMu，不能另立一把锁。
+//
+// 为什么要有这条护栏：队列若另有其锁，dispatch 的「读钩子 → 入队」与
+// SetOnShowAddTask 的「设钩子 → 排空」就不在同一个临界区，会出现
+// 「读到钩子为空 → 对方注册并排空空队列 → 才入队」的交错——那条请求
+// 既没被投递也没被补发，就永远卡在队列里送不出去。
+//
+// 这条竞态在自然调度下极罕见（实测约百万分之一的派发才会踩中），
+// 任何黑盒用例都抓不住它——修复后的实现根本不存在「已入队但尚未投递」
+// 这种中间态可供观察。因此这里用结构断言守死：队列一旦另立一把锁，
+// 本用例立刻失败。
+//
+// 另有一道互补的护栏：TestClientLateShowAddTaskReplay 在 hookMu 下读队列，
+// 若实现把队列写在别的锁上，`go test -race` 会直接报出数据竞争。
+func TestClientShowAddTaskQueueSharesHookLock(t *testing.T) {
+	ty := reflect.TypeOf(client{})
+	mutexType := reflect.TypeOf(sync.Mutex{})
+	for i := 0; i < ty.NumField(); i++ {
+		f := ty.Field(i)
+		if f.Type != mutexType {
+			continue
+		}
+		// settingsMu / subMu 各自守自己的字段，与本队列无关。
+		if f.Name == "settingsMu" || f.Name == "subMu" || f.Name == "hookMu" {
+			continue
+		}
+		if strings.Contains(f.Name, "showAddTask") || strings.Contains(f.Name, "Queue") {
+			t.Fatalf("show_add_task 队列另有独立的锁 %q：必须与 onShowAddTask 共用 hookMu，"+
+				"否则「读钩子/入队」与「设钩子/排空」不互斥，早到的请求会永久卡在队列里",
+				f.Name)
+		}
 	}
 }
 
