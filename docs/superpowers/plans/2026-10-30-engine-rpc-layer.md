@@ -14,7 +14,9 @@
 
 - 每个任务结束时仓库必须 `go build ./... && go vet ./... && go test ./...` 全绿。
 - 注释与文档字符串一律用中文，风格跟随现有代码（见 `internal/engine/engine.go`、`internal/protocol/protocol.go`）。
-- 文件头保留 MPL-2.0 许可证头 + `Copyright (c) 2026 langbiantianya`。
+- 每个新文件（**包括 `_test.go`**）都要有 MPL-2.0 许可证头 + `Copyright (c) 2026 langbiantianya`。
+  本计划里的代码块如果省略了文件头，**以仓库既有文件为准补上**
+  （参考 `internal/protocol/protocol_test.go:1-5`）。
 - `internal/api` 与 `internal/urlkind` 是叶子包：**不得** import 任何其它 `internal/*` 包（`internal/api` 只允许 import `internal/urlkind`）。
 - `internal/rpc/grpcx` 与 `internal/rpc/httpx` **不得** import `internal/rpc`（避免 `rpc → httpx → rpc` 的环）；接口满足靠结构化类型，由 `internal/rpc` 里的 `var _ Transport = (*httpx.Client)(nil)` 断言。
 - `internal/ui` **不得** import `internal/store`、`internal/scheduler`、`internal/engine`、`internal/protocol`、`internal/bittorrent`、`internal/appservice`。
