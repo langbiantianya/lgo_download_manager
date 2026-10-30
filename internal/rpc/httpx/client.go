@@ -208,12 +208,17 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// checkOpen 检查客户端是否已关闭。
+// checkOpen 检查客户端是否已关闭或未初始化。
 func (c *Client) checkOpen() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return errors.New("httpx: 客户端已关闭")
+	}
+	// 零值客户端的 http 字段是 nil，直接 Do 会 nil 指针解引用 panic。
+	// Client 是导出类型，零值是被允许的构造物，这里要回错误而不是炸进程。
+	if c.http == nil {
+		return errors.New("httpx: 客户端未初始化，请用 Dial 创建")
 	}
 	return nil
 }

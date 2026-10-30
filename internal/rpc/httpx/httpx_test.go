@@ -157,7 +157,8 @@ func TestServeRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
-// TestServeUnknownMethod 验证 api.AllMethods 之外的方法返回 404。
+// TestServeUnknownMethod 验证 api.AllMethods 之外的方法返回 404，且错误体
+// 形状与业务端点一致（{"ok":false,"error":"..."}）。
 func TestServeUnknownMethod(t *testing.T) {
 	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
 	mux := newMux(h, "secret")
@@ -168,6 +169,72 @@ func TestServeUnknownMethod(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("未知方法应当 404, got %d", rec.Code)
+	}
+	assertErrorBody(t, rec, "未知路径")
+}
+
+// TestServeUnknownPathNeedsToken 验证未注册的路径也要过鉴权：没 token 时回
+// 401，而不是 ServeMux 内置的纯文本 404。
+//
+// 这一条守住「不该让没 token 的调用方知道某个端点存不存在」：没有它，
+// 401 与 404 的差别会让任何调用方枚举出端点。
+func TestServeUnknownPathNeedsToken(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	mux := newMux(h, "secret")
+
+	// 完全不带 token。
+	req := httptest.NewRequest(http.MethodPost, "/nope", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("未知路径不带 token 应当 401, got %d: %s", rec.Code, rec.Body.String())
+	}
+	assertErrorBody(t, rec, "无效的 token")
+
+	// 带错误的 token。
+	req = httptest.NewRequest(http.MethodPost, "/nope", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("未知路径带错 token 应当 401, got %d: %s", rec.Code, rec.Body.String())
+	}
+	assertErrorBody(t, rec, "无效的 token")
+}
+
+// TestServeUnknownPathWithToken 验证带对 token 时未知路径回 404，且错误体
+// 是统一的 JSON 形状。
+func TestServeUnknownPathWithToken(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	mux := newMux(h, "secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/nope", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("未知路径带对 token 应当 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+	assertErrorBody(t, rec, "未知路径 /nope")
+}
+
+// TestServeFallbackRouteKeepsDocsEndpointsOpen 验证兜底路由没有把文档端点
+// 圈进去：/openapi.yaml、/openapi.json、/docs 仍按设计不参与 token 校验。
+//
+// 兜底路由是 "/"（兜底子树），文档端点是更精确的 pattern，更精确的优先
+// 命中。这条测试守着这个前提——哪天有人把兜底路由改成「所有请求都先过
+// 鉴权」的整体包装，文档页就跟着挂。
+func TestServeFallbackRouteKeepsDocsEndpointsOpen(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	mux := newMux(h, "secret")
+
+	for _, path := range []string{"/openapi.yaml", "/openapi.json", "/docs"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s 不带 token 应当 200, got %d", path, rec.Code)
+		}
 	}
 }
 
@@ -326,6 +393,64 @@ func TestClientCallRejectsBadToken(t *testing.T) {
 	}
 }
 
+// TestClientCallUnknownMethodKeepsErrorReason 验证客户端能从 404 的响应体
+// 里读出错误原因。服务端的错误体形状固定为 {"ok":false,"error":"..."}，
+// 客户端按 error 字段解析——解析不出来就退化成裸串「HTTP 404」。
+func TestClientCallUnknownMethodKeepsErrorReason(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	a := startServer(t, h, "secret")
+
+	c, err := Dial(context.Background(), a, "secret")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	err = c.Call(context.Background(), "nope", &api.Empty{}, &api.Empty{})
+	if err == nil {
+		t.Fatal("未知方法应当调用失败")
+	}
+	if !strings.Contains(err.Error(), "未知路径") {
+		t.Fatalf("错误信息应当带上服务端的原因: %v", err)
+	}
+	if strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("错误原因不该退化成裸状态码: %v", err)
+	}
+}
+
+// TestZeroValueClientReturnsError 验证零值客户端的 Call 与 Stream 返回错误
+// 而不是 panic。
+//
+// Client 是导出类型，零值是被允许的构造物（contract_test.go 就用它验证
+// Close 不炸）。零值客户端的 http 字段是 nil，直接 Do 会 nil 指针解引用。
+func TestZeroValueClientReturnsError(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("零值客户端不该 panic: %v", r)
+		}
+	}()
+
+	c := &Client{}
+	err := c.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, &api.Settings{})
+	if err == nil {
+		t.Fatal("零值客户端的 Call 应当返回错误")
+	}
+	if !strings.Contains(err.Error(), "未初始化") {
+		t.Fatalf("错误信息应当说明客户端未初始化: %v", err)
+	}
+
+	ch, err := c.Stream(context.Background())
+	if err == nil {
+		t.Fatal("零值客户端的 Stream 应当返回错误")
+	}
+	if !strings.Contains(err.Error(), "未初始化") {
+		t.Fatalf("错误信息应当说明客户端未初始化: %v", err)
+	}
+	if ch != nil {
+		t.Fatal("零值客户端的 Stream 不该返回消息通道")
+	}
+}
+
 // TestClientStreamReceivesMessages 验证客户端能收到事件与控制消息两种。
 func TestClientStreamReceivesMessages(t *testing.T) {
 	h := &stubHandler{events: make(chan api.Event, 4), controls: make(chan api.Message, 4)}
@@ -408,6 +533,32 @@ func TestDialFailsWhenServerAbsent(t *testing.T) {
 	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "missing.sock")}
 	if _, err := Dial(context.Background(), a, "secret"); err == nil {
 		t.Fatal("服务端没起来时 Dial 应当失败")
+	}
+}
+
+// assertErrorBody 断言响应是统一的错误信封：Content-Type 是 application/json，
+// body 是 {"ok":false,"error":"..."}。wantContains 非空时，error 字段还要包含
+// 它。
+func assertErrorBody(t *testing.T, rec *httptest.ResponseRecorder, wantContains string) {
+	t.Helper()
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("错误体的 Content-Type 不对: %q", ct)
+	}
+	var e struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("错误体不是 JSON: %v (%s)", err, rec.Body.String())
+	}
+	if e.OK {
+		t.Fatalf("错误体的 ok 应当是 false: %s", rec.Body.String())
+	}
+	if e.Error == "" {
+		t.Fatalf("错误体缺少 error 字段: %s", rec.Body.String())
+	}
+	if wantContains != "" && !strings.Contains(e.Error, wantContains) {
+		t.Fatalf("错误信息应当包含 %q，实际是 %q", wantContains, e.Error)
 	}
 }
 

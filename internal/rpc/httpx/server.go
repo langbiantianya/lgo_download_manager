@@ -78,7 +78,8 @@ func newMux(h Handler, token string) *http.ServeMux {
 	// 文档端点不走 authed：它们只暴露接口形状，不暴露任务数据。
 	registerDocs(mux)
 	// authed 是鉴权 + 方法检查的中间件。鉴权在前：不该让没 token 的调用方
-	// 知道某个端点存不存在。
+	// 知道某个端点存不存在。没注册的路径由下面的兜底路由兜住，它同样先过
+	// 鉴权，这条前提才成立。
 	authed := func(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			if !validToken(r.Header.Get("Authorization"), token) {
@@ -104,16 +105,28 @@ func newMux(h Handler, token string) *http.ServeMux {
 	mux.HandleFunc(servicePrefix+api.MethodStreamMessages, authed(func(w http.ResponseWriter, r *http.Request) {
 		serveStream(w, r, h)
 	}))
+	// 兜底路由：未注册的路径也要先过鉴权。否则 401 与 404 的差别会泄露
+	// 端点存不存在——没 token 的调用方能靠状态码枚举出有哪些端点；而且
+	// ServeMux 内置的 404 是纯文本，错误体形状与业务端点对不上，客户端
+	// 只能退化成裸串「HTTP 404」，错误原因丢失。
+	//
+	// Go 1.22+ 的 ServeMux：未以 / 结尾的 pattern 是精确匹配，"/" 是兜底
+	// 子树，更精确的 pattern 优先命中。业务端点与文档端点都不受影响。
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if !validToken(r.Header.Get("Authorization"), token) {
+			writeError(w, http.StatusUnauthorized, "无效的 token")
+			return
+		}
+		// 不检查方法：对不存在的路径谈「只接受 POST」是误导。
+		writeError(w, http.StatusNotFound, "未知路径 "+r.URL.Path)
+	})
 	return mux
 }
 
 // serveCall 处理一次调用。
 func serveCall(w http.ResponseWriter, r *http.Request, h Handler, method string) {
+	// method 一定来自 api.AllMethods，api.Spec 对它们必有 spec。
 	spec := api.Spec(method)
-	if spec == nil {
-		writeError(w, http.StatusNotFound, "未知方法 "+method)
-		return
-	}
 	in := spec.NewIn()
 	if r.Body != nil {
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
