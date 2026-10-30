@@ -18,6 +18,7 @@ require (
 require (
 	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/FyshOS/fancyfs v0.0.1 // indirect
+	github.com/KyleBanks/depth v1.2.1 // indirect
 	github.com/RoaringBitmap/roaring v1.2.3 // indirect
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
 	github.com/anacrolix/btree v0.0.0-20251201064447-d86c3fa41bd8 // indirect
@@ -58,6 +59,10 @@ require (
 	github.com/go-llsqlite/crawshaw v0.5.6-0.20250312230104-194977a03421 // indirect
 	github.com/go-logr/logr v1.4.3 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
+	github.com/go-openapi/jsonpointer v0.19.5 // indirect
+	github.com/go-openapi/jsonreference v0.20.0 // indirect
+	github.com/go-openapi/spec v0.20.6 // indirect
+	github.com/go-openapi/swag v0.19.15 // indirect
 	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
 	github.com/go-text/render v0.2.1 // indirect
 	github.com/go-text/typesetting v0.3.4 // indirect
@@ -70,8 +75,10 @@ require (
 	github.com/hack-pad/go-indexeddb v0.3.2 // indirect
 	github.com/hack-pad/safejs v0.1.0 // indirect
 	github.com/huandu/xstrings v1.3.2 // indirect
+	github.com/josharian/intern v1.0.0 // indirect
 	github.com/jsummers/gobmp v0.0.0-20230614200233-a9de23ed2e25 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.3 // indirect
+	github.com/mailru/easyjson v0.7.6 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mattn/go-runewidth v0.0.24 // indirect
 	github.com/minio/sha256-simd v1.0.0 // indirect
@@ -106,6 +113,8 @@ require (
 	github.com/srwiley/oksvg v0.0.0-20221011165216-be6e8873101c // indirect
 	github.com/srwiley/rasterx v0.0.0-20220730225603-2ab79fcdd4ef // indirect
 	github.com/stretchr/testify v1.12.1 // indirect
+	github.com/swaggo/files v1.0.1 // indirect
+	github.com/swaggo/swag v1.8.1 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
 	github.com/wlynxg/anet v0.0.3 // indirect
 	github.com/yuin/goldmark v1.8.2 // indirect
@@ -118,6 +127,8 @@ require (
 	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
 	golang.org/x/image v0.24.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
+	golang.org/x/tools v0.39.0 // indirect
+	gopkg.in/yaml.v2 v2.4.0 // indirect
 	lukechampine.com/blake3 v1.1.6 // indirect
 	modernc.org/libc v1.74.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
@@ -127,6 +138,17 @@ require (
 
 require (
 	github.com/dop251/goja v0.0.0-20261028213108-85be1416108e
+	github.com/swaggo/http-swagger v1.3.4
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.43.0
+)
+
+// 排除 x/tools 的这两个新版本：它们会经由 golang.org/x/net 把 x/net 抬到
+// v0.56/v0.59，而 x/net v0.56 起的 httpproxy 改了环境变量优先级
+//（小写 http_proxy 优先于大写 HTTP_PROXY），会打破 internal/protocol 里
+// TestProxyFuncSystemModeReturnsEnv 的预期。x/tools 只被 swaggo/swag 间接
+// 用到（go/loader），v0.39.0 已足够。
+exclude (
+	golang.org/x/tools v0.47.0
+	golang.org/x/tools v0.51.0
 )

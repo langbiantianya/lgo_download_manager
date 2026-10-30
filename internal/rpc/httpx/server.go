@@ -75,6 +75,8 @@ func Serve(ctx context.Context, a addr.Addr, token string, h Handler) error {
 // newMux 组装路由与中间件。
 func newMux(h Handler, token string) *http.ServeMux {
 	mux := http.NewServeMux()
+	// 文档端点不走 authed：它们只暴露接口形状，不暴露任务数据。
+	registerDocs(mux)
 	// authed 是鉴权 + 方法检查的中间件。鉴权在前：不该让没 token 的调用方
 	// 知道某个端点存不存在。
 	authed := func(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
