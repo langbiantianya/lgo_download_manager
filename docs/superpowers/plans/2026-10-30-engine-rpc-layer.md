@@ -54,7 +54,7 @@ internal/rpc/contract_test.go           契约测试套件（两种传输各跑�
 internal/rpc/httpx/server.go            net/http 服务端
 internal/rpc/httpx/client.go            net/http 客户端
 internal/rpc/httpx/openapi.yaml         OpenAPI 3.0.3 规范
-internal/rpc/httpx/docs.go              /openapi.yaml、/openapi.json、/docs
+internal/rpc/httpx/docs.go              /openapi.yaml、/openapi.json、/docs、/docs/
 internal/rpc/httpx/httpx_test.go
 internal/rpc/httpx/openapi_test.go      规范与代码一致性测试
 internal/rpc/grpcx/server.go            gRPC 服务端
@@ -3523,21 +3523,49 @@ git commit -m "feat(httpx): 实现基于 net/http 的传输"
 - Create: `internal/rpc/httpx/openapi.yaml`
 - Create: `internal/rpc/httpx/docs.go`
 - Create: `internal/rpc/httpx/openapi_test.go`
-- Modify: `internal/rpc/httpx/server.go`（挂上三个文档端点）
+- Modify: `internal/rpc/httpx/server.go`（挂上文档端点）
+- Modify: `go.mod` / `go.sum`（新增 swaggo 依赖）
 
 **Interfaces:**
 - Consumes: `internal/api`（Task 2）
 - Produces:
   ```go
   package httpx
-  func openAPISpec() []byte            // 嵌入的规范原文
-  func openAPIJSON() ([]byte, error)   // 规范转成的 JSON（缓存）
-  func registerDocs(mux *http.ServeMux) // 注册 /openapi.yaml、/openapi.json、/docs
+  func openAPISpec() []byte              // 嵌入的规范原文
+  func openAPIJSON() ([]byte, error)     // 规范转成的 JSON（缓存）
+  func yamlToJSON(data []byte) ([]byte, error) // YAML→JSON 转换，失败时返回错误
+  func registerDocs(mux *http.ServeMux)  // 注册 /openapi.yaml、/openapi.json、/docs、/docs/
   ```
+
+> **与控制器补充说明（B1–B11）的对照**：本节代码是按 B1–B11 修正后的最终实现，
+> 与最初的草稿有出入的地方见文末「与初稿的差异」。
+>
+> **文档端点契约**（设计文档 §6.2、§6.4）：
+>
+> | 端点 | 方法 | 响应 | 参与 token 校验 |
+> |---|---|---|---|
+> | `/openapi.yaml` | GET | 200 `application/yaml` | 否 |
+> | `/openapi.json` | GET | 200 `application/json` | 否 |
+> | `/docs` | GET | 200 `text/html; charset=utf-8` | 否 |
+> | `/docs/*` | GET | 200 静态资源（离线嵌入的 swagger-ui） | 否 |
+>
+> 只接受 GET；其他方法回 405 并带上 `Allow: GET`，错误体沿用全站统一的
+> `{"ok":false,"error":"..."}` 形状。
 
 - [ ] **Step 1: 写 `internal/rpc/httpx/openapi.yaml`**
 
+规范是 HTTP 这一侧接口形状的唯一真相源：路径、方法名、DTO 字段都必须与
+`internal/api` 对齐。**每个业务端点都要声明实现里真实存在的状态码**
+（200 / 400 / 401 / 405 / 500，见 B3），错误响应用 `components.responses` 复用。
+
 ```yaml
+# lgdm HTTP 传输的接口规范。
+#
+# 这是 HTTP 这一侧接口形状的唯一真相源：路径、方法名、DTO 字段都必须与
+# internal/api 的常量与结构体一一对应。internal/rpc/httpx/openapi_test.go
+# 里的规范一致性测试负责在两边漂移时失败。
+#
+# 同步规则：新增/修改端点或 DTO 字段时必须同步改本文件。
 openapi: 3.0.3
 info:
   title: LGDM Download Service
@@ -3550,9 +3578,14 @@ info:
 
     消息流端点 /lgdm.v1.DownloadService/stream_messages 返回 NDJSON，
     每行一个消息对象，事件与控制消息合并在同一条流里。
+
+    文档端点（/openapi.yaml、/openapi.json、/docs）不参与 token 校验：
+    它们只暴露接口形状，不暴露任务数据。
 servers:
-  - url: http://lgdm/lgdm.v1.DownloadService
-    description: 本机 Unix socket（或 LDM_RPC_LISTEN 指定的 host:port）
+  - url: /
+    description: |
+      同源相对地址。默认部署在本机 Unix socket 上，浏览器无法直连；
+      若通过 LDM_RPC_LISTEN 指定 host:port 监听，文档页与接口同源。
 security:
   - bearerAuth: []
 paths:
@@ -3571,7 +3604,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ListResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /lgdm.v1.DownloadService/add:
     post:
       summary: 添加下载任务
@@ -3587,7 +3623,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Task" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /lgdm.v1.DownloadService/start:
     post:
       summary: 启动任务
@@ -3598,8 +3637,15 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/TaskRef" }
       responses:
-        "200": { description: 已启动 }
+        "200":
+          description: 已启动
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Empty" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /lgdm.v1.DownloadService/pause:
     post:
       summary: 暂停任务
@@ -3610,8 +3656,15 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/TaskRef" }
       responses:
-        "200": { description: 已暂停 }
+        "200":
+          description: 已暂停
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Empty" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /lgdm.v1.DownloadService/delete:
     post:
       summary: 删除任务
@@ -3622,8 +3675,15 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/TaskRef" }
       responses:
-        "200": { description: 已删除 }
+        "200":
+          description: 已删除
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Empty" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /lgdm.v1.DownloadService/is_preparing:
     post:
       summary: 报告任务是否处于「已预留 slot 但引擎未启动」的准备阶段
@@ -3639,7 +3699,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/BoolResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /lgdm.v1.DownloadService/probe:
     post:
       summary: 探测 URL 目标大小
@@ -3655,7 +3718,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ProbeResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /lgdm.v1.DownloadService/get_settings:
     post:
       summary: 读取权威设置快照
@@ -3671,7 +3737,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Settings" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /lgdm.v1.DownloadService/save_settings:
     post:
       summary: 持久化设置
@@ -3682,8 +3751,15 @@ paths:
           application/json:
             schema: { $ref: "#/components/schemas/Settings" }
       responses:
-        "200": { description: 已保存 }
+        "200":
+          description: 已保存
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Empty" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /lgdm.v1.DownloadService/bt_info:
     post:
       summary: 查询 BT 任务实时详情
@@ -3699,7 +3775,10 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/BTDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
   /lgdm.v1.DownloadService/stream_messages:
     post:
       summary: 订阅消息流（进度事件 + 控制消息）
@@ -3715,15 +3794,33 @@ paths:
           content:
             application/x-ndjson:
               schema: { $ref: "#/components/schemas/Message" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
 components:
   securitySchemes:
     bearerAuth:
       type: http
       scheme: bearer
   responses:
+    BadRequest:
+      description: 请求体不是合法 JSON
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     Unauthorized:
       description: token 缺失或无效
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    MethodNotAllowed:
+      description: 只接受 POST
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InternalError:
+      description: 业务侧调用失败
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -3732,6 +3829,7 @@ components:
       type: object
     Error:
       type: object
+      required: [ok, error]
       properties:
         ok: { type: boolean }
         error: { type: string }
@@ -3900,19 +3998,32 @@ components:
           type: string
           enum: [event, show, show_add_task, language, close]
         event: { $ref: "#/components/schemas/Event" }
-        show_add_task:
-          type: object
-          properties:
-            url: { type: string }
-            name: { type: string }
-            ua: { type: string }
-            cookies: { type: string }
+        show_add_task: { $ref: "#/components/schemas/ShowAddTaskParams" }
         language: { type: string }
+    ShowAddTaskParams:
+      type: object
+      properties:
+        url: { type: string }
+        name: { type: string }
+        ua: { type: string }
+        cookies: { type: string }
 ```
 
 - [ ] **Step 2: 建 `internal/rpc/httpx/docs.go`**
 
+Swagger UI **离线嵌入**（B1）：`github.com/swaggo/http-swagger` +
+`github.com/swaggo/files` 把 swagger-ui 静态资源打进二进制，页面不引任何
+公网 CDN。`/docs` 自己渲染 HTML 并用**绝对路径**引资源（B2：页面挂在
+`/docs`（无尾斜杠）时，相对路径 `./swagger-ui.css` 会被浏览器解析到
+`/swagger-ui.css` → 404）；静态资源本体由 `/docs/` 提供。
+
 ```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package httpx
 
 import (
@@ -3921,81 +4032,129 @@ import (
 	"net/http"
 	"sync"
 
+	httpSwagger "github.com/swaggo/http-swagger"
 	"go.yaml.in/yaml/v3"
 )
 
 //go:embed openapi.yaml
 var openapiYAML []byte
 
-// openAPIJSON 缓存规范转成的 JSON 形式。
+// openAPIJSON 缓存规范转成的 JSON 形式。转换只做一次：规范是嵌入的常量，
+// 结果不会变，重复解析纯属浪费。
 var (
 	openAPIJSONOnce sync.Once
 	openAPIJSONData []byte
 	openAPIJSONErr  error
 )
 
-// openAPISpec 返回嵌入的 OpenAPI 规范原文。
+// openAPISpec 返回嵌入的 OpenAPI 规范原文（YAML）。
 func openAPISpec() []byte { return openapiYAML }
 
-// openAPIJSON 返回规范的 JSON 形式。转换只做一次，之后走缓存。
+// openAPIJSON 返回规范的 JSON 形式。转换失败时返回错误，调用方据此回 500。
 func openAPIJSON() ([]byte, error) {
 	openAPIJSONOnce.Do(func() {
-		var v any
-		if err := yaml.Unmarshal(openapiYAML, &v); err != nil {
-			openAPIJSONErr = err
-			return
-		}
-		openAPIJSONData, openAPIJSONErr = json.Marshal(v)
+		openAPIJSONData, openAPIJSONErr = yamlToJSON(openapiYAML)
 	})
 	return openAPIJSONData, openAPIJSONErr
 }
 
+// yamlToJSON 把 YAML 文本转成 JSON 字节。转换失败时返回错误而不是 panic：
+// 规范是嵌入的常量，正常不会失败，但一旦失败也不该把请求打崩。
+func yamlToJSON(data []byte) ([]byte, error) {
+	var v any
+	if err := yaml.Unmarshal(data, &v); err != nil {
+		return nil, err
+	}
+	return json.Marshal(v)
+}
+
 // registerDocs 注册文档端点。它们不参与 token 校验——只暴露接口形状，
-// 不暴露任务数据。
+// 不暴露任务数据。文档端点只接受 GET，其他方法回 405 并带上 Allow 头。
 func registerDocs(mux *http.ServeMux) {
-	mux.HandleFunc("/openapi.yaml", func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("/openapi.yaml", getOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/yaml")
 		_, _ = w.Write(openAPISpec())
-	})
-	mux.HandleFunc("/openapi.json", func(w http.ResponseWriter, r *http.Request) {
-		raw, err := openAPIJSON()
+	})))
+	mux.Handle("/openapi.json", getOnly(serveOpenAPIJSON(openAPIJSON)))
+	// /docs 自己渲染页面：静态资源用绝对路径引，避免 /docs 被当成「文件」
+	// 时相对路径解析到 / 下面去。资源本体由 /docs/ 提供。
+	mux.Handle("/docs", getOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(swaggerPage))
+	})))
+	// /docs/ 交给 http-swagger：它把 swagger-ui 静态资源（已嵌进二进制）
+	// 从内存文件系统里吐出来，不依赖公网 CDN。
+	mux.Handle("/docs/", getOnly(httpSwagger.WrapHandler))
+}
+
+// serveOpenAPIJSON 把规范以 JSON 形式吐出来。取 JSON 的方式由参数传入，
+// 方便测试注入「转换失败」的情形。
+func serveOpenAPIJSON(load func() ([]byte, error)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		raw, err := load()
 		if err != nil {
 			http.Error(w, "openapi: "+err.Error(), http.StatusInternalServerError)
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(raw)
-	})
-	mux.HandleFunc("/docs", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(swaggerPage))
+	}
+}
+
+// getOnly 把 handler 限制在 GET 上：其他方法回 405 并带上 Allow: GET。
+// 错误体沿用全站统一的 {"ok":false,"error":"..."} 形状。
+func getOnly(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", http.MethodGet)
+			writeError(w, http.StatusMethodNotAllowed, "只接受 GET")
+			return
+		}
+		h.ServeHTTP(w, r)
 	})
 }
 
-// swaggerPage 是一个离线的 Swagger UI 页面：UI 资源用 CDN 加载，
-// 规范本体从同源的 /openapi.json 取。CDN 不可达时页面仍会提示用户
-// 直接打开 /openapi.yaml。
+// swaggerPage 是离线的 Swagger UI 页面：静态资源从同源的 /docs/ 取，
+// 规范本体从同源的 /openapi.json 取。整页不引用任何外链资源——本机工具的
+// 文档页不该依赖公网。
+//
+// 资源用绝对路径（/docs/swagger-ui.css）而不是相对路径（./swagger-ui.css）：
+// 页面挂在 /docs（无尾斜杠）时，浏览器会把 /docs 当成「文件」，其父目录是
+// /，相对路径会解析到 /swagger-ui.css —— 404。
 const swaggerPage = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LGDM Download Service — API 文档</title>
-<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css">
+<link rel="stylesheet" type="text/css" href="/docs/swagger-ui.css">
+<link rel="icon" type="image/png" href="/docs/favicon-32x32.png" sizes="32x32">
 </head>
 <body>
 <div id="swagger-ui"></div>
-<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script src="/docs/swagger-ui-bundle.js"></script>
+<script src="/docs/swagger-ui-standalone-preset.js"></script>
 <script>
-window.addEventListener('load', function () {
+window.onload = function () {
   if (typeof SwaggerUIBundle === 'undefined') {
     document.getElementById('swagger-ui').innerHTML =
-      '<p>无法加载 Swagger UI 资源（离线环境）。' +
-      '请直接查看 <a href="/openapi.yaml">/openapi.yaml</a> 或 ' +
+      '<p>无法加载 Swagger UI 资源。请直接查看 ' +
+      '<a href="/openapi.yaml">/openapi.yaml</a> 或 ' +
       '<a href="/openapi.json">/openapi.json</a>。</p>';
     return;
   }
-  window.ui = SwaggerUIBundle({ url: '/openapi.json', dom_id: '#swagger-ui' });
-});
+  window.ui = SwaggerUIBundle({
+    url: '/openapi.json',
+    deepLinking: true,
+    docExpansion: 'list',
+    dom_id: '#swagger-ui',
+    persistAuthorization: true,
+    validatorUrl: null,
+    presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+    plugins: [SwaggerUIBundle.plugins.DownloadUrl],
+    layout: 'StandaloneLayout'
+  });
+};
 </script>
 </body>
 </html>`
@@ -4003,119 +4162,465 @@ window.addEventListener('load', function () {
 
 - [ ] **Step 3: 在 `server.go` 里挂上文档端点**
 
-在 `newMux` 函数的 `mux := http.NewServeMux()` 之后加一行：
+在 `newMux` 函数的 `mux := http.NewServeMux()` 之后加两行——文档端点**不进**
+`authed` 中间件（设计文档 §6.4：它们不参与 token 校验）：
 
 ```go
+	mux := http.NewServeMux()
+	// 文档端点不走 authed：它们只暴露接口形状，不暴露任务数据。
 	registerDocs(mux)
 ```
 
 - [ ] **Step 4: 写规范一致性测试**
 
-创建 `internal/rpc/httpx/openapi_test.go`：
+创建 `internal/rpc/httpx/openapi_test.go`：方法 ↔ 路径双向核对、DTO 字段 ↔
+schema property 双向核对（B4）、字段类型 ↔ OpenAPI type 核对（B9）、`$ref`
+完整性、以及文档端点的行为（免鉴权、只收 GET、不引外链）。
 
 ```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package httpx
 
 import (
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"go.yaml.in/yaml/v3"
 	"lgo_download_manager/internal/api"
 )
 
+// dtoSchemas 列出「在规范里有 schema 的 DTO」与 schema 名的对应关系。
+// 规范里每个 schema 都必须在这里出现，DTO 加字段时同步改规范就会被
+// TestOpenAPISchemasMatchDTO 逮住。
+var dtoSchemas = []struct {
+	schema string
+	dto    any
+}{
+	{"Task", api.Task{}},
+	{"Settings", api.Settings{}},
+	{"AuthOptions", api.AuthOptions{}},
+	{"AddTaskInput", api.AddTaskInput{}},
+	{"Event", api.Event{}},
+	{"Message", api.Message{}},
+	{"ShowAddTaskParams", api.ShowAddTaskParams{}},
+	{"BTDetail", api.BTDetail{}},
+	{"FileProgress", api.FileProgress{}},
+	{"ListParams", api.ListParams{}},
+	{"ListResult", api.ListResult{}},
+	{"TaskRef", api.TaskRef{}},
+	{"BoolResult", api.BoolResult{}},
+	{"ProbeParams", api.ProbeParams{}},
+	{"ProbeResult", api.ProbeResult{}},
+	{"BTInfoParams", api.BTInfoParams{}},
+	{"Empty", api.Empty{}},
+}
+
+// TestOpenAPIParses 验证规范能转成 JSON，且版本号是 3.0.3。
 func TestOpenAPIParses(t *testing.T) {
-	raw, err := openAPIJSON()
-	if err != nil {
-		t.Fatalf("规范转 JSON 失败: %v", err)
-	}
-	var doc map[string]any
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatal(err)
-	}
-	if doc["openapi"] != "3.0.3" {
-		t.Fatalf("openapi 版本不对: %v", doc["openapi"])
+	doc := parseSpec(t)
+	if got := doc["openapi"]; got != "3.0.3" {
+		t.Fatalf("openapi 版本不对: %v", got)
 	}
 }
 
+// TestOpenAPICoversAllMethods 双向核对方法与路径：api.AllMethods 里的每个
+// 方法都要有路径，规范里也不能有多余的业务路径。
 func TestOpenAPICoversAllMethods(t *testing.T) {
-	raw, err := openAPIJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var doc struct {
-		Paths map[string]any `json:"paths"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatal(err)
-	}
+	doc := parseSpec(t)
+	paths := specPaths(t, doc)
+
 	for _, m := range api.AllMethods {
 		p := servicePrefix + m
-		if _, ok := doc.Paths[p]; !ok {
+		if _, ok := paths[p]; !ok {
 			t.Fatalf("规范缺少方法 %q 的路径 %q", m, p)
 		}
 	}
+	for p := range paths {
+		if !strings.HasPrefix(p, servicePrefix) {
+			t.Fatalf("规范里有非业务路径 %q", p)
+		}
+		m := strings.TrimPrefix(p, servicePrefix)
+		found := false
+		for _, known := range api.AllMethods {
+			if known == m {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("规范里有多余的业务路径 %q（api.AllMethods 里没有 %q）", p, m)
+		}
+	}
 }
 
+// TestOpenAPIEndpointsDeclareErrorResponses 验证每个业务端点都声明了实现里
+// 真实存在的状态码：200 / 400 / 401 / 405 / 500。
+func TestOpenAPIEndpointsDeclareErrorResponses(t *testing.T) {
+	doc := parseSpec(t)
+	paths := specPaths(t, doc)
+	want := []string{"200", "400", "401", "405", "500"}
+	for _, m := range api.AllMethods {
+		p := servicePrefix + m
+		item, ok := paths[p].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 的定义不是对象", p)
+		}
+		post, ok := item["post"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 post 定义", p)
+		}
+		responses, ok := post["responses"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 responses 定义", p)
+		}
+		for _, code := range want {
+			if _, ok := responses[code]; !ok {
+				t.Fatalf("路径 %q 的响应里缺少 %s", p, code)
+			}
+		}
+	}
+}
+
+// TestOpenAPISchemasMatchDTO 双向核对 schema 的属性与 DTO 的 JSON 字段。
 func TestOpenAPISchemasMatchDTO(t *testing.T) {
-	raw, err := openAPIJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	var doc struct {
-		Components struct {
-			Schemas map[string]struct {
-				Properties map[string]any `json:"properties"`
-			} `json:"schemas"`
-		} `json:"components"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatal(err)
-	}
-	cases := []struct {
-		schema string
-		dto    any
-	}{
-		{"Task", api.Task{}},
-		{"Settings", api.Settings{}},
-		{"Event", api.Event{}},
-		{"BTDetail", api.BTDetail{}},
-		{"FileProgress", api.FileProgress{}},
-		{"AddTaskInput", api.AddTaskInput{}},
-		{"AuthOptions", api.AuthOptions{}},
-	}
-	for _, c := range cases {
-		s, ok := doc.Components.Schemas[c.schema]
+	doc := parseSpec(t)
+	schemas := specSchemas(t, doc)
+	for _, c := range dtoSchemas {
+		s, ok := schemas[c.schema].(map[string]any)
 		if !ok {
 			t.Fatalf("规范缺少 schema %q", c.schema)
 		}
-		want := jsonFields(reflect.TypeOf(c.dto))
-		got := make([]string, 0, len(s.Properties))
-		for k := range s.Properties {
+		props, ok := s["properties"].(map[string]any)
+		if !ok {
+			if len(jsonFields(reflect.TypeOf(c.dto))) != 0 {
+				t.Fatalf("schema %q 没有 properties，但 DTO 有字段", c.schema)
+			}
+			continue
+		}
+		got := make([]string, 0, len(props))
+		for k := range props {
 			got = append(got, k)
 		}
+		want := jsonFields(reflect.TypeOf(c.dto))
 		if !sameSet(want, got) {
 			t.Fatalf("schema %q 的字段与 DTO 不一致:\nDTO  = %v\n规范 = %v", c.schema, want, got)
 		}
 	}
 }
 
-// jsonFields 返回结构体的 json tag 字段名集合。
+// TestOpenAPISchemasCoverAllDTOs 验证规范里的 schema 没有漏网的 DTO：
+// 规范里每个 schema 都必须在 dtoSchemas 里登记过。
+func TestOpenAPISchemasCoverAllDTOs(t *testing.T) {
+	doc := parseSpec(t)
+	schemas := specSchemas(t, doc)
+	known := map[string]bool{}
+	for _, c := range dtoSchemas {
+		known[c.schema] = true
+	}
+	// Error 是错误信封，不是 DTO：它不对应任何请求/响应结构体。
+	known["Error"] = true
+	for name := range schemas {
+		if !known[name] {
+			t.Fatalf("规范里的 schema %q 没有对应的 DTO 登记", name)
+		}
+	}
+}
+
+// TestOpenAPISchemaTypesMatchDTO 逐字段核对 OpenAPI 的 type 与 Go 类型。
+// 只比字段名不够：字段名对但类型写错（比如把 int64 写成 string）一样会坑人。
+func TestOpenAPISchemaTypesMatchDTO(t *testing.T) {
+	doc := parseSpec(t)
+	schemas := specSchemas(t, doc)
+	for _, c := range dtoSchemas {
+		s, ok := schemas[c.schema].(map[string]any)
+		if !ok {
+			t.Fatalf("规范缺少 schema %q", c.schema)
+		}
+		props, _ := s["properties"].(map[string]any)
+		typ := reflect.TypeOf(c.dto)
+		for i := 0; i < typ.NumField(); i++ {
+			f := typ.Field(i)
+			name := jsonFieldName(f)
+			if name == "" {
+				continue
+			}
+			prop, ok := props[name].(map[string]any)
+			if !ok {
+				t.Fatalf("schema %q 缺少字段 %q", c.schema, name)
+			}
+			got := parseShape(prop)
+			want := expectShape(f.Type)
+			if want.ref == "" && want.kind == "" {
+				// 映射不了的类型（map、interface 等）不比。
+				continue
+			}
+			checkShape(t, c.schema+"."+name, want, got)
+		}
+	}
+}
+
+// TestOpenAPIReferencesResolve 验证规范里所有 $ref 都指得到东西。
+func TestOpenAPIReferencesResolve(t *testing.T) {
+	doc := parseSpec(t)
+	refs := map[string]bool{}
+	collectRefs(doc, refs)
+	for ref := range refs {
+		parts := strings.Split(strings.TrimPrefix(ref, "#/"), "/")
+		if len(parts) != 3 || parts[0] != "components" {
+			t.Fatalf("引用 %q 的形式不对", ref)
+		}
+		var cur any = doc
+		for _, p := range parts {
+			m, ok := cur.(map[string]any)
+			if !ok {
+				t.Fatalf("引用 %q 指向的不是对象", ref)
+			}
+			cur, ok = m[p]
+			if !ok {
+				t.Fatalf("引用 %q 指向 %q，但那里没有东西", ref, strings.Join(parts, "."))
+			}
+		}
+	}
+}
+
+// TestOpenAPIJSONIsValid 验证 /openapi.json 返回的是合法 JSON。
+func TestOpenAPIJSONIsValid(t *testing.T) {
+	mux := docsMux()
+	rec := doGet(mux, "/openapi.json")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应当 200, got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("Content-Type 不对: %q", ct)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
+		t.Fatalf("不是合法 JSON: %v (%s)", err, rec.Body.String())
+	}
+	if doc["openapi"] != "3.0.3" {
+		t.Fatalf("openapi 版本不对: %v", doc["openapi"])
+	}
+}
+
+// TestOpenAPIYAMLMatchesJSON 验证 /openapi.yaml 与 /openapi.json 是同一份规范。
+func TestOpenAPIYAMLMatchesJSON(t *testing.T) {
+	mux := docsMux()
+	rec := doGet(mux, "/openapi.yaml")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应当 200, got %d", rec.Code)
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/yaml") {
+		t.Fatalf("Content-Type 不对: %q", ct)
+	}
+	if rec.Body.String() != string(openAPISpec()) {
+		t.Fatal("/openapi.yaml 的内容与嵌入的规范原文不一致")
+	}
+	var fromYAML map[string]any
+	if err := yaml.Unmarshal(rec.Body.Bytes(), &fromYAML); err != nil {
+		t.Fatalf("/openapi.yaml 不是合法 YAML: %v", err)
+	}
+	// 归一化：YAML 与 JSON 的数字类型不同，两边都过一遍 JSON 再比。
+	normalized, err := json.Marshal(fromYAML)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var a, b map[string]any
+	if err := json.Unmarshal(normalized, &a); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(mustJSON(t), &b); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(a, b) {
+		t.Fatal("/openapi.yaml 与 /openapi.json 描述的不是同一份规范")
+	}
+}
+
+// TestDocsEndpointsNeedNoToken 验证文档端点不参与 token 校验。
+func TestDocsEndpointsNeedNoToken(t *testing.T) {
+	mux := docsMux()
+	cases := []struct {
+		path        string
+		contentType string
+	}{
+		{"/openapi.yaml", "application/yaml"},
+		{"/openapi.json", "application/json"},
+		{"/docs", "text/html"},
+		{"/docs/swagger-ui.css", "text/css"},
+		{"/docs/swagger-ui-bundle.js", "javascript"},
+	}
+	for _, c := range cases {
+		rec := doGet(mux, c.path)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s 应当 200（不带 token）, got %d", c.path, rec.Code)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, c.contentType) {
+			t.Fatalf("%s 的 Content-Type 不对: %q（期望含 %q）", c.path, ct, c.contentType)
+		}
+		if rec.Body.Len() == 0 {
+			t.Fatalf("%s 的响应体是空的", c.path)
+		}
+	}
+}
+
+// TestDocsEndpointsRejectNonGet 验证文档端点只接受 GET。
+func TestDocsEndpointsRejectNonGet(t *testing.T) {
+	mux := docsMux()
+	for _, path := range []string{"/openapi.yaml", "/openapi.json", "/docs", "/docs/swagger-ui.css"} {
+		req := httptest.NewRequest(http.MethodPost, path, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("POST %s 应当 405, got %d", path, rec.Code)
+		}
+		if got := rec.Header().Get("Allow"); got != http.MethodGet {
+			t.Fatalf("POST %s 的 Allow 头不对: %q", path, got)
+		}
+	}
+}
+
+// TestDocsPageReferencesLocalAssets 验证文档页不引外链资源：静态资源走
+// 绝对路径 /docs/...，规范本体走同源 /openapi.json。
+func TestDocsPageReferencesLocalAssets(t *testing.T) {
+	mux := docsMux()
+	rec := doGet(mux, "/docs")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("应当 200, got %d", rec.Code)
+	}
+	page := rec.Body.String()
+	if strings.Contains(page, "http://") || strings.Contains(page, "https://") {
+		t.Fatalf("文档页里有外链资源:\n%s", page)
+	}
+	for _, want := range []string{"/docs/swagger-ui.css", "/docs/swagger-ui-bundle.js", "/openapi.json"} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("文档页里没有引用 %q:\n%s", want, page)
+		}
+	}
+	// 相对路径引资源会在 /docs（无尾斜杠）下解析到 / 下面去，必须避免。
+	if strings.Contains(page, `"./swagger-ui`) || strings.Contains(page, `'/swagger-ui`) {
+		t.Fatalf("文档页用了相对路径引资源:\n%s", page)
+	}
+}
+
+// TestOpenAPIJSONFailsGracefully 验证 YAML→JSON 转换失败时端点回 500，
+// 而不是把请求打崩。
+func TestOpenAPIJSONFailsGracefully(t *testing.T) {
+	// 坏 YAML：转换必须返回错误。
+	if _, err := yamlToJSON([]byte("\tbad: [unclosed")); err == nil {
+		t.Fatal("坏 YAML 应当转换失败")
+	}
+	// 端点在转换失败时回 500。
+	h := serveOpenAPIJSON(func() ([]byte, error) {
+		return nil, errors.New("炸了")
+	})
+	req := httptest.NewRequest(http.MethodGet, "/openapi.json", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("转换失败应当 500, got %d", rec.Code)
+	}
+}
+
+// docsMux 造一个带文档端点的 mux。文档端点不参与鉴权，这里照常给业务端点
+// 设 token，确保鉴权没被误挂到文档端点上。
+func docsMux() *http.ServeMux {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	return newMux(h, "secret")
+}
+
+// doGet 发起一次不带 Authorization 头的 GET 请求。
+func doGet(mux *http.ServeMux, path string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	return rec
+}
+
+// parseSpec 解析规范（转成 JSON 之后的形态）。
+func parseSpec(t *testing.T) map[string]any {
+	t.Helper()
+	raw, err := openAPIJSON()
+	if err != nil {
+		t.Fatalf("规范转 JSON 失败: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("规范不是合法 JSON: %v", err)
+	}
+	return doc
+}
+
+// mustJSON 返回规范的 JSON 形态。
+func mustJSON(t *testing.T) []byte {
+	t.Helper()
+	raw, err := openAPIJSON()
+	if err != nil {
+		t.Fatalf("规范转 JSON 失败: %v", err)
+	}
+	return raw
+}
+
+// specPaths 取规范里的 paths。
+func specPaths(t *testing.T, doc map[string]any) map[string]any {
+	t.Helper()
+	paths, ok := doc["paths"].(map[string]any)
+	if !ok {
+		t.Fatal("规范里没有 paths")
+	}
+	return paths
+}
+
+// specSchemas 取规范里的 components.schemas。
+func specSchemas(t *testing.T, doc map[string]any) map[string]any {
+	t.Helper()
+	components, ok := doc["components"].(map[string]any)
+	if !ok {
+		t.Fatal("规范里没有 components")
+	}
+	schemas, ok := components["schemas"].(map[string]any)
+	if !ok {
+		t.Fatal("规范里没有 components.schemas")
+	}
+	return schemas
+}
+
+// jsonFieldName 返回结构体字段的 JSON 名字；没有 json tag 的字段返回空串。
+func jsonFieldName(f reflect.StructField) string {
+	tag := f.Tag.Get("json")
+	name := strings.Split(tag, ",")[0]
+	if name == "-" {
+		return ""
+	}
+	return name
+}
+
+// jsonFields 返回结构体的 json tag 字段名集合（排序后）。
 func jsonFields(t reflect.Type) []string {
 	out := make([]string, 0, t.NumField())
 	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		tag := f.Tag.Get("json")
-		name := strings.Split(tag, ",")[0]
-		if name == "" || name == "-" {
+		name := jsonFieldName(t.Field(i))
+		if name == "" {
 			continue
 		}
 		out = append(out, name)
 	}
+	sort.Strings(out)
 	return out
 }
 
+// sameSet 比较两个字符串集合是否相同（多重集语义）。
 func sameSet(a, b []string) bool {
 	if len(a) != len(b) {
 		return false
@@ -4134,6 +4639,117 @@ func sameSet(a, b []string) bool {
 	}
 	return true
 }
+
+// timeType 是 time.Time 的类型，用来把时间戳字段识别成 date-time 字符串。
+var timeType = reflect.TypeOf(time.Time{})
+
+// schemaShape 描述一个 OpenAPI schema 节点的类型信息。
+type schemaShape struct {
+	ref    string       // $ref 指向的 schema 名
+	kind   string       // type：string/boolean/integer/number/array/object
+	format string       // format
+	items  *schemaShape // array 的元素类型
+}
+
+// parseShape 从规范的 JSON 形态里读出一个 schema 节点的类型信息。
+func parseShape(v any) schemaShape {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return schemaShape{}
+	}
+	var s schemaShape
+	if ref, ok := m["$ref"].(string); ok {
+		s.ref = ref[strings.LastIndex(ref, "/")+1:]
+		return s
+	}
+	s.kind, _ = m["type"].(string)
+	s.format, _ = m["format"].(string)
+	if it, ok := m["items"]; ok {
+		child := parseShape(it)
+		s.items = &child
+	}
+	return s
+}
+
+// expectShape 按 Go 类型推出应有的 OpenAPI 类型。映射规则：
+// string→string、bool→boolean、整数→integer、浮点→number、
+// 切片→array、time.Time→string(date-time)、嵌套结构体→$ref。
+func expectShape(t reflect.Type) schemaShape {
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t == timeType {
+		return schemaShape{kind: "string", format: "date-time"}
+	}
+	switch t.Kind() {
+	case reflect.String:
+		return schemaShape{kind: "string"}
+	case reflect.Bool:
+		return schemaShape{kind: "boolean"}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return schemaShape{kind: "integer"}
+	case reflect.Float32, reflect.Float64:
+		return schemaShape{kind: "number"}
+	case reflect.Slice, reflect.Array:
+		item := expectShape(t.Elem())
+		return schemaShape{kind: "array", items: &item}
+	case reflect.Struct:
+		return schemaShape{ref: t.Name()}
+	default:
+		return schemaShape{}
+	}
+}
+
+// checkShape 比对期望类型与规范里的类型。
+func checkShape(t *testing.T, field string, want, got schemaShape) {
+	t.Helper()
+	if want.ref != "" {
+		if got.ref != want.ref {
+			t.Fatalf("字段 %s 应当 $ref %q，规范里是 %q", field, want.ref, got.ref)
+		}
+		return
+	}
+	if got.ref != "" {
+		t.Fatalf("字段 %s 应当是 %s，规范里却是 $ref %q", field, want.kind, got.ref)
+	}
+	if got.kind != want.kind {
+		t.Fatalf("字段 %s 的 type 应当是 %q，规范里是 %q", field, want.kind, got.kind)
+	}
+	if want.format == "date-time" {
+		if got.format != "date-time" {
+			t.Fatalf("字段 %s 应当声明 format: date-time，规范里是 %q", field, got.format)
+		}
+	} else if got.format == "date-time" {
+		t.Fatalf("字段 %s 不是时间戳，不该声明 format: date-time", field)
+	}
+	if want.kind == "array" {
+		if got.items == nil {
+			t.Fatalf("字段 %s 是数组，规范里没有 items", field)
+		}
+		checkShape(t, field+"[]", *want.items, *got.items)
+	}
+}
+
+// collectRefs 递归收集文档里所有的 $ref。
+func collectRefs(v any, out map[string]bool) {
+	switch x := v.(type) {
+	case map[string]any:
+		for k, val := range x {
+			if k == "$ref" {
+				if s, ok := val.(string); ok {
+					out[s] = true
+				}
+				continue
+			}
+			collectRefs(val, out)
+		}
+	case []any:
+		for _, item := range x {
+			collectRefs(item, out)
+		}
+	}
+}
 ```
 
 - [ ] **Step 5: 跑测试确认通过**
@@ -4144,9 +4760,61 @@ Expected: PASS。若 `TestOpenAPISchemasMatchDTO` 失败，按提示补齐 YAML 
 - [ ] **Step 6: 提交**
 
 ```bash
-git add internal/rpc/httpx
+git add internal/rpc/httpx go.mod go.sum
 git commit -m "feat(httpx): 增加 OpenAPI 规范与 Swagger 文档页"
 ```
+
+#### 与初稿的差异（B1–B11 的落法）
+
+| 条目 | 初稿的问题 | 最终实现 |
+| --- | --- | --- |
+| B1 | `docs.go` 用 `https://unpkg.com/swagger-ui-dist@5/...` 的 CDN 链接，与设计文档 §6.5「离线嵌入」冲突 | 改用 `github.com/swaggo/http-swagger` + `github.com/swaggo/files`，swagger-ui 静态资源打进二进制；页面里没有任何外链资源（有测试守着） |
+| B2 | 直接用 `httpSwagger.Handler` 渲染 `/docs`，其模板用相对路径 `./swagger-ui.css` 引资源；页面挂在 `/docs`（无尾斜杠）时浏览器会解析到 `/swagger-ui.css` → 404 | `/docs` 自己渲染 HTML，资源用绝对路径 `/docs/...` 引；`/docs/` 交给 `httpSwagger.WrapHandler` 提供离线静态资源；不引 `swagger-initializer.js`（它默认指向 petstore 的远程 URL） |
+| B3 | 规范只声明 200 与 401，与实现对不上 | 每个业务端点都声明 200 / 400 / 401 / 405 / 500，错误响应在 `components.responses` 里复用 `BadRequest` / `Unauthorized` / `MethodNotAllowed` / `InternalError`；有测试逐个端点核对 |
+| B4 | 一致性测试只覆盖 7 个 DTO | 覆盖全部 17 个有 schema 的 DTO（多出 `ShowAddTaskParams`），字段名双向核对；另加一条「规范里的 schema 都必须在 DTO 登记表里」的反向断言 |
+| B5 | YAML→JSON 用 `go.yaml.in/yaml/v3` | 不变——它本来就是项目的直接依赖，不算新增依赖 |
+| B6 | `newMux` 还没有文档端点 | 在 `newMux` 里 `mux := http.NewServeMux()` 之后调 `registerDocs(mux)`；四个文档端点都不进 `authed` 中间件 |
+| B7 | `registerDocs` 用 `mux.HandleFunc` 不限方法 | 文档端点只接受 GET，其他方法 405 + `Allow: GET`（`getOnly` 中间件），错误体沿用统一形状 |
+| B8 | `openAPIJSON` 用 `sync.Once` 缓存 | 不变；转换抽成 `yamlToJSON`，失败时返回错误，端点回 500 而不是 panic（有测试注入失败验证） |
+| B9 | 只比字段名集合 | 增加类型级护栏：按 `reflect` 推出的 Go 类型逐字段比对 OpenAPI 的 `type`（string / boolean / integer / number / array / `$ref`），`time.Time` 额外要求 `format: date-time` |
+| B10 | 依赖与许可证头约束 | 只 import `internal/api`、`internal/rpc/addr`、标准库与两个 swaggo 包；新文件都带 MPL-2.0 许可证头 |
+| B11 | 测试清单不全 | 补齐 8 类测试：解析、方法双向覆盖、错误码声明、字段名双向核对、schema 覆盖面、类型核对、`$ref` 完整性、文档端点免鉴权 / 只收 GET / 不引外链 / 转换失败回 500 |
+
+除 B1–B11 外还有两处与初稿不同：
+
+- **`servers[].url` 改成 `/`**（初稿是 `http://lgdm/lgdm.v1.DownloadService`）。
+  OpenAPI 的最终 URL 是 `servers[].url` 拼上 `paths` 的键，初稿那样拼会把
+  `/lgdm.v1.DownloadService` 重复两遍。改成同源相对地址后，
+  「Try it out」在 TCP 部署下正好打到文档页的同源。
+- **`Message.show_add_task` 改成 `$ref: ShowAddTaskParams`**（初稿是内联对象）。
+  这样「嵌套结构体 → `$ref`」的映射规则对所有 DTO 一致，类型级护栏也能
+  统一处理；`ShowAddTaskParams` 因此也进了 DTO 登记表。
+
+#### 依赖说明
+
+新增两个直接依赖：
+
+```
+github.com/swaggo/http-swagger v1.3.4   // Swagger UI 页面与静态资源（离线嵌入）
+github.com/swaggo/files v1.0.1          // swagger-ui 静态资源本体（间接）
+```
+
+它们经 `swaggo/swag` 间接用到 `golang.org/x/tools`。`golang.org/x/text v0.43.0`
+要求 `x/tools v0.51.0`，而 `x/tools v0.51.0` 要求 `x/net v0.59.0`——`x/net`
+从 v0.56 起改了 `httpproxy` 的环境变量优先级（小写 `http_proxy` 优先于大写
+`HTTP_PROXY`），会打破 `internal/protocol` 里 `TestProxyFuncSystemModeReturnsEnv`
+的预期。为免得把 `x/net`/`x/crypto`/`x/sys` 一起抬版本，`go.mod` 里排除了
+`x/tools` 的两个新版本：
+
+```
+exclude (
+	golang.org/x/tools v0.47.0
+	golang.org/x/tools v0.51.0
+)
+```
+
+这样 `x/net` 仍是 v0.47.0、`x/crypto` 仍是 v0.44.0、`x/sys` 仍是 v0.47.0，
+`x/tools` 取 v0.39.0（`swaggo/swag` 只用到它的 `go/loader`）。
 
 ---
 
