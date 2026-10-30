@@ -5310,6 +5310,22 @@ git commit -m "test(rpc): 为两种传输补同一套契约测试"
     func (s *Service) ValidateFileExistence() { s.sc.ValidateFileExistence() }
     ```
 
+12. **行为对照清单**：`internal/uimgr` 的旧 `dispatch` 与新的 `appservice.Call`
+    是同一套逻辑的两份拷贝，接线换入时必须逐项核对，别只看「能编译」：
+
+    | 旧 `uimgr.dispatch` 方法 | 新位置 | 核对点 |
+    |---|---|---|
+    | `list` | `appservice.Call` 的 `api.MethodList` | 筛选与排序参数的类型转换一致 |
+    | `add` | `api.MethodAdd` | 协议探测、凭据转换、chunk 参数 |
+    | `start` / `pause` / `delete` | 对应的三个分支 | 返回的错误语义一致 |
+    | `is_preparing` | `api.MethodIsPreparing` | 准备中的判定口径 |
+    | `probe` / `probe_bittorrent` | `Service.probe` / `Service.probeBittorrent` | 超时、代理配置、失败降级与日志 |
+    | `bt_info` | `api.MethodBTInfo` | 详情快照的字段 |
+    | `get_settings` / `save_settings` | 对应的两个分支 | 语言变更回调的触发时机 |
+
+    另外确认旧 `forwardEvents`（事件转发）与新的 `appservice.Events()` 在
+    「事件丢弃」「退订」两处的行为一致。
+
 - [ ] **Step 2: 改 `main.go` 的装配**
 
 `main.go` 里：
