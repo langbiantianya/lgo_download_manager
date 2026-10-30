@@ -12,6 +12,7 @@
 package addr
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -91,9 +92,18 @@ func Listen(a Addr) (net.Listener, func(), error) {
 	}, nil
 }
 
-// Dial 按地址建立连接。
+// Dial 按地址建立连接。它不感知 ctx，等价于用 context.Background() 调用
+// DialContext——保留它是为了兼容已有的调用方（gRPC 传输等）。
 func Dial(a Addr) (net.Conn, error) {
-	conn, err := net.Dial(a.Network, a.Address)
+	return DialContext(context.Background(), a)
+}
+
+// DialContext 按地址建立连接，ctx 取消会中断连接过程。
+//
+// 传输层要用请求自己的 ctx 建连：一次超时的调用不该留下一个还在建连的
+// socket goroutine。
+func DialContext(ctx context.Context, a Addr) (net.Conn, error) {
+	conn, err := (&net.Dialer{}).DialContext(ctx, a.Network, a.Address)
 	if err != nil {
 		return nil, fmt.Errorf("addr: dial %s %s: %w", a.Network, a.Address, err)
 	}

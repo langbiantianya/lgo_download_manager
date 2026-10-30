@@ -7,6 +7,7 @@
 package addr
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -80,4 +81,29 @@ func TestListenUnixAndDial(t *testing.T) {
 	}
 	// cleanup 幂等：再调一次不能 panic。
 	cleanup()
+}
+
+// TestDialContext 验证 DialContext：正常地址能连上，ctx 取消会中断连接。
+func TestDialContext(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "lgdm.sock")
+	a := Addr{Network: "unix", Address: path}
+	ln, cleanup, err := Listen(a)
+	if err != nil {
+		t.Fatalf("Listen: %v", err)
+	}
+	defer cleanup()
+	defer ln.Close()
+
+	conn, err := DialContext(context.Background(), a)
+	if err != nil {
+		t.Fatalf("DialContext: %v", err)
+	}
+	_ = conn.Close()
+
+	// ctx 已取消时不该建连成功。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := DialContext(ctx, a); err == nil {
+		t.Fatal("ctx 取消后应当连接失败")
+	}
 }
