@@ -38,16 +38,18 @@ Fyne UI 子进程。二者通过 `internal/ipc` 的自定义线协议通信（Un
    不再 import store / scheduler / engine / protocol / bittorrent。
 2. 在引擎与 UI 之间插入一层**传输抽象**，并分别实现 **gRPC** 与 **net/http** 两种协议。
    两种协议实现同一份契约，行为等价、可互换。
-3. 迁移完成后删除 `internal/ipc` 自定义 JSON 帧协议。
-4. 顺带按职责拆分 `internal/engine`，并用测试锁住依赖方向。
+3. 监听地址**可配置**：默认 Unix socket，也可以指定 `host:port`。
+4. HTTP 传输带一份 **OpenAPI（Swagger）规范**与可浏览的文档页。
+5. 迁移完成后删除 `internal/ipc` 自定义 JSON 帧协议。
+6. 顺带按职责拆分 `internal/engine`，并用测试锁住依赖方向。
 
 ### 1.3 非目标
 
 - 不改动浏览器扩展的本地端口通道（`internal/handoff`）与单实例 URL 转发
   （`internal/urllauncher`）。它们与本次分层无关，保持现状。
 - 不在「设置」里加传输协议开关。传输由环境变量 `LDM_UI_TRANSPORT` 决定，默认 `grpc`。
-- 不引入远程可达的监听端点。传输层只监听 Unix socket（0600 权限 + token 校验）。
-- 不做 HTTP/2（h2c）手工接线。HTTP 那一路直接用标准库 `net/http` 的 HTTP/1.1。
+- 不把接口默认暴露到网络上。默认地址仍是本机 Unix socket；指定 `host:port` 时
+  默认只绑回环地址，且 token 校验是强制的。
 - 不改动 `store` 的表结构与 `internal/protocol` 各驱动的下载逻辑。
 
 ## 2. 目标架构
@@ -70,7 +72,8 @@ Fyne UI 子进程。二者通过 `internal/ipc` 的自定义线协议通信（Un
 │         ├───────>│ internal/rpc │                  ▼             │
 │         │        │   httpx     │            internal/store        │
 │         │        │ (net/http   │                                 │
-│         │        │   + JSON)   │                                 │
+│         │        │   + JSON    │                                 │
+│         │        │  + Swagger) │                                 │
 │         │        └──────────────┘                                 │
 │         │        ┌──────────────┐                                 │
 │         └───────>│ internal/rpc │                                 │
@@ -106,8 +109,8 @@ Fyne UI 子进程。二者通过 `internal/ipc` 的自定义线协议通信（Un
 |---|---|---|
 | `internal/api` | 新增 | 契约词汇表 + DTO。`Task`/`Settings`/`Event`/`BTDetail`/`FileProgress`/`Message`/`AddTaskInput`/`ListParams`/`ShowAddTaskParams`；`Status`/`StatusFilter`/`TaskSort`/`ProxyMode`/`ProtocolKind` 均为 string 类型；方法名常量 |
 | `internal/urlkind` | 新增 | 纯 URL 助手：`ProtocolKind` 与常量、`DetectKind`、`IsBitTorrent`、`MagnetName`、`MagnetInfoHash`、`TorrentNameFromPath`、`SafeDirName`、`BittorrentDefaultDir`。从 `internal/protocol` 与 `internal/scheduler` 抽出 |
-| `internal/rpc` | 新增 | 接口层：`Transport`（传输能力面）、`Handler`（业务侧契约）、`Client`（UI 侧契约 + 共享实现）、`Serve`/`Dial` 注册表、契约测试套件 |
-| `internal/rpc/httpx` | 新增 | HTTP 传输实现：标准库 `net/http` + REST 风格路径 + JSON 正文 + NDJSON 消息流 |
+| `internal/rpc` | 新增 | 接口层：`Transport`（传输能力面）、`Handler`（业务侧契约）、`Client`（UI 侧契约 + 共享实现）、`Serve`/`Dial` 注册表、`Listen`（地址解析与监听）、契约测试套件 |
+| `internal/rpc/httpx` | 新增 | HTTP 传输实现：标准库 `net/http` + REST 风格路径 + JSON 正文 + NDJSON 消息流 + OpenAPI 规范与 Swagger UI |
 | `internal/rpc/grpcx` | 新增 | gRPC 传输实现：类型化 RPC + protobuf |
 | `internal/rpc/grpcx/pb` | 新增（生成） | `buf` 生成的 pb 代码，入库 |
 | `internal/appservice` | 新增 | 业务侧 `rpc.Handler` 实现。承接今天 `uimgr` 里的 `dispatch`/`probe`/`forwardEvents`，并做 DTO 转换 |
@@ -294,11 +297,13 @@ type Client interface {
 ### 4.4 注册表
 
 ```go
-func Serve(ctx context.Context, transport string, ln net.Listener, h Handler) error
-func Dial(ctx context.Context, transport string, endpoint, token string) (Client, error)
+func Serve(ctx context.Context, transport, addr string, h Handler) error
+func Dial(ctx context.Context, transport, endpoint, token string) (Client, error)
 ```
 
 `transport` 取值 `"grpc"`（默认）与 `"http"`。未知取值返回明确错误。
+
+`addr` / `endpoint` 是**统一的监听地址**描述，两种传输通用，格式见 §6.1。
 
 `Dial` 建立连接后先发一次 `get_settings`：这一次往返同时完成两件事——
 校验 token 是否正确（不对就立刻失败，UI 不会拿着一个连不上的连接去建窗口），
@@ -350,20 +355,66 @@ service DownloadService {
 
 ### 5.3 传输与鉴权
 
-- 服务端：`net.Listen("unix", path)` → `grpc.NewServer()` → `Serve(ln)`。
-- 客户端：`grpc.NewClient("passthrough:///lgdm", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(unixDialer(path)))`。
+- 服务端：`rpc.Listen(addr)`（§6.1 的统一地址解析）→ `grpc.NewServer()` → `Serve(ln)`。
+- 客户端：`grpc.NewClient("passthrough:///lgdm", grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithContextDialer(dialer(addr)))`。
+  `dialer` 按地址类型选 `net.Dial("unix", path)` 或 `net.Dial("tcp", hostport)`。
 - 鉴权：**每次调用校验**。token 放 metadata `authorization: Bearer <token>`，
   由 unary interceptor 与 stream interceptor 统一校验，不通过返回 `codes.Unauthenticated`。
 - 消息流：`StreamMessages` 是 server-streaming，服务端把 `Events()` 与 `Controls()`
   两条 channel 合并后逐条 `Send`。
+- 绑 TCP 时的安全约束与 HTTP 传输一致（见 §6.1）：默认只绑回环地址，
+  绑 `0.0.0.0` 时打警告，token 是唯一防线。
 
 ## 6. 传输实现二：net/http
 
 这一路只用标准库 `net/http`，**不接 `golang.org/x/net/http2` 的 h2c 手工接线**，
-也不引入任何新的第三方依赖。明文 Unix socket 上的 HTTP/1.1 已经够用：
+也不为 HTTP 传输引入任何第三方依赖。明文 Unix socket 上的 HTTP/1.1 已经够用：
 传输层跑在本机 socket 上，不存在中间设备降级、代理干扰这些 HTTP/2 才要解决的问题。
 
-### 6.1 端点映射
+（Swagger UI 页面所需的静态资产是唯一的例外，见 §6.5。）
+
+### 6.1 监听地址
+
+监听地址是**可配置的**，两种传输通用。格式：
+
+```
+unix:<path>          Unix socket，路径为 <path>
+tcp:<host:port>      TCP，监听 <host:port>（host 省略即 ":port"，端口 0 由系统分配）
+<裸值>               自动判别：含路径分隔符（/ 或 \）→ unix；否则按 host:port → tcp
+```
+
+判别规则之所以要区分 `/` 与 `\`，是因为 Windows 上的 socket 路径形如
+`C:\Users\...\ui.sock`，里面含 `:`，按「含冒号即 host:port」会误判。
+
+**默认地址**由业务进程生成：Unix socket，路径在用户缓存目录下
+（沿用今天 `uimgr.makeSocketPath` 的做法：`<UserCacheDir>/lgo_download_manager/ui-<随机后缀>.sock`），
+权限 0600。
+
+**用户可指定**：
+
+- 业务进程命令行参数 `--rpc-listen <addr>`，例如
+  `--rpc-listen tcp:127.0.0.1:17830`。
+- 业务进程读自己的环境变量 `LDM_RPC_LISTEN`（缺省用生成的 socket 路径）。
+
+业务进程把最终地址原样透传给 UI 子进程（环境变量 `LDM_UI_LISTEN`），
+子进程按同一套规则解析。
+
+**安全约束**（TCP 模式尤其重要）：
+
+- TCP 默认只绑 `127.0.0.1`；用户显式写 `0.0.0.0`/`::` 时启动日志必须打一条警告，
+  说明该接口已对本机网络可见。
+- TCP 模式下 **token 是唯一防线**，每次调用都校验（见 §6.3），不得提供「关闭鉴权」开关。
+- Unix socket 保持今天的 0600 权限与「启动前清理残留 socket 文件」逻辑。
+
+地址解析与监听由 `internal/rpc/listen.go` 提供，两种传输共用：
+
+```go
+// Listen 按地址描述创建监听器。unix 分支负责清理残留 socket 文件并把
+// 权限收紧到 0600；tcp 分支直接监听。cleanup 在关闭时移除 socket 文件。
+func Listen(addr string) (net.Listener, func(), error)
+```
+
+### 6.2 端点映射
 
 REST 风格路径 + JSON 正文，路径即方法名（对照表见 §3.4）：
 
@@ -375,27 +426,58 @@ POST /lgdm.v1.DownloadService/is_preparing  → 200 {"preparing":true}
 POST /lgdm.v1.DownloadService/probe          → 200 {"total_size":123}
 POST /lgdm.v1.DownloadService/get_settings  → 200 {"settings":{...}}
 POST /lgdm.v1.DownloadService/stream_messages → 200 application/x-ndjson（流式）
+
+GET  /openapi.yaml                          → 200 application/yaml（OpenAPI 规范原文）
+GET  /openapi.json                          → 200 application/json（同一份规范的 JSON 形式）
+GET  /docs                                  → 200 text/html（Swagger UI）
 ```
 
 错误：非 2xx 状态码 + `{"ok":false,"error":"..."}`。状态码语义：
 400 参数非法 / 404 任务不存在 / 409 状态冲突 / 500 其它。客户端把非 2xx 统一转成 error。
 
-### 6.2 传输与鉴权
+`/openapi.*` 与 `/docs` **不参与 token 校验**——它们只暴露接口形状，不暴露任务数据。
+其余端点全部要求 Bearer token。
 
-- 服务端：`net.Listen("unix", path)` → `http.Server{Handler: mux, ReadHeaderTimeout: 10s}`
+### 6.3 传输与鉴权
+
+- 服务端：`net.Listen` → `http.Server{Handler: mux, ReadHeaderTimeout: 10s}`
   → `srv.Serve(ln)`。`http.ServeMux` 按 §3.4 的路径分派，`mux.HandleFunc` 注册各方法。
-- 客户端：`http.Client{Transport: &http.Transport{DialContext: unixDialer(path)}}`。
-  `unixDialer` 忽略请求里的 host，一律连本地 socket。
+- 客户端：`http.Client{Transport: &http.Transport{DialContext: dialer(addr)}}`。
+  `dialer` 按地址类型选 `net.Dial("unix", path)` 或 `net.Dial("tcp", hostport)`。
 - 鉴权：**每次调用校验**。`Authorization: Bearer <token>` 头，由中间件统一校验，
   不通过返回 401。
-- 连接复用：`http.Transport` 默认 keep-alive，同一条 socket 上连续复用连接；
+- 连接复用：`http.Transport` 默认 keep-alive，同一条连接上连续复用；
   消息流是独立的长连接请求，与普通调用不共用。
 
-### 6.3 消息流
+### 6.4 消息流
 
 `POST /lgdm.v1.DownloadService/stream_messages`，响应 `Content-Type: application/x-ndjson`，
 每行一个 `api.Message` 的 JSON。服务端逐行 `Flush`；客户端用 `json.Decoder`
 在 `resp.Body` 上循环解码，读到 EOF 即流结束。
+
+### 6.5 Swagger / OpenAPI 文档
+
+HTTP 传输的接口形状必须有一份**可执行的规范**，而不是散落在代码里的注释。
+
+- **规范文件**：`internal/rpc/httpx/openapi.yaml`，OpenAPI 3.0.3 格式，
+  用 `go:embed` 打进二进制。它是 HTTP 这一侧接口形状的唯一真相源。
+- **内容**：
+  - `info`（标题、版本、说明）
+  - `components.securitySchemes`：`bearerAuth`（HTTP bearer）
+  - 每个方法一个 path：请求体 schema、响应 schema、错误码说明
+  - `components.schemas`：`Task` / `Settings` / `Event` / `BTDetail` / `Message` 等，
+    字段与 `internal/api` 的 DTO 一一对应
+  - `/stream_messages` 标注 `application/x-ndjson` 的流式响应
+- **对外暴露**：
+  - `GET /openapi.yaml` → 规范原文
+  - `GET /openapi.json` → 同一份规范的 JSON 形式（启动时用 `go.yaml.in/yaml/v3`
+    转一次并缓存；该 YAML 库已是直接依赖）
+  - `GET /docs` → Swagger UI 页面
+- **Swagger UI 资产**：用 `github.com/swaggo/http-swagger` + `github.com/swaggo/files`
+  把 swagger-ui 静态资源嵌进二进制，**离线可用**——本机工具的文档页不该依赖公网 CDN。
+  （若要零依赖，可退化为从 CDN 加载 UI，但离线时页面不可用，不作为默认方案。）
+- **与代码同步**：新增/修改端点或 DTO 字段时必须同步改 `openapi.yaml`，
+  由 §11.1 的规范一致性测试守住。
 
 ## 7. 业务侧改造
 
@@ -417,29 +499,39 @@ show / show_add_task / language / close。通道有缓冲，推送非阻塞（�
 
 ### 7.2 `internal/uimgr`
 
-保留：socket 路径生成、token 生成、拉起子进程、握手、会话结束清理、关闭时的强杀兜底。
+保留：地址生成、token 生成、拉起子进程、会话结束清理、关闭时的强杀兜底。
 
 改动：
-- 用 `rpc.Serve(ctx, transport, ln, handler)` 取代 `acceptLoop` 里的手写帧循环。
+- 用 `rpc.Serve(ctx, transport, addr, handler)` 取代 `acceptLoop` 里的手写帧循环。
+  `ipc.Listen`（unix socket 清理 + 0600）迁到 `internal/rpc/listen.go`，与 TCP 分支共用。
 - `SetLanguage` 改成往控制通道推 `MessageKindLanguage` 消息，而不是发 `MsgLanguage` 帧。
 - `Open()`（托盘「显示窗口」）在已有会话时推 `MessageKindShow`。
 - `SendShowAddTask` 推 `MessageKindShowAddTask`。
 - `Close()` 推 `MessageKindClose`，保留强杀兜底。
+- 握手改为 `rpc.Dial` 内部的一次 `get_settings` 往返（§4.4），不再有独立的 hello 帧。
 
-### 7.3 环境变量
+### 7.3 环境变量与参数
 
-| 变量 | 含义 | 默认 |
+| 名称 | 含义 | 默认 |
 |---|---|---|
 | `LDM_UI_CHILD` | `"1"` 表示当前进程以 UI 子进程角色运行（沿用） | 无 |
-| `LDM_UI_SOCKET` | Unix socket 路径（沿用） | 无 |
+| `LDM_UI_LISTEN` | UI 子进程要连的地址（§6.1 格式；unix 路径或 host:port） | 无 |
 | `LDM_UI_TOKEN` | 握手 token（沿用） | 无 |
 | `LDM_UI_TRANSPORT` | 传输协议：`grpc` \| `http`（**新增**） | `grpc` |
+| `LDM_RPC_LISTEN` | 业务进程自己的监听地址（**新增**，命令行 `--rpc-listen` 优先） | 生成的 unix socket 路径 |
 
-业务进程读**自己**的 `LDM_UI_TRANSPORT`（缺省 `grpc`），拉起 UI 子进程时原样透传。
-这样整条链路可以用 `LDM_UI_TRANSPORT=http ./lgdm` 直接切换，UI 子进程不需要
-自己猜协议。
+`LDM_UI_SOCKET` 被 `LDM_UI_LISTEN` 取代：地址不再局限于 socket 路径。
 
-不在「设置」里暴露该项（用户已确认）。
+业务进程读**自己的** `LDM_RPC_LISTEN` / `--rpc-listen`（缺省用生成的 socket 路径），
+拉起 UI 子进程时把地址与传输一起透传。这样整条链路可以直接切换：
+
+```
+LDM_RPC_LISTEN=tcp:127.0.0.1:17830 LDM_UI_TRANSPORT=http ./lgdm
+```
+
+UI 子进程不需要自己猜协议或地址。
+
+不在「设置」里暴露传输协议与地址（用户已确认）。
 
 ## 8. UI 侧改造
 
@@ -506,16 +598,20 @@ UI 的行为不再只在一个自定义协议上被验证过。
 2. **建 `internal/api`**：DTO + 词汇表 + 方法名常量。纯新增。
 3. **建 `internal/appservice`**：搬 `dispatch`/`probe`/`forwardEvents`，写 `convert.go`，
    补单元测试（转换往返 + 各方法行为）。
-4. **建 `internal/rpc`**：`Transport`/`Handler`/`Client`/注册表/共享客户端。
-5. **实现 `internal/rpc/httpx`**：`net/http` 服务端 + 客户端 + 契约测试。
+4. **建 `internal/rpc`**：`Transport`/`Handler`/`Client`/注册表/共享客户端，
+   以及 `listen.go`（地址解析：unix / host:port）。
+5. **实现 `internal/rpc/httpx`**：`net/http` 服务端 + 客户端 + 契约测试；
+   写 `internal/rpc/httpx/openapi.yaml` 并挂上 `/openapi.yaml`、`/openapi.json`、`/docs`。
 6. **写 proto 并实现 `internal/rpc/grpcx`**：`proto/lgdm/v1/lgdm.proto`、
    `buf.yaml`/`buf.gen.yaml`、`scripts/gen_proto.sh`，生成物入库；
    `convert.go` + 服务端 + 客户端 + 契约测试。
 7. **接线**：`internal/uimgr` 改用 `rpc.Serve`；`internal/ui` 改用 `rpc.Client`；
-   `main.go` 传 `LDM_UI_TRANSPORT`。
+   `main.go` 加 `--rpc-listen` 并把地址与传输透传给子进程
+   （`LDM_UI_LISTEN` / `LDM_UI_TRANSPORT`）。
 8. **删除**：`internal/ipc` 整个包、`internal/ui/service.go`。
 9. **拆引擎**：`internal/engine` 按 §9 拆文件。
-10. **边界测试**：断言依赖方向（§2）+ proto 生成物与 `.proto` 同步。
+10. **边界与规范测试**：断言依赖方向（§2）+ OpenAPI 规范与代码一致 +
+    proto 生成物与 `.proto` 同步。
 
 ## 11. 测试策略与验收标准
 
@@ -528,6 +624,8 @@ UI 的行为不再只在一个自定义协议上被验证过。
 | api JSON 往返 | `internal/api/types_test.go` | DTO 的 JSON 编解码不丢字段 |
 | 业务侧转换 | `internal/appservice/convert_test.go` | `store.Task→api.Task` 等映射正确，`api.Status` 取值与 `store.Status` 一致 |
 | 依赖边界 | `internal/ui/boundary_test.go`、`internal/rpc/boundary_test.go` | 用 `go list -deps` 或 AST 扫描断言禁止的 import |
+| 地址解析 | `internal/rpc/listen_test.go` | `unix:`/`tcp:`/裸路径/裸 host:port 四种写法解析正确；Windows 风格路径 `C:\...` 判为 unix |
+| OpenAPI 规范一致 | `internal/rpc/httpx/openapi_test.go` | 每个 `api.Method*` 常量在规范里都有对应 path；规范里 schema 的 property 集合与对应 DTO 的 json tag 集合一致；规范能被 YAML 解析 |
 | 引擎拆分回归 | `internal/engine/*_test.go` | 现有 1131 行测试保持通过（纯重构，不改行为） |
 
 ### 11.2 验收标准
@@ -537,6 +635,10 @@ UI 的行为不再只在一个自定义协议上被验证过。
 - `internal/ui` 不再 import `store`/`scheduler`/`engine`/`protocol`/`bittorrent`。
 - 仓库中不再存在 `internal/ipc`。
 - 两种传输都能完成一次完整的「添加任务 → 开始 → 收到进度事件 → 暂停 → 删除」流程。
+- HTTP 传输：`GET /docs` 能打开 Swagger UI；`GET /openapi.json` 返回合法 OpenAPI 文档；
+  `GET /openapi.yaml` 返回规范原文。
+- 监听地址可配置：`--rpc-listen tcp:127.0.0.1:17830` 时业务进程监听该端口，
+  UI 子进程能连上；`--rpc-listen unix:/tmp/x.sock` 时 socket 权限为 0600。
 - CI 的 cgo-free 交叉编译任务新增 `./internal/rpc/...`、`./internal/api/`、
   `./internal/urlkind/`、`./internal/appservice/`。
 
@@ -551,6 +653,9 @@ UI 的行为不再只在一个自定义协议上被验证过。
 | 事件流从「帧」变成「流」 | 断线重连语义变化 | 契约测试覆盖断线；今天 UI 断线即退出，行为保持一致 |
 | 引擎拆文件引入回归 | 下载行为变化 | 现有 1131 行引擎测试保持不变，作为回归网 |
 | 薄封装残留 | `protocol.DetectKind`、`scheduler.BittorrentDefaultDir` 等兼容薄封装在迁移后可能没有调用方，成为死代码 | 迁移第 10 步逐个确认引用，零引用的直接删掉，别让兼容层长期挂着 |
+| TCP 暴露面 | 监听地址可配成 `0.0.0.0` 后接口对本机网络可见 | 默认只绑回环地址；绑非回环地址时启动打警告；token 每次调用强制校验，不提供关闭鉴权的开关 |
+| OpenAPI 规范漂移 | 文档与代码不一致，调用方按文档写就踩坑 | 规范一致性测试：方法常量 ↔ path、DTO 字段 ↔ schema property 双向校验 |
+| swagger-ui 资产增大二进制 | 嵌入 UI 静态资源约 +2MB | 已评估可接受（相对 Fyne 桌面二进制的体积可忽略）；如需瘦身可改为 CDN 加载 |
 
 ## 13. 附录：依赖与 CI 变更
 
@@ -559,9 +664,12 @@ UI 的行为不再只在一个自定义协议上被验证过。
 ```
 google.golang.org/grpc
 google.golang.org/protobuf
+github.com/swaggo/http-swagger    // Swagger UI 页面（离线嵌入）
+github.com/swaggo/files           // swagger-ui 静态资源
 ```
 
-HTTP 传输只用标准库 `net/http`，**不新增依赖**、也不接 h2c。
+HTTP 传输本身只用标准库 `net/http`，**不新增依赖**、也不接 h2c；
+上面两个 swaggo 依赖只为 `/docs` 的 Swagger UI 页面服务。
 
 **开发期工具**（不入 go.mod）：`buf`、`protoc-gen-go`、`protoc-gen-go-grpc`，
 用 `go install` 装到 `$(go env GOPATH)/bin`。
@@ -573,3 +681,11 @@ HTTP 传输只用标准库 `net/http`，**不新增依赖**、也不接 h2c。
   校验生成物与 `.proto` 同步。
 
 **新增脚本**：`scripts/gen_proto.sh`（生成 pb 代码到 `internal/rpc/grpcx/pb/`）。
+
+**新增命令行参数**：
+
+| 参数 | 含义 | 默认 |
+|---|---|---|
+| `--rpc-listen <addr>` | UI 子进程连接的监听地址（§6.1 格式） | 生成的 unix socket 路径 |
+
+环境变量 `LDM_RPC_LISTEN` 同义，命令行优先。
