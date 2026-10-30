@@ -239,16 +239,14 @@ type Transport interface {
 
 ```go
 type Handler interface {
-	List(ctx context.Context, p api.ListParams) ([]*api.Task, error)
-	AddTask(ctx context.Context, in api.AddTaskInput) (*api.Task, error)
-	Start(ctx context.Context, id string) error
-	Pause(ctx context.Context, id string) error
-	Delete(ctx context.Context, id string) error
-	IsPreparing(ctx context.Context, id string) (bool, error)
-	Probe(ctx context.Context, url string) (int64, error)
-	BTTaskDetail(ctx context.Context, id string) (*api.BTDetail, error)
-	GetSettings(ctx context.Context) (api.Settings, error)
-	SaveSettings(ctx context.Context, s api.Settings) error
+	// Call 执行一次调用。method 取 api.Method* 常量；in / out 的具体类型
+	// 由 api.Spec(method) 决定，传输层分配好再传进来。
+	//
+	// 之所以用「方法名 + any」而不是十几个具名方法：业务侧只保留**一处**
+	// 方法分派（今天 uimgr.dispatch 的位置），两种传输实现不必各自抄一份
+	// 「方法 → 业务调用」的映射表。请求/响应类型仍由 api.Spec(method) 在
+	// 契约层钉死，业务侧在分派时对入参做类型断言，类型不符立刻报错。
+	Call(ctx context.Context, method string, in, out any) error
 
 	// Events 返回进度事件流与退订函数。
 	Events() (<-chan api.Event, func())

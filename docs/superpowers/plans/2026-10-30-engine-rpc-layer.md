@@ -1523,7 +1523,6 @@ git commit -m "feat(appservice): 抽出业务侧应用服务并做 DTO 转换"
 - Create: `internal/rpc/transport.go`
 - Create: `internal/rpc/handler.go`
 - Create: `internal/rpc/client.go`
-- Create: `internal/rpc/registry.go`
 - Create: `internal/rpc/client_test.go`
 
 **Interfaces:**
@@ -1541,14 +1540,13 @@ git commit -m "feat(appservice): 抽出业务侧应用服务并做 DTO 转换"
       Controls() <-chan api.Message
   }
   type Client interface { /* 见下 */ }
-  type ServerOptions struct { Transport, Addr, Token string }
-  func Serve(ctx context.Context, opts ServerOptions, h Handler) error
-  func Dial(ctx context.Context, transport, endpoint, token string) (Client, error)
+  // newClient 供本包测试用；对外的 Serve/Dial 在 Task 7 随注册表一起提供。
 
   package addr
   type Addr struct { Network, Address string }
   func Parse(s string) (Addr, error)
   func Listen(a Addr) (net.Listener, func(), error)
+  func Dial(a Addr) (net.Conn, error)
   ```
 
 - [ ] **Step 1: 写失败测试（地址解析）**
@@ -2250,94 +2248,21 @@ func TestClientUnsubscribeThenBroadcast(t *testing.T) {
 }
 ```
 
-- [ ] **Step 8: 建 `internal/rpc/registry.go`**
-
-```go
-package rpc
-
-import (
-	"context"
-	"fmt"
-
-	"lgo_download_manager/internal/api"
-	"lgo_download_manager/internal/rpc/addr"
-	"lgo_download_manager/internal/rpc/grpcx"
-	"lgo_download_manager/internal/rpc/httpx"
-)
-
-// 传输协议名。
-const (
-	TransportGRPC = "grpc"
-	TransportHTTP = "http"
-)
-
-// ServerOptions 描述一次服务端的启动参数。
-type ServerOptions struct {
-	// Transport 是传输协议名；为空时按 TransportGRPC 处理。
-	Transport string
-	// Addr 是监听地址，见 addr.Parse。
-	Addr string
-	// Token 是握手 token，每次调用都会校验。
-	Token string
-}
-
-// Serve 按 opts 启动服务。handler 的实现由业务侧提供。
-func Serve(ctx context.Context, opts ServerOptions, h Handler) error {
-	a, err := addr.Parse(opts.Addr)
-	if err != nil {
-		return err
-	}
-	switch opts.Transport {
-	case "", TransportGRPC:
-		return grpcx.Serve(ctx, a, opts.Token, h)
-	case TransportHTTP:
-		return httpx.Serve(ctx, a, opts.Token, h)
-	default:
-		return fmt.Errorf("rpc: 未知传输协议 %q（可选：%s、%s）", opts.Transport, TransportGRPC, TransportHTTP)
-	}
-}
-
-// Dial 连接到 endpoint 并返回客户端。endpoint 的格式与 addr.Parse 相同。
-func Dial(ctx context.Context, transport, endpoint, token string) (Client, error) {
-	a, err := addr.Parse(endpoint)
-	if err != nil {
-		return nil, err
-	}
-	var tr Transport
-	switch transport {
-	case "", TransportGRPC:
-		tr, err = grpcx.Dial(ctx, a, token)
-	case TransportHTTP:
-		tr, err = httpx.Dial(ctx, a, token)
-	default:
-		return nil, fmt.Errorf("rpc: 未知传输协议 %q（可选：%s、%s）", transport, TransportGRPC, TransportHTTP)
-	}
-	if err != nil {
-		return nil, err
-	}
-	return newClient(ctx, tr)
-}
-
-// 编译期断言：两种传输实现都满足 Transport。
-var (
-	_ Transport = (*grpcx.Client)(nil)
-	_ Transport = (*httpx.Client)(nil)
-)
-```
-
-- [ ] **Step 9: 跑测试**
+- [ ] **Step 8: 跑测试**
 
 Run: `go test ./internal/rpc/...`
-Expected: FAIL —— `grpcx` / `httpx` 包还不存在（Task 5、6 补齐后再跑通）
+Expected: PASS —— 本任务不引入任何传输实现，仓库保持全绿
 
-**本任务到此为止，`go build ./...` 暂时会失败是预期的**（registry.go 引用了尚未创建的传输包）。Task 5 与 Task 6 完成后恢复全绿。
-
-- [ ] **Step 10: 提交**
+- [ ] **Step 9: 提交**
 
 ```bash
 git add internal/rpc
 git commit -m "feat(rpc): 新增传输抽象层、共享客户端与地址解析"
 ```
+
+> 说明：`Serve` / `Dial` 注册表放在 Task 7（grpcx 落地时）一并提供——它要引用
+> 两种传输实现，提前写会让 Task 4 到 Task 7 之间仓库编译不过，
+> 与「每个任务结束时仓库全绿」的全局约束冲突。
 
 ---
 
@@ -3429,6 +3354,7 @@ git commit -m "feat(httpx): 增加 OpenAPI 规范与 Swagger 文档页"
 - Create: `internal/rpc/grpcx/client.go`
 - Create: `internal/rpc/grpcx/convert.go`
 - Create: `internal/rpc/grpcx/convert_test.go`
+- Create: `internal/rpc/registry.go`
 - Create (generated): `internal/rpc/grpcx/pb/lgdm.pb.go`、`internal/rpc/grpcx/pb/lgdm_grpc.pb.go`
 
 **Interfaces:**
@@ -3439,6 +3365,12 @@ git commit -m "feat(httpx): 增加 OpenAPI 规范与 Swagger 文档页"
   type Client struct { /* ... */ }
   func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error)
   func Serve(ctx context.Context, a addr.Addr, token string, h Handler) error
+
+  package rpc   // 本任务新增
+  type ServerOptions struct { Transport, Addr, Token string }
+  func Serve(ctx context.Context, opts ServerOptions, h Handler) error
+  func Dial(ctx context.Context, transport, endpoint, token string) (Client, error)
+  const TransportGRPC, TransportHTTP string
   ```
 
 - [ ] **Step 1: 写 `proto/lgdm/v1/lgdm.proto`**
@@ -4715,15 +4647,89 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 }
 ```
 
-- [ ] **Step 9: 跑测试**
+- [ ] **Step 9: 建 `internal/rpc/registry.go`（传输注册表）**
+
+```go
+package rpc
+
+import (
+	"context"
+	"fmt"
+
+	"lgo_download_manager/internal/rpc/addr"
+	"lgo_download_manager/internal/rpc/grpcx"
+	"lgo_download_manager/internal/rpc/httpx"
+)
+
+// 传输协议名。
+const (
+	TransportGRPC = "grpc"
+	TransportHTTP = "http"
+)
+
+// ServerOptions 描述一次服务端的启动参数。
+type ServerOptions struct {
+	// Transport 是传输协议名；为空时按 TransportGRPC 处理。
+	Transport string
+	// Addr 是监听地址，见 addr.Parse。
+	Addr string
+	// Token 是握手 token，每次调用都会校验。
+	Token string
+}
+
+// Serve 按 opts 启动服务。handler 的实现由业务侧提供。
+func Serve(ctx context.Context, opts ServerOptions, h Handler) error {
+	a, err := addr.Parse(opts.Addr)
+	if err != nil {
+		return err
+	}
+	switch opts.Transport {
+	case "", TransportGRPC:
+		return grpcx.Serve(ctx, a, opts.Token, h)
+	case TransportHTTP:
+		return httpx.Serve(ctx, a, opts.Token, h)
+	default:
+		return fmt.Errorf("rpc: 未知传输协议 %q（可选：%s、%s）", opts.Transport, TransportGRPC, TransportHTTP)
+	}
+}
+
+// Dial 连接到 endpoint 并返回客户端。endpoint 的格式与 addr.Parse 相同。
+func Dial(ctx context.Context, transport, endpoint, token string) (Client, error) {
+	a, err := addr.Parse(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	var tr Transport
+	switch transport {
+	case "", TransportGRPC:
+		tr, err = grpcx.Dial(ctx, a, token)
+	case TransportHTTP:
+		tr, err = httpx.Dial(ctx, a, token)
+	default:
+		return nil, fmt.Errorf("rpc: 未知传输协议 %q（可选：%s、%s）", transport, TransportGRPC, TransportHTTP)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return newClient(ctx, tr)
+}
+
+// 编译期断言：两种传输实现都满足 Transport。
+var (
+	_ Transport = (*grpcx.Client)(nil)
+	_ Transport = (*httpx.Client)(nil)
+)
+```
+
+- [ ] **Step 10: 跑测试**
 
 Run: `go test ./internal/rpc/... ./internal/appservice/`
 Expected: PASS
 
-- [ ] **Step 10: 提交**
+- [ ] **Step 11: 提交**
 
 ```bash
-git add proto buf.yaml buf.gen.yaml scripts/gen_proto.sh internal/rpc/grpcx go.mod go.sum
+git add proto buf.yaml buf.gen.yaml scripts/gen_proto.sh internal/rpc/grpcx internal/rpc/registry.go go.mod go.sum
 git commit -m "feat(grpcx): 实现基于 gRPC 的传输并加入 protobuf 契约"
 ```
 
@@ -6065,13 +6071,13 @@ Task 2  api
   ↓
 Task 3  appservice
   ↓
-Task 4  rpc 核心（addr / 接口 / 共享客户端）  ← 此后 go build 会因缺 grpcx/httpx 而失败
+Task 4  rpc 核心（addr / 接口 / 共享客户端）
   ↓
 Task 5  httpx
   ↓
 Task 6  httpx 的 OpenAPI + Swagger
   ↓
-Task 7  grpcx（proto + 生成 + 映射）
+Task 7  grpcx（proto + 生成 + 映射）+ rpc 注册表 Serve/Dial
   ↓
 Task 8  契约测试（两种传输）
   ↓
@@ -6086,5 +6092,5 @@ Task 12 引擎拆分 + 边界测试
 Task 13 CI + 文档 + 清理
 ```
 
-Task 4 之后到 Task 7 之前，`go build ./...` 会失败（`rpc/registry.go` 引用了尚未创建的
-`grpcx` / `httpx`）。Task 7 完成后恢复全绿。中间的 Task 5、6、7 各自能独立编译与测试。
+每个任务结束时仓库都能编译、测试全绿（与全局约束一致）。注册表 `Serve`/`Dial` 放在
+Task 7，因为它是唯一同时引用两种传输实现的地方。
