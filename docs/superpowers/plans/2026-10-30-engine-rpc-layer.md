@@ -2500,10 +2500,25 @@ git commit -m "feat(rpc): 新增传输抽象层、共享客户端与地址解析
 > 线格式：REST 风格路径 `/lgdm.v1.DownloadService/{method}` + JSON 正文；
 > 消息流用 NDJSON 逐行推送；每次请求都带 `Authorization: Bearer <token>`，
 > 服务端每次调用强制校验；只接受 POST。
-> 错误响应体形状固定为 `{"ok":false,"error":"..."}`，客户端按 `error` 字段解析。
+>
+> 服务端可能返回的状态码：`200` 成功、`400` 请求体解析失败（含超限）、
+> `401` token 缺失或无效、`404` 未知路径、`405` 非 POST 方法、`500` 业务侧调用失败。
+> 除 `200` 外一律是 `{"ok":false,"error":"..."}` 形状，客户端按 `error` 字段解析。
+> （另有 ServeMux 自己的 `307`：请求路径带 `//` 或 `..` 时它先做路径规范化重定向，
+> 发生在任何 handler 之前，不走鉴权也不是 JSON 形状。）
+>
+> 未注册的路径由兜底路由 `"/"` 兜住：它先校验 token（不过就回 `401`），过了才回
+> `404`「未知路径 `<path>`」。这样没 token 的调用方分不出「端点不存在」与「token 不对」，
+> `401` 与 `404` 的差别不会泄露端点存不存在；错误体形状也与业务端点一致，
+> 客户端不会退化成裸串「HTTP 404」。
+>
+> 文档端点（`/openapi.yaml`、`/openapi.json`、`/docs`）按设计不参与 token 校验：
+> Go 1.22+ 的 ServeMux 里未以 `/` 结尾的 pattern 是精确匹配、`"/"` 是兜底子树，
+> 更精确的 pattern 优先命中，因此兜底路由不会把它们圈进去。
 
-> **与控制器补充说明（A1–A11）的对照**：本节代码是按 A1–A11 修正后的最终实现，
-> 与最初的草稿有出入的地方见文末「与初稿的差异」。
+> **与控制器补充说明（A1–A11）的对照**：本节代码是按 A1–A11 修正、再经修复轮 1
+> 补上兜底路由与零值客户端保护后的最终实现，与最初的草稿有出入的地方见文末
+> 「与初稿的差异」。
 
 - [ ] **Step 1: 给 `internal/rpc/addr` 补 `DialContext`**
 
@@ -2743,12 +2758,17 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// checkOpen 检查客户端是否已关闭。
+// checkOpen 检查客户端是否已关闭或未初始化。
 func (c *Client) checkOpen() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed {
 		return errors.New("httpx: 客户端已关闭")
+	}
+	// 零值客户端的 http 字段是 nil，直接 Do 会 nil 指针解引用 panic。
+	// Client 是导出类型，零值是被允许的构造物，这里要回错误而不是炸进程。
+	if c.http == nil {
+		return errors.New("httpx: 客户端未初始化，请用 Dial 创建")
 	}
 	return nil
 }
@@ -2854,8 +2874,11 @@ func Serve(ctx context.Context, a addr.Addr, token string, h Handler) error {
 // newMux 组装路由与中间件。
 func newMux(h Handler, token string) *http.ServeMux {
 	mux := http.NewServeMux()
+	// 文档端点不走 authed：它们只暴露接口形状，不暴露任务数据。
+	registerDocs(mux)
 	// authed 是鉴权 + 方法检查的中间件。鉴权在前：不该让没 token 的调用方
-	// 知道某个端点存不存在。
+	// 知道某个端点存不存在。没注册的路径由下面的兜底路由兜住，它同样先过
+	// 鉴权，这条前提才成立。
 	authed := func(fn func(http.ResponseWriter, *http.Request)) http.HandlerFunc {
 		return func(w http.ResponseWriter, r *http.Request) {
 			if !validToken(r.Header.Get("Authorization"), token) {
@@ -2881,16 +2904,28 @@ func newMux(h Handler, token string) *http.ServeMux {
 	mux.HandleFunc(servicePrefix+api.MethodStreamMessages, authed(func(w http.ResponseWriter, r *http.Request) {
 		serveStream(w, r, h)
 	}))
+	// 兜底路由：未注册的路径也要先过鉴权。否则 401 与 404 的差别会泄露
+	// 端点存不存在——没 token 的调用方能靠状态码枚举出有哪些端点；而且
+	// ServeMux 内置的 404 是纯文本，错误体形状与业务端点对不上，客户端
+	// 只能退化成裸串「HTTP 404」，错误原因丢失。
+	//
+	// Go 1.22+ 的 ServeMux：未以 / 结尾的 pattern 是精确匹配，"/" 是兜底
+	// 子树，更精确的 pattern 优先命中。业务端点与文档端点都不受影响。
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if !validToken(r.Header.Get("Authorization"), token) {
+			writeError(w, http.StatusUnauthorized, "无效的 token")
+			return
+		}
+		// 不检查方法：对不存在的路径谈「只接受 POST」是误导。
+		writeError(w, http.StatusNotFound, "未知路径 "+r.URL.Path)
+	})
 	return mux
 }
 
 // serveCall 处理一次调用。
 func serveCall(w http.ResponseWriter, r *http.Request, h Handler, method string) {
+	// method 一定来自 api.AllMethods，api.Spec 对它们必有 spec。
 	spec := api.Spec(method)
-	if spec == nil {
-		writeError(w, http.StatusNotFound, "未知方法 "+method)
-		return
-	}
 	in := spec.NewIn()
 	if r.Body != nil {
 		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
@@ -3137,7 +3172,8 @@ func TestServeRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
-// TestServeUnknownMethod 验证 api.AllMethods 之外的方法返回 404。
+// TestServeUnknownMethod 验证 api.AllMethods 之外的方法返回 404，且错误体
+// 形状与业务端点一致（{"ok":false,"error":"..."}）。
 func TestServeUnknownMethod(t *testing.T) {
 	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
 	mux := newMux(h, "secret")
@@ -3148,6 +3184,72 @@ func TestServeUnknownMethod(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("未知方法应当 404, got %d", rec.Code)
+	}
+	assertErrorBody(t, rec, "未知路径")
+}
+
+// TestServeUnknownPathNeedsToken 验证未注册的路径也要过鉴权：没 token 时回
+// 401，而不是 ServeMux 内置的纯文本 404。
+//
+// 这一条守住「不该让没 token 的调用方知道某个端点存不存在」：没有它，
+// 401 与 404 的差别会让任何调用方枚举出端点。
+func TestServeUnknownPathNeedsToken(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	mux := newMux(h, "secret")
+
+	// 完全不带 token。
+	req := httptest.NewRequest(http.MethodPost, "/nope", nil)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("未知路径不带 token 应当 401, got %d: %s", rec.Code, rec.Body.String())
+	}
+	assertErrorBody(t, rec, "无效的 token")
+
+	// 带错误的 token。
+	req = httptest.NewRequest(http.MethodPost, "/nope", nil)
+	req.Header.Set("Authorization", "Bearer wrong")
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("未知路径带错 token 应当 401, got %d: %s", rec.Code, rec.Body.String())
+	}
+	assertErrorBody(t, rec, "无效的 token")
+}
+
+// TestServeUnknownPathWithToken 验证带对 token 时未知路径回 404，且错误体
+// 是统一的 JSON 形状。
+func TestServeUnknownPathWithToken(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	mux := newMux(h, "secret")
+
+	req := httptest.NewRequest(http.MethodPost, "/nope", nil)
+	req.Header.Set("Authorization", "Bearer secret")
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("未知路径带对 token 应当 404, got %d: %s", rec.Code, rec.Body.String())
+	}
+	assertErrorBody(t, rec, "未知路径 /nope")
+}
+
+// TestServeFallbackRouteKeepsDocsEndpointsOpen 验证兜底路由没有把文档端点
+// 圈进去：/openapi.yaml、/openapi.json、/docs 仍按设计不参与 token 校验。
+//
+// 兜底路由是 "/"（兜底子树），文档端点是更精确的 pattern，更精确的优先
+// 命中。这条测试守着这个前提——哪天有人把兜底路由改成「所有请求都先过
+// 鉴权」的整体包装，文档页就跟着挂。
+func TestServeFallbackRouteKeepsDocsEndpointsOpen(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	mux := newMux(h, "secret")
+
+	for _, path := range []string{"/openapi.yaml", "/openapi.json", "/docs"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("%s 不带 token 应当 200, got %d", path, rec.Code)
+		}
 	}
 }
 
@@ -3306,6 +3408,64 @@ func TestClientCallRejectsBadToken(t *testing.T) {
 	}
 }
 
+// TestClientCallUnknownMethodKeepsErrorReason 验证客户端能从 404 的响应体
+// 里读出错误原因。服务端的错误体形状固定为 {"ok":false,"error":"..."}，
+// 客户端按 error 字段解析——解析不出来就退化成裸串「HTTP 404」。
+func TestClientCallUnknownMethodKeepsErrorReason(t *testing.T) {
+	h := &stubHandler{events: make(chan api.Event), controls: make(chan api.Message)}
+	a := startServer(t, h, "secret")
+
+	c, err := Dial(context.Background(), a, "secret")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	err = c.Call(context.Background(), "nope", &api.Empty{}, &api.Empty{})
+	if err == nil {
+		t.Fatal("未知方法应当调用失败")
+	}
+	if !strings.Contains(err.Error(), "未知路径") {
+		t.Fatalf("错误信息应当带上服务端的原因: %v", err)
+	}
+	if strings.Contains(err.Error(), "HTTP 404") {
+		t.Fatalf("错误原因不该退化成裸状态码: %v", err)
+	}
+}
+
+// TestZeroValueClientReturnsError 验证零值客户端的 Call 与 Stream 返回错误
+// 而不是 panic。
+//
+// Client 是导出类型，零值是被允许的构造物（contract_test.go 就用它验证
+// Close 不炸）。零值客户端的 http 字段是 nil，直接 Do 会 nil 指针解引用。
+func TestZeroValueClientReturnsError(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("零值客户端不该 panic: %v", r)
+		}
+	}()
+
+	c := &Client{}
+	err := c.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, &api.Settings{})
+	if err == nil {
+		t.Fatal("零值客户端的 Call 应当返回错误")
+	}
+	if !strings.Contains(err.Error(), "未初始化") {
+		t.Fatalf("错误信息应当说明客户端未初始化: %v", err)
+	}
+
+	ch, err := c.Stream(context.Background())
+	if err == nil {
+		t.Fatal("零值客户端的 Stream 应当返回错误")
+	}
+	if !strings.Contains(err.Error(), "未初始化") {
+		t.Fatalf("错误信息应当说明客户端未初始化: %v", err)
+	}
+	if ch != nil {
+		t.Fatal("零值客户端的 Stream 不该返回消息通道")
+	}
+}
+
 // TestClientStreamReceivesMessages 验证客户端能收到事件与控制消息两种。
 func TestClientStreamReceivesMessages(t *testing.T) {
 	h := &stubHandler{events: make(chan api.Event, 4), controls: make(chan api.Message, 4)}
@@ -3388,6 +3548,32 @@ func TestDialFailsWhenServerAbsent(t *testing.T) {
 	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "missing.sock")}
 	if _, err := Dial(context.Background(), a, "secret"); err == nil {
 		t.Fatal("服务端没起来时 Dial 应当失败")
+	}
+}
+
+// assertErrorBody 断言响应是统一的错误信封：Content-Type 是 application/json，
+// body 是 {"ok":false,"error":"..."}。wantContains 非空时，error 字段还要包含
+// 它。
+func assertErrorBody(t *testing.T, rec *httptest.ResponseRecorder, wantContains string) {
+	t.Helper()
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		t.Fatalf("错误体的 Content-Type 不对: %q", ct)
+	}
+	var e struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &e); err != nil {
+		t.Fatalf("错误体不是 JSON: %v (%s)", err, rec.Body.String())
+	}
+	if e.OK {
+		t.Fatalf("错误体的 ok 应当是 false: %s", rec.Body.String())
+	}
+	if e.Error == "" {
+		t.Fatalf("错误体缺少 error 字段: %s", rec.Body.String())
+	}
+	if wantContains != "" && !strings.Contains(e.Error, wantContains) {
+		t.Fatalf("错误信息应当包含 %q，实际是 %q", wantContains, e.Error)
 	}
 }
 
@@ -3495,7 +3681,7 @@ git add internal/rpc/httpx internal/rpc/addr
 git commit -m "feat(httpx): 实现基于 net/http 的传输"
 ```
 
-#### 与初稿的差异（A1–A11 的落法）
+#### 与初稿的差异（A1–A11 与修复轮 1 的落法）
 
 | 条目 | 初稿的问题 | 最终实现 |
 | --- | --- | --- |
@@ -3510,10 +3696,17 @@ git commit -m "feat(httpx): 实现基于 net/http 的传输"
 | A9 | 事件通道关闭会顺带掐掉控制消息流 | 某一侧通道关闭只停那一侧（置 nil channel），两侧都结束才收尾 |
 | A10 | 请求体没有上限 | `http.MaxBytesReader` 限制在 1 MiB |
 | A11 | GET 也会命中路由，与 OpenAPI 只声明 POST 对不上 | 中间件里校验方法，不是 POST 一律 405（带 `Allow` 头） |
+| I1 | 未注册的路径落到 ServeMux 内置的 NotFound，`authed` 中间件根本不执行：没 token 的调用方靠 401/404 的差别就能枚举端点（与「鉴权在前」的注释自相矛盾），而且那个 404 是纯文本，错误体形状与业务端点对不上，客户端只能退化成裸串「HTTP 404」，错误原因丢失 | `newMux` 里注册兜底路由 `"/"`：先校验 token，不过就回 401，过了再回 404「未知路径 `<path>`」；错误体沿用统一的 `{"ok":false,"error":"..."}` 形状。兜底路由只做 token 校验，不做 POST 方法检查（对不存在的路径谈「只接受 POST」是误导）。更精确的 pattern 优先命中，业务端点与 Task 6 的文档端点都不受影响。同时删掉 `serveCall` 里 `spec == nil` 的死分支——`api.Spec` 对已注册方法必有 spec |
+| I3 | 零值 `httpx.Client` 的 `http` 字段是 nil，`Call`/`Stream` 走到 `c.http.Do` 会 nil 指针解引用 panic。`Client` 是导出类型，零值是被允许的构造物（`contract_test.go` 就用它验证 `Close()` 不炸），而 `rpc.Transport` 契约里 `Call`/`Stream` 都返回 error，panic 会带走整个进程 | `checkOpen` 并进「未初始化」判断：`c.http == nil` 时返回「客户端未初始化，请用 Dial 创建」；`Call` 与 `Stream` 都先过 `checkOpen`，覆盖到位 |
+| 状态码 | 服务端实际返回 200/400/401/404/405/500 | **Task 6 已补齐 400/401/405/500**：规范里每个业务端点声明 200/400/401/405/500，错误响应在 `components.responses` 里复用（见 Task 6 的 B3）。`404` 只由兜底路由产生（未知路径），不对应任何业务端点，因此规范里不声明——修复轮 1 之前那条 404 是 ServeMux 内置的纯文本，同样不属于业务端点 |
 
 初稿里的 `client.go` import 了 `"time"` 但没用得到，已删；`"net"` 在
 `DialContext` 闭包的签名里要用到，保留。初稿末尾的 `var _ = net.Dial` 占位
 没有采用——Go 会因未使用的 import 直接编译失败。
+
+修复轮 1 之后，本节 `server.go` 代码块里多了一行 `registerDocs(mux)`：它来自
+Task 6（见 Task 6 的 B6 与 Step 3）。代码块按「计划 == 实现」的要求与当前实现
+保持逐行一致，Task 6 的说明见那一节。
 
 ---
 
