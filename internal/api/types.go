@@ -64,6 +64,7 @@ type Settings struct {
 	BTSeedRatio        float64   `json:"bt_seed_ratio"`
 	BTMaxSeeding       int       `json:"bt_max_seeding"`
 	BTMaxConcurrent    int       `json:"bt_max_concurrent"`
+	BTTrackers         string    `json:"bt_trackers"`
 }
 
 // AuthOptions 是随任务一起传递的凭据。字段与 internal/protocol.AuthOptions

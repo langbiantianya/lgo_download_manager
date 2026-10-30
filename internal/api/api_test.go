@@ -68,3 +68,18 @@ func TestStatusValuesMatchStore(t *testing.T) {
 		}
 	}
 }
+
+func TestSettingsBTTrackersRoundTrip(t *testing.T) {
+	in := Settings{BTTrackers: "udp://tracker.example:1337"}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out Settings
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.BTTrackers != in.BTTrackers {
+		t.Fatalf("BTTrackers 丢失: %q", out.BTTrackers)
+	}
+}
