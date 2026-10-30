@@ -1049,8 +1049,8 @@ func toStoreProxyMode(m api.ProxyMode) protocol.ProxyMode {
 	return protocol.ParseProxyMode(string(m))
 }
 
-// toAPIAuthOptions 把契约层的凭据转成协议层的凭据。
-func toAPIAuthOptions(a api.AuthOptions) protocol.AuthOptions {
+// toProtocolAuthOptions 把契约层的凭据转成协议层的凭据。
+func toProtocolAuthOptions(a api.AuthOptions) protocol.AuthOptions {
 	return protocol.AuthOptions{
 		Username:           a.Username,
 		Password:           a.Password,
@@ -1065,8 +1065,8 @@ func toAPIAuthOptions(a api.AuthOptions) protocol.AuthOptions {
 	}
 }
 
-// toStoreAuthOptions 是 toAPIAuthOptions 的逆变换。
-func toStoreAuthOptions(a protocol.AuthOptions) api.AuthOptions {
+// toAPIAuthOptions 把协议层的凭据转成契约层的凭据。
+func toAPIAuthOptions(a protocol.AuthOptions) api.AuthOptions {
 	return api.AuthOptions{
 		Username:           a.Username,
 		Password:           a.Password,
@@ -1281,7 +1281,7 @@ func (s *Service) Call(ctx context.Context, method string, in, out any) error {
 			URL:          p.URL,
 			SavePath:     p.SavePath,
 			Protocol:     kind,
-			Auth:         toAPIAuthOptions(p.Auth),
+			Auth:         toProtocolAuthOptions(p.Auth),
 			ChunkCount:   p.ChunkCount,
 			MinChunkSize: p.MinChunkSize,
 		})
@@ -1427,17 +1427,22 @@ func (s *Service) probe(raw string) (int64, error) {
 }
 
 // probeBittorrent 解析 .torrent 种子文件的总体积。磁力链接缺元数据，
-// 返回 0(体积未知)。任何取种子的失败都当作「未知」而不是错误。
+// 返回 0(体积未知)。任何取种子的失败都当作「未知」而不是错误——
+// 体积预览不该拦住用户添加任务。但要留下日志，否则用户看到的只是
+// 「体积未知」，无从判断是网络问题还是种子本身损坏。
 func (s *Service) probeBittorrent(raw string) (int64, error) {
 	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "magnet:") {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
 		data, err := bittorrent.FetchTorrentFile(ctx, raw, protocol.HTTPProxyFunc())
 		if err != nil {
+			logging.Printf("appservice: probe torrent file: %v", err)
 			return 0, nil
 		}
 		if _, total, perr := bittorrent.TorrentFileInfo(data); perr == nil {
 			return total, nil
+		} else {
+			logging.Printf("appservice: parse torrent file: %v", perr)
 		}
 	}
 	return 0, nil
@@ -1473,7 +1478,7 @@ func TestCallListAndSettings(t *testing.T) {
 	}
 	defer st.Close()
 
-	s := New(st, nil)
+	s := New(st, scheduler.New(st))
 	s.SetSettings(store.Settings{Language: "en"})
 
 	res := &api.ListResult{}
