@@ -1,0 +1,22 @@
+version: v2
+modules:
+  - path: proto
+lint:
+  use:
+    - STANDARD
+  # 这三条规则要求「每个 RPC 用自己专属的请求/响应消息，且消息名带上
+  # 方法名」。这里刻意不遵守，代价是 proto 里少一堆只有一个字段的样板
+  # 消息：
+  #   - TaskRef 被 start/pause/delete/is_preparing 四个方法共用；
+  #   - Empty 是无负载请求/响应的占位类型，被 get_settings、
+  #     save_settings、stream_messages 等方法共用。
+  # 契约层的形状由 internal/api 决定，proto 只是它的线格式投影，
+  # 不该在这里再复制一遍方法名。其余 STANDARD 规则（字段名、枚举名、
+  # 枚举零值必须带 _UNSPECIFIED、包名与目录路径一致等）照常生效。
+  except:
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
+breaking:
+  use:
+    - FILE

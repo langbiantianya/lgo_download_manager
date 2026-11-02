@@ -10,7 +10,7 @@ require (
 	github.com/jlaffaye/ftp v0.2.4
 	github.com/nicksnyder/go-i18n/v2 v2.5.1
 	go.yaml.in/yaml/v3 v3.0.5
-	golang.org/x/net v0.47.0
+	golang.org/x/net v0.60.0
 	golang.org/x/time v0.14.0
 	modernc.org/sqlite v1.57.0
 )
@@ -43,6 +43,7 @@ require (
 	github.com/bits-and-blooms/bitset v1.2.2 // indirect
 	github.com/bradfitz/iter v0.0.0-20191230175014-e8f45d346db8 // indirect
 	github.com/cespare/xxhash v1.1.0 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.2.0 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
 	github.com/dlclark/regexp2/v2 v2.11.0 // indirect
@@ -57,7 +58,7 @@ require (
 	github.com/go-gl/glfw/v3.4/glfw v0.1.0-pre.1.0.20260707082822-2a407d02d01a // indirect
 	github.com/go-llsqlite/adapter v0.0.0-20230927005056-7f5ce7f0c916 // indirect
 	github.com/go-llsqlite/crawshaw v0.5.6-0.20250312230104-194977a03421 // indirect
-	github.com/go-logr/logr v1.4.3 // indirect
+	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
 	github.com/go-openapi/jsonpointer v0.19.5 // indirect
 	github.com/go-openapi/jsonreference v0.20.0 // indirect
@@ -120,14 +121,15 @@ require (
 	github.com/yuin/goldmark v1.8.2 // indirect
 	go.etcd.io/bbolt v1.3.6 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
-	go.opentelemetry.io/otel v1.38.0 // indirect
-	go.opentelemetry.io/otel/metric v1.38.0 // indirect
-	go.opentelemetry.io/otel/trace v1.38.0 // indirect
-	golang.org/x/crypto v0.44.0 // indirect
+	go.opentelemetry.io/otel v1.45.0 // indirect
+	go.opentelemetry.io/otel/metric v1.45.0 // indirect
+	go.opentelemetry.io/otel/trace v1.45.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
 	golang.org/x/image v0.24.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/tools v0.39.0 // indirect
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20261026165753-2ffab32bce7e // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	lukechampine.com/blake3 v1.1.6 // indirect
 	modernc.org/libc v1.74.4 // indirect
@@ -139,8 +141,10 @@ require (
 require (
 	github.com/dop251/goja v0.0.0-20261028213108-85be1416108e
 	github.com/swaggo/http-swagger v1.3.4
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 	golang.org/x/text v0.43.0
+	google.golang.org/grpc v1.85.0
+	google.golang.org/protobuf v1.36.12
 )
 
 // 排除 x/tools 的这两个新版本：它们会经由 golang.org/x/net 把 x/net 抬到
@@ -152,3 +156,20 @@ exclude (
 	golang.org/x/tools v0.47.0
 	golang.org/x/tools v0.51.0
 )
+
+// 把 x/net 钉回 v0.47.0。
+//
+// 原因和上面的 exclude 是同一个：x/net v0.56 起 httpproxy 改了大小写环
+// 境变量的优先级（小写 http_proxy 优先于大写 HTTP_PROXY），与 Go 标准库
+// http.ProxyFromEnvironment 的大写优先行为不一致，会悄悄改变 internal/
+// protocol 的代理环境变量解析语义，打破 TestProxyFuncSystemModeReturnsEnv。
+//
+// 但 exclude 在这里压不住：google.golang.org/grpc v1.85.0 的 go.mod 直接
+// require golang.org/x/net v0.60.0（不是经由 x/tools 间接抬上来的），
+// 排除 x/tools 的任何版本都拦不住它。exclude 还会让 go 命令改选「下一个
+// 可用版本」（实测选到了 v0.58.0），同样在 v0.56 以上。
+//
+// 所以只能用 replace 硬钉。grpc 实际 import 的 x/net 包只有 http2、
+// http2/hpack、http/httpproxy、trace，v0.47.0 全都有，实测构建与全部
+// 测试通过。
+replace golang.org/x/net => golang.org/x/net v0.47.0
