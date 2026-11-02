@@ -940,10 +940,11 @@ func caseUnknownMethod(t *testing.T, env *contractEnv) {
 // caseBadInputType 断言入参类型不对时返回错误。
 //
 // 这里用一个「JSON 上也不兼容」的入参：gRPC 侧是类型断言失败，HTTP 侧
-// 是 JSON 解码失败（400）。两种传���都必须是错误。
+// 是 JSON 解码失败（400）。两种传输都必须是错误。
 //
-// 注意：「Go 类型不对但 JSON 恰好兼容」的情形两种传输不一样，见
-// TestContractDivergenceInputType。
+// 注意：「Go 类型不对但 JSON 恰好兼容」的情形由
+// TestContractInputTypeMismatchRejected 单独覆盖——那种情况两种传输都
+// 必须在发请求之前就报错。
 func caseBadInputType(t *testing.T, env *contractEnv) {
 	tr := dialTransport(t, env.transport, env.endpoint, contractToken)
 	defer tr.Close()
@@ -1068,7 +1069,7 @@ func collectContractResults(t *testing.T, transport string) map[string]string {
 	return out
 }
 
-// ---- 已知分歧 ----
+// ---- 已知分歧与类型一致性 ----
 //
 // 契约测试的价值一半在「一致」，另一半在「不一致」。下面把已知的分歧
 // 钉死：它们现在是绿灯的，但它们是真实的行为差异——改动任何一侧都会
@@ -1079,6 +1080,11 @@ func collectContractResults(t *testing.T, transport string) map[string]string {
 //
 // gRPC 侧走 protobuf 枚举，未知取值只能归一成 UNSPECIFIED（再映射回
 // 空串）；HTTP 侧走 JSON 字符串，未知取值原样保留。
+//
+// 这是 JSON 与 protobuf 的线格式固有差异，不是缺陷，不追求统一：protobuf
+// 的枚举在 wire 上是一个整数，词表外的取值没有对应的整数，只能落回
+// UNSPECIFIED；JSON 走的是字符串，词表外的字符串照原样传过去。要统一，
+// 就得让一边丢信息或让另一边凭空猜一个枚举值——两头都不对。
 func TestContractDivergenceUnknownEnum(t *testing.T) {
 	got := map[string]string{}
 	for _, transport := range []string{rpc.TransportGRPC, rpc.TransportHTTP} {
@@ -1102,8 +1108,13 @@ func TestContractDivergenceUnknownEnum(t *testing.T) {
 // gRPC 侧 proto3 的 repeated 字段空时不上线，反序列化后是非 nil 的空
 // 切片；HTTP 侧 JSON 编出来是 null，解回来是 nil。调用方用
 // reflect.DeepEqual 比对就会看到差异。
+//
+// 这是 JSON 与 protobuf 的线格式固有差异，不是缺陷，不追求统一：proto3
+// 的 repeated 字段没有「null」这个状态，只有「空」；JSON 有 null 与 []
+// 两种形态。契约层的比较一律走 JSON 归一（见 sameJSON），别拿
+// reflect.DeepEqual 当契约——它会把这些表示差异也算成契约差异。
 func TestContractDivergenceEmptySlice(t *testing.T) {
-	got := map[string]bool{}
+	got := map[string]string{}
 	for _, transport := range []string{rpc.TransportGRPC, rpc.TransportHTTP} {
 		// 切片字段刻意留空，才能看出「空」在两种线格式下长什么样。
 		env := newContractEnv(t, transport, func(h *stubHandler) {
@@ -1113,57 +1124,85 @@ func TestContractDivergenceEmptySlice(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got[transport] = detail.PieceBuckets == nil
+		// 用 JSON 归一比，别用 reflect.DeepEqual：分歧本来就发生在
+		// 线格式上——protobuf 侧的空 repeated 字段上线是「[]」，JSON
+		// 侧的 null 上线是「null」。
+		//
+		// 比的是 Files 而不是 PieceBuckets：PieceBuckets 是 []uint8，
+		// JSON 会把它编成 base64 字符串（空的是 ""，nil 的是 null），
+		// 看不出「空数组」与「null」的区别；Files 是普通结构体切片，
+		// 编出来就是数组。
+		got[transport] = mustJSON(t, "空切片", detail.Files)
 	}
-	if got[rpc.TransportGRPC] {
-		t.Error("gRPC 侧当前行为是「空切片非 nil」")
+	if got[rpc.TransportGRPC] != "[]" {
+		t.Errorf("gRPC 侧当前行为是「空切片非 nil」，线上是 %s", got[rpc.TransportGRPC])
 	}
-	if !got[rpc.TransportHTTP] {
-		t.Error("HTTP 侧当前行为是「空切片是 nil」")
+	if got[rpc.TransportHTTP] != "null" {
+		t.Errorf("HTTP 侧当前行为是「空切片是 nil」，线上是 %s", got[rpc.TransportHTTP])
 	}
 }
 
-// TestContractDivergenceInputType 记录分歧③：入参的 Go 类型不对时，两种
-// 传输的判断不一样。
+// TestContractInputTypeMismatchRejected 断言入参的 Go 类型不对时，两种
+// 传输都报错。
 //
-// gRPC 侧做 Go 类型断言，类型不对立刻报错；HTTP 侧把入参编码成 JSON 再
-// 由服务端解码，类型「碰巧兼容」时（例如拿 TaskRef 去调 list）会被
-// 静默接受，服务端收到的是零值——调用方看不出自己传错了类型。
-func TestContractDivergenceInputType(t *testing.T) {
-	errs := map[string]bool{}
+// 这条用例原来钉的是分歧③：gRPC 侧做 Go 类型断言，类型不对当场报错；
+// HTTP 侧把入参编码成 JSON 再由服务端解码，类型「碰巧兼容」时（例如拿
+// TaskRef 去调 list）会被静默接受，服务端收到的是零值——调用方看不出
+// 自己传错了类型。
+//
+// 现在 httpx 在序列化之前按 api.Spec 校验入参类型，两边的行为一致了，
+// 这条用例从「钉住分歧」改成「守住一致性」：任何一边改成静默接受，用例
+// 都会变红。
+func TestContractInputTypeMismatchRejected(t *testing.T) {
 	for _, transport := range []string{rpc.TransportGRPC, rpc.TransportHTTP} {
 		env := newContractEnv(t, transport, nil)
 		tr := dialTransport(t, env.transport, env.endpoint, contractToken)
+		// 拿 TaskRef 去调 list：JSON 上恰好兼容（TaskRef 只有 id 字段，
+		// ListParams 的 filter/sort 解不出来就是零值），所以它正是「静默
+		// 接受」最容易发生的那一类。
 		err := tr.Call(env.ctx, api.MethodList, &api.TaskRef{ID: "t1"}, &api.ListResult{})
-		errs[transport] = err != nil
 		_ = tr.Close()
-	}
-	if !errs[rpc.TransportGRPC] {
-		t.Error("gRPC 侧当前行为是「入参类型不对时报错」")
-	}
-	if errs[rpc.TransportHTTP] {
-		t.Error("HTTP 侧当前行为是「入参类型不对时静默接受」")
+		if err == nil {
+			t.Errorf("%s：入参类型不对应当报错", transport)
+			continue
+		}
+		if !strings.Contains(err.Error(), api.MethodList) {
+			t.Errorf("%s：错误信息应当带上方法名: %v", transport, err)
+		}
+		// 类型不对就不该把请求发出去：服务端不该收到这次调用。
+		if calls := env.h.callsOf(api.MethodList); len(calls) != 0 {
+			t.Errorf("%s：入参类型不对时不该发出请求，服务端却收到 %d 次", transport, len(calls))
+		}
 	}
 }
 
-// TestContractDivergenceOutputType 记录分歧④：出参的 Go 类型不对时，两种
-// 传输的判断不一样。
+// TestContractOutputTypeMismatchRejected 断言出参的 Go 类型不对时，两种
+// 传输都报错。
 //
-// gRPC 侧做 Go 类型断言并报错；HTTP 侧把服务端的响应体解码进出参类型，
-// 解不出来的字段被丢掉，调用方拿到一个零值对象，没有错误。
-func TestContractDivergenceOutputType(t *testing.T) {
-	errs := map[string]bool{}
+// 这条用例原来钉的是分歧④：gRPC 侧做 Go 类型断言并报错；HTTP 侧把服务端
+// 的响应体解码进出参类型，解不出来的字段被丢掉，调用方拿到一个零值对象，
+// 没有错误。
+//
+// 现在 httpx 在发请求之前就按 api.Spec 校验出参类型，两边的行为一致了，
+// 这条用例从「钉住分歧」改成「守住一致性」。
+func TestContractOutputTypeMismatchRejected(t *testing.T) {
 	for _, transport := range []string{rpc.TransportGRPC, rpc.TransportHTTP} {
 		env := newContractEnv(t, transport, nil)
 		tr := dialTransport(t, env.transport, env.endpoint, contractToken)
+		// 拿 Task 去接 list 的响应：JSON 上解得动（Task 的字段都是
+		// 字符串/数字），但那不是 list 的响应类型。
 		err := tr.Call(env.ctx, api.MethodList, &api.ListParams{}, &api.Task{})
-		errs[transport] = err != nil
 		_ = tr.Close()
-	}
-	if !errs[rpc.TransportGRPC] {
-		t.Error("gRPC 侧当前行为是「出参类型不对时报错」")
-	}
-	if errs[rpc.TransportHTTP] {
-		t.Error("HTTP 侧当前行为是「出参类型不对时静默返回零值」")
+		if err == nil {
+			t.Errorf("%s：出参类型不对应当报错", transport)
+			continue
+		}
+		if !strings.Contains(err.Error(), api.MethodList) {
+			t.Errorf("%s：错误信息应当带上方法名: %v", transport, err)
+		}
+		// 出参类型不对同样不该发出请求。
+		if calls := env.h.callsOf(api.MethodList); len(calls) != 0 {
+			t.Errorf("%s：出参类型不对时不该发出请求，服务端却收到 %d 次", transport, len(calls))
+		}
 	}
 }

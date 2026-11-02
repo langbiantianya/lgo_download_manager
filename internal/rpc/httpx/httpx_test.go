@@ -10,12 +10,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -415,6 +417,100 @@ func TestClientCallUnknownMethodKeepsErrorReason(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "HTTP 404") {
 		t.Fatalf("错误原因不该退化成裸状态码: %v", err)
+	}
+}
+
+// countingRoundTripper 记录自己被调用的次数。
+//
+// 它是「假」的：任何走到这里的请求都直接失败。类型校验如果漏了，测试会
+// 同时看到「发了请求」与「错误信息不是类型错误」两个信号。
+type countingRoundTripper struct {
+	calls atomic.Int64
+}
+
+// RoundTrip 记录一次调用并返回错误。
+func (rt *countingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	rt.calls.Add(1)
+	return nil, errors.New("不该发出请求")
+}
+
+// wrongCallType 是一个不属于任何方法规格的类型，用来模拟「调用方传错了
+// Go 类型」。它的字段刻意为空：只要 Go 类型不是规格里的那个，就算错。
+type wrongCallType struct{}
+
+// TestCallTypeMismatchDoesNotSendRequest 验证类型校验失败时客户端压根不发
+// 请求。
+//
+// 这是 httpx 侧的护栏。JSON 会把类型信息擦掉：入参类型不对时，服务端照样
+// 会按规格解码出一个零值对象；出参类型不对时，服务端的响应会被解码进一个
+// 形状不合的对象里。两种情况都是「静默成功」，调用方看不出自己传错了
+// 类型。所以校验必须发生在序列化之前——请求一旦发出去，错误就被吞掉了。
+//
+// 断言两件事：错误里带着方法名（方便定位是哪个方法传错了），以及假的
+// RoundTripper 一次都没被调用。
+func TestCallTypeMismatchDoesNotSendRequest(t *testing.T) {
+	rt := &countingRoundTripper{}
+	c := &Client{http: &http.Client{Transport: rt}}
+	ctx := context.Background()
+
+	for _, m := range api.AllMethods {
+		t.Run(m, func(t *testing.T) {
+			spec := api.Spec(m)
+			if spec == nil {
+				t.Fatalf("方法 %q 缺少规格", m)
+			}
+
+			// 入参类型不对（出参给对）：必须报「请求类型错误」。
+			err := c.Call(ctx, m, &wrongCallType{}, spec.NewOut())
+			if err == nil {
+				t.Fatal("入参类型不对应当报错")
+			}
+			if !strings.Contains(err.Error(), "请求类型错误") {
+				t.Fatalf("应当报请求类型错误: %v", err)
+			}
+			if !strings.Contains(err.Error(), m) {
+				t.Fatalf("错误信息应当带上方法名 %q: %v", m, err)
+			}
+
+			// 出参类型不对（入参给对）：必须报「响应类型错误」。
+			err = c.Call(ctx, m, spec.NewIn(), &wrongCallType{})
+			if err == nil {
+				t.Fatal("出参类型不对应当报错")
+			}
+			if !strings.Contains(err.Error(), "响应类型错误") {
+				t.Fatalf("应当报响应类型错误: %v", err)
+			}
+			if !strings.Contains(err.Error(), m) {
+				t.Fatalf("错误信息应当带上方法名 %q: %v", m, err)
+			}
+		})
+	}
+
+	if n := rt.calls.Load(); n != 0 {
+		t.Fatalf("类型校验失败时不该发出请求，实际发了 %d 次", n)
+	}
+}
+
+// TestCallUnknownMethodDoesNotPanic 验证未知方法返回错误而不是 panic。
+//
+// api.Spec 对未知方法返回 nil，校验逻辑不能因此解引用 nil。未知方法由
+// 服务端判（兜底路由回 404），这里用假 RoundTripper 代替服务端：客户端
+// 要么报错，要么把请求发出去让服务端拒——两种都不许 panic。
+func TestCallUnknownMethodDoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("未知方法不该 panic: %v", r)
+		}
+	}()
+
+	rt := &countingRoundTripper{}
+	c := &Client{http: &http.Client{Transport: rt}}
+	err := c.Call(context.Background(), "no_such_method", &api.Empty{}, &api.Empty{})
+	if err == nil {
+		t.Fatal("未知方法应当返回错误")
+	}
+	if !strings.Contains(err.Error(), "no_such_method") {
+		t.Fatalf("错误信息应当带上方法名: %v", err)
 	}
 }
 
