@@ -6,7 +6,7 @@
 
 package api
 
-// 方法名。沿用旧 IPC 协议（internal/ipc）的取值，两种传输共用同一张表。
+// 方法名。沿用已删除的旧 IPC 协议的取值，两种传输共用同一张表。
 const (
 	MethodList           = "list"
 	MethodAdd            = "add"

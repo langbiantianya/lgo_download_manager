@@ -8,11 +8,11 @@
 //
 //  1. 业务主进程（默认）：SQLite store + 下载 scheduler + 托盘 +
 //     URL 转发 socket server + UI 管理器（拉起 UI 子进程）。
-//  2. Fyne UI 子进程：由业务进程自我复刻启动，连接业务 socket 运行
-//     Fyne 界面，关闭即由操作系统回收所有内存。
+//  2. Fyne UI 子进程：由业务进程自我复刻启动，通过 gRPC 或 net/http 传输
+//     连回业务进程运行 Fyne 界面，关闭即由操作系统回收所有内存。
 //
-// 角色分派通过 ipc.EnvUIChild 环境变量完成：业务进程拉起子进程时
-// 会把 EnvUIChild=1 与 socket/token 一并注入。
+// 角色分派通过 rpc.EnvUIChild 环境变量完成：业务进程拉起子进程时会把
+// EnvUIChild=1 与监听地址/token/传输协议名一并注入。
 //
 // 浏览器接力有两条通道，扩展侧按这个优先级尝试：
 //
@@ -32,9 +32,9 @@ import (
 	"lgo_download_manager/internal/downloaddir"
 	"lgo_download_manager/internal/handoff"
 	"lgo_download_manager/internal/ilocale"
-	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
+	"lgo_download_manager/internal/rpc"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/settings"
 	"lgo_download_manager/internal/store"
@@ -139,7 +139,7 @@ func main() {
 	logging.Printf("lgdm %s", version.String())
 
 	// 这样业务子进程即便被误调用也不会去解析业务 flag 或拉起 store。
-	if os.Getenv(ipc.EnvUIChild) == "1" {
+	if os.Getenv(rpc.EnvUIChild) == "1" {
 		os.Exit(ui.RunChild())
 	}
 
