@@ -2570,6 +2570,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"reflect"
 	"sync"
 
 	"lgo_download_manager/internal/api"
@@ -2640,8 +2641,18 @@ func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error) {
 }
 
 // Call 执行一次调用。
+//
+// 调用前先按 api.Spec 校验入参与出参的 Go 类型。HTTP 走 JSON，类型信息在
+// 编码时被擦掉：入参类型不对时，服务端照样会按规格解码出一个零值对象；
+// 出参类型不对时，服务端的响应会被解码进一个形状不合的对象里。两种情况
+// 都是「静默成功」——调用方看不出自己传错了类型，错误要到业务逻辑不对的
+// 时候才暴露。gRPC 侧靠 Go 类型断言当场报错（grpcx.asPtr），这里在序列化
+// 之前补上同样的检查，让两种传输的行为一致。
 func (c *Client) Call(ctx context.Context, method string, in, out any) error {
 	if err := c.checkOpen(); err != nil {
+		return err
+	}
+	if err := checkCallTypes(method, in, out); err != nil {
 		return err
 	}
 	body, err := json.Marshal(in)
@@ -2668,6 +2679,39 @@ func (c *Client) Call(ctx context.Context, method string, in, out any) error {
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 		return fmt.Errorf("httpx: 解码 %s 响应: %w", method, err)
+	}
+	return nil
+}
+
+// checkCallTypes 按 api.Spec 校验入参与出参的 Go 类型。
+//
+// 错误信息带方法名、期望类型与实际类型，方便直接定位是哪个方法的哪个
+// 参数传错了。
+//
+// 两个边界都是有意这么定的：
+//
+//   - out == nil 表示「调用方不关心结果」，不是「传错了类型」。调用照常
+//     发出，响应体读了就扔（Call 里 out == nil 的提前返回分支）。没有类型
+//     可比，所以不做校验。
+//   - 未知方法（api.Spec 返回 nil）没有规格可比对，这里**不**报错，放行
+//     给服务端判——服务端的兜底路由会回 404「未知路径」，错误照样传回
+//     调用方。路由的真相在服务端，客户端不替它猜。
+func checkCallTypes(method string, in, out any) error {
+	spec := api.Spec(method)
+	if spec == nil || spec.NewIn == nil || spec.NewOut == nil {
+		// 未知方法：没有规格可比对，放行给服务端判（它会回 404）。
+		return nil
+	}
+	wantIn := reflect.TypeOf(spec.NewIn())
+	if reflect.TypeOf(in) != wantIn {
+		return fmt.Errorf("httpx: %s: 请求类型错误: 期望 %s, 实际 %T", method, wantIn, in)
+	}
+	if out == nil {
+		return nil
+	}
+	wantOut := reflect.TypeOf(spec.NewOut())
+	if reflect.TypeOf(out) != wantOut {
+		return fmt.Errorf("httpx: %s: 响应类型错误: 期望 %s, 实际 %T", method, wantOut, out)
 	}
 	return nil
 }
@@ -3025,12 +3069,14 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3433,6 +3479,100 @@ func TestClientCallUnknownMethodKeepsErrorReason(t *testing.T) {
 	}
 }
 
+// countingRoundTripper 记录自己被调用的次数。
+//
+// 它是「假」的：任何走到这里的请求都直接失败。类型校验如果漏了，测试会
+// 同时看到「发了请求」与「错误信息不是类型错误」两个信号。
+type countingRoundTripper struct {
+	calls atomic.Int64
+}
+
+// RoundTrip 记录一次调用并返回错误。
+func (rt *countingRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
+	rt.calls.Add(1)
+	return nil, errors.New("不该发出请求")
+}
+
+// wrongCallType 是一个不属于任何方法规格的类型，用来模拟「调用方传错了
+// Go 类型」。它的字段刻意为空：只要 Go 类型不是规格里的那个，就算错。
+type wrongCallType struct{}
+
+// TestCallTypeMismatchDoesNotSendRequest 验证类型校验失败时客户端压根不发
+// 请求。
+//
+// 这是 httpx 侧的护栏。JSON 会把类型信息擦掉：入参类型不对时，服务端照样
+// 会按规格解码出一个零值对象；出参类型不对时，服务端的响应会被解码进一个
+// 形状不合的对象里。两种情况都是「静默成功」，调用方看不出自己传错了
+// 类型。所以校验必须发生在序列化之前——请求一旦发出去，错误就被吞掉了。
+//
+// 断言两件事：错误里带着方法名（方便定位是哪个方法传错了），以及假的
+// RoundTripper 一次都没被调用。
+func TestCallTypeMismatchDoesNotSendRequest(t *testing.T) {
+	rt := &countingRoundTripper{}
+	c := &Client{http: &http.Client{Transport: rt}}
+	ctx := context.Background()
+
+	for _, m := range api.AllMethods {
+		t.Run(m, func(t *testing.T) {
+			spec := api.Spec(m)
+			if spec == nil {
+				t.Fatalf("方法 %q 缺少规格", m)
+			}
+
+			// 入参类型不对（出参给对）：必须报「请求类型错误」。
+			err := c.Call(ctx, m, &wrongCallType{}, spec.NewOut())
+			if err == nil {
+				t.Fatal("入参类型不对应当报错")
+			}
+			if !strings.Contains(err.Error(), "请求类型错误") {
+				t.Fatalf("应当报请求类型错误: %v", err)
+			}
+			if !strings.Contains(err.Error(), m) {
+				t.Fatalf("错误信息应当带上方法名 %q: %v", m, err)
+			}
+
+			// 出参类型不对（入参给对）：必须报「响应类型错误」。
+			err = c.Call(ctx, m, spec.NewIn(), &wrongCallType{})
+			if err == nil {
+				t.Fatal("出参类型不对应当报错")
+			}
+			if !strings.Contains(err.Error(), "响应类型错误") {
+				t.Fatalf("应当报响应类型错误: %v", err)
+			}
+			if !strings.Contains(err.Error(), m) {
+				t.Fatalf("错误信息应当带上方法名 %q: %v", m, err)
+			}
+		})
+	}
+
+	if n := rt.calls.Load(); n != 0 {
+		t.Fatalf("类型校验失败时不该发出请求，实际发了 %d 次", n)
+	}
+}
+
+// TestCallUnknownMethodDoesNotPanic 验证未知方法返回错误而不是 panic。
+//
+// api.Spec 对未知方法返回 nil，校验逻辑不能因此解引用 nil。未知方法由
+// 服务端判（兜底路由回 404），这里用假 RoundTripper 代替服务端：客户端
+// 要么报错，要么把请求发出去让服务端拒——两种都不许 panic。
+func TestCallUnknownMethodDoesNotPanic(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("未知方法不该 panic: %v", r)
+		}
+	}()
+
+	rt := &countingRoundTripper{}
+	c := &Client{http: &http.Client{Transport: rt}}
+	err := c.Call(context.Background(), "no_such_method", &api.Empty{}, &api.Empty{})
+	if err == nil {
+		t.Fatal("未知方法应当返回错误")
+	}
+	if !strings.Contains(err.Error(), "no_such_method") {
+		t.Fatalf("错误信息应当带上方法名: %v", err)
+	}
+}
+
 // TestZeroValueClientReturnsError 验证零值客户端的 Call 与 Stream 返回错误
 // 而不是 panic。
 //
@@ -3681,7 +3821,7 @@ git add internal/rpc/httpx internal/rpc/addr
 git commit -m "feat(httpx): 实现基于 net/http 的传输"
 ```
 
-#### 与初稿的差异（A1–A11 与修复轮 1 的落法）
+#### 与初稿的差异（A1–A12 与修复轮 1、2 的落法）
 
 | 条目 | 初稿的问题 | 最终实现 |
 | --- | --- | --- |
@@ -3696,6 +3836,7 @@ git commit -m "feat(httpx): 实现基于 net/http 的传输"
 | A9 | 事件通道关闭会顺带掐掉控制消息流 | 某一侧通道关闭只停那一侧（置 nil channel），两侧都结束才收尾 |
 | A10 | 请求体没有上限 | `http.MaxBytesReader` 限制在 1 MiB |
 | A11 | GET 也会命中路由，与 OpenAPI 只声明 POST 对不上 | 中间件里校验方法，不是 POST 一律 405（带 `Allow` 头） |
+| A12 | 客户端不校验入参/出参的 Go 类型。JSON 会把类型信息擦掉：入参类型不对时，服务端照样按规格解码出一个零值对象；出参类型不对时，服务端的响应被解码进一个形状不合的对象里——两种都是「静默成功」，调用方看不出自己传错了类型（Task 8 的契约测试实测出来的分歧③④，与 gRPC 侧的 Go 类型断言行为不一致） | `Call` 在序列化之前按 `api.Spec(method)` 校验 `in` 与 `out` 的 Go 类型，不符就带**方法名、期望类型、实际类型**报错，且**不发请求**。两个边界有意这么定：`out == nil` 是「调用方不关心结果」（保持原语义，不校验）；未知方法（`api.Spec` 返回 nil）没有规格可比对，不在客户端判，放行给服务端的兜底路由回 404「未知路径」——路由的真相在服务端 |
 | I1 | 未注册的路径落到 ServeMux 内置的 NotFound，`authed` 中间件根本不执行：没 token 的调用方靠 401/404 的差别就能枚举端点（与「鉴权在前」的注释自相矛盾），而且那个 404 是纯文本，错误体形状与业务端点对不上，客户端只能退化成裸串「HTTP 404」，错误原因丢失 | `newMux` 里注册兜底路由 `"/"`：先校验 token，不过就回 401，过了再回 404「未知路径 `<path>`」；错误体沿用统一的 `{"ok":false,"error":"..."}` 形状。兜底路由只做 token 校验，不做 POST 方法检查（对不存在的路径谈「只接受 POST」是误导）。更精确的 pattern 优先命中，业务端点与 Task 6 的文档端点都不受影响。同时删掉 `serveCall` 里 `spec == nil` 的死分支——`api.Spec` 对已注册方法必有 spec |
 | I3 | 零值 `httpx.Client` 的 `http` 字段是 nil，`Call`/`Stream` 走到 `c.http.Do` 会 nil 指针解引用 panic。`Client` 是导出类型，零值是被允许的构造物（`contract_test.go` 就用它验证 `Close()` 不炸），而 `rpc.Transport` 契约里 `Call`/`Stream` 都返回 error，panic 会带走整个进程 | `checkOpen` 并进「未初始化」判断：`c.http == nil` 时返回「客户端未初始化，请用 Dial 创建」；`Call` 与 `Stream` 都先过 `checkOpen`，覆盖到位 |
 | 状态码 | 服务端实际返回 200/400/401/404/405/500 | **Task 6 已补齐 400/401/405/500**：规范里每个业务端点声明 200/400/401/405/500，错误响应在 `components.responses` 里复用（见 Task 6 的 B3）。`404` 只由兜底路由产生（未知路径），不对应任何业务端点，因此规范里不声明——修复轮 1 之前那条 404 是 ServeMux 内置的纯文本，同样不属于业务端点 |
@@ -8623,6 +8764,7 @@ git commit -m "feat(grpcx): 实现基于 gRPC 的传输并加入 protobuf 契约
 **Files:**
 - Create: `internal/rpc/contract_test.go`
 - Modify: `internal/rpc/client.go`（握手失败时关掉传输层，见 F5）
+- Modify（修复轮 2）：`internal/rpc/httpx/client.go`（入参/出参类型校验，见 Task 5 的 A12）、`internal/rpc/httpx/httpx_test.go`（护栏测试）
 
 **Interfaces:**
 - Consumes: `internal/rpc`（Task 4）、`internal/rpc/httpx`（Task 5）、`internal/rpc/grpcx`（Task 7）
@@ -9575,10 +9717,11 @@ func caseUnknownMethod(t *testing.T, env *contractEnv) {
 // caseBadInputType 断言入参类型不对时返回错误。
 //
 // 这里用一个「JSON 上也不兼容」的入参：gRPC 侧是类型断言失败，HTTP 侧
-// 是 JSON 解码失败（400）。两种传���都必须是错误。
+// 是 JSON 解码失败（400）。两种传输都必须是错误。
 //
-// 注意：「Go 类型不对但 JSON 恰好兼容」的情形两种传输不一样，见
-// TestContractDivergenceInputType。
+// 注意：「Go 类型不对但 JSON 恰好兼容」的情形由
+// TestContractInputTypeMismatchRejected 单独覆盖——那种情况两种传输都
+// 必须在发请求之前就报错。
 func caseBadInputType(t *testing.T, env *contractEnv) {
 	tr := dialTransport(t, env.transport, env.endpoint, contractToken)
 	defer tr.Close()
@@ -9703,7 +9846,7 @@ func collectContractResults(t *testing.T, transport string) map[string]string {
 	return out
 }
 
-// ---- 已知分歧 ----
+// ---- 已知分歧与类型一致性 ----
 //
 // 契约测试的价值一半在「一致」，另一半在「不一致」。下面把已知的分歧
 // 钉死：它们现在是绿灯的，但它们是真实的行为差异——改动任何一侧都会
@@ -9714,6 +9857,11 @@ func collectContractResults(t *testing.T, transport string) map[string]string {
 //
 // gRPC 侧走 protobuf 枚举，未知取值只能归一成 UNSPECIFIED（再映射回
 // 空串）；HTTP 侧走 JSON 字符串，未知取值原样保留。
+//
+// 这是 JSON 与 protobuf 的线格式固有差异，不是缺陷，不追求统一：protobuf
+// 的枚举在 wire 上是一个整数，词表外的取值没有对应的整数，只能落回
+// UNSPECIFIED；JSON 走的是字符串，词表外的字符串照原样传过去。要统一，
+// 就得让一边丢信息或让另一边凭空猜一个枚举值——两头都不对。
 func TestContractDivergenceUnknownEnum(t *testing.T) {
 	got := map[string]string{}
 	for _, transport := range []string{rpc.TransportGRPC, rpc.TransportHTTP} {
@@ -9737,8 +9885,13 @@ func TestContractDivergenceUnknownEnum(t *testing.T) {
 // gRPC 侧 proto3 的 repeated 字段空时不上线，反序列化后是非 nil 的空
 // 切片；HTTP 侧 JSON 编出来是 null，解回来是 nil。调用方用
 // reflect.DeepEqual 比对就会看到差异。
+//
+// 这是 JSON 与 protobuf 的线格式固有差异，不是缺陷，不追求统一：proto3
+// 的 repeated 字段没有「null」这个状态，只有「空」；JSON 有 null 与 []
+// 两种形态。契约层的比较一律走 JSON 归一（见 sameJSON），别拿
+// reflect.DeepEqual 当契约——它会把这些表示差异也算成契约差异。
 func TestContractDivergenceEmptySlice(t *testing.T) {
-	got := map[string]bool{}
+	got := map[string]string{}
 	for _, transport := range []string{rpc.TransportGRPC, rpc.TransportHTTP} {
 		// 切片字段刻意留空，才能看出「空」在两种线格式下长什么样。
 		env := newContractEnv(t, transport, func(h *stubHandler) {
@@ -9748,58 +9901,86 @@ func TestContractDivergenceEmptySlice(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got[transport] = detail.PieceBuckets == nil
+		// 用 JSON 归一比，别用 reflect.DeepEqual：分歧本来就发生在
+		// 线格式上——protobuf 侧的空 repeated 字段上线是「[]」，JSON
+		// 侧的 null 上线是「null」。
+		//
+		// 比的是 Files 而不是 PieceBuckets：PieceBuckets 是 []uint8，
+		// JSON 会把它编成 base64 字符串（空的是 ""，nil 的是 null），
+		// 看不出「空数组」与「null」的区别；Files 是普通结构体切片，
+		// 编出来就是数组。
+		got[transport] = mustJSON(t, "空切片", detail.Files)
 	}
-	if got[rpc.TransportGRPC] {
-		t.Error("gRPC 侧当前行为是「空切片非 nil」")
+	if got[rpc.TransportGRPC] != "[]" {
+		t.Errorf("gRPC 侧当前行为是「空切片非 nil」，线上是 %s", got[rpc.TransportGRPC])
 	}
-	if !got[rpc.TransportHTTP] {
-		t.Error("HTTP 侧当前行为是「空切片是 nil」")
+	if got[rpc.TransportHTTP] != "null" {
+		t.Errorf("HTTP 侧当前行为是「空切片是 nil」，线上是 %s", got[rpc.TransportHTTP])
 	}
 }
 
-// TestContractDivergenceInputType 记录分歧③：入参的 Go 类型不对时，两种
-// 传输的判断不一样。
+// TestContractInputTypeMismatchRejected 断言入参的 Go 类型不对时，两种
+// 传输都报错。
 //
-// gRPC 侧做 Go 类型断言，类型不对立刻报错；HTTP 侧把入参编码成 JSON 再
-// 由服务端解码，类型「碰巧兼容」时（例如拿 TaskRef 去调 list）会被
-// 静默接受，服务端收到的是零值——调用方看不出自己传错了类型。
-func TestContractDivergenceInputType(t *testing.T) {
-	errs := map[string]bool{}
+// 这条用例原来钉的是分歧③：gRPC 侧做 Go 类型断言，类型不对当场报错；
+// HTTP 侧把入参编码成 JSON 再由服务端解码，类型「碰巧兼容」时（例如拿
+// TaskRef 去调 list）会被静默接受，服务端收到的是零值——调用方看不出
+// 自己传错了类型。
+//
+// 现在 httpx 在序列化之前按 api.Spec 校验入参类型，两边的行为一致了，
+// 这条用例从「钉住分歧」改成「守住一致性」：任何一边改成静默接受，用例
+// 都会变红。
+func TestContractInputTypeMismatchRejected(t *testing.T) {
 	for _, transport := range []string{rpc.TransportGRPC, rpc.TransportHTTP} {
 		env := newContractEnv(t, transport, nil)
 		tr := dialTransport(t, env.transport, env.endpoint, contractToken)
+		// 拿 TaskRef 去调 list：JSON 上恰好兼容（TaskRef 只有 id 字段，
+		// ListParams 的 filter/sort 解不出来就是零值），所以它正是「静默
+		// 接受」最容易发生的那一类。
 		err := tr.Call(env.ctx, api.MethodList, &api.TaskRef{ID: "t1"}, &api.ListResult{})
-		errs[transport] = err != nil
 		_ = tr.Close()
-	}
-	if !errs[rpc.TransportGRPC] {
-		t.Error("gRPC 侧当前行为是「入参类型不对时报错」")
-	}
-	if errs[rpc.TransportHTTP] {
-		t.Error("HTTP 侧当前行为是「入参类型不对时静默接受」")
+		if err == nil {
+			t.Errorf("%s：入参类型不对应当报错", transport)
+			continue
+		}
+		if !strings.Contains(err.Error(), api.MethodList) {
+			t.Errorf("%s：错误信息应当带上方法名: %v", transport, err)
+		}
+		// 类型不对就不该把请求发出去：服务端不该收到这次调用。
+		if calls := env.h.callsOf(api.MethodList); len(calls) != 0 {
+			t.Errorf("%s：入参类型不对时不该发出请求，服务端却收到 %d 次", transport, len(calls))
+		}
 	}
 }
 
-// TestContractDivergenceOutputType 记录分歧④：出参的 Go 类型不对时，两种
-// 传输的判断不一样。
+// TestContractOutputTypeMismatchRejected 断言出参的 Go 类型不对时，两种
+// 传输都报错。
 //
-// gRPC 侧做 Go 类型断言并报错；HTTP 侧把服务端的响应体解码进出参类型，
-// 解不出来的字段被丢掉，调用方拿到一个零值对象，没有错误。
-func TestContractDivergenceOutputType(t *testing.T) {
-	errs := map[string]bool{}
+// 这条用例原来钉的是分歧④：gRPC 侧做 Go 类型断言并报错；HTTP 侧把服务端
+// 的响应体解码进出参类型，解不出来的字段被丢掉，调用方拿到一个零值对象，
+// 没有错误。
+//
+// 现在 httpx 在发请求之前就按 api.Spec 校验出参类型，两边的行为一致了，
+// 这条用例从「钉住分歧」改成「守住一致性」。
+func TestContractOutputTypeMismatchRejected(t *testing.T) {
 	for _, transport := range []string{rpc.TransportGRPC, rpc.TransportHTTP} {
 		env := newContractEnv(t, transport, nil)
 		tr := dialTransport(t, env.transport, env.endpoint, contractToken)
+		// 拿 Task 去接 list 的响应：JSON 上解得动（Task 的字段都是
+		// 字符串/数字），但那不是 list 的响应类型。
 		err := tr.Call(env.ctx, api.MethodList, &api.ListParams{}, &api.Task{})
-		errs[transport] = err != nil
 		_ = tr.Close()
-	}
-	if !errs[rpc.TransportGRPC] {
-		t.Error("gRPC 侧当前行为是「出参类型不对时报错」")
-	}
-	if errs[rpc.TransportHTTP] {
-		t.Error("HTTP 侧当前行为是「出参类型不对时静默返回零值」")
+		if err == nil {
+			t.Errorf("%s：出参类型不对应当报错", transport)
+			continue
+		}
+		if !strings.Contains(err.Error(), api.MethodList) {
+			t.Errorf("%s：错误信息应当带上方法名: %v", transport, err)
+		}
+		// 出参类型不对同样不该发出请求。
+		if calls := env.h.callsOf(api.MethodList); len(calls) != 0 {
+			t.Errorf("%s：出参类型不对时不该发出请求，服务端却收到 %d 次", transport, len(calls))
+		}
 	}
 }
 ```
@@ -9816,7 +9997,7 @@ git add internal/rpc/contract_test.go internal/rpc/client.go
 git commit -m "test(rpc): 为两种传输补同一套契约测试"
 ```
 
-#### 与初稿的差异（F1–F12 的落法）
+#### 与初稿的差异（F1–F13 的落法）
 
 | 条目 | 初稿的问题 | 最终实现 |
 | --- | --- | --- |
@@ -9832,6 +10013,7 @@ git commit -m "test(rpc): 为两种传输补同一套契约测试"
 | F10 | 初稿写 `package rpc`（内部测试包） | 用 `package rpc_test`（外部测试包），并加编译期断言 `var _ rpc.Transport = (*grpcx.Client)(nil)` 等四条 |
 | F11 | 地址格式 | 全部走 `unix:` + 临时目录里的 socket，不碰真实网络 |
 | F12 | `rpc.Dial` 的 ctx 必须是会话级的 | 用 `context.WithCancel(context.Background())`，测试结束时 `cancel()`；不用短超时 |
+| F13 | 修复轮 1 只把分歧③④**钉住**，没有修 | 修复轮 2 补上 httpx 侧的入参/出参类型校验（Task 5 的 A12）：分歧③的用例改名 `TestContractInputTypeMismatchRejected`、分歧④改名 `TestContractOutputTypeMismatchRejected`，两条都从「钉住分歧」改成「守住一致性」——两种传输都必须报错，且都**不许把请求发出去**（断言服务端没收到这次调用）。分歧①②保持钉桩，注释里写明是线格式固有差异、不追求统一。httpx 侧另加护栏测试 `TestCallTypeMismatchDoesNotSendRequest`（假 RoundTripper 断言一次都没被调用）与 `TestCallUnknownMethodDoesNotPanic`（未知方法不 panic） |
 
 初稿的用例（握手/列表/添加/启动暂停删除/准备阶段/探测/事件流/控制消息/错误
 token）全部保留，另外补了 BT 详情、退订、语言与 close 控制消息、关闭之后调用
@@ -9839,19 +10021,27 @@ token）全部保留，另外补了 BT 详情、退订、语言与 close 控制�
 
 #### 契约测试发现的两种传输分歧
 
-契约测试的价值一半在「一致」，另一半在「不一致」。下面四条是**实测**出来的
+契约测试的价值一半在「一致」，另一半在「不一致」。下面是**实测**出来的
 真实分歧，各自都有专门的用例把当前行为钉住（改动任何一侧都会让用例变红，
 提醒人来统一）：
 
-| # | 场景 | gRPC | net/http | 用例 |
-| --- | --- | --- | --- | --- |
-| 1 | 词汇表里没有的枚举取值（`Settings.TaskSort` 等） | 归一成空串（protobuf 枚举只能映射到 UNSPECIFIED） | 原样保留（JSON 字符串） | `TestContractDivergenceUnknownEnum` |
-| 2 | 空切片（`BTDetail.PieceBuckets` / `Files`） | 非 nil 的空切片 | nil（JSON `null`） | `TestContractDivergenceEmptySlice` |
-| 3 | 入参 Go 类型不对但 JSON 恰好兼容 | 报错（Go 类型断言失败） | 静默接受，服务端收到零值 | `TestContractDivergenceInputType` |
-| 4 | 出参 Go 类型不对 | 报错（Go 类型断言失败） | 静默返回零值对象 | `TestContractDivergenceOutputType` |
+| # | 场景 | gRPC | net/http | 用例 | 性质 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 词汇表里没有的枚举取值（`Settings.TaskSort` 等） | 归一成空串（protobuf 枚举只能映射到 UNSPECIFIED） | 原样保留（JSON 字符串） | `TestContractDivergenceUnknownEnum` | **固有差异**：线格式不同，不追求统一 |
+| 2 | 空切片（`BTDetail.Files` / `PieceBuckets`） | 非 nil 的空切片 | nil（JSON `null`） | `TestContractDivergenceEmptySlice` | **固有差异**：线格式不同，不追求统一 |
+| 3 | 入参 Go 类型不对但 JSON 恰好兼容 | 报错（Go 类型断言失败） | ~~静默接受，服务端收到零值~~ → **已统一**：报错 | `TestContractInputTypeMismatchRejected` | **缺陷**：已修（见 Task 5 的 A12） |
+| 4 | 出参 Go 类型不对 | 报错（Go 类型断言失败） | ~~静默返回零值对象~~ → **已统一**：报错 | `TestContractOutputTypeMismatchRejected` | **缺陷**：已修（见 Task 5 的 A12） |
+
+第 1、2 条是 JSON 与 protobuf 的线格式固有差异，**不是缺陷，不追求统一**：
+protobuf 的枚举在 wire 上是整数，词表外的取值没有对应的整数，只能落回
+UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」；JSON 两样
+都有。强行统一就得让一边丢信息或让另一边凭空猜值——两头都不对。契约层的
+比较因此一律走 JSON 归一（见 `sameJSON`），别拿 `reflect.DeepEqual` 当契约。
 
 第 3、4 条对调用方最危险：类型传错了却「成功」，错误要到业务逻辑不对的时候
-才会暴露出来。
+才会暴露出来。修复轮 2 补上了 httpx 侧的入参/出参类型校验（Task 5 的 A12），
+两条用例从「钉住分歧」改成「守住一致性」，并新增 httpx 侧的护栏测试
+`TestCallTypeMismatchDoesNotSendRequest`：类型不对时客户端压根不发请求。
 
 #### 证伪自检（契约测试确实抓得住坏实现）
 
@@ -9866,6 +10056,7 @@ token）全部保留，另外补了 BT 详情、退订、语言与 close 控制�
 | 撤销 F5 的握手失败关传输层 | `握手失败不泄漏传输层`（两种传输都红，并打出 goroutine/fd 的涨落） |
 | gRPC 侧 `settingsToPB` 漏掉两个字段 | `保存设置往返` 与 `TestContractTransportsAgree` 都红 |
 | httpx 服务端解码后丢掉 list 的筛选/排序 | `列表`（HTTP 红） |
+| 去掉 httpx 的入参/出参类型校验（修复轮 2） | `TestContractInputTypeMismatchRejected`、`TestContractOutputTypeMismatchRejected`（HTTP 红），以及 httpx 的 `TestCallTypeMismatchDoesNotSendRequest`（红，并打出「实际发了 11 次」） |
 
 第一条证伪（事件通道关闭）最初**没有**变红——初版用例是「先关事件通道、
 再发控制消息」，服务端 select 在两个就绪分支之间随机挑，时好时坏。改成
