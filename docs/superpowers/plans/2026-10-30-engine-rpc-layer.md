@@ -11767,6 +11767,59 @@ git commit -m "refactor(ui): 改用 rpc.Client 与契约 DTO，解除对业务�
 
 ---
 
+#### Task 10 实施记录（已完成，2026-11-02）
+
+上面的草图是「打算怎么做」，下面是**实际落地**与偏差，后续任务以此为现状：
+
+**文件**
+- 删除 `internal/ui/client.go`、`internal/ui/service.go`、`internal/ui/client_test.go`
+  （旧的 IPC 客户端与 `ui.Service` 接口整体退场；`internal/ipc` 本体留给 Task 11）。
+- `internal/ui/child.go`：改用 `rpc.EnvUIChild/EnvUIListen/EnvUIToken/EnvUITransport`
+  + `rpc.Dial`；删掉了没有调用方的 `NewService`。握手语言同步抽成
+  `applyHandshakeLanguage(c rpc.Client)`，便于单测锁住「语言随 get_settings 快照
+  回填」这条行为。
+- 新增 `internal/ui/settings_effective.go`：4 个 `effective*` 助手（默认值 3/50/2/2，
+  与 store 的 `Default*` 常量逐字相同）+ `isBittorrentTask`。后者没有按草图放进
+  `task_row.go`——它和 Effective* 一样是「契约层没有、UI 自己需要」的纯函数，
+  集中在一个文件更醒目，也能一次性被 `settings_effective_test.go` 锁住。
+- 新增 `internal/ui/testenv_test.go`：`openTestStore` / `startTestService` /
+  `startUIE2E` 起「store + scheduler + appservice → `rpc.Serve` → 真实传输 →
+  `rpc.Dial`」的测试环境，外加 `nopClient` 测试替身。旧的
+  `localServiceAdapter`（直接调 scheduler）删除。
+- 三个 e2e 测试（`add_task_dialog_e2e_test.go`、`add_task_dialog_bt_e2e_test.go`、
+  `chunk_details_e2e_test.go`）改走真实客户端；`GlobalSettings` 一律来自
+  `env.client.Settings()`（握手快照），不再有 `st.LoadSettings()` 直读。
+  `TestAddTaskDialog_AddAndStart` 与握手语言用例在两种传输上各跑一遍。
+- `internal/ui/settings_dialog.go`：`ProxyMode` 零值 `""` 按 system 处理；语言下拉框
+  用 `restoring` 抑制「构建时 SetSelected 同步触发 OnChanged」把 ilocale 反向覆盖，
+  用户实际切换时先 `ilocale.Set` 再持久化（contract 层的 language 控制消息不带载荷，
+  见 `api.Message`，不能等回调再切）。
+- `internal/rpc/client.go`：`show_add_task` 队列改成「后到覆盖先到」。Task 4 的初版是
+  「只收第一条」，与旧 `internal/ui` 实现的「只留最新一条」语义相反：冷启动时连发
+  多条 lgom:// 转发会丢掉用户最后点的那条。补了
+  `TestClientLateShowAddTaskKeepsLatest` 与 `TestClientBroadcastUnsubscribeRace`。
+- `internal/ui/piece_mosaic.go` 只改了注释（`api.BTDetail.PieceBuckets`）。
+
+**测试依赖的取舍（对应补充说明 G4）**
+选了 (b)：**非测试代码**必须零依赖（`go list .Imports` 无业务包），**测试代码**允许
+import `store`/`scheduler` 造数据。除此之外测试还需要 `appservice`——它是生产环境
+唯一完整的 `rpc.Handler` 实现；若在测试里手写 handler，就必须再写一份
+`store.Settings → api.Settings` 的转换，正好是 G2 明令禁止的做法。
+`go list .TestImports` 因此会看到 `appservice`/`scheduler`/`store` 三个包，
+每个这样的测试文件顶部都有「仅测试用，生产代码不得引入」的注释。
+
+**门禁**
+- `go build ./... && go vet ./... && go test ./...`：全绿。
+- `go test -race -count=3 ./internal/ui/... ./internal/rpc/...`：`internal/rpc` 全绿；
+  `internal/ui` 偶发 `WARNING: DATA RACE`，栈完全落在
+  `github.com/go-text/typesetting/harfbuzz.(*Buffer).Clear` → Fyne 文本整形库。
+  在 HEAD（Task 9 结束时）复跑同样失败（`-count=3` 156 条、`-count=1` 34 条），
+  是既有的上游/工具链问题，不是本次改动引入；本次实现 `-count=1` 为 0 条。
+- 真实 GUI：`--debug` 起真实二进制，gRPC 与 http 两种 `LDM_UI_TRANSPORT` 各跑一次，
+  子进程环境变量/ESTAB unix socket/`/dev/dri` 句柄/优雅退出均正常。
+
+---
+
 ### Task 11: 删除 `internal/ipc` 与接线 `main.go`
 
 **Files:**
