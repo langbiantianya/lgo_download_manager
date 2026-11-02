@@ -3740,10 +3740,42 @@ Task 6（见 Task 6 的 B6 与 Step 3）。代码块按「计划 == 实现」的
 > | `/openapi.yaml` | GET | 200 `application/yaml` | 否 |
 > | `/openapi.json` | GET | 200 `application/json` | 否 |
 > | `/docs` | GET | 200 `text/html; charset=utf-8` | 否 |
-> | `/docs/*` | GET | 200 静态资源（离线嵌入的 swagger-ui） | 否 |
+> | `/docs/` | GET | 200 `text/html; charset=utf-8`（与 `/docs` 是同一个页面） | 否 |
+> | `/docs/<白名单里的资源>` | GET | 200 静态资源（离线嵌入的 swagger-ui） | 否 |
+> | `/docs/<其它>` | GET | 404 `{"ok":false,"error":"..."}` | 否 |
 >
 > 只接受 GET；其他方法回 405 并带上 `Allow: GET`，错误体沿用全站统一的
 > `{"ok":false,"error":"..."}` 形状。
+>
+> **静态资源的白名单**只有 4 个：`swagger-ui.css`、`swagger-ui-bundle.js`、
+> `swagger-ui-standalone-preset.js`、`favicon-32x32.png`——正好是页面自己引用的
+> 那几个。swagger-ui 自带的 `index.html` 与 `swagger-initializer.js` 不在其中：
+> 它们指向公网的 `petstore.swagger.io`，本机工具的文档页不该依赖公网，
+> 也不该把上游的首页当成本项目的首页。
+>
+> **`/docs/` 的前缀是写死的常量**，不由任何请求决定。修复轮 1 之前，静态资源
+> 由 `httpSwagger.WrapHandler` 提供：它是**包级单例**，内部的 `sync.Once` 会把
+> **进程级**的 `swaggerFiles.Handler.Prefix` 锁成「首个到达请求」解析出的前缀。
+> 而 http-swagger 的路径正则 `^(.*/)([^?].*)?[?|.]*$` 在「目录路径 + 查询串」上
+> 会把前缀回退成 `/`，于是**一次 `GET /docs/?x=1` 就能让本进程内
+> `/docs/swagger-ui.css` 之类的资源永久 404**。现在改成自己按固定前缀 +
+> 白名单从 `swaggo/files` 的内存文件系统里取资源，谁先打都不影响。
+>
+> **修复轮 1（评审 FAIL 后的 4 条 Important）**：本节代码是评审之后的最终实现。
+> 与上一轮的差别：
+>
+> | 条目 | 问题 | 落法 |
+> |---|---|---|
+> | I1 | 规范里的「路径 → schema」映射无人看守：把 `list` 的请求体改成 `TaskRef`、把 `add` 的 200 响应改成 `BoolResult`，全部测试仍绿 | 新增 `TestOpenAPIPathSchemasMatchAPISpec`：逐个方法比对 `requestBody` 与 200 响应的 `$ref` 末段，与 `api.Spec(method).NewIn()`/`NewOut()` 的类型名对上（`stream_messages` 显式特判为 `Message`） |
+> | I2 | 「防 CDN 回潮」的护栏形同虚设：协议相对 URL、大写 scheme、`data:` URI、相对路径都能绕过；正向断言还能被一行 HTML 注释满足 | `TestDocsPageReferencesLocalAssets` 改成用 `regexp` 抽 `<script src>` / `<link href>` 的**属性值**（跳过 HTML 注释），逐个判定必须是本地绝对路径且不带 scheme；正向断言改成「引用集合**恰好**等于期望集合」 |
+> | I3 | `httpSwagger.WrapHandler` 是包级单例，`sync.Once` 把进程级的 `swaggerFiles.Handler.Prefix` 锁成首个请求的前缀：一次 `GET /docs/?x=1` 就让静态资源永久 404 | 弃用 `httpSwagger.WrapHandler`，改为自己按**固定前缀 `/docs/` + 白名单**从 `swaggo/files` 的内存文件系统取资源；`/docs/` 与 `/docs` 返回同一个页面；白名单外的路径一律 404 |
+> | I4 | 文档端点契约与实测对不上：`/docs/` 实际是 301，`/docs/doc.json` 稳定吐 500 | `/docs/` 改成 200 页面、`/docs/doc.json` 改成 404；本节的端点契约表同步更新 |
+>
+> 顺带修了 3 条 Minor：整数的 `format` 也纳入类型护栏（`int64` ↔ `int64`、
+> `int32` ↔ `int32`）；`Message.kind` 的 enum 与 `api.MessageKind*` 常量集合
+> 对上（测试直接解析 `internal/api/message.go` 的源码，不靠手抄清单）；
+> `requestBody` 从 `required: true` 改成 `required: false`——服务端容忍空请求体
+> （EOF 不算错），`get_settings`/`stream_messages` 的入参本来就是 `api.Empty`。
 
 - [ ] **Step 1: 写 `internal/rpc/httpx/openapi.yaml`**
 
@@ -3772,6 +3804,8 @@ info:
     消息流端点 /lgdm.v1.DownloadService/stream_messages 返回 NDJSON，
     每行一个消息对象，事件与控制消息合并在同一条流里。
 
+    请求体一律可选：空请求体等价于 {}，服务端不因为 body 为空而报错。
+
     文档端点（/openapi.yaml、/openapi.json、/docs）不参与 token 校验：
     它们只暴露接口形状，不暴露任务数据。
 servers:
@@ -3787,7 +3821,7 @@ paths:
       summary: 查询任务列表
       operationId: list
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/ListParams" }
@@ -3806,7 +3840,7 @@ paths:
       summary: 添加下载任务
       operationId: add
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/AddTaskInput" }
@@ -3825,7 +3859,7 @@ paths:
       summary: 启动任务
       operationId: start
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/TaskRef" }
@@ -3844,7 +3878,7 @@ paths:
       summary: 暂停任务
       operationId: pause
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/TaskRef" }
@@ -3863,7 +3897,7 @@ paths:
       summary: 删除任务
       operationId: delete
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/TaskRef" }
@@ -3882,7 +3916,7 @@ paths:
       summary: 报告任务是否处于「已预留 slot 但引擎未启动」的准备阶段
       operationId: isPreparing
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/TaskRef" }
@@ -3901,7 +3935,7 @@ paths:
       summary: 探测 URL 目标大小
       operationId: probe
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/ProbeParams" }
@@ -3920,7 +3954,7 @@ paths:
       summary: 读取权威设置快照
       operationId: getSettings
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/Empty" }
@@ -3939,7 +3973,7 @@ paths:
       summary: 持久化设置
       operationId: saveSettings
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/Settings" }
@@ -3958,7 +3992,7 @@ paths:
       summary: 查询 BT 任务实时详情
       operationId: btInfo
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/BTInfoParams" }
@@ -3977,7 +4011,7 @@ paths:
       summary: 订阅消息流（进度事件 + 控制消息）
       operationId: streamMessages
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/Empty" }
@@ -4204,11 +4238,12 @@ components:
 
 - [ ] **Step 2: 建 `internal/rpc/httpx/docs.go`**
 
-Swagger UI **离线嵌入**（B1）：`github.com/swaggo/http-swagger` +
-`github.com/swaggo/files` 把 swagger-ui 静态资源打进二进制，页面不引任何
-公网 CDN。`/docs` 自己渲染 HTML 并用**绝对路径**引资源（B2：页面挂在
-`/docs`（无尾斜杠）时，相对路径 `./swagger-ui.css` 会被浏览器解析到
-`/swagger-ui.css` → 404）；静态资源本体由 `/docs/` 提供。
+Swagger UI **离线嵌入**（B1）：`github.com/swaggo/files` 把 swagger-ui 静态资源
+打进二进制，页面不引任何公网 CDN。`/docs` 自己渲染 HTML 并用**绝对路径**引资源
+（B2：页面挂在 `/docs`（无尾斜杠）时，相对路径 `./swagger-ui.css` 会被浏览器
+解析到 `/swagger-ui.css` → 404）；静态资源本体由 `/docs/` 提供——**固定前缀 +
+白名单**，白名单只收页面自己引用的那 4 个资源（修复轮 1 的落法，见本节的
+「文档端点契约」）。
 
 ```go
 // This Source Code Form is subject to the terms of the Mozilla Public
@@ -4223,9 +4258,11 @@ import (
 	_ "embed"
 	"encoding/json"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 
-	httpSwagger "github.com/swaggo/http-swagger"
+	swaggerFiles "github.com/swaggo/files"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -4261,6 +4298,39 @@ func yamlToJSON(data []byte) ([]byte, error) {
 	return json.Marshal(v)
 }
 
+// docsPrefix 是文档页静态资源的前缀。
+//
+// 它是**写死**的常量，不看请求里的任何东西。这一点很关键：先前用
+// httpSwagger.WrapHandler 提供的静态资源，它是包级单例，内部用 sync.Once
+// 把**进程级**的 swaggerFiles.Handler.Prefix 锁成「首个到达请求」解析出的
+// 前缀。http-swagger 的路径正则 ^(.*/)([^?].*)?[?|.]*$ 在「目录路径 + 查询串」
+// 上会把前缀回退成 "/"，于是一次 GET /docs/?x=1 就能让本进程内
+// /docs/swagger-ui.css 之类的资源**永久** 404。
+//
+// 现在前缀固定、白名单固定，谁先打都不影响。
+const docsPrefix = "/docs/"
+
+// docsAsset 描述一个允许从 /docs/ 提供的静态资源。
+type docsAsset struct {
+	// name 是资源名：请求路径去掉 docsPrefix 之后剩下的部分。
+	name string
+	// contentType 是响应的 Content-Type。
+	contentType string
+}
+
+// docsAssets 是文档页静态资源的白名单：只有这里列出的资源能从 /docs/ 拿到，
+// 其余一律 404。
+//
+// 清单只收本页自己真正引用的资源。swagger-ui 发行版自带的 index.html 与
+// swagger-initializer.js 不在其中——它们指向公网的 petstore.swagger.io，
+// 本机工具的文档页不该依赖公网，也不该把上游的首页当成本项目的首页。
+var docsAssets = []docsAsset{
+	{name: "swagger-ui.css", contentType: "text/css; charset=utf-8"},
+	{name: "swagger-ui-bundle.js", contentType: "text/javascript; charset=utf-8"},
+	{name: "swagger-ui-standalone-preset.js", contentType: "text/javascript; charset=utf-8"},
+	{name: "favicon-32x32.png", contentType: "image/png"},
+}
+
 // registerDocs 注册文档端点。它们不参与 token 校验——只暴露接口形状，
 // 不暴露任务数据。文档端点只接受 GET，其他方法回 405 并带上 Allow 头。
 func registerDocs(mux *http.ServeMux) {
@@ -4271,13 +4341,62 @@ func registerDocs(mux *http.ServeMux) {
 	mux.Handle("/openapi.json", getOnly(serveOpenAPIJSON(openAPIJSON)))
 	// /docs 自己渲染页面：静态资源用绝对路径引，避免 /docs 被当成「文件」
 	// 时相对路径解析到 / 下面去。资源本体由 /docs/ 提供。
-	mux.Handle("/docs", getOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(swaggerPage))
-	})))
-	// /docs/ 交给 http-swagger：它把 swagger-ui 静态资源（已嵌进二进制）
-	// 从内存文件系统里吐出来，不依赖公网 CDN。
-	mux.Handle("/docs/", getOnly(httpSwagger.WrapHandler))
+	mux.Handle("/docs", getOnly(http.HandlerFunc(writeSwaggerPage)))
+	// /docs/ 既是静态资源的挂载点，也是页面本身的第二个入口（/docs/ 与
+	// /docs 返回同一个页面，避免尾斜杠差异带来 301 契约漂移）。
+	mux.Handle(docsPrefix, getOnly(http.HandlerFunc(serveDocsSubtree)))
+}
+
+// serveDocsSubtree 处理 /docs/ 下的请求：
+//
+//   - 路径正好是 /docs/ → 返回本页自己的页面（与 /docs 相同）；
+//   - 路径命中白名单 → 返回对应的静态资源；
+//   - 其余 → 404。
+//
+// 前缀取自写死的 docsPrefix，与「谁先到」无关。
+func serveDocsSubtree(w http.ResponseWriter, r *http.Request) {
+	rest, ok := strings.CutPrefix(r.URL.Path, docsPrefix)
+	if !ok {
+		writeError(w, http.StatusNotFound, "未知路径 "+r.URL.Path)
+		return
+	}
+	if rest == "" {
+		writeSwaggerPage(w, r)
+		return
+	}
+	for _, a := range docsAssets {
+		if a.name == rest {
+			serveDocsAsset(w, r, a)
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "没有这个文档资源 "+rest)
+}
+
+// serveDocsAsset 把白名单里的静态资源吐出来。资源本体在 swaggo/files 的
+// 内存文件系统里（编译进二进制，不依赖公网）。用 http.ServeContent 而不是
+// 直接 Write，是为了顺带带上 Content-Length、Last-Modified 与 Range 支持。
+func serveDocsAsset(w http.ResponseWriter, r *http.Request, a docsAsset) {
+	f, err := swaggerFiles.FS.OpenFile(swaggerFiles.CTX, "/"+a.name, os.O_RDONLY, 0o644)
+	if err != nil {
+		// 资源读不出来是打包时出的问题，不是调用方的错。
+		writeError(w, http.StatusInternalServerError, "读不出文档资源 "+a.name)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "读不出文档资源 "+a.name)
+		return
+	}
+	w.Header().Set("Content-Type", a.contentType)
+	http.ServeContent(w, r, a.name, info.ModTime(), f)
+}
+
+// writeSwaggerPage 写出离线的 Swagger UI 页面。
+func writeSwaggerPage(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(swaggerPage))
 }
 
 // serveOpenAPIJSON 把规范以 JSON 形式吐出来。取 JSON 的方式由参数传入，
@@ -4314,6 +4433,10 @@ func getOnly(h http.Handler) http.Handler {
 // 资源用绝对路径（/docs/swagger-ui.css）而不是相对路径（./swagger-ui.css）：
 // 页面挂在 /docs（无尾斜杠）时，浏览器会把 /docs 当成「文件」，其父目录是
 // /，相对路径会解析到 /swagger-ui.css —— 404。
+//
+// 页面引用的资源必须与 docsAssets 白名单一一对应：openapi_test.go 里的
+// TestDocsPageReferencesLocalAssets 与 TestDocsAssetsMatchPageReferences
+// 守着这条不变量。
 const swaggerPage = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -4382,9 +4505,13 @@ package httpx
 import (
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -4484,6 +4611,205 @@ func TestOpenAPIEndpointsDeclareErrorResponses(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestOpenAPIPathSchemasMatchAPISpec 核对「路径 → schema」的映射：每个方法
+// 的请求体与 200 响应必须指向 api.Spec 里声明的那个 DTO。
+//
+// 只核对路径集合是不够的——路径挂错 schema（把 list 的请求体写成 TaskRef、
+// 把 add 的响应写成 BoolResult）一样没人管。这里把两头对上。
+func TestOpenAPIPathSchemasMatchAPISpec(t *testing.T) {
+	doc := parseSpec(t)
+	paths := specPaths(t, doc)
+	for _, m := range api.AllMethods {
+		spec := api.Spec(m)
+		if spec == nil {
+			t.Fatalf("api.Spec(%q) 是 nil", m)
+		}
+		p := servicePrefix + m
+		item, ok := paths[p].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 的定义不是对象", p)
+		}
+		post, ok := item["post"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 post 定义", p)
+		}
+
+		// 请求体 → api.Spec(method).NewIn()
+		rb, ok := post["requestBody"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 requestBody 定义", p)
+		}
+		wantIn := dtoTypeName(spec.NewIn())
+		gotIn := contentSchemaNames(t, rb["content"])
+		if !sameSet([]string{wantIn}, gotIn) {
+			t.Fatalf("路径 %q 的请求体 schema 不对：规范里是 %v，api.Spec 说是 %q", p, gotIn, wantIn)
+		}
+
+		// 200 响应 → api.Spec(method).NewOut()
+		responses, ok := post["responses"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 responses 定义", p)
+		}
+		ok200, ok := responses["200"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 200 响应定义", p)
+		}
+		wantOut := dtoTypeName(spec.NewOut())
+		if m == api.MethodStreamMessages {
+			// 流式端点的响应是 NDJSON 的消息行（api.Message），不是
+			// api.Spec 里的 NewOut（那是 api.Empty）。显式特判。
+			wantOut = "Message"
+		}
+		gotOut := contentSchemaNames(t, ok200["content"])
+		if !sameSet([]string{wantOut}, gotOut) {
+			t.Fatalf("路径 %q 的 200 响应 schema 不对：规范里是 %v，应当是 %q", p, gotOut, wantOut)
+		}
+	}
+}
+
+// contentSchemaNames 收集 content 下各媒体类型的 schema 名（$ref 的末段）。
+func contentSchemaNames(t *testing.T, content any) []string {
+	t.Helper()
+	m, ok := content.(map[string]any)
+	if !ok {
+		t.Fatalf("content 不是对象: %#v", content)
+	}
+	out := make([]string, 0, len(m))
+	for _, v := range m {
+		cm, ok := v.(map[string]any)
+		if !ok {
+			t.Fatalf("content 的成员不是对象: %#v", v)
+		}
+		sm, ok := cm["schema"].(map[string]any)
+		if !ok {
+			t.Fatalf("content 的成员没有 schema: %#v", cm)
+		}
+		ref, ok := sm["$ref"].(string)
+		if !ok {
+			t.Fatalf("schema 不是 $ref: %#v", sm)
+		}
+		out = append(out, ref[strings.LastIndex(ref, "/")+1:])
+	}
+	sort.Strings(out)
+	return out
+}
+
+// dtoTypeName 返回 DTO 指针的类型名。
+func dtoTypeName(v any) string {
+	t := reflect.TypeOf(v)
+	for t != nil && t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t == nil {
+		return ""
+	}
+	return t.Name()
+}
+
+// TestOpenAPIRequestBodiesAreOptional 验证规范没有把请求体标成必填：
+// 服务端容忍空请求体（EOF 不算错），get_settings / stream_messages 的
+// 入参本来就是 api.Empty。
+func TestOpenAPIRequestBodiesAreOptional(t *testing.T) {
+	doc := parseSpec(t)
+	paths := specPaths(t, doc)
+	for _, m := range api.AllMethods {
+		p := servicePrefix + m
+		item, _ := paths[p].(map[string]any)
+		post, _ := item["post"].(map[string]any)
+		rb, ok := post["requestBody"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 requestBody 定义", p)
+		}
+		raw, ok := rb["required"]
+		if !ok {
+			continue // 缺省即 false
+		}
+		if b, ok := raw.(bool); !ok || b {
+			t.Fatalf("路径 %q 的 requestBody 不该是必填（规范里是 %v）", p, raw)
+		}
+	}
+}
+
+// TestOpenAPIMessageKindEnumMatchesAPI 验证规范里 Message.kind 的 enum
+// 集合与 internal/api 的 MessageKind* 常量集合完全相同。
+//
+// 常量没法用反射枚举，这里直接解析 internal/api/message.go 的源码——
+// 这样 api 那边新增或改掉一个 MessageKind 常量时，这条测试会红。
+func TestOpenAPIMessageKindEnumMatchesAPI(t *testing.T) {
+	doc := parseSpec(t)
+	schemas := specSchemas(t, doc)
+	msg, ok := schemas["Message"].(map[string]any)
+	if !ok {
+		t.Fatal("规范缺少 schema \"Message\"")
+	}
+	props, ok := msg["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("schema \"Message\" 没有 properties")
+	}
+	kind, ok := props["kind"].(map[string]any)
+	if !ok {
+		t.Fatal("schema \"Message\" 没有 kind 字段")
+	}
+	rawEnum, ok := kind["enum"].([]any)
+	if !ok {
+		t.Fatal("schema \"Message\" 的 kind 没有 enum")
+	}
+	got := make([]string, 0, len(rawEnum))
+	for _, v := range rawEnum {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("enum 的成员不是字符串: %#v", v)
+		}
+		got = append(got, s)
+	}
+	sort.Strings(got)
+
+	want := apiMessageKindConsts(t)
+	if len(want) == 0 {
+		t.Fatal("没从 internal/api/message.go 里解析出 MessageKind 常量")
+	}
+	if !sameSet(want, got) {
+		t.Fatalf("Message.kind 的 enum 与 api 的 MessageKind 常量不一致:\n规范 = %v\napi  = %v", got, want)
+	}
+}
+
+// apiMessageKindConsts 解析 internal/api/message.go，取出全部 MessageKind*
+// 常量的取值。
+func apiMessageKindConsts(t *testing.T) []string {
+	t.Helper()
+	const src = "../../api/message.go"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, src, nil, 0)
+	if err != nil {
+		t.Fatalf("解析 %s 失败: %v", src, err)
+	}
+	var out []string
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok || len(vs.Values) != len(vs.Names) {
+				continue
+			}
+			for i, name := range vs.Names {
+				if !strings.HasPrefix(name.Name, "MessageKind") {
+					continue
+				}
+				lit, ok := vs.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Fatalf("常量 %s 的值不是字符串字面量", name.Name)
+				}
+				out = append(out, strings.Trim(lit.Value, `"`))
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // TestOpenAPISchemasMatchDTO 双向核对 schema 的属性与 DTO 的 JSON 字段。
@@ -4684,8 +5010,28 @@ func TestDocsEndpointsRejectNonGet(t *testing.T) {
 	}
 }
 
+// pageRefRe 抽出文档页里的资源引用：<script ... src="..."> 与
+// <link ... href="..."> 的**属性值**。
+//
+// 只认属性值，不做整页子串匹配：一行 HTML 注释不该能满足断言。匹配时
+// 跳过 HTML 注释（注释里的内容不算页面引用）。
+var pageRefRe = regexp.MustCompile(`(?is)<(?:script|link)\b[^>]*?\b(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+
+// pageSpecURLRe 抽出 SwaggerUIBundle 配置里的 url 选项：规范本体的地址。
+// 它不是 HTML 属性，但同样是页面引用的资源，必须一起守住。
+var pageSpecURLRe = regexp.MustCompile(`(?m)\burl\s*:\s*(?:"([^"]*)"|'([^']*)')`)
+
+// htmlCommentRe 匹配 HTML 注释。
+var htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)
+
+// pageLocalPrefixes 是页面里允许引用的本地路径前缀。
+var pageLocalPrefixes = []string{"/docs/", "/openapi.json", "/openapi.yaml"}
+
 // TestDocsPageReferencesLocalAssets 验证文档页不引外链资源：静态资源走
-// 绝对路径 /docs/...，规范本体走同源 /openapi.json。
+// 同源绝对路径 /docs/...，规范本体走同源 /openapi.json。
+//
+// 判定只看属性值，不做子串匹配；协议相对 URL（//cdn...）、大写 scheme、
+// data: URI、相对路径都必须被逮住。
 func TestDocsPageReferencesLocalAssets(t *testing.T) {
 	mux := docsMux()
 	rec := doGet(mux, "/docs")
@@ -4693,17 +5039,186 @@ func TestDocsPageReferencesLocalAssets(t *testing.T) {
 		t.Fatalf("应当 200, got %d", rec.Code)
 	}
 	page := rec.Body.String()
+
+	// 兜底：整页不该出现任何 http(s) 链接。这一条挡不住协议相对 URL，
+	// 但能挡住最常见的 CDN 回潮。
 	if strings.Contains(page, "http://") || strings.Contains(page, "https://") {
 		t.Fatalf("文档页里有外链资源:\n%s", page)
 	}
-	for _, want := range []string{"/docs/swagger-ui.css", "/docs/swagger-ui-bundle.js", "/openapi.json"} {
-		if !strings.Contains(page, want) {
-			t.Fatalf("文档页里没有引用 %q:\n%s", want, page)
+
+	refs := pageRefs(page)
+	if len(refs) == 0 {
+		t.Fatalf("文档页里没解析出任何资源引用:\n%s", page)
+	}
+	for _, ref := range refs {
+		checkLocalRef(t, ref)
+	}
+
+	// 正向断言：页面引用的资源集合必须**恰好**是期望的那些。
+	// 少一个说明功能坏了，多一个说明有人塞进了没登记的资源。
+	want := []string{
+		"/docs/swagger-ui.css",
+		"/docs/swagger-ui-bundle.js",
+		"/docs/swagger-ui-standalone-preset.js",
+		"/docs/favicon-32x32.png",
+		"/openapi.json",
+	}
+	got := append([]string(nil), refs...)
+	sort.Strings(got)
+	if !sameSet(want, got) {
+		t.Fatalf("文档页引用的资源不对:\n实际 = %v\n期望 = %v", got, want)
+	}
+}
+
+// pageRefs 抽出页面引用的全部资源地址：script/link 的 src/href 属性值，
+// 外加 SwaggerUIBundle 配置里的规范地址。
+func pageRefs(page string) []string {
+	stripped := htmlCommentRe.ReplaceAllString(page, "")
+	var out []string
+	for _, m := range pageRefRe.FindAllStringSubmatch(stripped, -1) {
+		out = append(out, firstNonEmpty(m[1], m[2]))
+	}
+	for _, m := range pageSpecURLRe.FindAllStringSubmatch(stripped, -1) {
+		out = append(out, firstNonEmpty(m[1], m[2]))
+	}
+	return out
+}
+
+// checkLocalRef 判定一个资源引用必须是同源的本地绝对路径。
+func checkLocalRef(t *testing.T, ref string) {
+	t.Helper()
+	switch {
+	case ref == "":
+		t.Fatal("页面里有空的资源引用")
+	case !strings.HasPrefix(ref, "/"):
+		t.Fatalf("资源引用 %q 不是绝对路径（相对路径在 /docs 下会解析到 / 下面去）", ref)
+	case strings.HasPrefix(ref, "//"):
+		t.Fatalf("资源引用 %q 是协议相对 URL", ref)
+	case strings.Contains(ref, ":"):
+		t.Fatalf("资源引用 %q 带 scheme（http:/https:/data: 等）", ref)
+	}
+	for _, p := range pageLocalPrefixes {
+		if strings.HasPrefix(ref, p) {
+			return
 		}
 	}
-	// 相对路径引资源会在 /docs（无尾斜杠）下解析到 / 下面去，必须避免。
-	if strings.Contains(page, `"./swagger-ui`) || strings.Contains(page, `'/swagger-ui`) {
-		t.Fatalf("文档页用了相对路径引资源:\n%s", page)
+	t.Fatalf("资源引用 %q 不在允许的本地路径前缀里（允许：%v）", ref, pageLocalPrefixes)
+}
+
+// firstNonEmpty 返回第一个非空字符串。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// TestDocsAssetsMatchPageReferences 双向核对白名单与页面引用：页面引用的
+// 每个静态资源都要在白名单里，白名单里的每个资源都要被页面引用。
+func TestDocsAssetsMatchPageReferences(t *testing.T) {
+	page := doGet(docsMux(), "/docs").Body.String()
+	referenced := map[string]bool{}
+	for _, ref := range pageRefs(page) {
+		if !strings.HasPrefix(ref, docsPrefix) {
+			continue
+		}
+		referenced[strings.TrimPrefix(ref, docsPrefix)] = true
+	}
+	for _, a := range docsAssets {
+		if !referenced[a.name] {
+			t.Fatalf("白名单里的资源 %q 没有被文档页引用", a.name)
+		}
+	}
+	for name := range referenced {
+		found := false
+		for _, a := range docsAssets {
+			if a.name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("文档页引用了白名单外的资源 %q", name)
+		}
+	}
+}
+
+// TestDocsStaticAssetsHaveFixedPrefix 是静态资源前缀的回归测试。
+//
+// 先前静态资源由 httpSwagger.WrapHandler 提供，它是包级单例，内部用
+// sync.Once 把**进程级**的 swaggerFiles.Handler.Prefix 锁成「首个到达请求」
+// 解析出的前缀。一次 GET /docs/?x=1 就能把前缀锁成 "/" ，此后本进程内的
+// 静态资源全部 404。现在前缀是写死的，谁先打都不影响。
+func TestDocsStaticAssetsHaveFixedPrefix(t *testing.T) {
+	mux := docsMux()
+	// 先打带查询串的目录请求。
+	rec := doGet(mux, "/docs/?x=1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /docs/?x=1 应当 200, got %d", rec.Code)
+	}
+	// 再打静态资源：必须仍然是 200 且有内容。
+	for _, a := range docsAssets {
+		rec := doGet(mux, docsPrefix+a.name)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s 应当 200, got %d", docsPrefix+a.name, rec.Code)
+		}
+		if rec.Body.Len() == 0 {
+			t.Fatalf("GET %s 的响应体是空的", docsPrefix+a.name)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, a.contentType) {
+			t.Fatalf("GET %s 的 Content-Type 不对: %q（期望 %q）", docsPrefix+a.name, ct, a.contentType)
+		}
+	}
+	// 换个顺序再来一遍：资源先到，结果必须一样。
+	mux2 := docsMux()
+	for _, a := range docsAssets {
+		if rec := doGet(mux2, docsPrefix+a.name); rec.Code != http.StatusOK {
+			t.Fatalf("GET %s 应当 200, got %d", docsPrefix+a.name, rec.Code)
+		}
+	}
+	if rec := doGet(mux2, "/docs/?x=2"); rec.Code != http.StatusOK {
+		t.Fatalf("GET /docs/?x=2 应当 200, got %d", rec.Code)
+	}
+}
+
+// TestDocsPathContract 核对文档端点的实际行为与端点契约一致。
+func TestDocsPathContract(t *testing.T) {
+	mux := docsMux()
+	cases := []struct {
+		path        string
+		wantCode    int
+		contentType string
+	}{
+		{"/docs", http.StatusOK, "text/html"},
+		{"/docs/", http.StatusOK, "text/html"},
+		{"/openapi.yaml", http.StatusOK, "application/yaml"},
+		{"/openapi.json", http.StatusOK, "application/json"},
+		{"/docs/swagger-ui.css", http.StatusOK, "text/css"},
+		{"/docs/swagger-ui-bundle.js", http.StatusOK, "javascript"},
+		// 白名单外的路径一律 404。/docs/doc.json 先前由 http-swagger 内建
+		// 路径处理，稳定吐 500；/docs/index.html 与 /docs/swagger-initializer.js
+		// 是 swagger-ui 自带的资源，不该被端出去。
+		{"/docs/doc.json", http.StatusNotFound, ""},
+		{"/docs/index.html", http.StatusNotFound, ""},
+		{"/docs/swagger-initializer.js", http.StatusNotFound, ""},
+		{"/docs/nope.txt", http.StatusNotFound, ""},
+	}
+	for _, c := range cases {
+		rec := doGet(mux, c.path)
+		if rec.Code != c.wantCode {
+			t.Fatalf("GET %s 应当 %d, got %d", c.path, c.wantCode, rec.Code)
+		}
+		if c.contentType != "" {
+			if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, c.contentType) {
+				t.Fatalf("GET %s 的 Content-Type 不对: %q（期望含 %q）", c.path, ct, c.contentType)
+			}
+		}
+	}
+	// /docs 与 /docs/ 必须是同一个页面：尾斜杠差异不该造成契约漂移。
+	if a, b := doGet(mux, "/docs").Body.String(), doGet(mux, "/docs/").Body.String(); a != b {
+		t.Fatal("/docs 与 /docs/ 返回的页面不一致")
 	}
 }
 
@@ -4881,7 +5396,7 @@ func expectShape(t reflect.Type) schemaShape {
 		return schemaShape{kind: "boolean"}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return schemaShape{kind: "integer"}
+		return schemaShape{kind: "integer", format: integerFormat(t)}
 	case reflect.Float32, reflect.Float64:
 		return schemaShape{kind: "number"}
 	case reflect.Slice, reflect.Array:
@@ -4891,6 +5406,22 @@ func expectShape(t reflect.Type) schemaShape {
 		return schemaShape{ref: t.Name()}
 	default:
 		return schemaShape{}
+	}
+}
+
+// integerFormat 返回整数类型在 OpenAPI 里应当声明的 format。
+//
+// int64 必须写 int64、int32 必须写 int32——把 int64 写成 int32 会让生成
+// 出来的客户端按 32 位宽度截断。Go 的 int 与更窄的整型宽度不稳定（int
+// 随平台变），不强制声明 format。
+func integerFormat(t reflect.Type) string {
+	switch t.Kind() {
+	case reflect.Int64:
+		return "int64"
+	case reflect.Int32:
+		return "int32"
+	default:
+		return ""
 	}
 }
 
@@ -4915,6 +5446,16 @@ func checkShape(t *testing.T, field string, want, got schemaShape) {
 		}
 	} else if got.format == "date-time" {
 		t.Fatalf("字段 %s 不是时间戳，不该声明 format: date-time", field)
+	}
+	if want.kind == "integer" {
+		switch {
+		case want.format != "":
+			if got.format != want.format {
+				t.Fatalf("字段 %s 应当声明 format: %s，规范里是 %q", field, want.format, got.format)
+			}
+		case got.format != "" && got.format != "int32" && got.format != "int64":
+			t.Fatalf("字段 %s 的 format %q 不是合法的整数 format", field, got.format)
+		}
 	}
 	if want.kind == "array" {
 		if got.items == nil {
@@ -4961,17 +5502,17 @@ git commit -m "feat(httpx): 增加 OpenAPI 规范与 Swagger 文档页"
 
 | 条目 | 初稿的问题 | 最终实现 |
 | --- | --- | --- |
-| B1 | `docs.go` 用 `https://unpkg.com/swagger-ui-dist@5/...` 的 CDN 链接，与设计文档 §6.5「离线嵌入」冲突 | 改用 `github.com/swaggo/http-swagger` + `github.com/swaggo/files`，swagger-ui 静态资源打进二进制；页面里没有任何外链资源（有测试守着） |
-| B2 | 直接用 `httpSwagger.Handler` 渲染 `/docs`，其模板用相对路径 `./swagger-ui.css` 引资源；页面挂在 `/docs`（无尾斜杠）时浏览器会解析到 `/swagger-ui.css` → 404 | `/docs` 自己渲染 HTML，资源用绝对路径 `/docs/...` 引；`/docs/` 交给 `httpSwagger.WrapHandler` 提供离线静态资源；不引 `swagger-initializer.js`（它默认指向 petstore 的远程 URL） |
+| B1 | `docs.go` 用 `https://unpkg.com/swagger-ui-dist@5/...` 的 CDN 链接，与设计文档 §6.5「离线嵌入」冲突 | 改用 `github.com/swaggo/files`（修复轮 1 起不再用 `http-swagger`），swagger-ui 静态资源打进二进制；页面里没有任何外链资源（有测试守着） |
+| B2 | 直接用 `httpSwagger.Handler` 渲染 `/docs`，其模板用相对路径 `./swagger-ui.css` 引资源；页面挂在 `/docs`（无尾斜杠）时浏览器会解析到 `/swagger-ui.css` → 404 | `/docs` 自己渲染 HTML，资源用绝对路径 `/docs/...` 引；`/docs/` 按**固定前缀 + 白名单**提供离线静态资源（修复轮 1 之前是 `httpSwagger.WrapHandler`，它的包级单例会污染进程级前缀，见「文档端点契约」）；不引 `swagger-initializer.js`（它默认指向 petstore 的远程 URL） |
 | B3 | 规范只声明 200 与 401，与实现对不上 | 每个业务端点都声明 200 / 400 / 401 / 405 / 500，错误响应在 `components.responses` 里复用 `BadRequest` / `Unauthorized` / `MethodNotAllowed` / `InternalError`；有测试逐个端点核对 |
 | B4 | 一致性测试只覆盖 7 个 DTO | 覆盖全部 17 个有 schema 的 DTO（多出 `ShowAddTaskParams`），字段名双向核对；另加一条「规范里的 schema 都必须在 DTO 登记表里」的反向断言 |
 | B5 | YAML→JSON 用 `go.yaml.in/yaml/v3` | 不变——它本来就是项目的直接依赖，不算新增依赖 |
 | B6 | `newMux` 还没有文档端点 | 在 `newMux` 里 `mux := http.NewServeMux()` 之后调 `registerDocs(mux)`；四个文档端点都不进 `authed` 中间件 |
 | B7 | `registerDocs` 用 `mux.HandleFunc` 不限方法 | 文档端点只接受 GET，其他方法 405 + `Allow: GET`（`getOnly` 中间件），错误体沿用统一形状 |
 | B8 | `openAPIJSON` 用 `sync.Once` 缓存 | 不变；转换抽成 `yamlToJSON`，失败时返回错误，端点回 500 而不是 panic（有测试注入失败验证） |
-| B9 | 只比字段名集合 | 增加类型级护栏：按 `reflect` 推出的 Go 类型逐字段比对 OpenAPI 的 `type`（string / boolean / integer / number / array / `$ref`），`time.Time` 额外要求 `format: date-time` |
+| B9 | 只比字段名集合 | 增加类型级护栏：按 `reflect` 推出的 Go 类型逐字段比对 OpenAPI 的 `type`（string / boolean / integer / number / array / `$ref`），`time.Time` 额外要求 `format: date-time`（修复轮 1 起，整数也校验 `format`：`int64` ↔ `int64`、`int32` ↔ `int32`） |
 | B10 | 依赖与许可证头约束 | 只 import `internal/api`、`internal/rpc/addr`、标准库与两个 swaggo 包；新文件都带 MPL-2.0 许可证头 |
-| B11 | 测试清单不全 | 补齐 8 类测试：解析、方法双向覆盖、错误码声明、字段名双向核对、schema 覆盖面、类型核对、`$ref` 完整性、文档端点免鉴权 / 只收 GET / 不引外链 / 转换失败回 500 |
+| B11 | 测试清单不全 | 补齐 8 类测试：解析、方法双向覆盖、错误码声明、字段名双向核对、schema 覆盖面、类型核对、`$ref` 完整性、文档端点免鉴权 / 只收 GET / 不引外链 / 转换失败回 500。修复轮 1 又补了：路径↔`api.Spec` 的 schema 映射、`requestBody` 可选、`Message.kind` 的 enum ↔ `api.MessageKind*` 常量、文档页引用的**属性值**判定、静态资源固定前缀、白名单 ↔ 页面引用双向核对、`/docs/*` 的 404 契约 |
 
 除 B1–B11 外还有两处与初稿不同：
 
@@ -4991,6 +5532,19 @@ git commit -m "feat(httpx): 增加 OpenAPI 规范与 Swagger 文档页"
 github.com/swaggo/http-swagger v1.3.4   // Swagger UI 页面与静态资源（离线嵌入）
 github.com/swaggo/files v1.0.1          // swagger-ui 静态资源本体（间接）
 ```
+
+> **修复轮 1 的变化**：`internal/rpc/httpx` 不再 import
+> `github.com/swaggo/http-swagger` 了。静态资源原先由它的包级单例
+> `httpSwagger.WrapHandler` 提供，而那个单例会把进程级的
+> `swaggerFiles.Handler.Prefix` 锁死成首个请求解析出的前缀（详见 Task 6
+> 章节的「文档端点契约」）。改成自己按固定前缀 + 白名单读
+> `github.com/swaggo/files` 的内存文件系统之后，`http-swagger` 就没用了：
+> `github.com/swaggo/files v1.0.1` 成了**直接依赖**，
+> `github.com/swaggo/http-swagger v1.3.4` 成了**没被引用的直接依赖**。
+>
+> 按本轮的范围约定，`go.mod`/`go.sum` 没有动——这两行的收口（删掉没用的
+> `http-swagger`、把 `files` 从 `// indirect` 升为直接依赖）留给后续的
+> `go mod tidy`。
 
 它们经 `swaggo/swag` 间接用到 `golang.org/x/tools`。`golang.org/x/text v0.43.0`
 要求 `x/tools v0.51.0`，而 `x/tools v0.51.0` 要求 `x/net v0.59.0`——`x/net`
