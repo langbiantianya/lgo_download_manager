@@ -9,6 +9,7 @@ package httpx
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -514,12 +515,24 @@ func TestDocsEndpointsRejectNonGet(t *testing.T) {
 	}
 }
 
-// pageRefRe 抽出文档页里的资源引用：<script ... src="..."> 与
-// <link ... href="..."> 的**属性值**。
+// pageTagRe 匹配文档页里**可能发起网络请求**的标签。
 //
-// 只认属性值，不做整页子串匹配：一行 HTML 注释不该能满足断言。匹配时
-// 跳过 HTML 注释（注释里的内容不算页面引用）。
-var pageRefRe = regexp.MustCompile(`(?is)<(?:script|link)\b[^>]*?\b(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+// 只看这些标签：它们身上的资源属性一旦指向外网，浏览器就会替文档页发起
+// 请求，「离线可用」就破了。只抽 <script> / <link> 是不够的——
+// <img src>、<iframe src>、<video poster>、<form action> 一样会发请求。
+var pageTagRe = regexp.MustCompile(`(?is)<(?:script|link|img|iframe|video|audio|source|embed|object|form|input|track)\b[^>]*>`)
+
+// pageAttrRe 匹配标签里**可能发起网络请求的属性值**。
+//
+// 属性名覆盖 src、href、data、action、poster、srcset、formaction：
+// src/href 是标签的资源地址，data 是 <object> 的资源地址，action 与
+// formaction 是表单的提交地址，poster 是视频封面，srcset 是响应式图片
+// 的候选列表。
+//
+// 属性值三种写法都认：双引号、单引号、不带引号（HTML5 允许不带引号，
+// 只要求值里不含空白与 >）。只认带引号的写法会漏掉
+// `href=//cdn.example.com/evil.css` 这种协议相对 URL。
+var pageAttrRe = regexp.MustCompile(`(?is)\b(srcset|formaction|src|href|data|action|poster)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))`)
 
 // pageSpecURLRe 抽出 SwaggerUIBundle 配置里的 url 选项：规范本体的地址。
 // 它不是 HTML 属性，但同样是页面引用的资源，必须一起守住。
@@ -528,6 +541,15 @@ var pageSpecURLRe = regexp.MustCompile(`(?m)\burl\s*:\s*(?:"([^"]*)"|'([^']*)')`
 // htmlCommentRe 匹配 HTML 注释。
 var htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)
 
+// pageProtoRelativeRe 匹配协议相对 URL（//host/path）。
+//
+// 引号、括号、等号、反引号之后出现 //，都当成外链嫌疑：属性抽取只覆盖
+// 白名单里的标签与属性，这条兜底负责在将来有人加了新标签时也能拦住。
+//
+// // 之后必须是像主机名的字符：协议相对 URL 的主机名不会以空白或非 ASCII
+// 开头，这样普通的中文 JS 注释（//注释）不会被误判。
+var pageProtoRelativeRe = regexp.MustCompile("[\"'(`=]\\s*//[A-Za-z0-9._-]")
+
 // pageLocalPrefixes 是页面里允许引用的本地路径前缀。
 var pageLocalPrefixes = []string{"/docs/", "/openapi.json", "/openapi.yaml"}
 
@@ -535,7 +557,10 @@ var pageLocalPrefixes = []string{"/docs/", "/openapi.json", "/openapi.yaml"}
 // 同源绝对路径 /docs/...，规范本体走同源 /openapi.json。
 //
 // 判定只看属性值，不做子串匹配；协议相对 URL（//cdn...）、大写 scheme、
-// data: URI、相对路径都必须被逮住。
+// data: URI、相对路径都必须被逮住。抽取覆盖所有可能发起网络请求的属性
+// （src / href / data / action / poster / srcset / formaction）与标签
+// （script / link / img / iframe / video / audio / source / embed /
+// object / form / input / track），属性值带不带引号都抽得到。
 func TestDocsPageReferencesLocalAssets(t *testing.T) {
 	mux := docsMux()
 	rec := doGet(mux, "/docs")
@@ -544,18 +569,14 @@ func TestDocsPageReferencesLocalAssets(t *testing.T) {
 	}
 	page := rec.Body.String()
 
-	// 兜底：整页不该出现任何 http(s) 链接。这一条挡不住协议相对 URL，
-	// 但能挡住最常见的 CDN 回潮。
-	if strings.Contains(page, "http://") || strings.Contains(page, "https://") {
-		t.Fatalf("文档页里有外链资源:\n%s", page)
+	// 三道判定合成一处：属性值逐个检查、http(s) 兜底、协议相对 URL 兜底。
+	if err := pageViolation(page); err != nil {
+		t.Fatalf("文档页里有外链资源: %v\n%s", err, page)
 	}
 
 	refs := pageRefs(page)
 	if len(refs) == 0 {
 		t.Fatalf("文档页里没解析出任何资源引用:\n%s", page)
-	}
-	for _, ref := range refs {
-		checkLocalRef(t, ref)
 	}
 
 	// 正向断言：页面引用的资源集合必须**恰好**是期望的那些。
@@ -574,13 +595,24 @@ func TestDocsPageReferencesLocalAssets(t *testing.T) {
 	}
 }
 
-// pageRefs 抽出页面引用的全部资源地址：script/link 的 src/href 属性值，
+// pageRefs 抽出页面引用的全部资源地址：标签里可能发起网络请求的属性值，
 // 外加 SwaggerUIBundle 配置里的规范地址。
+//
+// 只认属性值，不做整页子串匹配：一行 HTML 注释不该能满足断言。匹配时
+// 跳过 HTML 注释（注释里的内容不算页面引用）。
 func pageRefs(page string) []string {
 	stripped := htmlCommentRe.ReplaceAllString(page, "")
 	var out []string
-	for _, m := range pageRefRe.FindAllStringSubmatch(stripped, -1) {
-		out = append(out, firstNonEmpty(m[1], m[2]))
+	for _, tag := range pageTagRe.FindAllString(stripped, -1) {
+		for _, m := range pageAttrRe.FindAllStringSubmatch(tag, -1) {
+			value := firstNonEmpty(m[2], m[3], m[4])
+			if m[1] == "srcset" {
+				// srcset 的值是逗号分隔的候选列表，逐个候选单独判定。
+				out = append(out, srcsetURLs(value)...)
+				continue
+			}
+			out = append(out, value)
+		}
 	}
 	for _, m := range pageSpecURLRe.FindAllStringSubmatch(stripped, -1) {
 		out = append(out, firstNonEmpty(m[1], m[2]))
@@ -588,25 +620,103 @@ func pageRefs(page string) []string {
 	return out
 }
 
-// checkLocalRef 判定一个资源引用必须是同源的本地绝对路径。
-func checkLocalRef(t *testing.T, ref string) {
-	t.Helper()
+// srcsetURLs 把 srcset 的值拆成候选 URL 列表。
+//
+// srcset 的语法是逗号分隔的候选列表，每个候选是「URL」或「URL 描述符」
+// （描述符是 1x/2x/100w 之类）。必须逐个候选单独判定，否则
+// 「/docs/a.png 1x, //cdn/b.png 2x」这种混合写法能从缝里钻过去。
+func srcsetURLs(value string) []string {
+	var out []string
+	for _, part := range strings.Split(value, ",") {
+		fields := strings.Fields(part)
+		if len(fields) == 0 {
+			continue
+		}
+		out = append(out, fields[0])
+	}
+	return out
+}
+
+// pageViolation 返回页面违反「只用同源本地资源」的第一条原因；没问题返回 nil。
+//
+// 三道判定都在这儿：标签里的资源属性逐个检查、整页不许出现 http(s) 外链、
+// 整页不许出现协议相对 URL（//host/path）。正式测试与护栏自检共用它，
+// 免得两处口径漂移。
+func pageViolation(page string) error {
+	for _, ref := range pageRefs(page) {
+		if err := localRefErr(ref); err != nil {
+			return err
+		}
+	}
+	// 兜底：整页不该出现任何 http(s) 链接。这一条挡不住协议相对 URL，
+	// 但能挡住最常见的 CDN 回潮。
+	if strings.Contains(page, "http://") || strings.Contains(page, "https://") {
+		return errors.New("页面里有 http(s) 外链")
+	}
+	// 兜底：整页不该出现协议相对 URL。属性抽取只覆盖白名单里的标签与属性，
+	// 将来有人加了新标签时，这条兜底仍然能兜住。
+	if loc := pageProtoRelativeRe.FindString(page); loc != "" {
+		return fmt.Errorf("页面里有协议相对 URL（%q）", loc)
+	}
+	return nil
+}
+
+// localRefErr 返回一个资源引用违反「只用同源本地资源」时的原因；没问题返回 nil。
+//
+// 口径：必须以 / 开头（挡相对路径与 data: URI）、必须不以 // 开头（挡协议
+// 相对 URL）、必须不含 :（挡 http: / https: / data: / 大写 scheme），
+// 最后必须落在允许的本地路径前缀之内。
+func localRefErr(ref string) error {
 	switch {
 	case ref == "":
-		t.Fatal("页面里有空的资源引用")
+		return errors.New("页面里有空的资源引用")
 	case !strings.HasPrefix(ref, "/"):
-		t.Fatalf("资源引用 %q 不是绝对路径（相对路径在 /docs 下会解析到 / 下面去）", ref)
+		return fmt.Errorf("资源引用 %q 不是绝对路径（相对路径在 /docs 下会解析到 / 下面去）", ref)
 	case strings.HasPrefix(ref, "//"):
-		t.Fatalf("资源引用 %q 是协议相对 URL", ref)
+		return fmt.Errorf("资源引用 %q 是协议相对 URL", ref)
 	case strings.Contains(ref, ":"):
-		t.Fatalf("资源引用 %q 带 scheme（http:/https:/data: 等）", ref)
+		return fmt.Errorf("资源引用 %q 带 scheme（http:/https:/data: 等）", ref)
 	}
 	for _, p := range pageLocalPrefixes {
 		if strings.HasPrefix(ref, p) {
-			return
+			return nil
 		}
 	}
-	t.Fatalf("资源引用 %q 不在允许的本地路径前缀里（允许：%v）", ref, pageLocalPrefixes)
+	return fmt.Errorf("资源引用 %q 不在允许的本地路径前缀里（允许：%v）", ref, pageLocalPrefixes)
+}
+
+// TestDocsPageRejectsExternalReferences 是「防 CDN 回潮」护栏的**自检**。
+//
+// TestDocsPageReferencesLocalAssets 只跑真实页面，穷举不了各种绕过写法；
+// 这里把绕过写法固化成用例：每一种都必须被判成外链。判定走的是与正式
+// 测试**同一套**代码（pageViolation），不是另写一份口径。
+func TestDocsPageRejectsExternalReferences(t *testing.T) {
+	cases := []struct {
+		name string
+		html string
+	}{
+		{"属性值不加引号", `<link rel="stylesheet" href=//cdn.example.com/evil.css>`},
+		{"img 的 src", `<img src="//cdn.example.com/tracker.png">`},
+		{"iframe 的 src", `<iframe src="//cdn.example.com/frame.html">`},
+		{"video 的 poster", `<video poster="//cdn.example.com/p.jpg">`},
+		{"form 的 action", `<form action="//cdn.example.com/post">`},
+		{"img 的 srcset", `<img srcset="//cdn.example.com/a.png 1x">`},
+		{"object 的 data", `<object data="//cdn.example.com/x.svg">`},
+		{"协议相对 URL", `<link rel="stylesheet" href="//cdn.example.com/evil.css">`},
+		{"大写 scheme", `<link rel="stylesheet" href="HTTPS://cdn.example.com/evil.css">`},
+		{"data: URI", `<link rel="stylesheet" href="data:text/css,body{}">`},
+		{"不带 ./ 的相对路径", `<link rel="stylesheet" href="swagger-ui.css">`},
+		{"注释里的外链", `<!-- <link rel="stylesheet" href="//cdn.example.com/evil.css"> -->`},
+		{"复合场景", `<script src="/docs/swagger-ui-bundle.js"></script>` +
+			`<img src="//cdn.example.com/t.png"><link href="HTTPS://x/y.css">`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if err := pageViolation(c.html); err == nil {
+				t.Fatalf("护栏放过了外链（页面片段：%q）", c.html)
+			}
+		})
+	}
 }
 
 // firstNonEmpty 返回第一个非空字符串。
