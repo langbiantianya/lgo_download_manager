@@ -79,10 +79,14 @@ func RunChild() int {
 			ShowAddTaskDialogForURL(c, p)
 		})
 	})
-	// 语言变更:业务进程在「设置」里切语言或首启 InitData 都走这里。
+	// 语言变更:用户在「设置」里切语言时业务进程推 MessageKindLanguage,
+	// 这里只负责让 UI 重译当前可见 widget(标题/工具栏/侧边栏/状态栏/
+	// 任务行/设置页)。
+	//
 	// 本进程的 ilocale 已由「设置 → 语言」在写回前先行切换（见
-	// buildLanguageSelect），这里只负责让 UI 重译当前可见 widget
-	// (标题/工具栏/侧边栏/状态栏/任务行/设置页)。
+	// buildLanguageSelect）——契约层的语言控制消息不带语言标签，等不到。
+	// 首启的语言不走这条路径，由握手时的 settings 应用
+	// （见 applyHandshakeLanguage）。
 	c.SetOnLanguage(func() {
 		fyne.Do(func() { win.applyLanguage() })
 	})

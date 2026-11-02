@@ -564,11 +564,16 @@ func buildLanguageSelect(persist func()) *widget.Select {
 		labelToTag[lbl] = tag
 	}
 	// restoring 抑制「程序化 SetSelected」触发的那一次回调：Fyne 的
-	// SetSelected 会同步调用 OnChanged，把初始语言的标签当成用户选择，
-	// 反过来把 ilocale 改成另一门语言（例如设置里 Language 为空、
-	// 当前界面是英文时，会把界面拽回默认语言）。
+	// SetSelected 会同步调用 OnChanged，把初始语言的标签当成用户选择。
+	// 那不是用户操作，整个回调都该空转——否则既会把 ilocale 改成另一门
+	// 语言（例如设置里 Language 为空、当前界面是英文时，会把界面拽回默认
+	// 语言），又会凭空多存一次设置：**每次打开设置页都会发一次
+	// SaveSettings**。
 	restoring := false
 	sel := widget.NewSelect(opts, func(s string) {
+		if restoring {
+			return
+		}
 		tag, ok := labelToTag[s]
 		if !ok {
 			return
@@ -577,9 +582,7 @@ func buildLanguageSelect(persist func()) *widget.Select {
 		// 本进程先切:契约层的语言控制消息不携带语言标签(见
 		// api.Message),UI 只能靠自己知道切成了什么。SaveSettings 的
 		// 应答与随后到达的控制消息谁先到不确定,不能等回调再切。
-		if !restoring {
-			ilocale.Set(tag)
-		}
+		ilocale.Set(tag)
 		persist()
 	})
 	// 当前语言的标签:Normalize 后落到 Supported 中的一项,再用其自描述。

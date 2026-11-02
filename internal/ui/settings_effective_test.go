@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/scheduler"
+	"lgo_download_manager/internal/store"
 )
 
 // TestEffectiveSettingsMatchStoreDefaults 用硬编码期望值锁住四个
@@ -96,5 +98,70 @@ func TestIsBittorrentTaskMatchesSchedulerSemantics(t *testing.T) {
 				t.Fatalf("isBittorrentTask = %v，want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestEffectiveSettingsCrossCheckWithStore 直接与 store.Settings.Effective*
+// 对拍。
+//
+// 上面的 TestEffectiveSettingsMatchStoreDefaults 用的是硬编码期望值——它能
+// 抓住「UI 侧自己改了默认值」，但抓不住「store 侧改了默认值、UI 没跟」。
+// 这条用例把两侧放进同一个循环里比，任何一侧漂移都会红。
+//
+// internal/ui 的非测试代码不得 import internal/store；这里是测试代码，属于
+// G9 明确允许的例外——只用于对拍，不参与生产路径。
+func TestEffectiveSettingsCrossCheckWithStore(t *testing.T) {
+	for _, in := range []int{-5, -1, 0, 1, 2, 3, 8, 64} {
+		st := store.Settings{
+			MaxConcurrent:   in,
+			BTMaxConcurrent: in,
+			BTMaxSeeding:    in,
+			BTMaxPeers:      in,
+		}
+		ap := api.Settings{
+			MaxConcurrent:   in,
+			BTMaxConcurrent: in,
+			BTMaxSeeding:    in,
+			BTMaxPeers:      in,
+		}
+		checks := []struct {
+			name      string
+			ui, store int
+		}{
+			{"EffectiveMaxConcurrent", effectiveMaxConcurrent(ap), st.EffectiveMaxConcurrent()},
+			{"EffectiveBTMaxConcurrent", effectiveBTMaxConcurrent(ap), st.EffectiveBTMaxConcurrent()},
+			{"EffectiveBTMaxSeeding", effectiveBTMaxSeeding(ap), st.EffectiveBTMaxSeeding()},
+			{"EffectiveBTMaxPeers", effectiveBTMaxPeers(ap), st.EffectiveBTMaxPeers()},
+		}
+		for _, c := range checks {
+			if c.ui != c.store {
+				t.Errorf("输入 %d 时 %s: ui=%d store=%d —— 两侧漂移", in, c.name, c.ui, c.store)
+			}
+		}
+	}
+}
+
+// TestIsBittorrentTaskCrossCheckWithScheduler 直接与
+// scheduler.IsBittorrentTask 对拍（同上的对拍理由）。
+func TestIsBittorrentTaskCrossCheckWithScheduler(t *testing.T) {
+	urls := []string{
+		"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+		"https://x/a.torrent",
+		"http://x/a.torrent",
+		"https://x/a.bin",
+		"",
+	}
+	protocols := []string{"", "BT", "HTTP", "HTTPS", "FTP", "WEBDAV"}
+	for _, u := range urls {
+		for _, p := range protocols {
+			ui := isBittorrentTask(&api.Task{URL: u, Protocol: p})
+			sc := scheduler.IsBittorrentTask(&store.Task{URL: u, Protocol: p})
+			if ui != sc {
+				t.Errorf("url=%q protocol=%q: ui=%v scheduler=%v —— 两侧漂移", u, p, ui, sc)
+			}
+		}
+	}
+	if isBittorrentTask(nil) != scheduler.IsBittorrentTask(nil) {
+		t.Error("nil 任务的判定在两侧不一致")
 	}
 }

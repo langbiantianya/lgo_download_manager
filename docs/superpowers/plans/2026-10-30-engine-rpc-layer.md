@@ -11791,14 +11791,24 @@ git commit -m "refactor(ui): 改用 rpc.Client 与契约 DTO，解除对业务�
   `env.client.Settings()`（握手快照），不再有 `st.LoadSettings()` 直读。
   `TestAddTaskDialog_AddAndStart` 与握手语言用例在两种传输上各跑一遍。
 - `internal/ui/settings_dialog.go`：`ProxyMode` 零值 `""` 按 system 处理；语言下拉框
-  用 `restoring` 抑制「构建时 SetSelected 同步触发 OnChanged」把 ilocale 反向覆盖，
-  用户实际切换时先 `ilocale.Set` 再持久化（contract 层的 language 控制消息不带载荷，
-  见 `api.Message`，不能等回调再切）。
+  用 `restoring` **让整个回调空转**（不只是跳过 `ilocale.Set`）。构建时那次
+  `SetSelected` 会同步触发 OnChanged，若只抑制 locale 写入，`persist()` 仍会执行
+  ——**每次打开设置页都会多发一次 `SaveSettings`**（这是旧实现就有的行为，本次
+  顺手修掉）。用户实际切换时先 `ilocale.Set` 再持久化：契约层的 language 控制
+  消息不带载荷（见 `api.Message`），不能等回调再切。
+  护栏：`TestLanguageSelectSwitchAppliesLocaleBeforePersist`（真实驱动
+  `SetSelected`，断言 locale 已切 + `persist` 恰好一次）、
+  `TestBuildLanguageSelect_DoesNotOverrideLocaleOnInit`。
 - `internal/rpc/client.go`：`show_add_task` 队列改成「后到覆盖先到」。Task 4 的初版是
   「只收第一条」，与旧 `internal/ui` 实现的「只留最新一条」语义相反：冷启动时连发
   多条 lgom:// 转发会丢掉用户最后点的那条。补了
   `TestClientLateShowAddTaskKeepsLatest` 与 `TestClientBroadcastUnsubscribeRace`。
 - `internal/ui/piece_mosaic.go` 只改了注释（`api.BTDetail.PieceBuckets`）。
+- `internal/ui/settings_effective.go` 的等价性除了硬编码期望值，还有两条**交叉对拍**：
+  `TestEffectiveSettingsCrossCheckWithStore`（与 `store.Settings.Effective*` 同循环比）
+  与 `TestIsBittorrentTaskCrossCheckWithScheduler`（与 `scheduler.IsBittorrentTask`
+  比 url×protocol 的组合表）。硬编码断言抓得住「UI 侧自己改了」，
+  抓不住「业务侧改了、UI 没跟」——这两条补上后半边。
 
 **测试依赖的取舍（对应补充说明 G4）**
 选了 (b)：**非测试代码**必须零依赖（`go list .Imports` 无业务包），**测试代码**允许

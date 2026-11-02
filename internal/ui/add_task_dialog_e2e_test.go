@@ -4,6 +4,12 @@
 //
 // Copyright (c) 2026 langbiantianya
 
+// 注意：本文件是测试代码，为了构造「有任务、有设置」的初始状态而 import
+// 了 internal/store（以及 internal/scheduler / internal/appservice 之一）。
+// 这是**仅测试用**的例外：internal/ui 的非测试代码必须只依赖契约层
+// （internal/api + internal/rpc + internal/urlkind），不得 import 业务侧包。
+// 见 internal/ui/boundary_test.go 与 Task 10 的 G4/G9 说明。
+
 package ui
 
 import (

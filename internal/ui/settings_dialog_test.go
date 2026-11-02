@@ -284,3 +284,50 @@ func TestBuildLanguageSelect_DoesNotOverrideLocaleOnInit(t *testing.T) {
 		t.Fatalf("构建语言下拉框后 ilocale.Current() = %q，want en（初始化不得覆盖当前语言）", got)
 	}
 }
+
+// TestLanguageSelectSwitchAppliesLocaleBeforePersist 守住「用户切语言」这条
+// 路径的两个关键语义：
+//
+//  1. 本进程的 ilocale 必须**立刻**切到新语言——契约层的语言控制消息不带
+//     语言标签（见 api.Message / rpc.Client.SetOnLanguage），UI 等不到标签；
+//     而 SaveSettings 的应答与随后的控制消息谁先到不确定，等回调再切会让
+//     界面语言落后一拍。
+//  2. persist 必须被调用一次——否则用户的选择没有落库，重启后回退。
+//
+// 这条用例驱动的是真实的下拉框回调（SetSelected → OnChanged），不是直接
+// 调内部函数。
+func TestLanguageSelectSwitchAppliesLocaleBeforePersist(t *testing.T) {
+	test.NewApp()
+
+	prevLocale := ilocale.Current()
+	prevSettings := GlobalSettings
+	t.Cleanup(func() {
+		ilocale.Set(prevLocale)
+		GlobalSettings = prevSettings
+	})
+
+	// 从中文起步，切到英文。
+	GlobalSettings.Language = "zh-Hans"
+	ilocale.Set("zh-Hans")
+
+	var persists int
+	sel := buildLanguageSelect(func() { persists++ })
+
+	enLbl := ilocale.T(ilocale.SupportedLabels["en"])
+	if enLbl == "" {
+		t.Fatal("前置条件不成立: 找不到英文的自描述标签")
+	}
+
+	// 触发用户选择。
+	sel.SetSelected(enLbl)
+
+	if got := ilocale.Current(); got != "en" {
+		t.Fatalf("切语言后本进程 locale = %q，期望 en（必须本地先切，不能等控制消息）", got)
+	}
+	if GlobalSettings.Language != "en" {
+		t.Fatalf("GlobalSettings.Language = %q，期望 en", GlobalSettings.Language)
+	}
+	if persists != 1 {
+		t.Fatalf("persist 调用 %d 次，期望恰好 1 次", persists)
+	}
+}
