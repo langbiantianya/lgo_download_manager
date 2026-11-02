@@ -5018,11 +5018,14 @@ exclude (
 - Create: `buf.yaml`
 - Create: `buf.gen.yaml`
 - Create: `scripts/gen_proto.sh`
+- Create: `internal/rpc/grpcx/convert.go`
 - Create: `internal/rpc/grpcx/server.go`
 - Create: `internal/rpc/grpcx/client.go`
-- Create: `internal/rpc/grpcx/convert.go`
 - Create: `internal/rpc/grpcx/convert_test.go`
+- Create: `internal/rpc/grpcx/grpcx_test.go`
+- Create: `internal/rpc/grpcx/contract_test.go`
 - Create: `internal/rpc/registry.go`
+- Create: `internal/rpc/registry_test.go`
 - Create (generated): `internal/rpc/grpcx/pb/lgdm.pb.go`、`internal/rpc/grpcx/pb/lgdm_grpc.pb.go`
 
 **Interfaces:**
@@ -5041,9 +5044,73 @@ exclude (
   const TransportGRPC, TransportHTTP string
   ```
 
+#### 与初稿的差异（E1–E8 的落法）
+
+控制器在派发前通读初稿代码块 + 实测 grpc-go v1.85.0 源码后指出 8 处必修缺陷。
+初稿的 grpcx 代码块整体作废，本表逐条记录最终实现怎么落的：
+
+| 条目 | 初稿的问题 | 最终实现 |
+| --- | --- | --- |
+| E1 | `grpcx.Dial` 的 dialer 写的是 `addr.Dial(a)`，gRPC 专门给的 ctx 被丢掉 | dialer 改成 `addr.DialContext(ctx, a)`（用 gRPC 传进来的请求级 ctx） |
+| E2 | `Dial` 的 ctx 是死参数，且 `grpc.NewClient` 是惰性连接，「业务进程没起来」要等到第一次调用才暴露 | `Dial` 先用 ctx 预连接一次再立刻断开，失败直接返回错误——与 httpx 的 A1 对齐，两种传输的失败时机一致 |
+| E3 | `messageToPB` 里 `*m.Event` 直接解引用，`api.Message.Event` 为 nil 时 panic | `messageToPB` 先判 `m.Event == nil`，回一个空事件并保留消息类别，不炸进程 |
+| E4 | `StreamMessages` 里事件通道一关就 `return nil`，把控制消息流一起掐掉 | 改成 `events = nil` / `controls = nil`：一侧关闭只停那一侧，与 httpx 的 A9 一致 |
+| E5 | `Close()` 直接转调 `conn.Close()`，第二次调用返回 `ErrClientConnClosing`（非 nil），违反 `rpc.Transport` 的幂等契约 | 用 `sync.Once` 包住 `Close`，重复调用一律返回 nil |
+| E6 | `Call` 里 `in.(*api.ListParams)` 之类裸断言，类型不对直接 panic | 全部改成带 ok 检查的两值断言（泛型小助手 `asPtr[T]`），类型不对返回错误 |
+| E7 | ctx 取消时调 `srv.GracefulStop()`，它会等所有在跑的 RPC 结束，而 `StreamMessages` 是长连接流 → `Serve` 永久阻塞 | ctx 取消时调 `srv.Stop()`（立即取消所有活跃 RPC/流），与 httpx 的 `srv.Close()` 语义一致；另加 `done` channel 收尾监视 goroutine，修掉 httpx 的 A8 泄漏 |
+| E8 | proto 里 `ListRequest.filter` / `sort` 是裸 string，`filterToPB` / `filterFromPB` 两张表因此没有任何调用点，是死代码 | proto 改成 `StatusFilter` / `TaskSort` 枚举；六张映射表全部双向显式写出（含 `UNSPECIFIED → ""`），并由 `TestEnumTablesCoverAllConstants` 断言「每张表都有真实调用点」 |
+
+除以上 8 条外，实现还额外做了这些对齐与加固：
+
+- `grpcx` 自己声明一份 `Handler` 接口（方法集与 `rpc.Handler` 逐字一致），
+  靠结构化类型对接，避开 `grpcx → rpc` 的包环（E16）。
+- 时间字段统一用 RFC3339 字符串（`time.RFC3339Nano`），零值 `time.Time{}`
+  格式化成 `"0001-01-01T00:00:00Z"` 而不是空串——空串会让「零值」与
+  「没设置」混成一团（E14）。
+- `Client.Call` 在发 RPC **之前**就校验请求与响应的指针类型，类型不对
+  不会白跑一趟服务端。
+- `grpcx` 的 `Client` 额外处理了 nil 接收者与零值客户端：回错误而不是 panic。
+- 鉴权 metadata 的 key 一律小写 `authorization`（E10）；gRPC 的 metadata 值
+  只允许可打印 ASCII，实际部署的 token 是随机数的十六进制编码，纯 ASCII，
+  这个差异在 `TestNonASCIITokenIsRejected` 里钉死。
+
+#### 依赖钉版：为什么 exclude 压不住、必须用 replace
+
+新增 `google.golang.org/grpc v1.85.0` 会把 `golang.org/x/net` 抬到
+**v0.60.0**——不是经由 `x/tools` 间接抬上来的，而是 grpc 自己的 go.mod
+**直接 require** 的：
+
+```
+google.golang.org/grpc v1.85.0
+  require golang.org/x/net v0.60.0
+```
+
+x/net v0.56 起 `httpproxy` 改了大小写环境变量的优先级（小写 `http_proxy`
+优先于大写 `HTTP_PROXY`），与 Go 标准库 `http.ProxyFromEnvironment` 的
+**大写优先**行为不一致，会悄悄改变 `internal/protocol` 的代理环境变量解析
+语义，打破 `TestProxyFuncSystemModeReturnsEnv`。
+
+- Task 6 用的 `exclude golang.org/x/tools` **压不住**：x/tools 只被
+  `swaggo/swag` 间接用到，跟 grpc 没有关系；而且 exclude 的语义是「改选
+  下一个可用版本」，实测会把 x/net 选到 v0.58.0——照样在 v0.56 以上。
+- 所以只能用 `replace` 硬钉：
+
+```
+replace golang.org/x/net => golang.org/x/net v0.47.0
+```
+
+grpc 实际 import 的 x/net 包只有 `http2`、`http2/hpack`、`http/httpproxy`、
+`trace`，v0.47.0 全都有，实测构建与全部测试通过。
+
 - [ ] **Step 1: 写 `proto/lgdm/v1/lgdm.proto`**
 
 ```proto
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 syntax = "proto3";
 
 package lgdm.v1;
@@ -5051,7 +5118,11 @@ package lgdm.v1;
 option go_package = "lgo_download_manager/internal/rpc/grpcx/pb;pb";
 
 // DownloadService 是业务主进程暴露给 UI 子进程的下载管理服务。
-// 与 internal/api 的契约一一对应。
+// 与 internal/api 的契约一一对应：每个 rpc 对应一个 api.Method* 常量，
+// 请求/响应消息与 api 层的 DTO 一一对应。
+//
+// 服务名与 httpx 传输的 URL 前缀（/lgdm.v1.DownloadService/）保持一致，
+// 两种传输对外暴露的方法集合因此完全相同。
 service DownloadService {
   rpc List(ListRequest) returns (ListResponse);
   rpc AddTask(AddTaskRequest) returns (AddTaskResponse);
@@ -5066,6 +5137,7 @@ service DownloadService {
   rpc StreamMessages(Empty) returns (stream Message);
 }
 
+// Status 反映 Task 的生命周期状态。取值与 internal/store 完全一致。
 enum Status {
   STATUS_UNSPECIFIED = 0;
   STATUS_PENDING = 1;
@@ -5076,6 +5148,7 @@ enum Status {
   STATUS_FILE_LOST = 6;
 }
 
+// StatusFilter 是任务列表的筛选条件。UNSPECIFIED 表示不过滤。
 enum StatusFilter {
   STATUS_FILTER_UNSPECIFIED = 0;
   STATUS_FILTER_ALL = 1;
@@ -5087,6 +5160,7 @@ enum StatusFilter {
   STATUS_FILTER_FILE_LOST = 7;
 }
 
+// TaskSort 是任务列表的排序方式。UNSPECIFIED 表示默认排序。
 enum TaskSort {
   TASK_SORT_UNSPECIFIED = 0;
   TASK_SORT_CREATED_DESC = 1;
@@ -5095,6 +5169,7 @@ enum TaskSort {
   TASK_SORT_NAME_DESC = 4;
 }
 
+// ProxyMode 是代理模式。
 enum ProxyMode {
   PROXY_MODE_UNSPECIFIED = 0;
   PROXY_MODE_SYSTEM = 1;
@@ -5102,6 +5177,7 @@ enum ProxyMode {
   PROXY_MODE_MANUAL = 3;
 }
 
+// ProtocolKind 是任务所属的传输协议。
 enum ProtocolKind {
   PROTOCOL_KIND_UNSPECIFIED = 0;
   PROTOCOL_KIND_HTTP = 1;
@@ -5111,33 +5187,44 @@ enum ProtocolKind {
   PROTOCOL_KIND_BT = 5;
 }
 
+// Empty 是无负载请求/响应的占位类型。
 message Empty {}
 
+// TaskRef 引用单个任务。
 message TaskRef {
   string id = 1;
 }
 
+// BoolResponse 是布尔结果。
 message BoolResponse {
   bool value = 1;
 }
 
+// ProbeRequest 是体积探测的请求。
 message ProbeRequest {
   string url = 1;
 }
 
+// ProbeResponse 是体积探测的结果。
 message ProbeResponse {
   int64 total_size = 1;
 }
 
+// ListRequest 是列表查询参数。filter 与 sort 用枚举而不是裸字符串：
+// gRPC 传输的价值就在类型安全，用字符串会浪费 protobuf 的类型系统。
+// UNSPECIFIED 分别对应「不过滤」与「默认排序」，与 HTTP 传输传空字符串
+// 的语义一致。
 message ListRequest {
-  string filter = 1;
-  string sort = 2;
+  StatusFilter filter = 1;
+  TaskSort sort = 2;
 }
 
+// ListResponse 是列表查询的结果。
 message ListResponse {
   repeated Task tasks = 1;
 }
 
+// AuthOptions 是随任务一起传递的凭据。
 message AuthOptions {
   string username = 1;
   string password = 2;
@@ -5151,6 +5238,7 @@ message AuthOptions {
   string proxy_auto_config_url = 10;
 }
 
+// AddTaskRequest 是「添加下载任务」的请求。
 message AddTaskRequest {
   string url = 1;
   string save_path = 2;
@@ -5160,10 +5248,12 @@ message AddTaskRequest {
   int64 min_chunk_size = 6;
 }
 
+// AddTaskResponse 返回新建的任务。
 message AddTaskResponse {
   Task task = 1;
 }
 
+// Task 是任务的对外视图。
 message Task {
   string id = 1;
   string url = 2;
@@ -5185,12 +5275,15 @@ message Task {
   string auth_data = 18;
   string error_message = 19;
   string error_kind = 20;
+  // 时间字段用 RFC3339 字符串，而不是 google.protobuf.Timestamp：
+  // 避免为一个时间戳引入额外的 proto 依赖。
   string created_at = 21;
   string updated_at = 22;
   string completed_at = 23;
   string bt_file = 24;
 }
 
+// Settings 是权威设置快照。
 message Settings {
   string default_save_dir = 1;
   int32 default_threads = 2;
@@ -5221,24 +5314,29 @@ message Settings {
   string bt_trackers = 27;
 }
 
+// GetSettingsResponse 返回设置快照。
 message GetSettingsResponse {
   Settings settings = 1;
 }
 
+// SaveSettingsRequest 是保存设置的请求。
 message SaveSettingsRequest {
   Settings settings = 1;
 }
 
+// BTInfoRequest 是 BT 详情查询的请求。
 message BTInfoRequest {
   string task_id = 1;
 }
 
+// FileProgress 是种子内单个文件的进度。
 message FileProgress {
   string path = 1;
   int64 length = 2;
   int64 completed = 3;
 }
 
+// BTDetail 是 BT 任务的实时详情快照。
 message BTDetail {
   string name = 1;
   string info_hash = 2;
@@ -5261,16 +5359,19 @@ message BTDetail {
   repeated string trackers = 19;
 }
 
+// BTDetailResponse 返回 BT 详情。
 message BTDetailResponse {
   BTDetail detail = 1;
 }
 
+// Event 是一条任务事件。
 message Event {
   string why = 1;
   Task task = 2;
   double speed_bps = 3;
 }
 
+// ShowAddTaskParams 描述一次「请 UI 弹出新建下载任务对话框」的请求。
 message ShowAddTaskParams {
   string url = 1;
   string name = 2;
@@ -5278,6 +5379,7 @@ message ShowAddTaskParams {
   string cookies = 4;
 }
 
+// Message 是服务端推送的一条消息。事件与控制消息合并在同一条流里。
 message Message {
   oneof payload {
     Event event = 1;
@@ -5289,8 +5391,15 @@ message Message {
 }
 ```
 
+
 时间字段用 RFC3339 字符串（而不是 `google.protobuf.Timestamp`）——避免为时间戳引入额外的
 proto 依赖，转换时统一 `time.Time.Format(time.RFC3339Nano)`。
+
+`ListRequest` 的 `filter` / `sort` 用枚举而不是裸字符串（E8）：gRPC 传输的价值
+就在类型安全，用字符串会浪费 protobuf 的类型系统。`UNSPECIFIED` 分别对应
+「不过滤」与「默认排序」，与 HTTP 传输传空字符串的语义一致
+（`store.StatusFilter("")` 走 default 不过滤，`store.TaskSort("")` 走 default
+即 `created_at DESC`）。
 
 - [ ] **Step 2: 建 buf 配置与生成脚本**
 
@@ -5303,10 +5412,24 @@ modules:
 lint:
   use:
     - STANDARD
+  # 这三条规则要求「每个 RPC 用自己专属的请求/响应消息，且消息名带上
+  # 方法名」。这里刻意不遵守，代价是 proto 里少一堆只有一个字段的样板
+  # 消息：
+  #   - TaskRef 被 start/pause/delete/is_preparing 四个方法共用；
+  #   - Empty 是无负载请求/响应的占位类型，被 get_settings、
+  #     save_settings、stream_messages 等方法共用。
+  # 契约层的形状由 internal/api 决定，proto 只是它的线格式投影，
+  # 不该在这里再复制一遍方法名。其余 STANDARD 规则（字段名、枚举名、
+  # 枚举零值必须带 _UNSPECIFIED、包名与目录路径一致等）照常生效。
+  except:
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+    - RPC_REQUEST_RESPONSE_UNIQUE
 breaking:
   use:
     - FILE
 ```
+
 
 `buf.gen.yaml`：
 
@@ -5323,16 +5446,25 @@ plugins:
     opt: module=lgo_download_manager
 ```
 
+
 `scripts/gen_proto.sh`：
 
 ```bash
 #!/usr/bin/env bash
 # 生成 protobuf 代码。生成物入库，CI 只校验同步性。
+#
+# 用 buf generate 而不是直接调 protoc：本机没装 protoc，而 buf 自带
+# 解析器，还能顺手跑 lint（buf lint）。
+#
+# protoc-gen-go / protoc-gen-go-grpc 默认装在 $(go env GOPATH)/bin，
+# 不一定在 PATH 上，这里显式补上。
 set -euo pipefail
 cd "$(dirname "$0")/.."
+export PATH="$(go env GOPATH)/bin:$PATH"
 buf generate
 gofmt -w internal/rpc/grpcx/pb
 ```
+
 
 ```bash
 chmod +x scripts/gen_proto.sh
@@ -5343,18 +5475,19 @@ chmod +x scripts/gen_proto.sh
 Run: `PATH="$(go env GOPATH)/bin:$PATH" ./scripts/gen_proto.sh`
 Expected: 生成 `internal/rpc/grpcx/pb/lgdm.pb.go` 与 `internal/rpc/grpcx/pb/lgdm_grpc.pb.go`
 
-若 `buf` 未安装：
+本机没装 `protoc`，用 `buf generate` 代替（脚本里已经补上
+`$(go env GOPATH)/bin` 到 PATH，`protoc-gen-go` / `protoc-gen-go-grpc` 默认装在那里）。
 
-```bash
-go install github.com/bufbuild/buf/cmd/buf@latest
-go install google.golang.org/protobuf/cmd/protoc-gen-go@latest
-go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest
-```
+生成物入库，CI 只校验同步性——重新生成后 `git status` 必须干净。
+
+`buf lint` 也能过（`buf.yaml` 里排除了三条规则并写明理由：请求/响应消息
+共用会让 proto 里多出一堆只有一个字段的样板消息）。
 
 - [ ] **Step 4: 加依赖**
 
-Run: `go get google.golang.org/grpc@latest google.golang.org/protobuf@latest && go mod tidy`
-Expected: `go.mod` 里出现这两个直接依赖
+Run: `go get google.golang.org/grpc@v1.85.0 google.golang.org/protobuf@v1.36.12 && go mod tidy`
+Expected: `go.mod` 里出现这两个直接依赖，且 `golang.org/x/net` 被
+`replace` 钉回 v0.47.0（见上面的「依赖钉版」）。
 
 - [ ] **Step 5: 建 `internal/rpc/grpcx/convert.go`**
 
@@ -5368,16 +5501,26 @@ Expected: `go.mod` 里出现这两个直接依赖
 package grpcx
 
 import (
-	"fmt"
+	"slices"
 	"time"
 
 	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/rpc/grpcx/pb"
 )
 
+// 本文件是契约层（internal/api）与 protobuf 之间的唯一转换点：客户端与
+// 服务端都走这里的函数，两边不会各自写一份而慢慢走偏。
+//
+// 枚举映射表一律显式写出 UNSPECIFIED 条目，不依赖「map 缺失键返回零值」
+// 这类隐式行为——隐式行为在重构或换语言实现时很容易碎。
+//
+// 每张映射表都有真实调用点：状态走 Task，筛选与排序走 ListRequest，
+// 代理模式走 Settings 与 AuthOptions，协议种类走 AddTaskRequest。
+
 // ---- 状态枚举映射 ----
 
 var statusToPB = map[api.Status]pb.Status{
+	"":                    pb.Status_STATUS_UNSPECIFIED,
 	api.StatusPending:     pb.Status_STATUS_PENDING,
 	api.StatusDownloading: pb.Status_STATUS_DOWNLOADING,
 	api.StatusPaused:      pb.Status_STATUS_PAUSED,
@@ -5387,6 +5530,7 @@ var statusToPB = map[api.Status]pb.Status{
 }
 
 var statusFromPB = map[pb.Status]api.Status{
+	pb.Status_STATUS_UNSPECIFIED: "",
 	pb.Status_STATUS_PENDING:     api.StatusPending,
 	pb.Status_STATUS_DOWNLOADING: api.StatusDownloading,
 	pb.Status_STATUS_PAUSED:      api.StatusPaused,
@@ -5395,7 +5539,11 @@ var statusFromPB = map[pb.Status]api.Status{
 	pb.Status_STATUS_FILE_LOST:   api.StatusFileLost,
 }
 
+// ---- 筛选枚举映射 ----
+
+// 契约层的零值（空串）表示「不过滤」，与 HTTP 传输传空字符串的语义一致。
 var filterToPB = map[api.StatusFilter]pb.StatusFilter{
+	"":                    pb.StatusFilter_STATUS_FILTER_UNSPECIFIED,
 	api.FilterAll:         pb.StatusFilter_STATUS_FILTER_ALL,
 	api.FilterPending:     pb.StatusFilter_STATUS_FILTER_PENDING,
 	api.FilterDownloading: pb.StatusFilter_STATUS_FILTER_DOWNLOADING,
@@ -5406,6 +5554,7 @@ var filterToPB = map[api.StatusFilter]pb.StatusFilter{
 }
 
 var filterFromPB = map[pb.StatusFilter]api.StatusFilter{
+	pb.StatusFilter_STATUS_FILTER_UNSPECIFIED: "",
 	pb.StatusFilter_STATUS_FILTER_ALL:         api.FilterAll,
 	pb.StatusFilter_STATUS_FILTER_PENDING:     api.FilterPending,
 	pb.StatusFilter_STATUS_FILTER_DOWNLOADING: api.FilterDownloading,
@@ -5415,7 +5564,11 @@ var filterFromPB = map[pb.StatusFilter]api.StatusFilter{
 	pb.StatusFilter_STATUS_FILTER_FILE_LOST:   api.FilterFileLost,
 }
 
+// ---- 排序枚举映射 ----
+
+// 契约层的零值（空串）表示「默认排序」，与 HTTP 传输传空字符串的语义一致。
 var sortToPB = map[api.TaskSort]pb.TaskSort{
+	"":                  pb.TaskSort_TASK_SORT_UNSPECIFIED,
 	api.SortCreatedDesc: pb.TaskSort_TASK_SORT_CREATED_DESC,
 	api.SortCreatedAsc:  pb.TaskSort_TASK_SORT_CREATED_ASC,
 	api.SortNameAsc:     pb.TaskSort_TASK_SORT_NAME_ASC,
@@ -5423,25 +5576,33 @@ var sortToPB = map[api.TaskSort]pb.TaskSort{
 }
 
 var sortFromPB = map[pb.TaskSort]api.TaskSort{
+	pb.TaskSort_TASK_SORT_UNSPECIFIED:  "",
 	pb.TaskSort_TASK_SORT_CREATED_DESC: api.SortCreatedDesc,
 	pb.TaskSort_TASK_SORT_CREATED_ASC:  api.SortCreatedAsc,
 	pb.TaskSort_TASK_SORT_NAME_ASC:     api.SortNameAsc,
 	pb.TaskSort_TASK_SORT_NAME_DESC:    api.SortNameDesc,
 }
 
+// ---- 代理模式映射 ----
+
 var proxyToPB = map[api.ProxyMode]pb.ProxyMode{
+	"":                    pb.ProxyMode_PROXY_MODE_UNSPECIFIED,
 	api.ProxyModeSystem:   pb.ProxyMode_PROXY_MODE_SYSTEM,
 	api.ProxyModeDisabled: pb.ProxyMode_PROXY_MODE_DISABLED,
 	api.ProxyModeManual:   pb.ProxyMode_PROXY_MODE_MANUAL,
 }
 
 var proxyFromPB = map[pb.ProxyMode]api.ProxyMode{
-	pb.ProxyMode_PROXY_MODE_SYSTEM:   api.ProxyModeSystem,
-	pb.ProxyMode_PROXY_MODE_DISABLED: api.ProxyModeDisabled,
-	pb.ProxyMode_PROXY_MODE_MANUAL:   api.ProxyModeManual,
+	pb.ProxyMode_PROXY_MODE_UNSPECIFIED: "",
+	pb.ProxyMode_PROXY_MODE_SYSTEM:      api.ProxyModeSystem,
+	pb.ProxyMode_PROXY_MODE_DISABLED:    api.ProxyModeDisabled,
+	pb.ProxyMode_PROXY_MODE_MANUAL:      api.ProxyModeManual,
 }
 
+// ---- 协议种类映射 ----
+
 var kindToPB = map[api.ProtocolKind]pb.ProtocolKind{
+	"":              pb.ProtocolKind_PROTOCOL_KIND_UNSPECIFIED,
 	api.ProtoHTTP:   pb.ProtocolKind_PROTOCOL_KIND_HTTP,
 	api.ProtoHTTPS:  pb.ProtocolKind_PROTOCOL_KIND_HTTPS,
 	api.ProtoFTP:    pb.ProtocolKind_PROTOCOL_KIND_FTP,
@@ -5450,15 +5611,39 @@ var kindToPB = map[api.ProtocolKind]pb.ProtocolKind{
 }
 
 var kindFromPB = map[pb.ProtocolKind]api.ProtocolKind{
-	pb.ProtocolKind_PROTOCOL_KIND_HTTP:   api.ProtoHTTP,
-	pb.ProtocolKind_PROTOCOL_KIND_HTTPS:  api.ProtoHTTPS,
-	pb.ProtocolKind_PROTOCOL_KIND_FTP:    api.ProtoFTP,
-	pb.ProtocolKind_PROTOCOL_KIND_WEBDAV: api.ProtoWebDAV,
-	pb.ProtocolKind_PROTOCOL_KIND_BT:     api.ProtoBT,
+	pb.ProtocolKind_PROTOCOL_KIND_UNSPECIFIED: "",
+	pb.ProtocolKind_PROTOCOL_KIND_HTTP:        api.ProtoHTTP,
+	pb.ProtocolKind_PROTOCOL_KIND_HTTPS:       api.ProtoHTTPS,
+	pb.ProtocolKind_PROTOCOL_KIND_FTP:         api.ProtoFTP,
+	pb.ProtocolKind_PROTOCOL_KIND_WEBDAV:      api.ProtoWebDAV,
+	pb.ProtocolKind_PROTOCOL_KIND_BT:          api.ProtoBT,
 }
 
 // ---- DTO 映射 ----
 
+// listParamsToPB 把列表查询参数转成 proto 请求。
+func listParamsToPB(p *api.ListParams) *pb.ListRequest {
+	if p == nil {
+		return &pb.ListRequest{}
+	}
+	return &pb.ListRequest{
+		Filter: filterToPB[p.Filter],
+		Sort:   sortToPB[p.Sort],
+	}
+}
+
+// listParamsFromPB 把 proto 请求转回列表查询参数。
+func listParamsFromPB(r *pb.ListRequest) *api.ListParams {
+	if r == nil {
+		return &api.ListParams{}
+	}
+	return &api.ListParams{
+		Filter: filterFromPB[r.GetFilter()],
+		Sort:   sortFromPB[r.GetSort()],
+	}
+}
+
+// taskToPB 把任务转成 proto 消息。
 func taskToPB(t *api.Task) *pb.Task {
 	if t == nil {
 		return nil
@@ -5478,8 +5663,8 @@ func taskToPB(t *api.Task) *pb.Task {
 		IsAllocated:     t.IsAllocated,
 		ChunkCount:      int32(t.ChunkCount),
 		MinChunkSize:    t.MinChunkSize,
-		ChunkProgress:   t.ChunkProgress,
-		ChunkRanges:     t.ChunkRanges,
+		ChunkProgress:   slices.Clone(t.ChunkProgress),
+		ChunkRanges:     slices.Clone(t.ChunkRanges),
 		Status:          statusToPB[t.Status],
 		AuthData:        t.AuthData,
 		ErrorMessage:    t.ErrorMessage,
@@ -5491,38 +5676,40 @@ func taskToPB(t *api.Task) *pb.Task {
 	}
 }
 
+// taskFromPB 把 proto 消息转回任务。
 func taskFromPB(t *pb.Task) *api.Task {
 	if t == nil {
 		return nil
 	}
 	return &api.Task{
-		ID:              t.Id,
-		URL:             t.Url,
-		SavePath:        t.SavePath,
-		Protocol:        t.Protocol,
-		TotalSize:       t.TotalSize,
-		Downloaded:      t.Downloaded,
-		SupportRange:    t.SupportRange,
-		ETag:            t.Etag,
-		LastModified:    t.LastModified,
-		DigestAlgorithm: t.DigestAlgorithm,
-		Digest:          t.Digest,
-		IsAllocated:     t.IsAllocated,
-		ChunkCount:      int(t.ChunkCount),
-		MinChunkSize:    t.MinChunkSize,
-		ChunkProgress:   t.ChunkProgress,
-		ChunkRanges:     t.ChunkRanges,
-		Status:          statusFromPB[t.Status],
-		AuthData:        t.AuthData,
-		ErrorMessage:    t.ErrorMessage,
-		ErrorKind:       t.ErrorKind,
-		CreatedAt:       parseTime(t.CreatedAt),
-		UpdatedAt:       parseTime(t.UpdatedAt),
-		CompletedAt:     parseTime(t.CompletedAt),
-		BTFile:          t.BtFile,
+		ID:              t.GetId(),
+		URL:             t.GetUrl(),
+		SavePath:        t.GetSavePath(),
+		Protocol:        t.GetProtocol(),
+		TotalSize:       t.GetTotalSize(),
+		Downloaded:      t.GetDownloaded(),
+		SupportRange:    t.GetSupportRange(),
+		ETag:            t.GetEtag(),
+		LastModified:    t.GetLastModified(),
+		DigestAlgorithm: t.GetDigestAlgorithm(),
+		Digest:          t.GetDigest(),
+		IsAllocated:     t.GetIsAllocated(),
+		ChunkCount:      int(t.GetChunkCount()),
+		MinChunkSize:    t.GetMinChunkSize(),
+		ChunkProgress:   nilIfEmpty(t.GetChunkProgress()),
+		ChunkRanges:     nilIfEmpty(t.GetChunkRanges()),
+		Status:          statusFromPB[t.GetStatus()],
+		AuthData:        t.GetAuthData(),
+		ErrorMessage:    t.GetErrorMessage(),
+		ErrorKind:       t.GetErrorKind(),
+		CreatedAt:       parseTime(t.GetCreatedAt()),
+		UpdatedAt:       parseTime(t.GetUpdatedAt()),
+		CompletedAt:     parseTime(t.GetCompletedAt()),
+		BTFile:          t.GetBtFile(),
 	}
 }
 
+// settingsToPB 把设置转成 proto 消息。
 func settingsToPB(s api.Settings) *pb.Settings {
 	return &pb.Settings{
 		DefaultSaveDir:     s.DefaultSaveDir,
@@ -5555,41 +5742,43 @@ func settingsToPB(s api.Settings) *pb.Settings {
 	}
 }
 
+// settingsFromPB 把 proto 消息转回设置。
 func settingsFromPB(s *pb.Settings) api.Settings {
 	if s == nil {
 		return api.Settings{}
 	}
 	return api.Settings{
-		DefaultSaveDir:     s.DefaultSaveDir,
-		DefaultThreads:     int(s.DefaultThreads),
-		MinChunkSize:       s.MinChunkSize,
-		UserAgent:          s.UserAgent,
-		Cookies:            s.Cookies,
-		FTPPassive:         s.FtpPassive,
-		Prealloc:           s.Prealloc,
-		TaskSort:           sortFromPB[s.TaskSort],
-		ProxyMode:          proxyFromPB[s.ProxyMode],
-		ProxyURL:           s.ProxyUrl,
-		ProxyBypass:        s.ProxyBypass,
-		ProxyAutoConfigURL: s.ProxyAutoConfigUrl,
-		DownloadLimitKiB:   int(s.DownloadLimitKib),
-		LightMode:          s.LightMode,
-		MaxConcurrent:      int(s.MaxConcurrent),
-		AutoStart:          s.AutoStart,
-		Language:           s.Language,
-		BTPort:             int(s.BtPort),
-		BTMaxPeers:         int(s.BtMaxPeers),
-		BTDownloadLimitKiB: int(s.BtDownloadLimitKib),
-		BTUploadLimitKiB:   int(s.BtUploadLimitKib),
-		BTDHT:              s.BtDht,
-		BTPEX:              s.BtPex,
-		BTSeedRatio:        s.BtSeedRatio,
-		BTMaxSeeding:       int(s.BtMaxSeeding),
-		BTMaxConcurrent:    int(s.BtMaxConcurrent),
-		BTTrackers:         s.BtTrackers,
+		DefaultSaveDir:     s.GetDefaultSaveDir(),
+		DefaultThreads:     int(s.GetDefaultThreads()),
+		MinChunkSize:       s.GetMinChunkSize(),
+		UserAgent:          s.GetUserAgent(),
+		Cookies:            s.GetCookies(),
+		FTPPassive:         s.GetFtpPassive(),
+		Prealloc:           s.GetPrealloc(),
+		TaskSort:           sortFromPB[s.GetTaskSort()],
+		ProxyMode:          proxyFromPB[s.GetProxyMode()],
+		ProxyURL:           s.GetProxyUrl(),
+		ProxyBypass:        s.GetProxyBypass(),
+		ProxyAutoConfigURL: s.GetProxyAutoConfigUrl(),
+		DownloadLimitKiB:   int(s.GetDownloadLimitKib()),
+		LightMode:          s.GetLightMode(),
+		MaxConcurrent:      int(s.GetMaxConcurrent()),
+		AutoStart:          s.GetAutoStart(),
+		Language:           s.GetLanguage(),
+		BTPort:             int(s.GetBtPort()),
+		BTMaxPeers:         int(s.GetBtMaxPeers()),
+		BTDownloadLimitKiB: int(s.GetBtDownloadLimitKib()),
+		BTUploadLimitKiB:   int(s.GetBtUploadLimitKib()),
+		BTDHT:              s.GetBtDht(),
+		BTPEX:              s.GetBtPex(),
+		BTSeedRatio:        s.GetBtSeedRatio(),
+		BTMaxSeeding:       int(s.GetBtMaxSeeding()),
+		BTMaxConcurrent:    int(s.GetBtMaxConcurrent()),
+		BTTrackers:         s.GetBtTrackers(),
 	}
 }
 
+// authToPB 把凭据转成 proto 消息。
 func authToPB(a api.AuthOptions) *pb.AuthOptions {
 	return &pb.AuthOptions{
 		Username:           a.Username,
@@ -5605,24 +5794,56 @@ func authToPB(a api.AuthOptions) *pb.AuthOptions {
 	}
 }
 
+// authFromPB 把 proto 消息转回凭据。
 func authFromPB(a *pb.AuthOptions) api.AuthOptions {
 	if a == nil {
 		return api.AuthOptions{}
 	}
 	return api.AuthOptions{
-		Username:           a.Username,
-		Password:           a.Password,
-		UserAgent:          a.UserAgent,
-		Cookies:            a.Cookies,
-		Referer:            a.Referer,
-		FTPPassive:         a.FtpPassive,
-		ProxyMode:          proxyFromPB[a.ProxyMode],
-		ProxyURL:           a.ProxyUrl,
-		ProxyBypass:        a.ProxyBypass,
-		ProxyAutoConfigURL: a.ProxyAutoConfigUrl,
+		Username:           a.GetUsername(),
+		Password:           a.GetPassword(),
+		UserAgent:          a.GetUserAgent(),
+		Cookies:            a.GetCookies(),
+		Referer:            a.GetReferer(),
+		FTPPassive:         a.GetFtpPassive(),
+		ProxyMode:          proxyFromPB[a.GetProxyMode()],
+		ProxyURL:           a.GetProxyUrl(),
+		ProxyBypass:        a.GetProxyBypass(),
+		ProxyAutoConfigURL: a.GetProxyAutoConfigUrl(),
 	}
 }
 
+// addTaskInputToPB 把「添加下载任务」的入参转成 proto 请求。
+func addTaskInputToPB(in *api.AddTaskInput) *pb.AddTaskRequest {
+	if in == nil {
+		return &pb.AddTaskRequest{}
+	}
+	return &pb.AddTaskRequest{
+		Url:          in.URL,
+		SavePath:     in.SavePath,
+		Protocol:     kindToPB[in.Protocol],
+		Auth:         authToPB(in.Auth),
+		ChunkCount:   int32(in.ChunkCount),
+		MinChunkSize: in.MinChunkSize,
+	}
+}
+
+// addTaskInputFromPB 把 proto 请求转回「添加下载任务」的入参。
+func addTaskInputFromPB(r *pb.AddTaskRequest) *api.AddTaskInput {
+	if r == nil {
+		return &api.AddTaskInput{}
+	}
+	return &api.AddTaskInput{
+		URL:          r.GetUrl(),
+		SavePath:     r.GetSavePath(),
+		Protocol:     kindFromPB[r.GetProtocol()],
+		Auth:         authFromPB(r.GetAuth()),
+		ChunkCount:   int(r.GetChunkCount()),
+		MinChunkSize: r.GetMinChunkSize(),
+	}
+}
+
+// btDetailToPB 把 BT 详情转成 proto 消息。
 func btDetailToPB(d *api.BTDetail) *pb.BTDetail {
 	if d == nil {
 		return nil
@@ -5658,49 +5879,51 @@ func btDetailToPB(d *api.BTDetail) *pb.BTDetail {
 		Seeding:      d.Seeding,
 		Complete:     d.Complete,
 		Files:        files,
-		Trackers:     d.Trackers,
+		Trackers:     slices.Clone(d.Trackers),
 	}
 }
 
+// btDetailFromPB 把 proto 消息转回 BT 详情。
 func btDetailFromPB(d *pb.BTDetail) *api.BTDetail {
 	if d == nil {
 		return nil
 	}
-	files := make([]api.FileProgress, 0, len(d.Files))
-	for _, f := range d.Files {
+	files := make([]api.FileProgress, 0, len(d.GetFiles()))
+	for _, f := range d.GetFiles() {
 		files = append(files, api.FileProgress{
-			Path:      f.Path,
-			Length:    f.Length,
-			Completed: f.Completed,
+			Path:      f.GetPath(),
+			Length:    f.GetLength(),
+			Completed: f.GetCompleted(),
 		})
 	}
-	buckets := make([]uint8, 0, len(d.PieceBuckets))
-	for _, b := range d.PieceBuckets {
+	buckets := make([]uint8, 0, len(d.GetPieceBuckets()))
+	for _, b := range d.GetPieceBuckets() {
 		buckets = append(buckets, uint8(b))
 	}
 	return &api.BTDetail{
-		Name:         d.Name,
-		InfoHash:     d.InfoHash,
-		Total:        d.Total,
-		Downloaded:   d.Downloaded,
-		Uploaded:     d.Uploaded,
-		SpeedBPS:     d.SpeedBps,
-		UploadBPS:    d.UploadBps,
-		Peers:        int(d.Peers),
-		TotalPeers:   int(d.TotalPeers),
-		Seeders:      int(d.Seeders),
-		Leechers:     int(d.Leechers),
-		PieceLength:  d.PieceLength,
-		Pieces:       int(d.Pieces),
-		PiecesDone:   int(d.PiecesDone),
+		Name:         d.GetName(),
+		InfoHash:     d.GetInfoHash(),
+		Total:        d.GetTotal(),
+		Downloaded:   d.GetDownloaded(),
+		Uploaded:     d.GetUploaded(),
+		SpeedBPS:     d.GetSpeedBps(),
+		UploadBPS:    d.GetUploadBps(),
+		Peers:        int(d.GetPeers()),
+		TotalPeers:   int(d.GetTotalPeers()),
+		Seeders:      int(d.GetSeeders()),
+		Leechers:     int(d.GetLeechers()),
+		PieceLength:  d.GetPieceLength(),
+		Pieces:       int(d.GetPieces()),
+		PiecesDone:   int(d.GetPiecesDone()),
 		PieceBuckets: buckets,
-		Seeding:      d.Seeding,
-		Complete:     d.Complete,
+		Seeding:      d.GetSeeding(),
+		Complete:     d.GetComplete(),
 		Files:        files,
-		Trackers:     d.Trackers,
+		Trackers:     slices.Clone(d.GetTrackers()),
 	}
 }
 
+// eventToPB 把事件转成 proto 消息。
 func eventToPB(e api.Event) *pb.Event {
 	return &pb.Event{
 		Why:      e.Why,
@@ -5709,14 +5932,15 @@ func eventToPB(e api.Event) *pb.Event {
 	}
 }
 
+// eventFromPB 把 proto 消息转回事件。
 func eventFromPB(e *pb.Event) api.Event {
 	if e == nil {
 		return api.Event{}
 	}
 	return api.Event{
-		Why:      e.Why,
-		Task:     taskFromPB(e.Task),
-		SpeedBPS: e.SpeedBps,
+		Why:      e.GetWhy(),
+		Task:     taskFromPB(e.GetTask()),
+		SpeedBPS: e.GetSpeedBps(),
 	}
 }
 
@@ -5724,6 +5948,11 @@ func eventFromPB(e *pb.Event) api.Event {
 func messageToPB(m api.Message) *pb.Message {
 	switch m.Kind {
 	case api.MessageKindEvent:
+		// api.Message.Event 是指针，契约上允许为 nil（rpc 共享客户端的
+		// dispatch 就显式判过 msg.Event != nil），这里不能直接解引用。
+		if m.Event == nil {
+			return &pb.Message{Payload: &pb.Message_Event{Event: &pb.Event{}}}
+		}
 		return &pb.Message{Payload: &pb.Message_Event{Event: eventToPB(*m.Event)}}
 	case api.MessageKindShow:
 		return &pb.Message{Payload: &pb.Message_Show{Show: true}}
@@ -5752,7 +5981,7 @@ func messageFromPB(m *pb.Message) api.Message {
 	if m == nil {
 		return api.Message{}
 	}
-	switch p := m.Payload.(type) {
+	switch p := m.GetPayload().(type) {
 	case *pb.Message_Event:
 		ev := eventFromPB(p.Event)
 		return api.Message{Kind: api.MessageKindEvent, Event: &ev}
@@ -5777,11 +6006,12 @@ func messageFromPB(m *pb.Message) api.Message {
 	}
 }
 
-// formatTime 把时间转成 RFC3339 字符串。零值返回空串。
+// formatTime 把时间转成 RFC3339 字符串。
+//
+// 零值时间会格式化成 "0001-01-01T00:00:00Z"，而不是空串：proto3 的
+// string 字段本来就没有「有值 / 没值」之分，用空串表达零值会让「零值」
+// 和「没设置」混成一团。
 func formatTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
-	}
 	return t.Format(time.RFC3339Nano)
 }
 
@@ -5797,17 +6027,30 @@ func parseTime(s string) time.Time {
 	return t
 }
 
-// methodErrorf 构造带方法名的错误。
-func methodErrorf(method string, err error) error {
-	return fmt.Errorf("grpcx: %s: %w", method, err)
+// nilIfEmpty 把空切片归一成 nil。
+//
+// proto3 的 repeated 字段在空的时候不上线传输，反序列化后必然是 nil。
+// 归一之后「空切片」和「nil」在契约层就是同一件事，只在这一处处理。
+func nilIfEmpty(v []int64) []int64 {
+	if len(v) == 0 {
+		return nil
+	}
+	return slices.Clone(v)
 }
 ```
 
+
 - [ ] **Step 6: 写转换往返测试**
 
-创建 `internal/rpc/grpcx/convert_test.go`：
+`internal/rpc/grpcx/convert_test.go`：
 
 ```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package grpcx
 
 import (
@@ -5816,10 +6059,51 @@ import (
 	"time"
 
 	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/rpc/grpcx/pb"
 )
 
+// 测试用的固定时间点。用 time.Date 而不是 time.Now()：time.Now() 带单调
+// 时钟读数，格式化后就没了，往返比较必然不相等。
+var testTime = time.Date(2026, 3, 4, 5, 6, 7, 890123456, time.UTC)
+
+// normTask 把任务里的空切片归一成 nil。
+//
+// proto3 的 repeated 字段为空时不上线传输，反序列化后必然是 nil。
+// 归一之后「空切片」与「nil」在契约层就是同一件事。
+func normTask(t *api.Task) *api.Task {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	if len(c.ChunkProgress) == 0 {
+		c.ChunkProgress = nil
+	}
+	if len(c.ChunkRanges) == 0 {
+		c.ChunkRanges = nil
+	}
+	return &c
+}
+
+// normBTDetail 把详情里的空切片归一成 nil。
+func normBTDetail(d *api.BTDetail) *api.BTDetail {
+	if d == nil {
+		return nil
+	}
+	c := *d
+	if len(c.PieceBuckets) == 0 {
+		c.PieceBuckets = nil
+	}
+	if len(c.Files) == 0 {
+		c.Files = nil
+	}
+	if len(c.Trackers) == 0 {
+		c.Trackers = nil
+	}
+	return &c
+}
+
+// TestTaskRoundTrip 覆盖任务的完整字段往返。
 func TestTaskRoundTrip(t *testing.T) {
-	now := time.Now()
 	in := api.Task{
 		ID: "t1", URL: "http://x/a", SavePath: "/tmp/a", Protocol: "HTTP",
 		TotalSize: 100, Downloaded: 40, SupportRange: true,
@@ -5827,14 +6111,41 @@ func TestTaskRoundTrip(t *testing.T) {
 		IsAllocated: true, ChunkCount: 4, MinChunkSize: 1024,
 		ChunkProgress: []int64{1, 2}, ChunkRanges: []int64{0, 9},
 		Status: api.StatusDownloading, AuthData: "{}", ErrorMessage: "m",
-		ErrorKind: "k", CreatedAt: now, UpdatedAt: now, BTFile: "f",
+		ErrorKind: "k", CreatedAt: testTime, UpdatedAt: testTime,
+		CompletedAt: testTime, BTFile: "f",
 	}
 	got := taskFromPB(taskToPB(&in))
-	if !reflect.DeepEqual(*got, in) {
+	if !reflect.DeepEqual(normTask(got), normTask(&in)) {
 		t.Fatalf("Task 往返不一致:\n got = %+v\nwant = %+v", *got, in)
 	}
 }
 
+// TestTaskRoundTripZeroTimes 覆盖零值时间字段。
+//
+// 零值 time.Time{} 格式化后是 "0001-01-01T00:00:00Z"，必须能原样解析
+// 回零值——用空串表达零值会让「零值」与「没设置」混成一团。
+func TestTaskRoundTripZeroTimes(t *testing.T) {
+	in := api.Task{ID: "t0"}
+	got := taskFromPB(taskToPB(&in))
+	if !reflect.DeepEqual(normTask(got), normTask(&in)) {
+		t.Fatalf("零值时间字段往返不一致:\n got = %+v\nwant = %+v", *got, in)
+	}
+	if !got.CreatedAt.IsZero() || !got.UpdatedAt.IsZero() || !got.CompletedAt.IsZero() {
+		t.Fatalf("零值时间字段应当仍是零值: %+v", got)
+	}
+}
+
+// TestTaskRoundTripNil 覆盖 nil 任务。
+func TestTaskRoundTripNil(t *testing.T) {
+	if got := taskToPB(nil); got != nil {
+		t.Fatalf("nil 任务应当转成 nil: %+v", got)
+	}
+	if got := taskFromPB(nil); got != nil {
+		t.Fatalf("nil proto 任务应当转成 nil: %+v", got)
+	}
+}
+
+// TestSettingsRoundTrip 覆盖设置的完整字段往返。
 func TestSettingsRoundTrip(t *testing.T) {
 	in := api.Settings{
 		DefaultSaveDir: "/tmp", DefaultThreads: 8, MinChunkSize: 4096,
@@ -5853,6 +6164,16 @@ func TestSettingsRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSettingsRoundTripZero 覆盖设置的零值。
+func TestSettingsRoundTripZero(t *testing.T) {
+	in := api.Settings{}
+	got := settingsFromPB(settingsToPB(in))
+	if !reflect.DeepEqual(got, in) {
+		t.Fatalf("零值 Settings 往返不一致:\n got = %+v\nwant = %+v", got, in)
+	}
+}
+
+// TestAuthRoundTrip 覆盖凭据的完整字段往返。
 func TestAuthRoundTrip(t *testing.T) {
 	in := api.AuthOptions{
 		Username: "u", Password: "p", UserAgent: "UA", Cookies: "C",
@@ -5865,6 +6186,16 @@ func TestAuthRoundTrip(t *testing.T) {
 	}
 }
 
+// TestAuthRoundTripZero 覆盖凭据的零值。
+func TestAuthRoundTripZero(t *testing.T) {
+	in := api.AuthOptions{}
+	got := authFromPB(authToPB(in))
+	if !reflect.DeepEqual(got, in) {
+		t.Fatalf("零值 AuthOptions 往返不一致:\n got = %+v\nwant = %+v", got, in)
+	}
+}
+
+// TestBTDetailRoundTrip 覆盖 BT 详情的完整字段往返。
 func TestBTDetailRoundTrip(t *testing.T) {
 	in := api.BTDetail{
 		Name: "n", InfoHash: "h", Total: 10, Downloaded: 5, Uploaded: 1,
@@ -5875,48 +6206,376 @@ func TestBTDetailRoundTrip(t *testing.T) {
 		Trackers: []string{"t"},
 	}
 	got := btDetailFromPB(btDetailToPB(&in))
-	if !reflect.DeepEqual(*got, in) {
+	if !reflect.DeepEqual(normBTDetail(got), normBTDetail(&in)) {
 		t.Fatalf("BTDetail 往返不一致:\n got = %+v\nwant = %+v", *got, in)
 	}
 }
 
+// TestBTDetailRoundTripZero 覆盖 BT 详情的零值。
+func TestBTDetailRoundTripZero(t *testing.T) {
+	in := api.BTDetail{}
+	got := btDetailFromPB(btDetailToPB(&in))
+	if !reflect.DeepEqual(normBTDetail(got), normBTDetail(&in)) {
+		t.Fatalf("零值 BTDetail 往返不一致:\n got = %+v\nwant = %+v", *got, in)
+	}
+}
+
+// TestEventRoundTrip 覆盖事件的往返。
+func TestEventRoundTrip(t *testing.T) {
+	in := api.Event{
+		Why:      "progress",
+		Task:     &api.Task{ID: "t1", Status: api.StatusDownloading, CreatedAt: testTime},
+		SpeedBPS: 1024,
+	}
+	got := eventFromPB(eventToPB(in))
+	if !reflect.DeepEqual(normTask(got.Task), normTask(in.Task)) {
+		t.Fatalf("Event 往返不一致:\n got = %+v\nwant = %+v", got, in)
+	}
+	if got.Why != in.Why || got.SpeedBPS != in.SpeedBPS {
+		t.Fatalf("Event 字段往返不一致: %+v", got)
+	}
+}
+
+// TestEventRoundTripNilTask 覆盖事件里的 nil 任务。
+func TestEventRoundTripNilTask(t *testing.T) {
+	in := api.Event{Why: "w"}
+	got := eventFromPB(eventToPB(in))
+	if got.Task != nil {
+		t.Fatalf("nil 任务应当仍是 nil: %+v", got.Task)
+	}
+}
+
+// TestMessageRoundTrip 覆盖消息流里每一种消息的往返。
+func TestMessageRoundTrip(t *testing.T) {
+	cases := []api.Message{
+		{Kind: api.MessageKindEvent, Event: &api.Event{Why: "w", SpeedBPS: 1}},
+		{Kind: api.MessageKindShow},
+		{Kind: api.MessageKindShowAddTask, ShowAddTask: &api.ShowAddTaskParams{
+			URL: "http://x", Name: "n", UA: "ua", Cookies: "c",
+		}},
+		{Kind: api.MessageKindLanguage, Language: "en"},
+		{Kind: api.MessageKindClose},
+	}
+	for _, in := range cases {
+		got := messageFromPB(messageToPB(in))
+		if got.Kind != in.Kind {
+			t.Fatalf("消息类别往返不一致: got = %q, want = %q", got.Kind, in.Kind)
+		}
+		switch in.Kind {
+		case api.MessageKindEvent:
+			if got.Event == nil || got.Event.Why != in.Event.Why {
+				t.Fatalf("事件往返不一致: %+v", got.Event)
+			}
+		case api.MessageKindShowAddTask:
+			if got.ShowAddTask == nil || *got.ShowAddTask != *in.ShowAddTask {
+				t.Fatalf("弹窗参数往返不一致: %+v", got.ShowAddTask)
+			}
+		case api.MessageKindLanguage:
+			if got.Language != in.Language {
+				t.Fatalf("语言往返不一致: %q", got.Language)
+			}
+		}
+	}
+}
+
+// TestMessageToPBHandlesNilEvent 是 E3 的回归测试。
+//
+// api.Message.Event 是指针，契约上允许为 nil；messageToPB 直接解引用会
+// panic。
+func TestMessageToPBHandlesNilEvent(t *testing.T) {
+	got := messageToPB(api.Message{Kind: api.MessageKindEvent})
+	if got == nil {
+		t.Fatal("nil 事件也应当转成一个 proto 消息")
+	}
+	if got.GetEvent() == nil {
+		t.Fatal("nil 事件应当转成空事件，而不是丢掉消息类别")
+	}
+	back := messageFromPB(got)
+	if back.Kind != api.MessageKindEvent {
+		t.Fatalf("消息类别应当保留: %q", back.Kind)
+	}
+	if back.Event == nil {
+		t.Fatal("回转后的事件指针不应为 nil")
+	}
+}
+
+// TestMessageFromPBNil 覆盖 nil proto 消息。
+func TestMessageFromPBNil(t *testing.T) {
+	got := messageFromPB(nil)
+	if got.Kind != "" {
+		t.Fatalf("nil 消息应当转成零值消息: %+v", got)
+	}
+}
+
+// TestListParamsRoundTrip 覆盖筛选与排序枚举的往返（E8）。
+func TestListParamsRoundTrip(t *testing.T) {
+	cases := []api.ListParams{
+		{Filter: api.FilterAll, Sort: api.SortCreatedDesc},
+		{Filter: api.FilterPending, Sort: api.SortCreatedAsc},
+		{Filter: api.FilterDownloading, Sort: api.SortNameAsc},
+		{Filter: api.FilterPaused, Sort: api.SortNameDesc},
+		{Filter: api.FilterCompleted, Sort: api.SortCreatedDesc},
+		{Filter: api.FilterFailed, Sort: api.SortCreatedDesc},
+		{Filter: api.FilterFileLost, Sort: api.SortCreatedDesc},
+		// 零值表示「不过滤」与「默认排序」。
+		{Filter: "", Sort: ""},
+	}
+	for _, in := range cases {
+		got := listParamsFromPB(listParamsToPB(&in))
+		if *got != in {
+			t.Fatalf("ListParams 往返不一致: got = %+v, want = %+v", *got, in)
+		}
+	}
+}
+
+// TestListParamsFromPBUnspecified 覆盖 UNSPECIFIED 的语义（E8）。
+//
+// UNSPECIFIED 必须映射回空串，而不是映射成某个具体枚举——空串在存储层
+// 表示「不过滤 / 默认排序」。
+func TestListParamsFromPBUnspecified(t *testing.T) {
+	got := listParamsFromPB(&pb.ListRequest{
+		Filter: pb.StatusFilter_STATUS_FILTER_UNSPECIFIED,
+		Sort:   pb.TaskSort_TASK_SORT_UNSPECIFIED,
+	})
+	if got.Filter != "" {
+		t.Fatalf("UNSPECIFIED 筛选应当映射回空串: %q", got.Filter)
+	}
+	if got.Sort != "" {
+		t.Fatalf("UNSPECIFIED 排序应当映射回空串: %q", got.Sort)
+	}
+}
+
+// TestAddTaskInputRoundTrip 覆盖「添加下载任务」入参的往返。
+func TestAddTaskInputRoundTrip(t *testing.T) {
+	in := api.AddTaskInput{
+		URL: "http://x", SavePath: "/tmp", Protocol: api.ProtoBT,
+		Auth: api.AuthOptions{
+			Username: "u", Password: "p", UserAgent: "UA", Cookies: "C",
+			Referer: "r", FTPPassive: true, ProxyMode: api.ProxyModeManual,
+			ProxyURL: "http://p", ProxyBypass: "b", ProxyAutoConfigURL: "u",
+		},
+		ChunkCount: 8, MinChunkSize: 1024,
+	}
+	got := addTaskInputFromPB(addTaskInputToPB(&in))
+	if !reflect.DeepEqual(*got, in) {
+		t.Fatalf("AddTaskInput 往返不一致:\n got = %+v\nwant = %+v", *got, in)
+	}
+}
+
+// TestFormatParseTime 覆盖时间的格式化与解析（E14）。
+func TestFormatParseTime(t *testing.T) {
+	// 零值时间格式化成 "0001-01-01T00:00:00Z"，并且能原样解析回零值。
+	if got := formatTime(time.Time{}); got != "0001-01-01T00:00:00Z" {
+		t.Fatalf("零值时间应当格式化成 RFC3339 零值: %q", got)
+	}
+	if got := parseTime("0001-01-01T00:00:00Z"); !got.IsZero() {
+		t.Fatalf("零值时间应当解析回零值: %v", got)
+	}
+	// 空串与非法值都退化成零值，不能炸。
+	if got := parseTime(""); !got.IsZero() {
+		t.Fatalf("空串应当解析成零值: %v", got)
+	}
+	if got := parseTime("不是时间"); !got.IsZero() {
+		t.Fatalf("非法值应当解析成零值: %v", got)
+	}
+	// 正常时间往返无损。
+	if got := parseTime(formatTime(testTime)); !got.Equal(testTime) {
+		t.Fatalf("时间往返不一致: got = %v, want = %v", got, testTime)
+	}
+}
+
+// TestEnumTablesCoverAllConstants 校验每张枚举映射表都双向闭合、覆盖
+// UNSPECIFIED，并且都有真实调用点。
+//
+// 「有调用点」这一条是 E8 的要害：初稿里 ListRequest 用的是裸 string，
+// filterToPB / filterFromPB 两张表因此是死代码，而只检查反向映射存在的
+// 测试照样能过——测不出「枚举压根没被用」。
 func TestEnumTablesCoverAllConstants(t *testing.T) {
-	for s := range statusToPB {
-		if _, ok := statusFromPB[statusToPB[s]]; !ok {
-			t.Fatalf("状态 %q 没有反向映射", s)
+	t.Run("状态", func(t *testing.T) {
+		for s, p := range statusToPB {
+			back, ok := statusFromPB[p]
+			if !ok {
+				t.Fatalf("状态 %q 没有反向映射", s)
+			}
+			if back != s {
+				t.Fatalf("状态 %q 反向映射成了 %q", s, back)
+			}
+		}
+		if _, ok := statusFromPB[pb.Status_STATUS_UNSPECIFIED]; !ok {
+			t.Fatal("statusFromPB 缺少 UNSPECIFIED 的显式条目")
+		}
+		if got := statusFromPB[pb.Status_STATUS_UNSPECIFIED]; got != "" {
+			t.Fatalf("UNSPECIFIED 应当映射回空串: %q", got)
+		}
+		// 调用点：状态走 Task。
+		for s := range statusToPB {
+			pbTask := taskToPB(&api.Task{Status: s})
+			if pbTask.GetStatus() != statusToPB[s] {
+				t.Fatalf("状态 %q 没有出现在 Task 的转换结果里", s)
+			}
+			if got := taskFromPB(pbTask).Status; got != s {
+				t.Fatalf("状态 %q 经 Task 往返后变成了 %q", s, got)
+			}
+		}
+	})
+
+	t.Run("筛选", func(t *testing.T) {
+		for s, p := range filterToPB {
+			back, ok := filterFromPB[p]
+			if !ok {
+				t.Fatalf("筛选 %q 没有反向映射", s)
+			}
+			if back != s {
+				t.Fatalf("筛选 %q 反向映射成了 %q", s, back)
+			}
+		}
+		if _, ok := filterFromPB[pb.StatusFilter_STATUS_FILTER_UNSPECIFIED]; !ok {
+			t.Fatal("filterFromPB 缺少 UNSPECIFIED 的显式条目")
+		}
+		// 调用点：筛选走 ListRequest。
+		for s := range filterToPB {
+			req := listParamsToPB(&api.ListParams{Filter: s})
+			if req.GetFilter() != filterToPB[s] {
+				t.Fatalf("筛选 %q 没有出现在 ListRequest 的转换结果里", s)
+			}
+			if got := listParamsFromPB(req).Filter; got != s {
+				t.Fatalf("筛选 %q 经 ListRequest 往返后变成了 %q", s, got)
+			}
+		}
+	})
+
+	t.Run("排序", func(t *testing.T) {
+		for s, p := range sortToPB {
+			back, ok := sortFromPB[p]
+			if !ok {
+				t.Fatalf("排序 %q 没有反向映射", s)
+			}
+			if back != s {
+				t.Fatalf("排序 %q 反向映射成了 %q", s, back)
+			}
+		}
+		if _, ok := sortFromPB[pb.TaskSort_TASK_SORT_UNSPECIFIED]; !ok {
+			t.Fatal("sortFromPB 缺少 UNSPECIFIED 的显式条目")
+		}
+		// 调用点：排序走 ListRequest。
+		for s := range sortToPB {
+			req := listParamsToPB(&api.ListParams{Sort: s})
+			if req.GetSort() != sortToPB[s] {
+				t.Fatalf("排序 %q 没有出现在 ListRequest 的转换结果里", s)
+			}
+			if got := listParamsFromPB(req).Sort; got != s {
+				t.Fatalf("排序 %q 经 ListRequest 往返后变成了 %q", s, got)
+			}
+		}
+	})
+
+	t.Run("代理模式", func(t *testing.T) {
+		for s, p := range proxyToPB {
+			back, ok := proxyFromPB[p]
+			if !ok {
+				t.Fatalf("代理模式 %q 没有反向映射", s)
+			}
+			if back != s {
+				t.Fatalf("代理模式 %q 反向映射成了 %q", s, back)
+			}
+		}
+		if _, ok := proxyFromPB[pb.ProxyMode_PROXY_MODE_UNSPECIFIED]; !ok {
+			t.Fatal("proxyFromPB 缺少 UNSPECIFIED 的显式条目")
+		}
+		// 调用点一：代理模式走 Settings。
+		for s := range proxyToPB {
+			pbSet := settingsToPB(api.Settings{ProxyMode: s})
+			if pbSet.GetProxyMode() != proxyToPB[s] {
+				t.Fatalf("代理模式 %q 没有出现在 Settings 的转换结果里", s)
+			}
+			if got := settingsFromPB(pbSet).ProxyMode; got != s {
+				t.Fatalf("代理模式 %q 经 Settings 往返后变成了 %q", s, got)
+			}
+		}
+		// 调用点二：代理模式走 AuthOptions。
+		for s := range proxyToPB {
+			pbAuth := authToPB(api.AuthOptions{ProxyMode: s})
+			if pbAuth.GetProxyMode() != proxyToPB[s] {
+				t.Fatalf("代理模式 %q 没有出现在 AuthOptions 的转换结果里", s)
+			}
+			if got := authFromPB(pbAuth).ProxyMode; got != s {
+				t.Fatalf("代理模式 %q 经 AuthOptions 往返后变成了 %q", s, got)
+			}
+		}
+	})
+
+	t.Run("协议种类", func(t *testing.T) {
+		for s, p := range kindToPB {
+			back, ok := kindFromPB[p]
+			if !ok {
+				t.Fatalf("协议 %q 没有反向映射", s)
+			}
+			if back != s {
+				t.Fatalf("协议 %q 反向映射成了 %q", s, back)
+			}
+		}
+		if _, ok := kindFromPB[pb.ProtocolKind_PROTOCOL_KIND_UNSPECIFIED]; !ok {
+			t.Fatal("kindFromPB 缺少 UNSPECIFIED 的显式条目")
+		}
+		// 调用点：协议种类走 AddTaskRequest。
+		for s := range kindToPB {
+			req := addTaskInputToPB(&api.AddTaskInput{Protocol: s})
+			if req.GetProtocol() != kindToPB[s] {
+				t.Fatalf("协议 %q 没有出现在 AddTaskRequest 的转换结果里", s)
+			}
+			if got := addTaskInputFromPB(req).Protocol; got != s {
+				t.Fatalf("协议 %q 经 AddTaskRequest 往返后变成了 %q", s, got)
+			}
+		}
+	})
+}
+
+// TestEnumTablesCoverEveryConstant 确认映射表没有漏掉契约层的常量。
+//
+// 只查「表里的项都有反向映射」不够：漏掉一个常量（比如新增了状态却忘了
+// 加映射）那样查不出来。这边把契约层的常量逐个过一遍。
+func TestEnumTablesCoverEveryConstant(t *testing.T) {
+	for _, s := range []api.Status{
+		api.StatusPending, api.StatusDownloading, api.StatusPaused,
+		api.StatusCompleted, api.StatusFailed, api.StatusFileLost,
+	} {
+		if _, ok := statusToPB[s]; !ok {
+			t.Fatalf("状态 %q 缺少 proto 映射", s)
 		}
 	}
-	for s := range filterToPB {
-		if _, ok := filterFromPB[filterToPB[s]]; !ok {
-			t.Fatalf("筛选 %q 没有反向映射", s)
+	for _, f := range []api.StatusFilter{
+		api.FilterAll, api.FilterPending, api.FilterDownloading,
+		api.FilterPaused, api.FilterCompleted, api.FilterFailed,
+		api.FilterFileLost,
+	} {
+		if _, ok := filterToPB[f]; !ok {
+			t.Fatalf("筛选 %q 缺少 proto 映射", f)
 		}
 	}
-	for s := range sortToPB {
-		if _, ok := sortFromPB[sortToPB[s]]; !ok {
-			t.Fatalf("排序 %q 没有反向映射", s)
+	for _, s := range api.AllTaskSorts() {
+		if _, ok := sortToPB[s]; !ok {
+			t.Fatalf("排序 %q 缺少 proto 映射", s)
 		}
 	}
-	for s := range proxyToPB {
-		if _, ok := proxyFromPB[proxyToPB[s]]; !ok {
-			t.Fatalf("代理模式 %q 没有反向映射", s)
+	for _, p := range []api.ProxyMode{
+		api.ProxyModeSystem, api.ProxyModeDisabled, api.ProxyModeManual,
+	} {
+		if _, ok := proxyToPB[p]; !ok {
+			t.Fatalf("代理模式 %q 缺少 proto 映射", p)
 		}
 	}
-	for s := range kindToPB {
-		if _, ok := kindFromPB[kindToPB[s]]; !ok {
-			t.Fatalf("协议 %q 没有反向映射", s)
+	for _, k := range []api.ProtocolKind{
+		api.ProtoHTTP, api.ProtoHTTPS, api.ProtoFTP, api.ProtoWebDAV, api.ProtoBT,
+	} {
+		if _, ok := kindToPB[k]; !ok {
+			t.Fatalf("协议 %q 缺少 proto 映射", k)
 		}
 	}
 }
 ```
 
-- [ ] **Step 7: 跑测试确认通过**
 
-Run: `go test ./internal/rpc/grpcx/`
-Expected: PASS
-
-- [ ] **Step 8: 建 `internal/rpc/grpcx/server.go` 与 `client.go`**
-
-`server.go`：
+- [ ] **Step 7: 建 `internal/rpc/grpcx/server.go`**
 
 ```go
 // This Source Code Form is subject to the terms of the Mozilla Public
@@ -5926,11 +6585,18 @@ Expected: PASS
 // Copyright (c) 2026 langbiantianya
 
 // Package grpcx 是基于 gRPC 的传输实现：类型化 RPC + protobuf 载荷。
+//
+// 与 httpx 并列，两者是同一个契约层（internal/api）的两种线格式实现。
+// 本包只依赖 internal/api 与 internal/rpc/addr，不依赖 internal/rpc
+// 本身——否则会形成 rpc → grpcx → rpc 的包环。业务侧能力的接口在这里
+// 独立声明一份，方法集与 rpc.Handler 逐字一致，靠结构化类型对接。
 package grpcx
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -5942,14 +6608,22 @@ import (
 	"lgo_download_manager/internal/rpc/grpcx/pb"
 )
 
-// Handler 是 grpcx 需要的业务侧能力。结构上与 rpc.Handler 相同。
+// Handler 是 grpcx 需要的业务侧能力。方法集与 internal/rpc 里的
+// rpc.Handler 逐字一致，靠结构化类型与它对接——这里独立声明是为了避开
+// grpcx → rpc 的包环（rpc → grpcx 已经存在）。
 type Handler interface {
+	// Call 执行一次调用。method 取 api.Method* 常量；in / out 的具体类型
+	// 由 api.Spec(method) 决定，传输层分配好再传进来。
 	Call(ctx context.Context, method string, in, out any) error
+
+	// Events 返回进度事件流与退订函数。
 	Events() (<-chan api.Event, func())
+
+	// Controls 返回控制消息流（显示窗口 / 弹对话框 / 语言变更 / 退出）。
 	Controls() <-chan api.Message
 }
 
-// Serve 在地址上启动 gRPC 服务。
+// Serve 在地址上启动 gRPC 服务。ctx 取消时服务关闭。
 func Serve(ctx context.Context, a addr.Addr, token string, h Handler) error {
 	ln, cleanup, err := addr.Listen(a)
 	if err != nil {
@@ -5962,11 +6636,27 @@ func Serve(ctx context.Context, a addr.Addr, token string, h Handler) error {
 		grpc.StreamInterceptor(streamAuth(token)),
 	)
 	pb.RegisterDownloadServiceServer(srv, &server{h: h})
+
+	// done 用来收尾监视 goroutine：Serve 返回后它就退出，不留悬挂 goroutine。
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		srv.GracefulStop()
+		select {
+		case <-ctx.Done():
+			// 必须用 Stop 而不是 GracefulStop：GracefulStop 会等所有在跑
+			// 的 RPC 结束，而 StreamMessages 是长连接流，客户端不主动断开
+			// 它就永远不会结束——那样 Serve 会永久阻塞。Stop 立即取消所有
+			// 活跃的 RPC 与流，与 httpx 的 srv.Close() 语义一致。
+			srv.Stop()
+		case <-done:
+		}
 	}()
-	return srv.Serve(ln)
+
+	err = srv.Serve(ln)
+	if errors.Is(err, grpc.ErrServerStopped) {
+		return nil
+	}
+	return err
 }
 
 // unaryAuth 校验一元调用的 token。
@@ -5990,6 +6680,9 @@ func streamAuth(token string) grpc.StreamServerInterceptor {
 }
 
 // checkToken 从 metadata 里取 Bearer token 并比对。
+//
+// metadata 的 key 会被 gRPC 规范化为小写，所以这里必须写小写
+// "authorization"——写 "Authorization" 会取不到。
 func checkToken(ctx context.Context, token string) bool {
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
@@ -6001,7 +6694,7 @@ func checkToken(ctx context.Context, token string) bool {
 	}
 	const prefix = "Bearer "
 	v := vals[0]
-	if len(v) <= len(prefix) || v[:len(prefix)] != prefix {
+	if len(v) <= len(prefix) || !strings.HasPrefix(v, prefix) {
 		return false
 	}
 	return v[len(prefix):] == token
@@ -6013,13 +6706,18 @@ type server struct {
 	h Handler
 }
 
+// internalErr 把业务侧错误转成 gRPC 状态错误。
+//
+// gRPC 的 status 里放不进 Go 的错误链，业务错误的原因只能靠 message
+// 传递——这与 httpx 把错误写进响应体的做法等价。
+func internalErr(err error) error {
+	return status.Error(codes.Internal, err.Error())
+}
+
 func (s *server) List(ctx context.Context, req *pb.ListRequest) (*pb.ListResponse, error) {
 	out := &api.ListResult{}
-	if err := s.h.Call(ctx, api.MethodList, &api.ListParams{
-		Filter: api.StatusFilter(req.GetFilter()),
-		Sort:   api.TaskSort(req.GetSort()),
-	}, out); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	if err := s.h.Call(ctx, api.MethodList, listParamsFromPB(req), out); err != nil {
+		return nil, internalErr(err)
 	}
 	tasks := make([]*pb.Task, 0, len(out.Tasks))
 	for _, t := range out.Tasks {
@@ -6030,36 +6728,29 @@ func (s *server) List(ctx context.Context, req *pb.ListRequest) (*pb.ListRespons
 
 func (s *server) AddTask(ctx context.Context, req *pb.AddTaskRequest) (*pb.AddTaskResponse, error) {
 	out := &api.Task{}
-	if err := s.h.Call(ctx, api.MethodAdd, &api.AddTaskInput{
-		URL:          req.GetUrl(),
-		SavePath:     req.GetSavePath(),
-		Protocol:     kindFromPB[req.GetProtocol()],
-		Auth:         authFromPB(req.GetAuth()),
-		ChunkCount:   int(req.GetChunkCount()),
-		MinChunkSize: req.GetMinChunkSize(),
-	}, out); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+	if err := s.h.Call(ctx, api.MethodAdd, addTaskInputFromPB(req), out); err != nil {
+		return nil, internalErr(err)
 	}
 	return &pb.AddTaskResponse{Task: taskToPB(out)}, nil
 }
 
 func (s *server) StartTask(ctx context.Context, req *pb.TaskRef) (*pb.Empty, error) {
 	if err := s.h.Call(ctx, api.MethodStart, &api.TaskRef{ID: req.GetId()}, &api.Empty{}); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, internalErr(err)
 	}
 	return &pb.Empty{}, nil
 }
 
 func (s *server) PauseTask(ctx context.Context, req *pb.TaskRef) (*pb.Empty, error) {
 	if err := s.h.Call(ctx, api.MethodPause, &api.TaskRef{ID: req.GetId()}, &api.Empty{}); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, internalErr(err)
 	}
 	return &pb.Empty{}, nil
 }
 
 func (s *server) DeleteTask(ctx context.Context, req *pb.TaskRef) (*pb.Empty, error) {
 	if err := s.h.Call(ctx, api.MethodDelete, &api.TaskRef{ID: req.GetId()}, &api.Empty{}); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, internalErr(err)
 	}
 	return &pb.Empty{}, nil
 }
@@ -6067,7 +6758,7 @@ func (s *server) DeleteTask(ctx context.Context, req *pb.TaskRef) (*pb.Empty, er
 func (s *server) IsPreparing(ctx context.Context, req *pb.TaskRef) (*pb.BoolResponse, error) {
 	out := &api.BoolResult{}
 	if err := s.h.Call(ctx, api.MethodIsPreparing, &api.TaskRef{ID: req.GetId()}, out); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, internalErr(err)
 	}
 	return &pb.BoolResponse{Value: out.Value}, nil
 }
@@ -6075,7 +6766,7 @@ func (s *server) IsPreparing(ctx context.Context, req *pb.TaskRef) (*pb.BoolResp
 func (s *server) Probe(ctx context.Context, req *pb.ProbeRequest) (*pb.ProbeResponse, error) {
 	out := &api.ProbeResult{}
 	if err := s.h.Call(ctx, api.MethodProbe, &api.ProbeParams{URL: req.GetUrl()}, out); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, internalErr(err)
 	}
 	return &pb.ProbeResponse{TotalSize: out.TotalSize}, nil
 }
@@ -6083,7 +6774,7 @@ func (s *server) Probe(ctx context.Context, req *pb.ProbeRequest) (*pb.ProbeResp
 func (s *server) GetSettings(ctx context.Context, _ *pb.Empty) (*pb.GetSettingsResponse, error) {
 	out := &api.Settings{}
 	if err := s.h.Call(ctx, api.MethodGetSettings, &api.Empty{}, out); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, internalErr(err)
 	}
 	return &pb.GetSettingsResponse{Settings: settingsToPB(*out)}, nil
 }
@@ -6091,7 +6782,7 @@ func (s *server) GetSettings(ctx context.Context, _ *pb.Empty) (*pb.GetSettingsR
 func (s *server) SaveSettings(ctx context.Context, req *pb.SaveSettingsRequest) (*pb.Empty, error) {
 	in := settingsFromPB(req.GetSettings())
 	if err := s.h.Call(ctx, api.MethodSaveSettings, &in, &api.Empty{}); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, internalErr(err)
 	}
 	return &pb.Empty{}, nil
 }
@@ -6099,7 +6790,7 @@ func (s *server) SaveSettings(ctx context.Context, req *pb.SaveSettingsRequest) 
 func (s *server) BTTaskDetail(ctx context.Context, req *pb.BTInfoRequest) (*pb.BTDetailResponse, error) {
 	out := &api.BTDetail{}
 	if err := s.h.Call(ctx, api.MethodBTInfo, &api.BTInfoParams{TaskID: req.GetTaskId()}, out); err != nil {
-		return nil, status.Error(codes.Internal, err.Error())
+		return nil, internalErr(err)
 	}
 	return &pb.BTDetailResponse{Detail: btDetailToPB(out)}, nil
 }
@@ -6109,13 +6800,18 @@ func (s *server) StreamMessages(_ *pb.Empty, stream pb.DownloadService_StreamMes
 	events, unsub := s.h.Events()
 	defer unsub()
 	controls := s.h.Controls()
-	for {
+
+	// 某一侧通道关闭只停掉那一侧：事件流结束不代表控制消息也没了。
+	// 这与 httpx 的处理一致，否则同一套业务侧实现在两种传输下行为不同。
+	for events != nil || controls != nil {
 		select {
 		case <-stream.Context().Done():
+			// 客户端断开：立刻收手，别让 goroutine 挂着。
 			return nil
 		case ev, ok := <-events:
 			if !ok {
-				return nil
+				events = nil
+				continue
 			}
 			if err := stream.Send(messageToPB(api.Message{
 				Kind:  api.MessageKindEvent,
@@ -6125,25 +6821,42 @@ func (s *server) StreamMessages(_ *pb.Empty, stream pb.DownloadService_StreamMes
 			}
 		case ctl, ok := <-controls:
 			if !ok {
-				return nil
+				controls = nil
+				continue
 			}
 			if err := stream.Send(messageToPB(ctl)); err != nil {
 				return err
 			}
 		}
 	}
+	return nil
+}
+
+// methodErrorf 构造带方法名的错误。
+func methodErrorf(method string, err error) error {
+	return fmt.Errorf("grpcx: %s: %w", method, err)
 }
 ```
 
-`client.go`：
+
+- [ ] **Step 8: 建 `internal/rpc/grpcx/client.go`**
 
 ```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package grpcx
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -6154,16 +6867,46 @@ import (
 	"lgo_download_manager/internal/rpc/grpcx/pb"
 )
 
+// streamBuffer 是消息流 channel 的缓冲条数。
+const streamBuffer = 64
+
 // Client 是 gRPC 传输的客户端。
 type Client struct {
+	// conn 是底层连接，cli 是它的 gRPC 桩。
 	conn *grpc.ClientConn
+	cli  pb.DownloadServiceClient
+
+	// closed 标记客户端是否已关闭。
+	closed atomic.Bool
+
+	// closeOnce 保证底层连接只关一次。
+	//
+	// grpc.ClientConn.Close() 第二次调用返回 ErrClientConnClosing（非 nil
+	// 错误），而 rpc.Transport 的契约明确要求 Close 幂等，所以必须用
+	// sync.Once 包住。
+	closeOnce sync.Once
 }
 
 // Dial 按地址建立 gRPC 连接。token 随每次调用发送。
+//
+// Dial 会用 ctx 预连接一次再立刻断开。gRPC 的连接是惰性的
+// （grpc.NewClient 不建连，要等第一次 RPC），不预连接的话
+// 「业务进程没起来」要等到第一次调用才暴露，调用方只会看到一个含义模糊
+// 的握手失败。预连接让失败时机与 httpx 传输一致。
 func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error) {
-	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
-		return addr.Dial(a)
+	conn, err := addr.DialContext(ctx, a)
+	if err != nil {
+		return nil, fmt.Errorf("grpcx: 连接 %s 失败: %w", a.Address, err)
 	}
+	_ = conn.Close()
+
+	// dialer 用 gRPC 传进来的 ctx 建连：一次超时的调用不该留下一个还在
+	// 建连的 socket goroutine。
+	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
+		return addr.DialContext(ctx, a)
+	}
+	// 显式用 passthrough 解析器：grpc.NewClient 默认走 dns 解析器，
+	// 而我们的地址是 unix socket / host:port，由上面的 dialer 负责解析。
 	cc, err := grpc.NewClient("passthrough:///lgdm",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 		grpc.WithContextDialer(dialer),
@@ -6173,12 +6916,18 @@ func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("grpcx: 建立连接: %w", err)
 	}
-	return &Client{conn: cc}, nil
+	return &Client{conn: cc, cli: pb.NewDownloadServiceClient(cc)}, nil
 }
 
 // clientUnaryToken 给一元调用附加 token。
 func clientUnaryToken(token string) grpc.UnaryClientInterceptor {
 	return func(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		// metadata 的 key 会被 gRPC 规范化为小写，服务端也按小写取，
+		// 两边必须一致。
+		//
+		// 注意 gRPC 的 metadata 值只允许可打印 ASCII：token 里有非 ASCII
+		// 字符时 grpc-go 会直接报错。实际部署不受影响——业务侧的握手
+		// token 是随机数的十六进制编码，纯 ASCII。
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
 		return invoker(ctx, method, req, reply, cc, opts...)
 	}
@@ -6194,15 +6943,23 @@ func clientStreamToken(token string) grpc.StreamClientInterceptor {
 
 // Call 执行一次调用。
 func (c *Client) Call(ctx context.Context, method string, in, out any) error {
-	cli := pb.NewDownloadServiceClient(c.conn)
+	if err := c.checkOpen(); err != nil {
+		return err
+	}
 	switch method {
 	case api.MethodList:
-		p := in.(*api.ListParams)
-		res, err := cli.List(ctx, &pb.ListRequest{Filter: string(p.Filter), Sort: string(p.Sort)})
+		p, ok := asPtr[api.ListParams](in)
+		if !ok {
+			return badIn(method, in, "*api.ListParams")
+		}
+		r, ok := asPtr[api.ListResult](out)
+		if !ok {
+			return badOut(method, out, "*api.ListResult")
+		}
+		res, err := c.cli.List(ctx, listParamsToPB(p))
 		if err != nil {
 			return methodErrorf(method, err)
 		}
-		r := out.(*api.ListResult)
 		r.Tasks = nil
 		for _, t := range res.GetTasks() {
 			r.Tasks = append(r.Tasks, taskFromPB(t))
@@ -6210,82 +6967,142 @@ func (c *Client) Call(ctx context.Context, method string, in, out any) error {
 		return nil
 
 	case api.MethodAdd:
-		p := in.(*api.AddTaskInput)
-		res, err := cli.AddTask(ctx, &pb.AddTaskRequest{
-			Url:          p.URL,
-			SavePath:     p.SavePath,
-			Protocol:     kindToPB[p.Protocol],
-			Auth:         authToPB(p.Auth),
-			ChunkCount:   int32(p.ChunkCount),
-			MinChunkSize: p.MinChunkSize,
-		})
+		p, ok := asPtr[api.AddTaskInput](in)
+		if !ok {
+			return badIn(method, in, "*api.AddTaskInput")
+		}
+		r, ok := asPtr[api.Task](out)
+		if !ok {
+			return badOut(method, out, "*api.Task")
+		}
+		res, err := c.cli.AddTask(ctx, addTaskInputToPB(p))
 		if err != nil {
 			return methodErrorf(method, err)
 		}
-		*(out.(*api.Task)) = *taskFromPB(res.GetTask())
+		t := taskFromPB(res.GetTask())
+		if t == nil {
+			return fmt.Errorf("grpcx: %s: 服务端返回的任务为空", method)
+		}
+		*r = *t
 		return nil
 
 	case api.MethodStart:
-		p := in.(*api.TaskRef)
-		if _, err := cli.StartTask(ctx, &pb.TaskRef{Id: p.ID}); err != nil {
+		p, ok := asPtr[api.TaskRef](in)
+		if !ok {
+			return badIn(method, in, "*api.TaskRef")
+		}
+		if _, ok := asPtr[api.Empty](out); !ok {
+			return badOut(method, out, "*api.Empty")
+		}
+		if _, err := c.cli.StartTask(ctx, &pb.TaskRef{Id: p.ID}); err != nil {
 			return methodErrorf(method, err)
 		}
 		return nil
 
 	case api.MethodPause:
-		p := in.(*api.TaskRef)
-		if _, err := cli.PauseTask(ctx, &pb.TaskRef{Id: p.ID}); err != nil {
+		p, ok := asPtr[api.TaskRef](in)
+		if !ok {
+			return badIn(method, in, "*api.TaskRef")
+		}
+		if _, ok := asPtr[api.Empty](out); !ok {
+			return badOut(method, out, "*api.Empty")
+		}
+		if _, err := c.cli.PauseTask(ctx, &pb.TaskRef{Id: p.ID}); err != nil {
 			return methodErrorf(method, err)
 		}
 		return nil
 
 	case api.MethodDelete:
-		p := in.(*api.TaskRef)
-		if _, err := cli.DeleteTask(ctx, &pb.TaskRef{Id: p.ID}); err != nil {
+		p, ok := asPtr[api.TaskRef](in)
+		if !ok {
+			return badIn(method, in, "*api.TaskRef")
+		}
+		if _, ok := asPtr[api.Empty](out); !ok {
+			return badOut(method, out, "*api.Empty")
+		}
+		if _, err := c.cli.DeleteTask(ctx, &pb.TaskRef{Id: p.ID}); err != nil {
 			return methodErrorf(method, err)
 		}
 		return nil
 
 	case api.MethodIsPreparing:
-		p := in.(*api.TaskRef)
-		res, err := cli.IsPreparing(ctx, &pb.TaskRef{Id: p.ID})
+		p, ok := asPtr[api.TaskRef](in)
+		if !ok {
+			return badIn(method, in, "*api.TaskRef")
+		}
+		r, ok := asPtr[api.BoolResult](out)
+		if !ok {
+			return badOut(method, out, "*api.BoolResult")
+		}
+		res, err := c.cli.IsPreparing(ctx, &pb.TaskRef{Id: p.ID})
 		if err != nil {
 			return methodErrorf(method, err)
 		}
-		out.(*api.BoolResult).Value = res.GetValue()
+		r.Value = res.GetValue()
 		return nil
 
 	case api.MethodProbe:
-		p := in.(*api.ProbeParams)
-		res, err := cli.Probe(ctx, &pb.ProbeRequest{Url: p.URL})
+		p, ok := asPtr[api.ProbeParams](in)
+		if !ok {
+			return badIn(method, in, "*api.ProbeParams")
+		}
+		r, ok := asPtr[api.ProbeResult](out)
+		if !ok {
+			return badOut(method, out, "*api.ProbeResult")
+		}
+		res, err := c.cli.Probe(ctx, &pb.ProbeRequest{Url: p.URL})
 		if err != nil {
 			return methodErrorf(method, err)
 		}
-		out.(*api.ProbeResult).TotalSize = res.GetTotalSize()
+		r.TotalSize = res.GetTotalSize()
 		return nil
 
 	case api.MethodGetSettings:
-		res, err := cli.GetSettings(ctx, &pb.Empty{})
+		if _, ok := asPtr[api.Empty](in); !ok {
+			return badIn(method, in, "*api.Empty")
+		}
+		r, ok := asPtr[api.Settings](out)
+		if !ok {
+			return badOut(method, out, "*api.Settings")
+		}
+		res, err := c.cli.GetSettings(ctx, &pb.Empty{})
 		if err != nil {
 			return methodErrorf(method, err)
 		}
-		*(out.(*api.Settings)) = settingsFromPB(res.GetSettings())
+		*r = settingsFromPB(res.GetSettings())
 		return nil
 
 	case api.MethodSaveSettings:
-		p := in.(*api.Settings)
-		if _, err := cli.SaveSettings(ctx, &pb.SaveSettingsRequest{Settings: settingsToPB(*p)}); err != nil {
+		p, ok := asPtr[api.Settings](in)
+		if !ok {
+			return badIn(method, in, "*api.Settings")
+		}
+		if _, ok := asPtr[api.Empty](out); !ok {
+			return badOut(method, out, "*api.Empty")
+		}
+		if _, err := c.cli.SaveSettings(ctx, &pb.SaveSettingsRequest{Settings: settingsToPB(*p)}); err != nil {
 			return methodErrorf(method, err)
 		}
 		return nil
 
 	case api.MethodBTInfo:
-		p := in.(*api.BTInfoParams)
-		res, err := cli.BTTaskDetail(ctx, &pb.BTInfoRequest{TaskId: p.TaskID})
+		p, ok := asPtr[api.BTInfoParams](in)
+		if !ok {
+			return badIn(method, in, "*api.BTInfoParams")
+		}
+		r, ok := asPtr[api.BTDetail](out)
+		if !ok {
+			return badOut(method, out, "*api.BTDetail")
+		}
+		res, err := c.cli.BTTaskDetail(ctx, &pb.BTInfoRequest{TaskId: p.TaskID})
 		if err != nil {
 			return methodErrorf(method, err)
 		}
-		*(out.(*api.BTDetail)) = *btDetailFromPB(res.GetDetail())
+		d := btDetailFromPB(res.GetDetail())
+		if d == nil {
+			return fmt.Errorf("grpcx: %s: 服务端返回的详情为空", method)
+		}
+		*r = *d
 		return nil
 
 	default:
@@ -6295,17 +7112,21 @@ func (c *Client) Call(ctx context.Context, method string, in, out any) error {
 
 // Stream 打开消息流。
 func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
-	cli := pb.NewDownloadServiceClient(c.conn)
-	stream, err := cli.StreamMessages(ctx, &pb.Empty{})
+	if err := c.checkOpen(); err != nil {
+		return nil, err
+	}
+	stream, err := c.cli.StreamMessages(ctx, &pb.Empty{})
 	if err != nil {
 		return nil, fmt.Errorf("grpcx: 打开消息流: %w", err)
 	}
-	out := make(chan api.Message, 64)
+	out := make(chan api.Message, streamBuffer)
 	go func() {
 		defer close(out)
 		for {
 			msg, err := stream.Recv()
 			if err != nil {
+				// 流结束（服务端收手、连接断开、ctx 取消）都在这里收尾：
+				// 关闭 out，读循环随之知道消息流没了。
 				return
 			}
 			select {
@@ -6319,17 +7140,675 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 }
 
 // Close 关闭底层 gRPC 连接。必须幂等——Close 可能被重复调用。
+//
+// 连接一关，所有还在跑的 RPC 与流都会随之取消，所以不需要像 httpx 那样
+// 单独维护活动流列表。
 func (c *Client) Close() error {
-	if c.conn == nil {
+	if c == nil {
 		return nil
 	}
-	return c.conn.Close()
+	c.closeOnce.Do(func() {
+		c.closed.Store(true)
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+	})
+	return nil
+}
+
+// checkOpen 检查客户端是否已关闭或未初始化。
+func (c *Client) checkOpen() error {
+	if c == nil {
+		return errors.New("grpcx: 客户端未初始化，请用 Dial 创建")
+	}
+	if c.closed.Load() {
+		return errors.New("grpcx: 客户端已关闭")
+	}
+	// 零值客户端的 conn 是 nil，直接发 RPC 会 nil 指针解引用 panic。
+	// Client 是导出类型，零值是被允许的构造物，这里要回错误而不是炸进程。
+	if c.conn == nil {
+		return errors.New("grpcx: 客户端未初始化，请用 Dial 创建")
+	}
+	return nil
+}
+
+// asPtr 把 any 转成指定类型的指针，并报告是否转换成功。
+//
+// 类型不对必须回错误而不是 panic：httpx 那边是 JSON 编解码，类型不对会
+// 在服务端返回 400；gRPC 这边直接解引用就是 panic。
+func asPtr[T any](v any) (*T, bool) {
+	p, ok := v.(*T)
+	return p, ok
+}
+
+// badIn 构造「请求类型不对」的错误。
+func badIn(method string, got any, want string) error {
+	return fmt.Errorf("grpcx: %s: 请求类型错误: 期望 %s, 实际 %T", method, want, got)
+}
+
+// badOut 构造「响应类型不对」的错误。
+func badOut(method string, got any, want string) error {
+	return fmt.Errorf("grpcx: %s: 响应类型错误: 期望 %s, 实际 %T", method, want, got)
 }
 ```
 
-- [ ] **Step 9: 建 `internal/rpc/registry.go`（传输注册表）**
+
+- [ ] **Step 9: 写服务端与客户端的行为测试**
+
+`internal/rpc/grpcx/grpcx_test.go`：
 
 ```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
+package grpcx
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+
+	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/rpc/addr"
+)
+
+const testToken = "tok-123"
+
+// mockHandler 是测试用的业务侧实现。
+type mockHandler struct {
+	events   chan api.Event
+	controls chan api.Message
+
+	// settings 是 get_settings 的返回值。
+	settings api.Settings
+	// tasks 是 list 的返回值。
+	tasks []*api.Task
+	// callErr 非 nil 时 Call 直接返回它。
+	callErr error
+
+	// eventsCalled 在服务端进入消息流处理函数时关闭。
+	eventsCalled chan struct{}
+	eventsOnce   sync.Once
+
+	// unsubed 在服务端的消息流处理函数返回（退订）时关闭。
+	unsubed   chan struct{}
+	unsubOnce sync.Once
+}
+
+func newMockHandler() *mockHandler {
+	return &mockHandler{
+		events:       make(chan api.Event, 8),
+		controls:     make(chan api.Message, 8),
+		eventsCalled: make(chan struct{}),
+		unsubed:      make(chan struct{}),
+	}
+}
+
+func (m *mockHandler) Call(ctx context.Context, method string, in, out any) error {
+	if m.callErr != nil {
+		return m.callErr
+	}
+	switch method {
+	case api.MethodGetSettings:
+		o, ok := out.(*api.Settings)
+		if !ok {
+			return errors.New("mock: 响应类型不对")
+		}
+		*o = m.settings
+	case api.MethodList:
+		o, ok := out.(*api.ListResult)
+		if !ok {
+			return errors.New("mock: 响应类型不对")
+		}
+		o.Tasks = m.tasks
+	case api.MethodIsPreparing:
+		o, ok := out.(*api.BoolResult)
+		if !ok {
+			return errors.New("mock: 响应类型不对")
+		}
+		o.Value = true
+	case api.MethodProbe:
+		o, ok := out.(*api.ProbeResult)
+		if !ok {
+			return errors.New("mock: 响应类型不对")
+		}
+		o.TotalSize = 4096
+	case api.MethodBTInfo:
+		o, ok := out.(*api.BTDetail)
+		if !ok {
+			return errors.New("mock: 响应类型不对")
+		}
+		*o = api.BTDetail{Name: "种子"}
+	case api.MethodAdd:
+		o, ok := out.(*api.Task)
+		if !ok {
+			return errors.New("mock: 响应类型不对")
+		}
+		p, ok := in.(*api.AddTaskInput)
+		if !ok {
+			return errors.New("mock: 请求类型不对")
+		}
+		o.ID = "new"
+		o.URL = p.URL
+		o.SavePath = p.SavePath
+		o.Protocol = string(p.Protocol)
+		o.Status = api.StatusPending
+	case api.MethodStart, api.MethodPause, api.MethodDelete, api.MethodSaveSettings:
+		// 没有返回值的方法。
+	default:
+		return errors.New("mock: 未知方法 " + method)
+	}
+	return nil
+}
+
+func (m *mockHandler) Events() (<-chan api.Event, func()) {
+	m.eventsOnce.Do(func() { close(m.eventsCalled) })
+	return m.events, func() {
+		m.unsubOnce.Do(func() { close(m.unsubed) })
+	}
+}
+
+func (m *mockHandler) Controls() <-chan api.Message { return m.controls }
+
+// startServer 在临时目录里的 unix socket 上启动服务，返回监听地址。
+func startServer(t *testing.T, h Handler, token string) addr.Addr {
+	t.Helper()
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "lgdm.sock")}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = Serve(ctx, a, token, h) }()
+	// socket 文件在 net.Listen 绑定成功时创建，文件出现即表示能连。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(a.Address); err == nil {
+			return a
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("服务没有在超时前就绪: %v", a)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// dialClient 连上服务并返回一个客户端。
+func dialClient(t *testing.T, a addr.Addr, token string) *Client {
+	t.Helper()
+	c, err := Dial(context.Background(), a, token)
+	if err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// TestEndToEndCallAndStream 是端到端冒烟：真起服务、连一次、调一次、
+// 收一条消息。
+func TestEndToEndCallAndStream(t *testing.T) {
+	h := newMockHandler()
+	h.settings = api.Settings{Language: "en", DefaultThreads: 8}
+	h.tasks = []*api.Task{{ID: "t1", Status: api.StatusDownloading}}
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+
+	// 一元调用：拿设置。
+	out := &api.Settings{}
+	if err := c.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, out); err != nil {
+		t.Fatalf("get_settings 失败: %v", err)
+	}
+	if out.Language != "en" || out.DefaultThreads != 8 {
+		t.Fatalf("设置不对: %+v", out)
+	}
+
+	// 一元调用：列任务。
+	list := &api.ListResult{}
+	if err := c.Call(context.Background(), api.MethodList,
+		&api.ListParams{Filter: api.FilterAll, Sort: api.SortCreatedDesc}, list); err != nil {
+		t.Fatalf("list 失败: %v", err)
+	}
+	if len(list.Tasks) != 1 || list.Tasks[0].ID != "t1" {
+		t.Fatalf("任务列表不对: %+v", list.Tasks)
+	}
+
+	// 流式调用：收一条事件。
+	stream, err := c.Stream(context.Background())
+	if err != nil {
+		t.Fatalf("打开消息流失败: %v", err)
+	}
+	h.events <- api.Event{Why: "progress", SpeedBPS: 512}
+	select {
+	case msg := <-stream:
+		if msg.Kind != api.MessageKindEvent || msg.Event == nil {
+			t.Fatalf("收到的事件不对: %+v", msg)
+		}
+		if msg.Event.Why != "progress" || msg.Event.SpeedBPS != 512 {
+			t.Fatalf("事件内容不对: %+v", msg.Event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("没有收到事件")
+	}
+}
+
+// TestClientCloseStopsStreamAndServerStream 验证 Close 之后连接真的断掉：
+// 服务端的消息流处理函数必须返回。
+func TestClientCloseStopsStreamAndServerStream(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c, err := Dial(context.Background(), a, testToken)
+	if err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	if _, err := c.Stream(context.Background()); err != nil {
+		t.Fatalf("打开消息流失败: %v", err)
+	}
+	// 等服务端真的进了消息流处理函数，再关客户端。
+	select {
+	case <-h.eventsCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("服务端没有进入消息流处理函数")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+	select {
+	case <-h.unsubed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("客户端关闭后，服务端的消息流没有结束")
+	}
+}
+
+// TestClientCloseIsIdempotent 是 E5 的回归测试。
+//
+// grpc.ClientConn.Close() 第二次调用返回 ErrClientConnClosing（非 nil），
+// 而 rpc.Transport 的契约要求 Close 幂等。
+func TestClientCloseIsIdempotent(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+
+	for i := 0; i < 3; i++ {
+		if err := c.Close(); err != nil {
+			t.Fatalf("第 %d 次 Close 应当返回 nil，实际: %v", i+1, err)
+		}
+	}
+}
+
+// TestClientCallAfterClose 验证关闭之后调用返回错误而不是 panic。
+func TestClientCallAfterClose(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+	if err := c.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+	out := &api.Settings{}
+	err := c.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, out)
+	if err == nil {
+		t.Fatal("关闭之后的调用应当返回错误")
+	}
+	if _, err := c.Stream(context.Background()); err == nil {
+		t.Fatal("关闭之后的开流应当返回错误")
+	}
+}
+
+// TestZeroValueClientReturnsError 验证零值客户端回错误而不是 panic。
+func TestZeroValueClientReturnsError(t *testing.T) {
+	c := &Client{}
+	out := &api.Settings{}
+	if err := c.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, out); err == nil {
+		t.Fatal("零值客户端的调用应当返回错误")
+	}
+	if _, err := c.Stream(context.Background()); err == nil {
+		t.Fatal("零值客户端的开流应当返回错误")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatalf("零值客户端的 Close 应当返回 nil: %v", err)
+	}
+}
+
+// TestCallRejectsWrongInType 是 E6 的回归测试：类型不对要回错误，不能 panic。
+func TestCallRejectsWrongInType(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+
+	// 请求类型不对。
+	err := c.Call(context.Background(), api.MethodList, "不是 ListParams", &api.ListResult{})
+	if err == nil {
+		t.Fatal("请求类型不对时应当返回错误")
+	}
+	// 响应类型不对。
+	err = c.Call(context.Background(), api.MethodList, &api.ListParams{}, "不是 ListResult")
+	if err == nil {
+		t.Fatal("响应类型不对时应当返回错误")
+	}
+	// 未知方法。
+	err = c.Call(context.Background(), "没有这个方法", &api.Empty{}, &api.Empty{})
+	if err == nil {
+		t.Fatal("未知方法应当返回错误")
+	}
+}
+
+// TestServerRejectsBadToken 覆盖一元与流式两条鉴权路径。
+func TestServerRejectsBadToken(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, "wrong-token")
+
+	// 一元调用。
+	err := c.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, &api.Settings{})
+	if err == nil {
+		t.Fatal("错的 token 应当被拒绝")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.Unauthenticated {
+		t.Fatalf("应当是 Unauthenticated，实际: %v", err)
+	}
+
+	// 流式调用。服务端流式 RPC 的拒绝要等第一次收消息才浮现，对客户端
+	// 表现为「流立刻结束」。另外，服务端的鉴权拦截器在业务处理函数之前
+	// 就返回了，所以 mock 的 Events() 压根不会被调用——用它来确认请求
+	// 真的被挡在了门外，而不是进了业务层才失败。
+	stream, err := c.Stream(context.Background())
+	if err == nil {
+		select {
+		case msg, ok := <-stream:
+			if ok {
+				t.Fatalf("错的 token 应当被拒绝，却收到了消息: %+v", msg)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("错的 token 应当被拒绝")
+		}
+	}
+	select {
+	case <-h.eventsCalled:
+		t.Fatal("错的 token 不该进到业务侧的消息流处理函数")
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestNonASCIITokenIsRejected 记录 gRPC 传输与 net/http 传输的一个已知
+// 差异：gRPC 的 metadata 值只允许可打印 ASCII，带非 ASCII 字符的 token
+// 根本发不出去（grpc-go 直接报错），而 httpx 的 Authorization 头收任意
+// UTF-8。
+//
+// 实际部署不受影响：业务侧的握手 token 是 32 字节随机数的十六进制编码
+// （见 internal/uimgr 的 randomToken），纯 ASCII。这里把行为钉死，免得
+// 以后有人踩到时不知道是哪儿来的。
+func TestNonASCIITokenIsRejected(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, "带中文的 token")
+	err := c.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, &api.Settings{})
+	if err == nil {
+		t.Fatal("带非 ASCII 字符的 token 应当发不出去")
+	}
+	if !strings.Contains(err.Error(), "non-printable ASCII") {
+		t.Fatalf("应当是 metadata 的可打印 ASCII 限制，实际: %v", err)
+	}
+}
+
+// TestServerAcceptsGoodToken 确认对的 token 能过。
+func TestServerAcceptsGoodToken(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+	if err := c.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, &api.Settings{}); err != nil {
+		t.Fatalf("对的 token 应当被接受: %v", err)
+	}
+}
+
+// TestServerRejectsEmptyToken 确认空 token 也会被拒。
+//
+// 服务端要求 "Bearer " 后面还有内容（长度必须大于前缀长度），所以空
+// token 发过去就是 "Bearer "，一律拒绝。
+func TestServerRejectsEmptyToken(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	empty := dialClient(t, a, "")
+	err := empty.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, &api.Settings{})
+	if err == nil {
+		t.Fatal("空 token 应当被拒绝")
+	}
+	if st, ok := status.FromError(err); !ok || st.Code() != codes.Unauthenticated {
+		t.Fatalf("应当是 Unauthenticated，实际: %v", err)
+	}
+}
+
+// TestServeStopsOnContextCancelWithActiveStream 是 E7 的回归测试。
+//
+// 服务端停机用的是 Stop 而不是 GracefulStop：GracefulStop 会等所有在跑
+// 的 RPC 结束，而 StreamMessages 是长连接流，客户端不主动断开它就永远
+// 不结束——那样 Serve 会永久阻塞。
+func TestServeStopsOnContextCancelWithActiveStream(t *testing.T) {
+	h := newMockHandler()
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "lgdm.sock")}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	served := make(chan error, 1)
+	go func() { served <- Serve(ctx, a, testToken, h) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(a.Address); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("服务没有在超时前就绪")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	c, err := Dial(context.Background(), a, testToken)
+	if err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	defer c.Close()
+	if _, err := c.Stream(context.Background()); err != nil {
+		t.Fatalf("打开消息流失败: %v", err)
+	}
+	// 等服务端真的进了消息流处理函数——这时候 GracefulStop 必然挂死。
+	select {
+	case <-h.eventsCalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("服务端没有进入消息流处理函数")
+	}
+
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("Serve 应当正常返回，实际: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ctx 取消后 Serve 没有返回（有活跃流时会挂死）")
+	}
+}
+
+// TestServeStopsOnContextCancelWithoutStream 覆盖没有活跃流的停机。
+func TestServeStopsOnContextCancelWithoutStream(t *testing.T) {
+	h := newMockHandler()
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "lgdm.sock")}
+	ctx, cancel := context.WithCancel(context.Background())
+
+	served := make(chan error, 1)
+	go func() { served <- Serve(ctx, a, testToken, h) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(a.Address); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("服务没有在超时前就绪")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("Serve 应当正常返回，实际: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("ctx 取消后 Serve 没有返回")
+	}
+}
+
+// TestStreamMessagesContinuesAfterEventsClosed 是 E4 的回归测试。
+//
+// 事件通道关闭只停掉那一侧，控制消息流要继续——否则同一套业务侧实现在
+// 两种传输下行为不一致。
+func TestStreamMessagesContinuesAfterEventsClosed(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+
+	stream, err := c.Stream(context.Background())
+	if err != nil {
+		t.Fatalf("打开消息流失败: %v", err)
+	}
+	// 事件侧关闭。
+	close(h.events)
+	// 控制侧仍然有消息。
+	h.controls <- api.Message{Kind: api.MessageKindLanguage, Language: "en"}
+
+	select {
+	case msg := <-stream:
+		if msg.Kind != api.MessageKindLanguage || msg.Language != "en" {
+			t.Fatalf("应当收到控制消息，实际: %+v", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("事件通道关闭后控制消息流没有继续")
+	}
+}
+
+// TestStreamMessagesStopsAfterBothSidesClosed 覆盖两侧都关闭的情形。
+func TestStreamMessagesStopsAfterBothSidesClosed(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+
+	stream, err := c.Stream(context.Background())
+	if err != nil {
+		t.Fatalf("打开消息流失败: %v", err)
+	}
+	close(h.events)
+	close(h.controls)
+	// 两侧都关掉之后，服务端收手，客户端的流会结束。
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case _, ok := <-stream:
+			if !ok {
+				return
+			}
+		case <-time.After(100 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("两侧都关闭之后消息流没有结束")
+		}
+	}
+}
+
+// TestDialFailsWhenServerAbsent 覆盖 E2：预连接让「业务进程没起来」在
+// Dial 阶段就暴露，而不是等到第一次调用。
+func TestDialFailsWhenServerAbsent(t *testing.T) {
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "missing.sock")}
+	if _, err := Dial(context.Background(), a, testToken); err == nil {
+		t.Fatal("服务没起来时 Dial 应当失败")
+	}
+}
+
+// TestDialRespectsContext 覆盖 E2：ctx 不是死参数。
+func TestDialRespectsContext(t *testing.T) {
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "missing.sock")}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := Dial(ctx, a, testToken); err == nil {
+		t.Fatal("ctx 取消之后 Dial 应当失败")
+	}
+}
+
+// TestServerPropagatesBusinessError 确认业务侧的错误能传到客户端。
+func TestServerPropagatesBusinessError(t *testing.T) {
+	h := newMockHandler()
+	h.callErr = errors.New("业务侧出错了")
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+
+	err := c.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, &api.Settings{})
+	if err == nil {
+		t.Fatal("业务侧的错误应当传回客户端")
+	}
+	if !strings.Contains(err.Error(), "业务侧出错了") {
+		t.Fatalf("错误里应当带上业务侧的原因，实际: %v", err)
+	}
+}
+```
+
+
+外部测试包 `internal/rpc/grpcx/contract_test.go`（放编译期断言，Go 允许
+外部测试包 import 上层包，不会成环）：
+
+```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
+// 这是外部测试包：grpcx 自己不能 import internal/rpc（会形成
+// rpc → grpcx → rpc 的包环），但外部测试包可以 import 上层包，Go 不会
+// 因此成环。用它在这里就把「grpcx.Client 满足 rpc.Transport」这件事钉死，
+// 不用等到注册表落地时才发现签名对不上。
+package grpcx_test
+
+import (
+	"testing"
+
+	"lgo_download_manager/internal/rpc"
+	"lgo_download_manager/internal/rpc/grpcx"
+)
+
+// 编译期断言。
+var (
+	// grpcx.Client 满足 rpc.Transport。
+	_ rpc.Transport = (*grpcx.Client)(nil)
+	// rpc.Handler 的方法集与 grpcx.Handler 结构兼容：业务侧拿 rpc.Handler
+	// 的实现就能直接交给 grpcx.Serve。方向是 rpc.Handler → grpcx.Handler。
+	_ grpcx.Handler = (rpc.Handler)(nil)
+)
+
+// TestTransportContract 是上面断言的运行时版本：接口方法集对得上，零值
+// 客户端的 Close 也不会炸。
+func TestTransportContract(t *testing.T) {
+	var tr rpc.Transport = &grpcx.Client{}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("零值客户端 Close 应当返回 nil: %v", err)
+	}
+}
+```
+
+
+- [ ] **Step 10: 建 `internal/rpc/registry.go`（传输注册表）**
+
+```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
 package rpc
 
 import (
@@ -6374,6 +7853,10 @@ func Serve(ctx context.Context, opts ServerOptions, h Handler) error {
 }
 
 // Dial 连接到 endpoint 并返回客户端。endpoint 的格式与 addr.Parse 相同。
+//
+// ctx 应当是贯穿整个会话的 ctx：握手那一次调用用的就是它。两种传输都在
+// Dial 阶段预连接一次，所以「业务进程没起来」在这里就暴露，而不是等到
+// 第一次调用。
 func Dial(ctx context.Context, transport, endpoint, token string) (Client, error) {
 	a, err := addr.Parse(endpoint)
 	if err != nil {
@@ -6391,7 +7874,11 @@ func Dial(ctx context.Context, transport, endpoint, token string) (Client, error
 	if err != nil {
 		return nil, err
 	}
-	return newClient(ctx, tr)
+	c, err := newClient(ctx, tr)
+	if err != nil {
+		return nil, err
+	}
+	return c, nil
 }
 
 // 编译期断言：两种传输实现都满足 Transport。
@@ -6401,19 +7888,181 @@ var (
 )
 ```
 
-- [ ] **Step 10: 跑测试**
+
+`internal/rpc/registry_test.go`：
+
+```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
+package rpc
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"lgo_download_manager/internal/api"
+)
+
+// stubHandler 是最小业务侧实现。
+type stubHandler struct {
+	events   chan api.Event
+	controls chan api.Message
+}
+
+func (s *stubHandler) Call(ctx context.Context, method string, in, out any) error {
+	switch method {
+	case api.MethodGetSettings:
+		o, ok := out.(*api.Settings)
+		if !ok {
+			return errors.New("stub: 响应类型不对")
+		}
+		o.Language = "en"
+	case api.MethodList:
+		o, ok := out.(*api.ListResult)
+		if !ok {
+			return errors.New("stub: 响应类型不对")
+		}
+		o.Tasks = []*api.Task{{ID: "t1"}}
+	default:
+		return errors.New("stub: 未实现 " + method)
+	}
+	return nil
+}
+
+func (s *stubHandler) Events() (<-chan api.Event, func()) {
+	return s.events, func() {}
+}
+
+func (s *stubHandler) Controls() <-chan api.Message { return s.controls }
+
+// startServer 在临时目录里的 unix socket 上启动服务，返回地址与停服函数。
+func startServer(t *testing.T, transport, token string) (string, func()) {
+	t.Helper()
+	sock := filepath.Join(t.TempDir(), "lgdm.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &stubHandler{
+		events:   make(chan api.Event, 4),
+		controls: make(chan api.Message, 4),
+	}
+	served := make(chan error, 1)
+	go func() {
+		served <- Serve(ctx, ServerOptions{Transport: transport, Addr: "unix:" + sock, Token: token}, h)
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(sock); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatalf("服务没有在超时前就绪")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	stop := func() {
+		cancel()
+		select {
+		case <-served:
+		case <-time.After(10 * time.Second):
+			t.Error("服务没有在超时前停下")
+		}
+	}
+	t.Cleanup(stop)
+	return sock, stop
+}
+
+// TestRegistryBothTransports 确认注册表在两种传输下都能起服务、连上、
+// 调一次。
+func TestRegistryBothTransports(t *testing.T) {
+	for _, transport := range []string{TransportGRPC, TransportHTTP} {
+		t.Run(transport, func(t *testing.T) {
+			sock, _ := startServer(t, transport, "tok")
+			c, err := Dial(context.Background(), transport, "unix:"+sock, "tok")
+			if err != nil {
+				t.Fatalf("连接失败: %v", err)
+			}
+			defer c.Close()
+
+			tasks, err := c.List(api.FilterAll, api.SortCreatedDesc)
+			if err != nil {
+				t.Fatalf("list 失败: %v", err)
+			}
+			if len(tasks) != 1 || tasks[0].ID != "t1" {
+				t.Fatalf("任务列表不对: %+v", tasks)
+			}
+			if got := c.Settings().Language; got != "en" {
+				t.Fatalf("设置不对: %q", got)
+			}
+		})
+	}
+}
+
+// TestRegistryDefaultTransport 确认不写传输名时默认走 gRPC。
+func TestRegistryDefaultTransport(t *testing.T) {
+	sock, _ := startServer(t, "", "tok")
+	c, err := Dial(context.Background(), "", "unix:"+sock, "tok")
+	if err != nil {
+		t.Fatalf("连接失败: %v", err)
+	}
+	defer c.Close()
+	if _, err := c.List(api.FilterAll, api.SortCreatedDesc); err != nil {
+		t.Fatalf("list 失败: %v", err)
+	}
+}
+
+// TestRegistryUnknownTransport 确认未知传输名会报错。
+func TestRegistryUnknownTransport(t *testing.T) {
+	err := Serve(context.Background(), ServerOptions{Transport: "quic", Addr: "unix:/tmp/x.sock"}, &stubHandler{})
+	if err == nil {
+		t.Fatal("未知传输名应当报错")
+	}
+	if _, err := Dial(context.Background(), "quic", "unix:/tmp/x.sock", ""); err == nil {
+		t.Fatal("未知传输名应当报错")
+	}
+}
+
+// TestRegistryBadAddr 确认地址解析失败会报错。
+func TestRegistryBadAddr(t *testing.T) {
+	err := Serve(context.Background(), ServerOptions{Addr: ""}, &stubHandler{})
+	if err == nil {
+		t.Fatal("空地址应当报错")
+	}
+	if _, err := Dial(context.Background(), TransportGRPC, "", ""); err == nil {
+		t.Fatal("空地址应当报错")
+	}
+}
+```
+
+
+- [ ] **Step 11: 跑测试**
 
 Run: `go test ./internal/rpc/... ./internal/appservice/`
 Expected: PASS
 
-- [ ] **Step 11: 提交**
+端到端另外要真起一次服务（unix socket）确认：客户端 `Call` 一次拿到结果、
+`Stream` 收到一条消息、`Close()` 之后服务端的消息流处理函数真的返回。
+这两条分别由 `TestEndToEndCallAndStream` 与
+`TestClientCloseStopsStreamAndServerStream` 覆盖。
+
+- [ ] **Step 12: 提交**
 
 ```bash
-git add proto buf.yaml buf.gen.yaml scripts/gen_proto.sh internal/rpc/grpcx internal/rpc/registry.go go.mod go.sum
+git add proto buf.yaml buf.gen.yaml scripts/gen_proto.sh internal/rpc/grpcx internal/rpc/registry.go internal/rpc/registry_test.go go.mod go.sum
 git commit -m "feat(grpcx): 实现基于 gRPC 的传输并加入 protobuf 契约"
 ```
 
 ---
+
+
 
 ### Task 8: 契约测试套件（两种传输各跑一遍）
 
