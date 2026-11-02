@@ -14,21 +14,20 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/test"
 
-	"lgo_download_manager/internal/scheduler"
-	"lgo_download_manager/internal/store"
+	"lgo_download_manager/internal/api"
 )
 
-// detailsStubService 是 Service 的最小实现:订阅返回一个关得掉的
+// detailsStubService 是 rpc.Client 的最小实现:订阅返回一个关得掉的
 // channel,窗口关闭时订阅方退出,不留挂起的 goroutine。
 type detailsStubService struct {
 	btStubService
 	mu sync.Mutex
 }
 
-func (s *detailsStubService) Subscribe() (<-chan scheduler.Event, func()) {
+func (s *detailsStubService) Subscribe() (<-chan api.Event, func()) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ch := make(chan scheduler.Event)
+	ch := make(chan api.Event)
 	once := &sync.Once{}
 	return ch, func() { once.Do(func() { close(ch) }) }
 }
@@ -69,7 +68,7 @@ func TestDetailsWindowIsSingletonPerTask(t *testing.T) {
 	test.NewApp()
 	defer test.NewApp()
 
-	tk := &store.Task{
+	tk := &api.Task{
 		ID:       "http-singleton",
 		URL:      "https://example.com/a.zip",
 		SavePath: filepath.Join("C:", "dl", "a.zip"),
@@ -118,8 +117,8 @@ func TestDetailsWindowPerTaskIsIndependent(t *testing.T) {
 	test.NewApp()
 	defer test.NewApp()
 
-	mk := func(id string) *store.Task {
-		return &store.Task{
+	mk := func(id string) *api.Task {
+		return &api.Task{
 			ID:       id,
 			URL:      "https://example.com/" + id + ".zip",
 			SavePath: filepath.Join("C:", "dl", id+".zip"),
@@ -148,7 +147,7 @@ func TestBTDetailsWindowIsSingletonPerTask(t *testing.T) {
 	test.NewApp()
 	defer test.NewApp()
 
-	tk := &store.Task{
+	tk := &api.Task{
 		ID:       "bt-singleton",
 		URL:      "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
 		SavePath: filepath.Join("C:", "dl", "bt"),

@@ -23,9 +23,10 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/diskstat"
 	"lgo_download_manager/internal/ilocale"
-	"lgo_download_manager/internal/store"
+	"lgo_download_manager/internal/rpc"
 )
 
 // diskRefreshInterval 是状态栏磁盘空间信息的刷新间隔。磁盘占用会因为
@@ -35,7 +36,7 @@ const diskRefreshInterval = 30 * time.Second
 // MainWindow 保存所有 GUI 状态以及顶层 Fyne 窗口。
 type MainWindow struct {
 	app     fyne.App
-	svc     Service
+	svc     rpc.Client
 	win     fyne.Window
 	content *fyne.Container
 
@@ -44,15 +45,15 @@ type MainWindow struct {
 	statusBar *statusBar
 
 	// 可翻译 widget 引用,语言切换时由 applyLanguage 重新写入。
-	winTitle       string
-	tbNew          *widget.Button
-	tbPauseAll     *widget.Button
-	tbResumeAll    *widget.Button
-	tbSettings     *widget.Button
-	searchEntry    *widget.Entry
-	sidebarHeader  *widget.Label
-	sidebarRadios  *widget.RadioGroup
-	diskLabel      *widget.Label
+	winTitle      string
+	tbNew         *widget.Button
+	tbPauseAll    *widget.Button
+	tbResumeAll   *widget.Button
+	tbSettings    *widget.Button
+	searchEntry   *widget.Entry
+	sidebarHeader *widget.Label
+	sidebarRadios *widget.RadioGroup
+	diskLabel     *widget.Label
 
 	// settingsHeaderTitle 在设置页切换时即时翻译(不像其它 widget 持久持有)。
 	settingsPageOpen bool
@@ -61,7 +62,7 @@ type MainWindow struct {
 	// persist/SaveSettings。设置页重建(applyLanguage 调用 showSettingsPage
 	// 或 buildSettingsContent)会重新构造 select/entry,SetSelected 与
 	// SetText 的回调可能在我们刚收到 SetLanguage 的瞬间再次写回 SaveSettings,
-	// 业务侧 dispatch → SetLanguage → MsgLanguage → applyLanguage 形成
+	// 业务侧 dispatch → SetLanguage → language 控制消息 → applyLanguage 形成
 	// 无限循环直到 UI 进程 panic。这里在重建期间统一 short-circuit。
 	suppressPersist bool
 
@@ -77,7 +78,7 @@ type MainWindow struct {
 // 必须在 Fyne 事件线程上调用（通常在 app.New…() 之后、
 // a.Run() 之前的主 goroutine 中），因为 widget 构造器依赖
 // fyne.CurrentApp() 解析为刚创建的 app。
-func NewMainWindow(a fyne.App, svc Service) *MainWindow {
+func NewMainWindow(a fyne.App, svc rpc.Client) *MainWindow {
 	GlobalSettings = svc.Settings()
 	setGlobalSvc(svc)
 	m := &MainWindow{
@@ -113,7 +114,7 @@ func (m *MainWindow) buildMainUI() {
 
 // applyLanguage 把 ilocale.Current 对应的语言应用到所有持久持有的
 // widget(title/工具栏/侧边栏/状态栏标签)。由 NewMainWindow 首启调用,
-// 以及 MsgLanguage 回调触发。必须在 Fyne 事件线程上调用(write widget)。
+// 以及 language 控制消息回调触发。必须在 Fyne 事件线程上调用(write widget)。
 func (m *MainWindow) applyLanguage() {
 	if m.win != nil {
 		title := ilocale.T("main.window.title")
@@ -154,7 +155,7 @@ func (m *MainWindow) applyLanguage() {
 	// suppressPersist 必须夹住重建:buildSettingsContent 会重新构造
 	// select/entry,SetSelected/SetText 的回调会触发 persist,若不挡
 	// 住就会把刚切完的语言再写回一次,业务侧 dispatch → SetLanguage →
-	// MsgLanguage → applyLanguage 形成无限循环,直到 UI 进程 panic。
+	// language 控制消息 → applyLanguage 形成无限循环,直到 UI 进程 panic。
 	if m.settingsPageOpen {
 		m.suppressPersist = true
 		m.showSettingsPage()
@@ -211,16 +212,16 @@ func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 		//
 		// 请求并发发起:每一次 Pause 都是一次阻塞的 IPC 往返,串行做的话
 		// 任务一多,工具栏按钮要卡上好几秒才恢复响应。
-		paused := store.TaskStatus.Paused
+		paused := api.StatusPaused
 		for _, tk := range m.taskList.allTasks() {
 			m.taskList.setOptimistic(tk.ID, paused)
 			go func(id string) { _ = m.svc.Pause(id) }(tk.ID)
 		}
 	})
 	resumeAllBtn := widget.NewButtonWithIcon("", theme.MediaPlayIcon(), func() {
-		down := store.TaskStatus.Downloading
+		down := api.StatusDownloading
 		for _, tk := range m.taskList.allTasks() {
-			if tk.Status == store.TaskStatus.Paused || tk.Status == store.TaskStatus.Failed {
+			if tk.Status == api.StatusPaused || tk.Status == api.StatusFailed {
 				m.taskList.setOptimistic(tk.ID, down)
 				go func(id string) { _ = m.svc.Start(id) }(tk.ID)
 			}
@@ -539,7 +540,7 @@ func (sb *statusBar) setDiskSpace(free, total int64) {
 	frac := 1.0 - float64(free)/float64(total)
 	sb.diskBar.setProgress(frac)
 	sb.diskLabel.SetText(ilocale.TF("main.status.disk.format", fmt.Sprintf("磁盘空间: 可用 %s / 总计 %s", formatBytes(free), formatBytes(total)), map[string]any{
-		"Free": formatBytes(free),
+		"Free":  formatBytes(free),
 		"Total": formatBytes(total),
 	}))
 }

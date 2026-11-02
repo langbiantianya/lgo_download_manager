@@ -21,9 +21,9 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/ilocale"
-	"lgo_download_manager/internal/scheduler"
-	"lgo_download_manager/internal/store"
+	"lgo_download_manager/internal/rpc"
 )
 
 // blockSize 是马赛克中使用的固定可视分块大小（1 MiB）。
@@ -97,8 +97,8 @@ type chunkMosaic struct {
 //
 // 返回值是本次新建的 BT 面板(非 BT 任务、或者窗口已存在时为 nil),
 // 供测试断言渲染内容。
-func showChunkDetails(t *store.Task, svc Service, parent fyne.Window) *btDetailsPanel {
-	if scheduler.IsBittorrentTask(t) {
+func showChunkDetails(t *api.Task, svc rpc.Client, parent fyne.Window) *btDetailsPanel {
+	if isBittorrentTask(t) {
 		return showBTDetails(t, svc, parent)
 	}
 	// 同一任务已经开着详情窗口:置前即可,别再开一个一模一样的。
@@ -411,7 +411,7 @@ func max64(a, b int64) int64 {
 }
 
 // uaForTask 返回应用于该任务下载的 User-Agent 字符串。
-func uaForTask(t *store.Task) string {
+func uaForTask(t *api.Task) string {
 	if t.AuthData == "" {
 		return ilocale.T("details.ua.default")
 	}
@@ -425,6 +425,6 @@ func uaForTask(t *store.Task) string {
 }
 
 // taskName 返回任务保存路径中的文件名部分。
-func taskName(t *store.Task) string {
+func taskName(t *api.Task) string {
 	return filepath.Base(t.SavePath)
 }

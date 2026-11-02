@@ -7,7 +7,6 @@
 package ui
 
 import (
-	"context"
 	"crypto/rand"
 	"fmt"
 	"image/color"
@@ -24,8 +23,8 @@ import (
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/theme"
 
-	"lgo_download_manager/internal/protocol"
-	"lgo_download_manager/internal/scheduler"
+	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/rpc"
 	"lgo_download_manager/internal/store"
 )
 
@@ -66,47 +65,29 @@ func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 	defer test.NewApp()
 
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "lgdm.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	defer st.Close()
-	// 等待 scheduler.Run 退出后再关 store,避免 flushAll 写已关闭的 DB。
-	sc := scheduler.New(st)
-	schedulerDone := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer func() {
-		cancel()
-		<-schedulerDone
-	}()
-	go func() {
-		sc.Run(ctx)
-		close(schedulerDone)
-	}()
+	st := openTestStore(t)
+	// 走真实链路：rpc.Client → 传输 → appservice → scheduler/engine。
+	env := startTestService(t, st, rpc.TransportHTTP)
+	svc := env.client
 
-	tk, err := sc.Add(scheduler.AddTaskInput{
+	tk, err := svc.AddTask(api.AddTaskInput{
 		URL:        srv.URL,
 		SavePath:   filepath.Join(dir, "out.bin"),
-		Protocol:   protocol.ProtoHTTP,
+		Protocol:   api.ProtoHTTP,
 		ChunkCount: 4,
 	})
 	if err != nil {
-		t.Fatalf("scheduler.Add: %v", err)
+		t.Fatalf("AddTask: %v", err)
 	}
 
-	if err := sc.Start(tk.ID); err != nil {
-		t.Fatalf("scheduler.Start: %v", err)
-	}
-
-	if cur, err := st.GetTask(tk.ID); err == nil {
-		tk = cur
+	if err := svc.Start(tk.ID); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
 
 	m := newChunkMosaic(tk.ID)
 	m.resizeForTotal(tk.TotalSize)
 
-	ch, unsub := sc.Subscribe()
+	ch, unsub := svc.Subscribe()
 	defer unsub()
 	go func() {
 		for ev := range ch {

@@ -16,20 +16,20 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/ilocale"
-	"lgo_download_manager/internal/scheduler"
-	"lgo_download_manager/internal/store"
+	"lgo_download_manager/internal/rpc"
 )
 
 type taskRow struct {
 	widget.BaseWidget
-	task *store.Task
-	svc  Service
+	task *api.Task
+	svc  rpc.Client
 
 	// optimisticStatus 在用户点击 Start/Pause 后立即覆盖渲染,
 	// 真实事件到达(status 与乐观值一致)时由 onEvent 清掉。
 	// 用于消除按钮点击到后端事件回传之间肉眼可见的「卡顿」。
-	optimisticStatus *store.Status
+	optimisticStatus *api.Status
 
 	// 第一行:名称 + 大小 + 状态
 	name      *widget.Label
@@ -91,12 +91,12 @@ type rowState struct {
 	buttons    rowButtons
 
 	// 状态部分
-	status    store.Status
+	status    api.Status
 	preparing bool
 	errorKind string
 }
 
-func newTaskRow(_ *store.Task) *taskRow {
+func newTaskRow(_ *api.Task) *taskRow {
 	r := &taskRow{}
 	r.ExtendBaseWidget(r)
 	r.build()
@@ -162,7 +162,7 @@ func (r *taskRow) build() {
 	r.inner = container.NewVBox(row1, row2, row3)
 }
 
-func (r *taskRow) onProgress(ev scheduler.Event) {
+func (r *taskRow) onProgress(ev api.Event) {
 	r.task = ev.Task
 	if ev.SpeedBPS > 0 {
 		r.curSpeed = ev.SpeedBPS
@@ -170,7 +170,7 @@ func (r *taskRow) onProgress(ev scheduler.Event) {
 	r.refresh()
 }
 
-func (r *taskRow) bind(t *store.Task, svc Service) {
+func (r *taskRow) bind(t *api.Task, svc rpc.Client) {
 	//   - curSpeed：不在 Task 结构体中，仅由进度事件更新。
 	r.task = t
 	r.svc = svc
@@ -178,7 +178,7 @@ func (r *taskRow) bind(t *store.Task, svc Service) {
 	r.bindButtons(t, svc)
 }
 
-func (r *taskRow) bindButtons(t *store.Task, svc Service) {
+func (r *taskRow) bindButtons(t *api.Task, svc rpc.Client) {
 	if t == nil {
 		return
 	}
@@ -188,7 +188,7 @@ func (r *taskRow) bindButtons(t *store.Task, svc Service) {
 	pauseBtn := r.pauseBtn
 	startBtn.OnTapped = func() {
 		// 乐观更新:让用户立即看到「下载中/准备中」,不等事件回环。
-		down := store.TaskStatus.Downloading
+		down := api.StatusDownloading
 		r.optimisticStatus = &down
 		fyne.Do(func() { r.refresh() })
 		if err := svc.Start(taskID); err != nil {
@@ -199,7 +199,7 @@ func (r *taskRow) bindButtons(t *store.Task, svc Service) {
 		}
 	}
 	pauseBtn.OnTapped = func() {
-		paused := store.TaskStatus.Paused
+		paused := api.StatusPaused
 		r.optimisticStatus = &paused
 		fyne.Do(func() { r.refresh() })
 		if err := svc.Pause(taskID); err != nil {
@@ -255,18 +255,18 @@ func (r *taskRow) refresh() {
 // 准备阶段判定：store 中 Status 仍是 Pending，且 scheduler 已为该任务预留了
 // slot（engine 尚未接管）。乐观覆盖为 Downloading 时不再视为「准备中」，
 // 用户刚点完 Start 不应再看到「准备中」闪烁。
-func (r *taskRow) effectiveStatus(t *store.Task) (store.Status, bool) {
+func (r *taskRow) effectiveStatus(t *api.Task) (api.Status, bool) {
 	eff := t.Status
 	if r.optimisticStatus != nil {
 		eff = *r.optimisticStatus
 	}
-	preparing := eff == store.TaskStatus.Pending && r.svc != nil && r.svc.IsPreparing(t.ID)
+	preparing := eff == api.StatusPending && r.svc != nil && r.svc.IsPreparing(t.ID)
 	return eff, preparing
 }
 
 // refreshProgress 写入随进度变化的部分：名称、添加时间、大小、进度条，
 // 以及下载中才显示的速度与剩余时间。每个值都先与上次渲染值比较。
-func (r *taskRow) refreshProgress(t *store.Task, eff store.Status) {
+func (r *taskRow) refreshProgress(t *api.Task, eff api.Status) {
 	r.setText(r.name, &r.st.name, displayName(t))
 	r.setText(r.createdAtLbl, &r.st.createdAt, ilocale.T("taskRow.createdAt.prefix")+formatTime(t.CreatedAt))
 	r.setText(r.size, &r.st.size, taskSizeText(t.TotalSize))
@@ -283,7 +283,7 @@ func (r *taskRow) refreshProgress(t *store.Task, eff store.Status) {
 		r.progress.SetValue(pct)
 	}
 
-	downloading := eff == store.TaskStatus.Downloading
+	downloading := eff == api.StatusDownloading
 	r.setSpeedVisible(downloading)
 	if downloading {
 		r.setText(r.speed, &r.st.speed, formatBPS(r.curSpeed))
@@ -293,7 +293,7 @@ func (r *taskRow) refreshProgress(t *store.Task, eff store.Status) {
 
 // refreshStatus 只在 effective status（或「准备中」判定）变化时更新状态标签、
 // 按钮可见性与图标——这些操作会触发布局与图标绘制，是每个 tick 里最贵的部分。
-func (r *taskRow) refreshStatus(eff store.Status, preparing bool, errorKind string) {
+func (r *taskRow) refreshStatus(eff api.Status, preparing bool, errorKind string) {
 	s := &r.st
 	if s.valid && s.status == eff && s.preparing == preparing && s.errorKind == errorKind {
 		return
@@ -304,7 +304,7 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool, errorKind stri
 	s.valid = true
 
 	switch eff {
-	case store.TaskStatus.Pending:
+	case api.StatusPending:
 		if preparing {
 			r.statusLbl.SetText(ilocale.T("taskRow.status.preparing"))
 			r.setVis(r.pauseBtn, showPause, true)
@@ -318,13 +318,13 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool, errorKind stri
 		}
 		r.setVis(r.openFolderBtn, showFolder, false)
 		r.setVis(r.openFileBtn, showFile, false)
-	case store.TaskStatus.Downloading:
+	case api.StatusDownloading:
 		r.statusLbl.SetText(ilocale.T("taskRow.status.downloading"))
 		r.setVis(r.startBtn, showStart, false)
 		r.setVis(r.pauseBtn, showPause, true)
 		r.setVis(r.openFolderBtn, showFolder, false)
 		r.setVis(r.openFileBtn, showFile, false)
-	case store.TaskStatus.Paused:
+	case api.StatusPaused:
 		r.statusLbl.SetText(ilocale.T("taskRow.status.paused"))
 		r.startBtn.SetIcon(theme.MediaPlayIcon())
 		r.startBtn.Importance = widget.LowImportance
@@ -332,13 +332,13 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool, errorKind stri
 		r.setVis(r.pauseBtn, showPause, false)
 		r.setVis(r.openFolderBtn, showFolder, false)
 		r.setVis(r.openFileBtn, showFile, false)
-	case store.TaskStatus.Completed:
+	case api.StatusCompleted:
 		r.statusLbl.SetText(ilocale.T("taskRow.status.completed"))
 		r.setVis(r.pauseBtn, showPause, false)
 		r.setVis(r.startBtn, showStart, false)
 		r.setVis(r.openFolderBtn, showFolder, true)
 		r.setVis(r.openFileBtn, showFile, true)
-	case store.TaskStatus.FileLost:
+	case api.StatusFileLost:
 		r.statusLbl.SetText(ilocale.T("taskRow.status.filelost"))
 		r.startBtn.SetIcon(theme.DownloadIcon())
 		r.startBtn.Importance = widget.HighImportance
@@ -346,7 +346,7 @@ func (r *taskRow) refreshStatus(eff store.Status, preparing bool, errorKind stri
 		r.setVis(r.pauseBtn, showPause, false)
 		r.setVis(r.openFolderBtn, showFolder, false)
 		r.setVis(r.openFileBtn, showFile, false)
-	case store.TaskStatus.Failed:
+	case api.StatusFailed:
 		reason := errorKindText(errorKind)
 		if reason == "" {
 			r.statusLbl.SetText(ilocale.T("taskRow.status.failed"))
@@ -382,7 +382,7 @@ func errorKindText(kind string) string {
 //
 // 删除会连同已下载的数据一起清掉(scheduler.Delete → removeTaskData 先删
 // .part 文件),之前是零确认:手滑点一下,几个 GB 的进度就没了。
-func confirmDelete(t *store.Task, svc Service) {
+func confirmDelete(t *api.Task, svc rpc.Client) {
 	name := displayName(t)
 	message := ilocale.TF("taskRow.delete.confirm",
 		"确定删除任务「{{ .Name }}」吗?已下载的内容也会一并删除。",
@@ -437,7 +437,7 @@ func (r *taskRow) CreateRenderer() fyne.WidgetRenderer {
 }
 
 // displayName 返回任务的人类可读文件名。
-func displayName(t *store.Task) string {
+func displayName(t *api.Task) string {
 	if t.SavePath != "" {
 		return filepath.Base(t.SavePath)
 	}
@@ -447,8 +447,8 @@ func displayName(t *store.Task) string {
 // taskFolder 返回「打开文件夹」按钮应打开的目录。
 // 普通任务的 SavePath 是一个文件,打开其所在目录;BT 任务的 SavePath
 // 本身就是「任务目录」(种子内容与 .part 临时文件都在里面),直接打开它。
-func taskFolder(t *store.Task) string {
-	if scheduler.IsBittorrentTask(t) {
+func taskFolder(t *api.Task) string {
+	if isBittorrentTask(t) {
 		return t.SavePath
 	}
 	return filepath.Dir(t.SavePath)
@@ -456,8 +456,8 @@ func taskFolder(t *store.Task) string {
 
 // taskFile 返回「打开文件」按钮应打开的文件。BT 单文件种子用元数据里
 // 记下的相对路径定位;多文件种子没有单一文件可打开,退化为打开任务目录。
-func taskFile(t *store.Task) string {
-	if !scheduler.IsBittorrentTask(t) {
+func taskFile(t *api.Task) string {
+	if !isBittorrentTask(t) {
 		return t.SavePath
 	}
 	if t.BTFile == "" {
@@ -486,7 +486,7 @@ func formatBPS(bps float64) string {
 }
 
 // etaText 估算正在运行任务的剩余时间。
-func etaText(t *store.Task, bps float64) string {
+func etaText(t *api.Task, bps float64) string {
 	if bps <= 0 || t.TotalSize <= 0 {
 		return ilocale.T("taskRow.eta.unknown")
 	}
@@ -504,9 +504,9 @@ func etaText(t *store.Task, bps float64) string {
 // setGlobalSvc 由 NewMainWindow 调用，以便在不需要
 // 在每个 widget 构造器中传递 svc 的情况下，使业务服务
 // 可被任务行按钮回调访问。
-var globalSvc Service
+var globalSvc rpc.Client
 
-func setGlobalSvc(svc Service) { globalSvc = svc }
+func setGlobalSvc(svc rpc.Client) { globalSvc = svc }
 
 var globalWin fyne.Window
 

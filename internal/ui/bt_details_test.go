@@ -17,37 +17,20 @@ import (
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/test"
 
-	"lgo_download_manager/internal/bittorrent"
+	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/ilocale"
-	"lgo_download_manager/internal/scheduler"
-	"lgo_download_manager/internal/store"
 )
 
-// btStubService 是 Service 的最小实现:只有 BTTaskDetail 有内容,其余
-// 方法在 BT 详情面板的测试里不会被走到。
+// btStubService 只覆盖 BTTaskDetail：其余方法由 nopClient 给出无害默认值。
 type btStubService struct {
-	detail *bittorrent.Detail
+	nopClient
+	detail *api.BTDetail
 	err    error
 }
 
-func (s *btStubService) List(store.StatusFilter, store.TaskSort) ([]*store.Task, error) {
-	return nil, nil
-}
-func (s *btStubService) Subscribe() (<-chan scheduler.Event, func()) {
-	return make(chan scheduler.Event), func() {}
-}
-func (s *btStubService) AddTask(AddTaskInput) (*store.Task, error) { return nil, nil }
-func (s *btStubService) Start(string) error                        { return nil }
-func (s *btStubService) Pause(string) error                        { return nil }
-func (s *btStubService) Delete(string) error                       { return nil }
-func (s *btStubService) IsPreparing(string) bool                   { return false }
-func (s *btStubService) Probe(string) (int64, error)               { return 0, nil }
-func (s *btStubService) BTTaskDetail(string) (*bittorrent.Detail, error) {
+func (s *btStubService) BTTaskDetail(string) (*api.BTDetail, error) {
 	return s.detail, s.err
 }
-func (s *btStubService) Settings() store.Settings          { return store.Settings{} }
-func (s *btStubService) SaveSettings(store.Settings) error { return nil }
-func (s *btStubService) Close() error                      { return nil }
 
 // samplePieceBuckets 造一份分片热力图数据:前面四成已经下完,中间三成
 // 下了一半(逐步推进),后面三成还没动——这样图上能同时看到「完成 /
@@ -68,8 +51,8 @@ func samplePieceBuckets() []uint8 {
 }
 
 // sampleBTDetail 造一份覆盖面板各字段的详情快照。
-func sampleBTDetail() *bittorrent.Detail {
-	return &bittorrent.Detail{
+func sampleBTDetail() *api.BTDetail {
+	return &api.BTDetail{
 		Name:         "debian-13.7.0-amd64-netinst.iso",
 		InfoHash:     "0123456789abcdef0123456789abcdef01234567",
 		Total:        1000,
@@ -88,7 +71,7 @@ func sampleBTDetail() *bittorrent.Detail {
 		Complete:     true,
 		Trackers:     []string{"udp://tracker.example:6969/announce"},
 		PieceBuckets: samplePieceBuckets(),
-		Files: []bittorrent.FileProgress{
+		Files: []api.FileProgress{
 			{Path: "debian-13.7.0-amd64-netinst.iso", Length: 1000, Completed: 400},
 			{Path: "README", Length: 100, Completed: 100},
 		},
@@ -102,7 +85,7 @@ func TestBTDetailsPanelShowsTorrentFacts(t *testing.T) {
 	test.NewApp()
 	defer test.NewApp()
 
-	tk := &store.Task{
+	tk := &api.Task{
 		ID:       "bt-1",
 		URL:      "https://example.com/a.torrent",
 		SavePath: filepath.Join("C:", "dl", "a"),
@@ -174,8 +157,8 @@ func TestBTDetailsPanelTracksFileCount(t *testing.T) {
 	test.NewApp()
 	defer test.NewApp()
 
-	p := newBTDetailsPanel(&store.Task{ID: "bt-1", Protocol: "BT"})
-	p.update(&bittorrent.Detail{})
+	p := newBTDetailsPanel(&api.Task{ID: "bt-1", Protocol: "BT"})
+	p.update(&api.BTDetail{})
 	if len(p.fileRows) != 0 {
 		t.Fatalf("file rows before metadata = %d, want 0", len(p.fileRows))
 	}
@@ -197,7 +180,7 @@ func TestBTDetailsPanelInactive(t *testing.T) {
 	test.NewApp()
 	defer test.NewApp()
 
-	p := newBTDetailsPanel(&store.Task{ID: "bt-1", Protocol: "BT"})
+	p := newBTDetailsPanel(&api.Task{ID: "bt-1", Protocol: "BT"})
 	p.fetch(&btStubService{err: errors.New("not active")}, "bt-1")
 	if p.lblState.Text != ilocale.T("details.bt.state.inactive") {
 		t.Errorf("state = %q, want the inactive label", p.lblState.Text)
@@ -213,7 +196,7 @@ func TestShowChunkDetailsPicksBTPanel(t *testing.T) {
 	test.NewApp()
 	defer test.NewApp()
 
-	btTask := &store.Task{
+	btTask := &api.Task{
 		ID:       "bt-1",
 		URL:      "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
 		SavePath: filepath.Join("C:", "dl", "bt"),
@@ -237,7 +220,7 @@ func TestShowChunkDetailsPicksBTPanel(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	httpTask := &store.Task{
+	httpTask := &api.Task{
 		ID:       "http-1",
 		URL:      "https://example.com/a.zip",
 		SavePath: filepath.Join("C:", "dl", "a.zip"),
@@ -272,7 +255,7 @@ func TestBTDetailsPanelFeedsPieceMosaic(t *testing.T) {
 	test.NewApp()
 	defer test.NewApp()
 
-	p := newBTDetailsPanel(&store.Task{ID: "bt-1", Protocol: "BT"})
+	p := newBTDetailsPanel(&api.Task{ID: "bt-1", Protocol: "BT"})
 	d := sampleBTDetail()
 	p.update(d)
 
@@ -292,12 +275,13 @@ func TestBTDetailsPanelFeedsPieceMosaic(t *testing.T) {
 // 出可视区),文字还在但画面会是空的,只有渲染出来才看得出来。
 //
 // 需要留图时用环境变量指定落盘路径:
+//
 //	LGDM_BT_PANEL_PNG=out.png go test ./internal/ui -run TestBTDetailsPanelRenders
 func TestBTDetailsPanelRenders(t *testing.T) {
 	test.NewApp()
 	defer test.NewApp()
 
-	tk := &store.Task{
+	tk := &api.Task{
 		ID:       "bt-1",
 		URL:      "https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/debian-13.7.0-amd64-netinst.iso.torrent",
 		SavePath: filepath.Join("C:", "Users", "lbty", "Downloads", "debian-13.7.0-amd64-netinst.iso"),

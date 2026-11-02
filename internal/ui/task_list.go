@@ -15,14 +15,14 @@ import (
 	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/ilocale"
-	"lgo_download_manager/internal/scheduler"
-	"lgo_download_manager/internal/store"
+	"lgo_download_manager/internal/rpc"
 )
 
 // taskList 是右侧显示下载队列的面板。
 type taskList struct {
-	svc     Service
+	svc     rpc.Client
 	filter  binding.String
 	searchQ binding.String
 
@@ -49,12 +49,12 @@ type taskList struct {
 	// 查询过滤结果，没有缓存时每个事件、每一个可见行都要走一次
 	// svc.List（阻塞 IPC，最长 30s 超时）。
 	cacheMu    sync.Mutex
-	cache      []*store.Task
+	cache      []*api.Task
 	cacheKey   string
 	cacheValid bool
 }
 
-func newTaskList(svc Service, filter binding.String) *taskList {
+func newTaskList(svc rpc.Client, filter binding.String) *taskList {
 	tl := &taskList{
 		svc:     svc,
 		filter:  filter,
@@ -71,9 +71,9 @@ func (tl *taskList) container() *fyne.Container { return tl.panel }
 // allTasks 直接向后端取一次当前状态筛选下的全部任务。
 // 用于「暂停全部/恢复全部」这类一次性用户操作——它们要的是后端权威快照，
 // 且不受搜索框影响，因此不走 filtered() 的缓存。
-func (tl *taskList) allTasks() []*store.Task {
+func (tl *taskList) allTasks() []*api.Task {
 	fv, _ := tl.filter.Get()
-	tks, _ := tl.svc.List(store.StatusFilter(fv), GlobalSettings.TaskSort)
+	tks, _ := tl.svc.List(api.StatusFilter(fv), GlobalSettings.TaskSort)
 	return tks
 }
 
@@ -90,7 +90,7 @@ func (tl *taskList) filterKey() string {
 // 结果被缓存：状态过滤由业务侧（SQL）完成，搜索框匹配 URL 或保存路径，
 // 在内存里完成。只有过滤条件本身变化，或集合发生变化（added/deleted、
 // 状态筛选下的归属变化）时才会重新调用 svc.List。
-func (tl *taskList) filtered() []*store.Task {
+func (tl *taskList) filtered() []*api.Task {
 	key := tl.filterKey()
 	tl.cacheMu.Lock()
 	if tl.cacheValid && tl.cacheKey == key {
@@ -102,7 +102,7 @@ func (tl *taskList) filtered() []*store.Task {
 
 	// 取数在锁外进行：svc.List 是阻塞 IPC，不应阻塞事件派发路径。
 	fv, _ := tl.filter.Get()
-	tasks, _ := tl.svc.List(store.StatusFilter(fv), GlobalSettings.TaskSort)
+	tasks, _ := tl.svc.List(api.StatusFilter(fv), GlobalSettings.TaskSort)
 	sv, _ := tl.searchQ.Get()
 	tasks = filterBySearch(tasks, strings.ToLower(sv))
 
@@ -114,11 +114,11 @@ func (tl *taskList) filtered() []*store.Task {
 
 // filterBySearch 返回匹配搜索关键字（URL 或保存路径，大小写不敏感）的任务。
 // needle 必须已小写化；空关键字匹配所有任务。
-func filterBySearch(tasks []*store.Task, needle string) []*store.Task {
+func filterBySearch(tasks []*api.Task, needle string) []*api.Task {
 	if needle == "" {
 		return tasks
 	}
-	var out []*store.Task
+	var out []*api.Task
 	for _, t := range tasks {
 		if matchesSearch(t, needle) {
 			out = append(out, t)
@@ -128,7 +128,7 @@ func filterBySearch(tasks []*store.Task, needle string) []*store.Task {
 }
 
 // matchesSearch 报告任务是否匹配已小写的搜索关键字。
-func matchesSearch(t *store.Task, needle string) bool {
+func matchesSearch(t *api.Task, needle string) bool {
 	return strings.Contains(strings.ToLower(t.URL), needle) ||
 		strings.Contains(strings.ToLower(t.SavePath), needle)
 }
@@ -142,11 +142,11 @@ func (tl *taskList) invalidate() {
 
 // patch 用事件携带的任务快照就地更新缓存，避免为一次变化重跑整表查询。
 // 返回 true 表示缓存的归属/顺序需要后端重新确认（调用方应 invalidate）。
-func (tl *taskList) patch(t *store.Task) bool {
+func (tl *taskList) patch(t *api.Task) bool {
 	sv, _ := tl.searchQ.Get()
 	needle := strings.ToLower(sv)
 	fv, _ := tl.filter.Get()
-	statusFiltered := fv != "" && fv != string(store.FilterAll)
+	statusFiltered := fv != "" && fv != string(api.FilterAll)
 
 	tl.cacheMu.Lock()
 	defer tl.cacheMu.Unlock()
@@ -294,7 +294,7 @@ func (tl *taskList) refreshEmptyState() {
 //
 // 状态事件到达时，若 row 持有匹配的乐观覆盖，则清掉它，让 refresh 重新按
 // 真实 status 渲染（进度事件不清覆盖，以避免乐观闪烁）。
-func (tl *taskList) onEvent(ev scheduler.Event) {
+func (tl *taskList) onEvent(ev api.Event) {
 	if ev.Task == nil {
 		// 集合变化事件（deleted 不带任务快照）：必须重新取数。
 		tl.invalidate()
@@ -327,7 +327,7 @@ func (tl *taskList) onEvent(ev scheduler.Event) {
 
 // setOptimistic 给定任务 ID 立刻设置其 row 的乐观状态并刷新。
 // 真实事件(status 与乐观值一致)由 onEvent 清掉,这里只负责「立即看见」。
-func (tl *taskList) setOptimistic(taskID string, st store.Status) {
+func (tl *taskList) setOptimistic(taskID string, st api.Status) {
 	tl.rowMu.Lock()
 	row, ok := tl.rowMap[taskID]
 	tl.rowMu.Unlock()

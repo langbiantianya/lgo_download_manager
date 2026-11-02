@@ -17,12 +17,12 @@ import (
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/autostart"
 	"lgo_download_manager/internal/diskstat"
 	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/logging"
-	"lgo_download_manager/internal/protocol"
-	"lgo_download_manager/internal/store"
+	"lgo_download_manager/internal/rpc"
 )
 
 const mib = int64(1 << 20)
@@ -41,20 +41,20 @@ const (
 )
 
 // GlobalSettings 是 UI 侧持有的设置镜像，供“新建任务”预填、状态栏
-// 磁盘空间、任务排序等即时读取。权威设置在业务进程（store）；UI 通过
-// svc.SaveSettings 持久化，业务进程负责应用代理配置。每次修改镜像后
-// 都同步保存，因此两者保持一致。
-var GlobalSettings store.Settings
+// 磁盘空间、任务排序等即时读取。权威设置在业务进程（appservice 持有的
+// store.Settings 快照），UI 通过 svc.SaveSettings 持久化，业务进程负责
+// 应用代理配置。每次修改镜像后都同步保存，因此两者保持一致。
+var GlobalSettings api.Settings
 
 // settingsPersist 把 GlobalSettings 写回 svc,触发刷新回调。可选的
 // suppressPersist 在重建设置页期间返回 true,会让 persist 提前返回,
 // 防止切语言后的 OnChanged 链把 SaveSettings 反复推回业务侧造成
 // 无限循环。svc/onChange/suppressPersist 任一为 nil 时对应分支跳过,
 // 老调用方可以继续用 nil 调用。
-func settingsPersist(svc Service, onChange func(), suppressPersist func() bool) {
+func settingsPersist(svc rpc.Client, onChange func(), suppressPersist func() bool) {
 	// applyLanguage 重建设置页期间,widget 重建(SetSelected/SetText)
 	// 会触发 OnChanged 并再次写回 SaveSettings——这会让业务侧 dispatch
-	// 再次推送 MsgLanguage,UI 又收到一条「切语言」,再次重建,无限循环。
+	// 再次推送 language 控制消息,UI 又收到一条「切语言」,再次重建,无限循环。
 	// suppressPersist 在重建窗口内返回 true,这里 short-circuit。
 	if suppressPersist != nil && suppressPersist() {
 		return
@@ -104,7 +104,7 @@ func newSaveDirEntry(persist func()) *widget.Entry {
 	return entry
 }
 
-func buildSettingsContent(svc Service, onChange func(), suppressPersist func() bool) fyne.CanvasObject {
+func buildSettingsContent(svc rpc.Client, onChange func(), suppressPersist func() bool) fyne.CanvasObject {
 	persist := func() {
 		settingsPersist(svc, onChange, suppressPersist)
 	}
@@ -151,7 +151,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	// 这里仍接受用户输入并在持久化前做基本校验(正整数),
 	// 以免 store 收到 0/负数(EffectiveMaxConcurrent 会兜底但 UX 不直观)。
 	maxConcEntry := widget.NewEntry()
-	maxConcEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveMaxConcurrent()))
+	maxConcEntry.SetText(fmt.Sprintf("%d", effectiveMaxConcurrent(GlobalSettings)))
 	maxConcEntry.OnChanged = func(s string) {
 		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n <= maxConcurrent {
 			GlobalSettings.MaxConcurrent = n
@@ -200,8 +200,8 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 	// 调用入口 → showSettingsPage),label ↔ enum 的双向映射每次重建
 	// 时重新生成。
 	proxyModeOpts := make([]string, 0, 3)
-	labelToProxyMode := map[string]protocol.ProxyMode{}
-	for _, m := range []protocol.ProxyMode{protocol.ProxyModeSystem, protocol.ProxyModeDisabled, protocol.ProxyModeManual} {
+	labelToProxyMode := map[string]api.ProxyMode{}
+	for _, m := range []api.ProxyMode{api.ProxyModeSystem, api.ProxyModeDisabled, api.ProxyModeManual} {
 		lbl := proxyModeLabel(m)
 		proxyModeOpts = append(proxyModeOpts, lbl)
 		labelToProxyMode[lbl] = m
@@ -216,8 +216,8 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 			return
 		}
 		GlobalSettings.ProxyMode = mode
-		manual := mode == protocol.ProxyModeManual
-		system := mode == protocol.ProxyModeSystem
+		manual := mode == api.ProxyModeManual
+		system := mode == api.ProxyModeSystem
 		if manual {
 			proxyURLEntry.Show()
 			proxyBypassEntry.Show()
@@ -232,16 +232,19 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		}
 		persist()
 	})
+	// 契约层的 ProxyMode 是字符串枚举：零值是 ""，等同于「未设置」。
+	// 未设置时按 system 处理，与 store.Settings 把零值 iota 解释成
+	// ProxyModeSystem 的历史语义一致；这里绝不能写成反向判定。
 	initialMode := GlobalSettings.ProxyMode
-	if initialMode == 0 {
-		initialMode = protocol.ProxyModeSystem
+	if initialMode == "" {
+		initialMode = api.ProxyModeSystem
 	}
 	proxyModeSelect.SetSelected(proxyModeLabel(initialMode))
-	if initialMode != protocol.ProxyModeManual {
+	if initialMode != api.ProxyModeManual {
 		proxyURLEntry.Hide()
 		proxyBypassEntry.Hide()
 	}
-	if initialMode != protocol.ProxyModeSystem {
+	if initialMode != api.ProxyModeSystem {
 		pacURLEntry.Hide()
 	}
 
@@ -309,7 +312,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 
 	// BT 任务专用的同时下载上限,独立于“通用/下载”页里的全局并发数。
 	btMaxConcurrentEntry := widget.NewEntry()
-	btMaxConcurrentEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveBTMaxConcurrent()))
+	btMaxConcurrentEntry.SetText(fmt.Sprintf("%d", effectiveBTMaxConcurrent(GlobalSettings)))
 	btMaxConcurrentEntry.SetPlaceHolder(ilocale.T("settings.btMaxConcurrent.placeholder"))
 	btMaxConcurrentEntry.OnChanged = func(s string) {
 		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n <= maxBTConcurrent {
@@ -343,7 +346,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 
 	// 每个种子的最大连接数(留空/0 表示使用默认值)。
 	btPeersEntry := widget.NewEntry()
-	btPeersEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveBTMaxPeers()))
+	btPeersEntry.SetText(fmt.Sprintf("%d", effectiveBTMaxPeers(GlobalSettings)))
 	btPeersEntry.SetPlaceHolder(ilocale.T("settings.btPeers.placeholder"))
 	btPeersEntry.OnChanged = func(s string) {
 		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n <= maxBTPeers {
@@ -375,7 +378,7 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 		}
 	}
 	btMaxSeedingEntry := widget.NewEntry()
-	btMaxSeedingEntry.SetText(fmt.Sprintf("%d", GlobalSettings.EffectiveBTMaxSeeding()))
+	btMaxSeedingEntry.SetText(fmt.Sprintf("%d", effectiveBTMaxSeeding(GlobalSettings)))
 	btMaxSeedingEntry.SetPlaceHolder(ilocale.T("settings.btMaxSeeding.placeholder"))
 	btMaxSeedingEntry.OnChanged = func(s string) {
 		if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 && n <= maxBTSeeding {
@@ -406,8 +409,8 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 
 	// 任务列表排序方式（单选下拉框）
 	sortOpts := make([]string, 0, 4)
-	labelToSort := map[string]store.TaskSort{}
-	for _, s := range store.AllTaskSorts() {
+	labelToSort := map[string]api.TaskSort{}
+	for _, s := range api.AllTaskSorts() {
 		lbl := sortLabel(s)
 		sortOpts = append(sortOpts, lbl)
 		labelToSort[lbl] = s
@@ -454,9 +457,10 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 
 	// 语言选择:下拉显示「友好显示名」(由 ilocale.T("lang.<tag>") 给出),
 	// 选中的就是 BCP-47 tag。语言变更的传播路径:
-	//   UI select.OnChanged → 写 GlobalSettings.Language → svc.SaveSettings
-	//   → 业务侧 settings.Save → uimgr.SetLanguage → UI 子进程收 MsgLanguage
-	//   → ilocale.Set + applyLanguage(本文件 → settingsDialog 整体重建)
+	//   UI select.OnChanged → ilocale.Set(本进程先行切换)
+	//   → 写 GlobalSettings.Language → svc.SaveSettings
+	//   → 业务侧 settings.Save → uimgr.SetLanguage → UI 子进程收 language
+	//     控制消息 → applyLanguage(本文件 → settingsDialog 整体重建)
 	//   → 重译所有 widget。
 	langSelect := buildLanguageSelect(persist)
 
@@ -515,13 +519,13 @@ func buildSettingsContent(svc Service, onChange func(), suppressPersist func() b
 }
 
 // proxyModeLabel 返回代理模式在当前语言下的显示标签。
-func proxyModeLabel(m protocol.ProxyMode) string {
+func proxyModeLabel(m api.ProxyMode) string {
 	switch m {
-	case protocol.ProxyModeSystem:
+	case api.ProxyModeSystem:
 		return ilocale.T("settings.proxyMode.system")
-	case protocol.ProxyModeDisabled:
+	case api.ProxyModeDisabled:
 		return ilocale.T("settings.proxyMode.disabled")
-	case protocol.ProxyModeManual:
+	case api.ProxyModeManual:
 		return ilocale.T("settings.proxyMode.manual")
 	}
 	return ilocale.T("settings.proxyMode.system")
@@ -533,15 +537,15 @@ func formatSeedRatio(v float64) string {
 }
 
 // sortLabel 返回任务排序方式在当前语言下的显示标签。
-func sortLabel(s store.TaskSort) string {
+func sortLabel(s api.TaskSort) string {
 	switch s {
-	case store.SortCreatedDesc:
+	case api.SortCreatedDesc:
 		return ilocale.T("settings.sort.createdDesc")
-	case store.SortCreatedAsc:
+	case api.SortCreatedAsc:
 		return ilocale.T("settings.sort.createdAsc")
-	case store.SortNameAsc:
+	case api.SortNameAsc:
 		return ilocale.T("settings.sort.nameAsc")
-	case store.SortNameDesc:
+	case api.SortNameDesc:
 		return ilocale.T("settings.sort.nameDesc")
 	}
 	return ilocale.T("settings.sort.createdDesc")
@@ -550,7 +554,7 @@ func sortLabel(s store.TaskSort) string {
 // buildLanguageSelect 构造「设置 → 语言」下拉框。选项按 ilocale.Supported
 // 顺序排列,显示当前语言下的友好名称(自身语言的名字,例如对日文 UI
 // 来说,英文条目显示 "English" 而不是 "英文")。变更通过 persist 写回
-// svc.SaveSettings,业务进程随后推送 MsgLanguage 触发本进程 applyLanguage。
+// svc.SaveSettings,业务进程随后推送 language 控制消息触发本进程 applyLanguage。
 func buildLanguageSelect(persist func()) *widget.Select {
 	opts := make([]string, 0, len(ilocale.Supported))
 	labelToTag := map[string]string{}
@@ -559,19 +563,32 @@ func buildLanguageSelect(persist func()) *widget.Select {
 		opts = append(opts, lbl)
 		labelToTag[lbl] = tag
 	}
+	// restoring 抑制「程序化 SetSelected」触发的那一次回调：Fyne 的
+	// SetSelected 会同步调用 OnChanged，把初始语言的标签当成用户选择，
+	// 反过来把 ilocale 改成另一门语言（例如设置里 Language 为空、
+	// 当前界面是英文时，会把界面拽回默认语言）。
+	restoring := false
 	sel := widget.NewSelect(opts, func(s string) {
 		tag, ok := labelToTag[s]
 		if !ok {
 			return
 		}
 		GlobalSettings.Language = tag
+		// 本进程先切:契约层的语言控制消息不携带语言标签(见
+		// api.Message),UI 只能靠自己知道切成了什么。SaveSettings 的
+		// 应答与随后到达的控制消息谁先到不确定,不能等回调再切。
+		if !restoring {
+			ilocale.Set(tag)
+		}
 		persist()
 	})
 	// 当前语言的标签:Normalize 后落到 Supported 中的一项,再用其自描述。
 	cur := ilocale.Normalize(GlobalSettings.Language)
 	curLbl := ilocale.T(ilocale.SupportedLabels[cur])
 	if curLbl != "" {
+		restoring = true
 		sel.SetSelected(curLbl)
+		restoring = false
 	}
 	return sel
 }
