@@ -10758,21 +10758,62 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
    }
    ```
 
-2. **构造函数**：
+2. **常量**：删掉 `handshakeTimeout`（握手改由传输层负责），新增两个。
+
+   ```go
+   const (
+   	// validateEvery 为文件存在性轮询间隔（原 UI 窗口聚焦 ticker 的周期）。
+   	validateEvery = 10 * time.Second
+   	// closeGrace 为收到退出指令后等待子进程自行退出的时间。
+   	closeGrace = 2 * time.Second
+   	// listenTimeout 是等待传输层监听就绪的上限。
+   	listenTimeout = 3 * time.Second
+   	// socketSuffixLen 是 unix socket 文件名里随机后缀的长度（hex 字符）。
+   	//
+   	// macOS 的 sockaddr_un 只有 104 字节，socket 路径放不下完整的长
+   	// 随机串；16 个 hex 字符（8 字节随机数）足够区分同机上的多个实例。
+   	socketSuffixLen = 16
+   )
+   ```
+
+3. **构造函数**：除了持有 `svc`，还要把 appservice 的语言变更回调接过来。
 
    ```go
    // New 创建 UI 管理器。svc 是业务侧应用服务。
+   //
+   // 构造时把 appservice 的语言变更回调接到本管理器的 SetLanguage 上：UI
+   // 在「设置」里保存新语言时，appservice 先落库再回调这里，由它触发本地
+   // 化刷新并把权威语言推给 UI 子进程——与旧实现（dispatch 的 save_settings
+   // 分支 → SetSettings → SetLanguage）等价。
    func New(svc *appservice.Service) *Manager {
-   	return &Manager{
-   		svc: svc,
+   	m := &Manager{
+   		svc:       svc,
+   		transport: transportFromEnv(),
    		onExit: func() {
    			logging.Println("uimgr: UI session ended; business keeps running")
    		},
    	}
+   	if svc != nil {
+   		svc.OnLanguageChanged = m.SetLanguage
+   	}
+   	return m
+   }
+
+   // transportFromEnv 决定用哪种传输协议服务 UI 通道：环境变量
+   // LDM_UI_TRANSPORT 优先（grpc / http），缺省是 grpc。
+   //
+   // 取值非法时原样返回，由 Start() 报错——静默回退会让「我明明指定了
+   // http 却跑成 grpc」这类问题很难排查。
+   func transportFromEnv() string {
+   	v := strings.TrimSpace(os.Getenv(rpc.EnvUITransport))
+   	if v == "" {
+   		return rpc.TransportGRPC
+   	}
+   	return v
    }
    ```
 
-3. **`SetSettings` / `Settings`**：改成读写 `appservice`：
+4. **`SetSettings` / `Settings`**：改成读写 `appservice`：
 
    ```go
    func (m *Manager) SetSettings(s store.Settings) {
@@ -10789,7 +10830,7 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
    }
    ```
 
-4. **`SetLanguage`**：改成推控制消息。
+5. **`SetLanguage`**：改成推控制消息。
 
    ```go
    // SetLanguage 把业务进程的权威 Language 推给 UI 子进程。
@@ -10809,28 +10850,66 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
    }
    ```
 
-5. **`Start()`**：地址与 token 的生成、spawn 子进程、`rpc.Serve`：
+6. **`Start()`**：地址与 token 的生成、起传输层服务、spawn 子进程、`rpc.Serve`：
 
    ```go
    func (m *Manager) Start() error {
    	m.mu.Lock()
-   	defer m.mu.Unlock()
    	if m.cancel != nil {
+   		m.mu.Unlock()
    		return fmt.Errorf("uimgr: UI already running")
+   	}
+   	if m.svc == nil {
+   		m.mu.Unlock()
+   		return fmt.Errorf("uimgr: 缺少业务服务（appservice）")
    	}
    	addr, err := m.resolveAddr()
    	if err != nil {
+   		m.mu.Unlock()
    		return err
    	}
    	token, err := randomToken()
    	if err != nil {
+   		m.mu.Unlock()
    		return err
+   	}
+   	switch m.transport {
+   	case rpc.TransportGRPC, rpc.TransportHTTP:
+   	default:
+   		m.mu.Unlock()
+   		return fmt.Errorf("uimgr: 未知传输协议 %q（可选：%s、%s）", m.transport, rpc.TransportGRPC, rpc.TransportHTTP)
    	}
    	self, err := os.Executable()
    	if err != nil {
+   		m.mu.Unlock()
    		return fmt.Errorf("uimgr: resolve self executable: %w", err)
    	}
    	ctx, cancel := context.WithCancel(context.Background())
+   	m.gen++
+   	gen := m.gen
+   	m.addr = addr
+   	m.token = token
+   	m.cancel = cancel
+   	m.cmd = nil
+   	m.sessionActive = false
+   	m.exitOnce = &sync.Once{}
+   	m.waitCh = make(chan struct{})
+   	m.mu.Unlock()
+
+   	// 传输层服务在后台跑：它绑定监听、接管业务调用与消息流。
+   	go m.serve(ctx, gen, addr, token, m.transport)
+   	a, err := addrpkg.Parse(addr)
+   	if err != nil {
+   		cancel()
+   		m.finishSession(gen)
+   		return fmt.Errorf("uimgr: 解析监听地址 %q: %w", addr, err)
+   	}
+   	if err := waitListening(ctx, a, listenTimeout); err != nil {
+   		cancel()
+   		m.finishSession(gen)
+   		return fmt.Errorf("uimgr: 监听 %s 未就绪: %w", addr, err)
+   	}
+
    	cmd := exec.Command(self)
    	cmd.Env = append(os.Environ(),
    		rpc.EnvUIChild+"=1",
@@ -10842,43 +10921,77 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
    	cmd.Stderr = os.Stderr
    	if err := cmd.Start(); err != nil {
    		cancel()
+   		m.finishSession(gen)
    		return fmt.Errorf("uimgr: spawn UI child: %w", err)
    	}
-   	m.gen++
-   	gen := m.gen
-   	m.addr = addr
-   	m.token = token
-   	m.cancel = cancel
+
+   	m.mu.Lock()
    	m.cmd = cmd
-   	m.exitOnce = &sync.Once{}
+   	m.sessionActive = true
+   	m.mu.Unlock()
+
+   	// 子进程的唯一回收点：Wait 必须被且仅被调用一次。无论服务是否正常，
+   	// 进程消亡都会在这里被回收（失败路径另行 Kill），避免子进程变成无主
+   	// 进程、带着窗口一直存活。
+   	// 这里只捕获局部 cmd，不再读写 m.cmd，消除与 finishSession 的竞态。
    	go func() {
    		err := cmd.Wait()
    		logging.Printf("uimgr: UI child exited: %v", err)
    		cancel()
    	}()
-   	go m.serve(ctx, gen, addr, token)
+
    	return nil
    }
    ```
 
-6. **`serve`**：替代原来的 `acceptLoop`：
+   注意两处与「先拉子进程」写法不同的地方，都是必须的：
+
+   - **不能 `defer m.mu.Unlock()`**。生成地址、起服务、等监听、spawn 子进程都在锁外，
+     只有读写字段的那几段持锁。否则 `serve` 里的 `finishSession` 会在 `Start`
+     还没返回时就去抢同一把锁。
+   - **必须先确认监听就绪再拉子进程**。`rpc.Serve` 在自己的 goroutine 里绑定，
+     而 UI 子进程连不上就退出（`rpc.Dial` 不重试），先拉子进程会让它「出生即死」。
+
+7. **`serve`**：替代原来的 `acceptLoop`。它是会话 `gen` 的唯一结束者：
 
    ```go
-   // serve 在监听地址上启动传输层服务，并把事件与控制消息合并推给 UI。
-   func (m *Manager) serve(ctx context.Context, gen uint64, addr, token string) {
+   // serve 在监听地址上启动传输层服务。它是会话 gen 的唯一结束者：
+   // rpc.Serve 返回（服务出错或 ctx 取消）时结束会话。
+   func (m *Manager) serve(ctx context.Context, gen uint64, addr, token, transport string) {
    	defer m.finishSession(gen)
+   	// 业务侧文件存在性轮询（原 UI 焦点 ticker，随会话启停）。
+   	go m.validateLoop(ctx)
    	err := rpc.Serve(ctx, rpc.ServerOptions{
-   		Transport: m.transport,
+   		Transport: transport,
    		Addr:      addr,
    		Token:     token,
    	}, m.svc)
    	if err != nil {
    		logging.Printf("uimgr: rpc serve: %v", err)
+   		// 服务起不来时子进程连不上：把它收掉，别留一个孤儿窗口。
+   		m.killChild(gen)
    	}
    }
    ```
 
-7. **`resolveAddr`**：默认生成 unix socket 路径，命令行/环境变量可覆盖。
+   配套的 `killChild`（只杀当前会话的子进程）：
+
+   ```go
+   // killChild 终止会话 gen 的 UI 子进程（若它仍属于该会话）。被 Kill 的
+   // 进程仍由 Start 中的回收 goroutine 负责 Wait，不会留下僵尸进程。
+   func (m *Manager) killChild(gen uint64) {
+   	m.mu.Lock()
+   	cmd := m.cmd
+   	cur := m.gen == gen
+   	m.mu.Unlock()
+   	if !cur || cmd == nil || cmd.Process == nil {
+   		return
+   	}
+   	_ = cmd.Process.Kill()
+   }
+   ```
+
+8. **`resolveAddr`**：默认生成 unix socket 路径，命令行/环境变量可覆盖。
    TCP 且不是回环地址时打一条警告——接口会被本机网络上的其它进程看到。
 
    ```go
@@ -10904,7 +11017,7 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
    	if err != nil {
    		return "", err
    	}
-   	return "unix:" + filepath.Join(sub, "ui-"+suffix+".sock"), nil
+   	return "unix:" + filepath.Join(sub, "ui-"+suffix[:socketSuffixLen]+".sock"), nil
    }
 
    // warnIfExposed 在监听地址不是回环地址时告警。TCP 模式下 token 是
@@ -10931,7 +11044,7 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
    `addrpkg` 是 `"lgo_download_manager/internal/rpc/addr"` 的 import 别名（`addr` 已被
    本函数的局部变量名占用，故起别名）。
 
-8. **`Open()`**：已有会话时推 `show` 消息。
+9. **`Open()`**：已有会话时推 `show` 消息。
 
    ```go
    func (m *Manager) Open() {
@@ -10945,29 +11058,44 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
    }
    ```
 
-9. **`SendShowAddTask`**：推控制消息。**会话不存在时必须返回错误**——
-   `main.go` 依赖这个错误把「扩展请求没被接收」如实告诉浏览器，浏览器据此
-   退到 lgom:// URL 通道。旧实现里这个错误来自「连接为空」，新实现改用
-   `sessionActive`（子进程已拉起且未结束）判断。
+10. **`SendShowAddTask`**：推控制消息。**会话不存在时先拉起 UI，拉不起来才报错**——
+   这与旧实现一致（托盘常驻 `--autostart` 与冷启动两种场景下，`lgom://` 转发都要能
+   弹对话框）。`main.go` 依赖这个错误把「扩展请求没被接收」如实告诉浏览器，浏览器
+   据此退到 lgom:// URL 通道。
+
+   旧实现拉起后会 `waitConnReady` 等握手完成再发（IPC 的 `conn` 要等 accept 才有），
+   新实现不需要等：控制通道是缓冲的，UI 连上来之后会收到排队的消息。
 
    ```go
    // SendShowAddTask 让 UI 弹出「新建下载任务」对话框。
-   // 没有活跃的 UI 会话时返回错误——调用方据此告诉浏览器「没收到」。
+   //
+   // 行为:
+   //   - UI 会话已在:立刻把参数推进控制消息通道,UI 端读到后显示主窗口并
+   //     打开对话框;
+   //   - UI 会话不在:先拉起一个 UI 子进程再推消息——与旧实现一致。托盘
+   //     常驻(--autostart)与冷启动两种场景下,lgom:// 转发都要能弹对话框;
+   //     控制通道有缓冲,消息会等 UI 连上来之后送达。
+   //
+   // 拉不起 UI 时返回错误——调用方(main.go)据此告诉浏览器「请求没被接收」,
+   // 浏览器退到 lgom:// URL 通道。
    func (m *Manager) SendShowAddTask(p api.ShowAddTaskParams) error {
-   	m.mu.Lock()
-   	active := m.sessionActive
-   	m.mu.Unlock()
-   	if !active {
-   		return fmt.Errorf("uimgr: 没有活跃的 UI 会话")
+   	if !m.Running() {
+   		if err := m.Start(); err != nil {
+   			return fmt.Errorf("uimgr: cannot start UI for show_add_task: %w", err)
+   		}
    	}
-   	m.svc.PushControl(api.Message{Kind: api.MessageKindShowAddTask, ShowAddTask: &p})
+   	m.pushControl(api.Message{Kind: api.MessageKindShowAddTask, ShowAddTask: &p})
    	return nil
    }
    ```
 
    `sessionActive` 在 `Start()` 里置 true、在 `finishSession()` 里置 false。
 
-10. **`Close()`**：推 `close` 消息后强杀子进程。
+   顺带记一笔既有局限（不是本任务引入）：`PushControl` 是「满 16 条就丢」的非阻塞写，
+   丢掉时仍返回 nil。也就是说 UI 会话在、但控制通道积压超过 16 条时，这条
+   `show_add_task` 会被静默丢弃，而浏览器仍被告知「请求已被接收」。
+
+11. **`Close()`**：推 `close` 消息后强杀子进程。
 
     ```go
     func (m *Manager) Close() {
@@ -10976,10 +11104,12 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
     	cmd := m.cmd
     	m.mu.Unlock()
 
-    	m.svc.PushControl(api.Message{Kind: api.MessageKindClose})
+    	m.pushControl(api.Message{Kind: api.MessageKindClose})
+
     	if cmd != nil && cmd.Process != nil {
-    		var killTimer *time.Timer
-    		killTimer = time.AfterFunc(closeGrace, func() { _ = cmd.Process.Kill() })
+    		// 兜底 Kill 必须先于等待排上定时器:子进程僵死时可能永不退出,
+    		// 只有定时器能保证退出一定发生,不至于吃掉 main 的 5s 退出预算。
+    		killTimer := time.AfterFunc(closeGrace, func() { _ = cmd.Process.Kill() })
     		select {
     		case <-time.After(closeGrace):
     		case <-m.waitDone():
@@ -10991,17 +11121,68 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
     }
     ```
 
-11. **删除**：`acceptLoop`、`handshake`、`serveCalls`、`forwardEvents`、`send`、`makeSocketPath`，
-    以及 `ipc` 的所有 import。`validateLoop`（文件存在性校验）保留，改为调用 `m.svc` 的
-    调度器能力——若 `appservice` 没有暴露 `ValidateFileExistence`，则在 `appservice` 上加一个
-    方法：
+    配套的 `pushControl`（`svc` 为空时静默跳过——测试里存在不带服务的 Manager）：
+
+    ```go
+    // pushControl 往业务服务的控制通道推一条消息。
+    func (m *Manager) pushControl(msg api.Message) {
+    	if m.svc == nil {
+    		return
+    	}
+    	m.svc.PushControl(msg)
+    }
+    ```
+
+12. **删除**：`acceptLoop`、`handshake`、`serveCalls`、`forwardEvents`、`send`、`makeSocketPath`、
+    `waitConnReady`，以及 `ipc` 的所有 import。`validateLoop`（文件存在性校验）保留，改为调用
+    `m.svc.ValidateFileExistence()`。
+
+    `appservice` 侧要加这个方法（`s.sc` 为 nil 时直接返回——契约测试里存在不带调度器的
+    Service）：
 
     ```go
     // ValidateFileExistence 校验运行中任务的落地文件是否还在。
-    func (s *Service) ValidateFileExistence() { s.sc.ValidateFileExistence() }
+    //
+    // 业务进程在 UI 会话存活期间按周期调用它（见 internal/uimgr）：下载中的
+    // 任务对应的文件被用户删掉时，任务要落到「文件缺失」状态而不是永远挂着。
+    func (s *Service) ValidateFileExistence() {
+    	if s.sc == nil {
+    		return
+    	}
+    	s.sc.ValidateFileExistence()
+    }
     ```
 
-12. **行为对照清单**：`internal/uimgr` 的旧 `dispatch` 与新的 `appservice.Call`
+    同时把旧 `uimgr.Manager.SetSettings` 里「把设置推给调度器」那一段搬进
+    `appservice.SetSettings`——`save_settings` 这条路径现在完全在 appservice 内部，
+    没人再经过 uimgr：
+
+    ```go
+    func (s *Service) SetSettings(cur store.Settings) {
+    	s.mu.Lock()
+    	s.settings = cur
+    	s.mu.Unlock()
+    	s.applyToScheduler(cur)
+    }
+
+    // applyToScheduler 把设置推给调度器。调度器为空时什么都不做——
+    // 契约测试里存在不带调度器的 Service。
+    func (s *Service) applyToScheduler(cur store.Settings) {
+    	if s.sc == nil {
+    		return
+    	}
+    	// 并发上限推到 scheduler：改小之后超限的任务留在 Pending；改大之后
+    	// promotePending 会把之前排队的任务提上来。
+    	s.sc.SetMaxConcurrent(cur.EffectiveMaxConcurrent())
+    	s.sc.SetPrealloc(cur.Prealloc)
+    	s.sc.SetDownloadLimitKiB(cur.DownloadLimitKiB)
+    	// BitTorrent 设置同步：限速立即生效，端口/DHT/PEX 等在客户端可安全
+    	// 重建时生效（见 scheduler.SetBittorrentConfig）。
+    	s.sc.SetBittorrentConfig(scheduler.BittorrentConfigFrom(cur))
+    }
+    ```
+
+13. **行为对照清单**：`internal/uimgr` 的旧 `dispatch` 与新的 `appservice.Call`
     是同一套逻辑的两份拷贝，接线换入时必须逐项核对，别只看「能编译」：
 
     | 旧 `uimgr.dispatch` 方法 | 新位置 | 核对点 |
@@ -11215,13 +11396,25 @@ func dialWithRetry(ctx context.Context, transport, endpoint, token string) (rpc.
 }
 ```
 
-`TestSendShowAddTask_NoConn_ReturnsError` → 没有会话时必须报错：
+`TestSendShowAddTask_NoSession_ReturnsError` → 拉不起 UI 时必须报错。
+**注意不能直接调 `SendShowAddTask`**：它无会话时会调 `Start()`，而 `Start()` 会
+`os.Executable()` 拉起**测试二进制自身**，造成一串失控的子进程。必须先把
+`m.cancel` 设成非 nil，让 `Start()` 走「already running」早退分支：
 
 ```go
-// TestSendShowAddTask_NoSession_ReturnsError 验证没有 UI 会话时如实报错——
+// TestSendShowAddTask_NoSession_ReturnsError 验证 UI 拉不起来时如实报错——
 // main.go 依赖这个错误告诉浏览器「请求没被接收」。
+//
+// 不直接走 Start() 的拉起路径:在测试里 Start 会自我复刻拉起本测试二进制,
+// 造成一串失控的子进程。改为先把 m.cancel 设为非 nil,Start 见到已有
+// cancel 会立刻返回「uimgr: UI already running」错误,SendShowAddTask 把
+// 这个错误带回去。
 func TestSendShowAddTask_NoSession_ReturnsError(t *testing.T) {
 	m := New(appservice.New(nil, scheduler.New(nil)))
+	m.mu.Lock()
+	m.cancel = func() {} // 让 Start() 走 already-running 早退路径
+	m.mu.Unlock()
+
 	if err := m.SendShowAddTask(api.ShowAddTaskParams{URL: "https://example.com/x"}); err == nil {
 		t.Fatal("没有会话时应当报错")
 	}
@@ -11232,6 +11425,16 @@ func TestSendShowAddTask_NoSession_ReturnsError(t *testing.T) {
 构造方式改成 `New(appservice.New(nil, scheduler.New(nil)))`，其余断言不变
 （语言变更的 hook 与有没有连接无关，这正是新实现保留的语义）。
 
+另外补三条本任务新增的用例（`TestSendShowAddTask_LiveSession` 之外的接线护栏）：
+
+- `TestSetLanguage_PushesControlMessage`：`SetLanguage` 真的往 `svc.Controls()` 推了一条
+  `MessageKindLanguage`——守住「UI 端能立即重译」。
+- `TestResolveAddrPrefersEnvOverride` / `TestResolveAddrGeneratesUnixSocket`：监听地址
+  的环境变量优先级，以及自动生成的 socket 路径长度在 macOS `sockaddr_un`（104 字节）
+  上限之内。
+- `TestStartRejectsUnknownTransport` / `TestStartTwiceReturnsError`：非法的
+  `LDM_UI_TRANSPORT` 要报错而不是静默回退；已有会话时不会拉起第二个子进程。
+
 - [ ] **Step 4: 跑测试**
 
 Run: `go test ./internal/uimgr/ ./internal/appservice/`
@@ -11240,9 +11443,37 @@ Expected: PASS
 - [ ] **Step 5: 提交**
 
 ```bash
-git add internal/uimgr main.go internal/appservice
+git add internal/uimgr main.go internal/appservice internal/rpc/env.go
 git commit -m "refactor(uimgr): 用 rpc.Serve 取代手写 IPC 帧循环"
 ```
+
+- [ ] **Step 6: 记录过渡态（Task 9 与 Task 10 之间 GUI 起不来）**
+
+这条必须写进提交说明或台账，否则下一个任务的人会以为是自己弄坏的。
+
+Task 9 只换了业务侧：`uimgr.Start()` 现在注入 `LDM_UI_CHILD` / `LDM_UI_LISTEN` /
+`LDM_UI_TOKEN` / `LDM_UI_TRANSPORT`（即 `rpc.EnvUI*`）。但 `internal/ui/child.go`
+（Task 10 才改）读的还是旧的 `ipc.EnvUISocket`（`LDM_UI_SOCKET`）与
+`ipc.EnvUIToken`：
+
+```go
+sock := os.Getenv(ipc.EnvUISocket)
+tok := os.Getenv(ipc.EnvUIToken)
+if sock == "" || tok == "" {
+	logging.Println("ui.RunChild: missing socket/token env; exiting")
+	return 2
+}
+```
+
+`LDM_UI_SOCKET` 没人设了 → 子进程返回 2 退出 → `uimgr` 打
+「UI child exited」并结束会话。所以**这一版跑真实 GUI 是起不来的**，这不是缺陷，
+是计划安排的两段式换轨（任务书 G5「main.go 只加装配不删 ipc」正是这个意思）。
+
+本任务能验的是**传输层与业务侧真的通**：用 `rpc.Dial` 直连 `uimgr.Start()`
+起的服务，`List` 一次。两种传输各跑一遍，代码见 Step 4 的验收脚本。
+
+Task 10 完成后的验收必须包含**真实 GUI 端到端**（`go run .` 能起窗口、能列任务），
+那是这次换轨真正落地的证据。
 
 ---
 
