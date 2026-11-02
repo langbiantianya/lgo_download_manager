@@ -701,3 +701,45 @@ func recvMessage(t *testing.T, ch <-chan api.Message) api.Message {
 	}
 	return api.Message{}
 }
+
+// TestCallMalformedResponseReturnsError 回归旧 UI IPC 客户端里
+// TestIpcClient_MalformedResultDoesNotHang 的语义：服务端回了一段解不开的
+// 响应体时，调用必须**当场返回错误**，而不是一直等一个永远不会完成的
+// 应答（旧实现的症状是 UI 永远转圈，且没有任何日志）。
+//
+// 在新的分层里这属于传输层的职责：每个调用有自己的响应，解码失败直接
+// 变成 error；共享 rpc.Client 不需要再维护 request 表与超时兜底。
+func TestCallMalformedResponseReturnsError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"language":`)) // 截断的 JSON
+	}))
+	defer srv.Close()
+
+	a, err := addr.Parse("tcp:" + strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("addr.Parse: %v", err)
+	}
+	c, err := Dial(context.Background(), a, "secret")
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer c.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- c.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, &api.Settings{})
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("坏响应体应当返回错误")
+		}
+		if !strings.Contains(err.Error(), "解码") {
+			t.Fatalf("错误信息应说明是解码失败: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("坏响应体让调用挂住了")
+	}
+}
