@@ -10768,6 +10768,12 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
    	closeGrace = 2 * time.Second
    	// listenTimeout 是等待传输层监听就绪的上限。
    	listenTimeout = 3 * time.Second
+   	// spawnGrace 是拉起 UI 子进程后，观察它「有没有立刻死掉」的窗口。
+   	//
+   	// 旧实现靠等握手（上限 30s）判断 UI 到底起没起来。新架构里没有
+   	// 「会话就绪」信号，但启动即崩是最常见的失败形态；用一个小窗口
+   	// 覆盖它，别在这类失败上骗调用方「消息已送达」。
+   	spawnGrace = 500 * time.Millisecond
    	// socketSuffixLen 是 unix socket 文件名里随机后缀的长度（hex 字符）。
    	//
    	// macOS 的 sockaddr_un 只有 104 字节，socket 路径放不下完整的长
@@ -11064,7 +11070,10 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
    据此退到 lgom:// URL 通道。
 
    旧实现拉起后会 `waitConnReady` 等握手完成再发（IPC 的 `conn` 要等 accept 才有），
-   新实现不需要等：控制通道是缓冲的，UI 连上来之后会收到排队的消息。
+   新实现不需要等握手：控制通道是缓冲的，UI 连上来之后会收到排队的消息。
+   但旧实现顺带提供了「UI 到底起没起来」的失败检测（握不上就报错），
+   新实现用一个 `spawnGrace` 观察窗口把它补回来——覆盖最常见的
+   「启动即崩」形态，代价是无会话拉起时多等 500ms。
 
    ```go
    // SendShowAddTask 让 UI 弹出「新建下载任务」对话框。
@@ -11083,9 +11092,29 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
    		if err := m.Start(); err != nil {
    			return fmt.Errorf("uimgr: cannot start UI for show_add_task: %w", err)
    		}
+   		// 旧实现拉起后还要等握手完成（上限 30s），握不上就报错。新架构
+   		// 里没有「会话就绪」这个信号，但最常见的失败形态是子进程启动即
+   		// 崩（Fyne 初始化失败、缺图形库、权限问题）——用一个小窗口盯住它，
+   		// 至少不会在这类失败上骗浏览器「已接收」。
+   		if err := m.waitSpawnAlive(); err != nil {
+   			return err
+   		}
    	}
    	m.pushControl(api.Message{Kind: api.MessageKindShowAddTask, ShowAddTask: &p})
    	return nil
+   }
+
+   // waitSpawnAlive 观察刚拉起的子进程一小会儿，看它是不是立刻就退出了。
+   //
+   // 正常启动要走几秒，本窗口过后把消息留在控制通道的缓冲里即可——UI 连上
+   // 之后会收到。返回错误表示子进程在窗口内就退出了，这条消息不可能送达。
+   func (m *Manager) waitSpawnAlive() error {
+   	select {
+   	case <-m.waitDone():
+   		return fmt.Errorf("uimgr: UI 子进程启动后立即退出，show_add_task 未送达")
+   	case <-time.After(spawnGrace):
+   		return nil
+   	}
    }
    ```
 
@@ -11701,76 +11730,48 @@ git commit -m "refactor(ui): 改用 rpc.Client 与契约 DTO，解除对业务�
 **Files:**
 - Delete: `internal/ipc/`（整个包）
 - Modify: `main.go`
-- Modify: `internal/rpc/registry.go`（补上环境变量常量）
 
 **Interfaces:**
-- Consumes: `internal/rpc`
-- Produces:
-  ```go
-  package rpc
-  const EnvUIChild = "LDM_UI_CHILD"
-  const EnvUIListen = "LDM_UI_LISTEN"
-  const EnvUIToken = "LDM_UI_TOKEN"
-  const EnvUITransport = "LDM_UI_TRANSPORT"
-  ```
+- Consumes: `internal/rpc`、`internal/api`
+- Produces: 无
 
-- [ ] **Step 1: 在 `internal/rpc/registry.go` 补环境变量常量**
+> **前置状态（Task 9 已完成的部分，本任务不要重做）**
+>
+> - `internal/rpc/env.go` 已经有 `EnvUIChild` / `EnvUIListen` / `EnvUIToken` /
+>   `EnvUITransport` 四个常量（Task 9 新建），**不要再往 `registry.go` 里加一份**。
+> - `main.go` 已经有 `--rpc-listen` flag 与 `os.Setenv(uimgr.EnvRPCListen, *rpcListen)`。
+> - `main.go` 里 `uim.SendShowAddTask(...)` 已经改成 `api.ShowAddTaskParams`，
+>   并已经 import 了 `internal/api` 与 `internal/appservice`。
+>
+> 所以本任务剩下的只有：把 `main.go` 里最后残留的 `ipc.EnvUIChild` 换掉，然后删包。
 
-```go
-// UI 子进程的启动环境变量（单二进制自我复刻角色切换）。
-const (
-	EnvUIChild     = "LDM_UI_CHILD"     // "1" 表示当前进程以 UI 子进程角色运行
-	EnvUIListen    = "LDM_UI_LISTEN"    // 监听地址（unix 路径或 host:port）
-	EnvUIToken     = "LDM_UI_TOKEN"     // 握手 token
-	EnvUITransport = "LDM_UI_TRANSPORT" // 传输协议：grpc | http
-)
-```
+- [ ] **Step 1: 改 `main.go` 里最后的 ipc 引用**
 
-- [ ] **Step 2: 改 `main.go`**
+1. 角色分派：`if os.Getenv(ipc.EnvUIChild) == "1"` → `if os.Getenv(rpc.EnvUIChild) == "1"`
+   （两个常量的值都是 `"LDM_UI_CHILD"`，行为不变，只是换了归属包）。
+2. import 换成 `"lgo_download_manager/internal/rpc"`，删掉 `"lgo_download_manager/internal/ipc"`。
+3. 顶部注释里「角色分派通过 ipc.EnvUIChild 环境变量完成」一并改成 `rpc.EnvUIChild`。
 
-1. 新增命令行参数：
-
-```go
-	rpcListen := flag.String("rpc-listen", "", "listen address for the UI channel (unix:<path> or tcp:<host:port>)")
-```
-
-2. 把地址传给 UI 管理器。`main.go` 里在 `flag.Parse()` 之后：
-
-```go
-	if *rpcListen != "" {
-		os.Setenv(uimgr.EnvRPCListen, *rpcListen)
-	}
-```
-
-`uimgr.EnvRPCListen` 就是 `"LDM_RPC_LISTEN"`（Task 9 里导出），不要在 `main.go`
-里再定义一份。
-
-3. `main.go` 里所有 `ipc.EnvUIChild` / `ipc.ShowAddTaskParams` 改为
-   `rpc.EnvUIChild` / `api.ShowAddTaskParams`；import 换成
-   `"lgo_download_manager/internal/rpc"` 与 `"lgo_download_manager/internal/api"`。
-
-4. `handleRequest` 里的 `uim.SendShowAddTask(ipc.ShowAddTaskParams{...})` 改为
-   `uim.SendShowAddTask(api.ShowAddTaskParams{...})`。
-
-5. `if os.Getenv(ipc.EnvUIChild) == "1"` 改为 `if os.Getenv(rpc.EnvUIChild) == "1"`。
-
-- [ ] **Step 3: 删除 `internal/ipc`**
+- [ ] **Step 2: 删除 `internal/ipc`**
 
 ```bash
 git rm -r internal/ipc
 ```
 
-- [ ] **Step 4: 确认没有残留引用**
+- [ ] **Step 3: 确认没有残留引用**
 
 Run: `grep -rn "internal/ipc" --include=*.go .`
 Expected: 无输出
 
-- [ ] **Step 5: 跑构建与测试**
+Run: `grep -rn "ipc\." --include=*.go . | grep -v "internal/ipc/"`  # 确认没有漏掉的 ipc.X 符号引用
+Expected: 无输出
+
+- [ ] **Step 4: 跑构建与测试**
 
 Run: `go build ./... && go vet ./... && go test ./...`
 Expected: 全部通过
 
-- [ ] **Step 6: 提交**
+- [ ] **Step 5: 提交**
 
 ```bash
 git add -A
