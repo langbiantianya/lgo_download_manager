@@ -5719,6 +5719,7 @@ exclude (
 - Create: `internal/rpc/grpcx/convert_test.go`
 - Create: `internal/rpc/grpcx/grpcx_test.go`
 - Create: `internal/rpc/grpcx/contract_test.go`
+- Create（修复轮 1）：`internal/rpc/grpcx/parity_test.go`（跨传输一致性测试）
 - Create: `internal/rpc/registry.go`
 - Create: `internal/rpc/registry_test.go`
 - Create (generated): `internal/rpc/grpcx/pb/lgdm.pb.go`、`internal/rpc/grpcx/pb/lgdm_grpc.pb.go`
@@ -5739,7 +5740,7 @@ exclude (
   const TransportGRPC, TransportHTTP string
   ```
 
-#### 与初稿的差异（E1–E8 的落法）
+#### 与初稿的差异（E1–E8 与修复轮 1 的落法）
 
 控制器在派发前通读初稿代码块 + 实测 grpc-go v1.85.0 源码后指出 8 处必修缺陷。
 初稿的 grpcx 代码块整体作废，本表逐条记录最终实现怎么落的：
@@ -5748,12 +5749,23 @@ exclude (
 | --- | --- | --- |
 | E1 | `grpcx.Dial` 的 dialer 写的是 `addr.Dial(a)`，gRPC 专门给的 ctx 被丢掉 | dialer 改成 `addr.DialContext(ctx, a)`（用 gRPC 传进来的请求级 ctx） |
 | E2 | `Dial` 的 ctx 是死参数，且 `grpc.NewClient` 是惰性连接，「业务进程没起来」要等到第一次调用才暴露 | `Dial` 先用 ctx 预连接一次再立刻断开，失败直接返回错误——与 httpx 的 A1 对齐，两种传输的失败时机一致 |
-| E3 | `messageToPB` 里 `*m.Event` 直接解引用，`api.Message.Event` 为 nil 时 panic | `messageToPB` 先判 `m.Event == nil`，回一个空事件并保留消息类别，不炸进程 |
+| E3 | `messageToPB` 里 `*m.Event` 直接解引用，`api.Message.Event` 为 nil 时 panic | `messageToPB` 先判 `m.Event == nil`，回一个空事件并保留消息类别，不炸进程（修复轮 1 的 I3 把它改成「载荷缺席」，语义见下表） |
 | E4 | `StreamMessages` 里事件通道一关就 `return nil`，把控制消息流一起掐掉 | 改成 `events = nil` / `controls = nil`：一侧关闭只停那一侧，与 httpx 的 A9 一致 |
 | E5 | `Close()` 直接转调 `conn.Close()`，第二次调用返回 `ErrClientConnClosing`（非 nil），违反 `rpc.Transport` 的幂等契约 | 用 `sync.Once` 包住 `Close`，重复调用一律返回 nil |
 | E6 | `Call` 里 `in.(*api.ListParams)` 之类裸断言，类型不对直接 panic | 全部改成带 ok 检查的两值断言（泛型小助手 `asPtr[T]`），类型不对返回错误 |
 | E7 | ctx 取消时调 `srv.GracefulStop()`，它会等所有在跑的 RPC 结束，而 `StreamMessages` 是长连接流 → `Serve` 永久阻塞 | ctx 取消时调 `srv.Stop()`（立即取消所有活跃 RPC/流），与 httpx 的 `srv.Close()` 语义一致；另加 `done` channel 收尾监视 goroutine，修掉 httpx 的 A8 泄漏 |
 | E8 | proto 里 `ListRequest.filter` / `sort` 是裸 string，`filterToPB` / `filterFromPB` 两张表因此没有任何调用点，是死代码 | proto 改成 `StatusFilter` / `TaskSort` 枚举；六张映射表全部双向显式写出（含 `UNSPECIFIED → ""`），并由 `TestEnumTablesCoverAllConstants` 断言「每张表都有真实调用点」 |
+
+**修复轮 1（独立评审 FAIL 后的 1 条 Important + 1 条跨传输分歧 + 3 个测试
+缺口）**的落法：
+
+| 条目 | 评审指出的问题 | 修复轮 1 的落法 |
+| --- | --- | --- |
+| I2 | `Stream` 的 goroutine 阻塞在 `out <- msg`（缓冲 64 条满了）时，`Close()` 只关连接、不取消流的 ctx：`conn.Close()` 只让 `stream.Recv()` 报错，管不到已经卡在发送上的 goroutine，`select` 的 `ctx.Done()` 分支又是调用方的 ctx、Close 从不取消它 → goroutine 永久泄漏 | `Client` 持有活动流表（`streams map[*stream]struct{}` + `mu` 保护）：`Stream` 用 `context.WithCancel(ctx)` 派生自己的 ctx 并登记 cancel，`Close()` 在 `closeOnce.Do` 里先取消所有活动流、再关连接，流 goroutine 退出时把自己从表里摘掉。与 httpx 的做法一致 |
+| I3 | `api.Message.Event` / `ShowAddTask` 契约上允许为 nil，但 proto 把类别只放在 oneof 上：载荷缺席时类别就丢了（`Event=nil` 被兜成空事件 → 客户端 `if msg.Event != nil` 恒真，空事件被广播给所有订阅者；未知 Kind 回来变成 `Kind=""`） | proto 的 `Message` 加显式的 `string kind = 1`，oneof 只承载载荷（字段号 2–6）：`messageToPB` 总是写 kind，载荷为 nil 时**故意不设 oneof**，未知类别只写 kind；`messageFromPB` 先取 kind 再按 oneof 的实际类型填载荷，oneof 缺席时载荷保持 nil。与 httpx 的 JSON `omitempty` 语义对齐 |
+| G1（E1 的测试缺口） | dialer 用不用 ctx 完全没有测试覆盖：把 dialer 改回 `addr.Dial(a)` 测试仍全绿 | 补两条：`TestDialFailsWithinTimeoutWhenServerAbsent`（服务端没在监听 + 带超时的 ctx → `Dial` 必须在超时内回错误，不挂住，钉住预连接那条路径）与 `TestDialerRespectsContext`（dialer 拿到已取消的 ctx 时回的是 ctx 的错而不是连接错误，钉住 dialer 本身那条路径） |
+| G2（E6 的测试缺口） | 类型断言的 ok 检查覆盖不全：删掉 `MethodStart` 的 `out` 类型检查测试仍全绿 | 补表驱动测试 `TestCallRejectsWrongTypesForEveryMethod`：`Call` 分派的 10 个方法逐个过一遍「入参类型不对 → 报错」「出参类型不对 → 报错」 |
+| G3（E4 的测试缺口） | `TestStreamMessagesContinuesAfterEventsClosed` 是 flaky 的：服务端 select 同时盯着已关闭的 `events` 与有缓冲消息的 `controls`，Go 在两个 case 都 ready 时随机选 → 坏实现（整体收手）有 38% 概率先看到 `controls` 把消息送出去，测试误判为通过 | 改成三段式：先发第一条控制消息并等它被收到（证明服务端在正常服务）→ 关闭事件通道 → **断言消息流还活着**（坏实现此时已经收手）→ 再发第二条控制消息并断言它能被收到。实测坏实现下旧写法 50 次错 25 次，新写法 50 次错 50 次 |
 
 除以上 8 条外，实现还额外做了这些对齐与加固：
 
@@ -5768,6 +5780,13 @@ exclude (
 - 鉴权 metadata 的 key 一律小写 `authorization`（E10）；gRPC 的 metadata 值
   只允许可打印 ASCII，实际部署的 token 是随机数的十六进制编码，纯 ASCII，
   这个差异在 `TestNonASCIITokenIsRejected` 里钉死。
+- `convert.go` 的注释里写明了 proto3 的两个固有限制：枚举带不了未知值
+  （表外取值静默降级成 UNSPECIFIED，httpx 那边是 JSON 原样透传）、repeated
+  字段分不出「空切片」与「没设置」（`taskToPB` 用 `slices.Clone`、
+  `taskFromPB` 用 `nilIfEmpty`，两边不对称是 proto3 的限制，改不动）。
+- 修复轮 1 新增 `internal/rpc/grpcx/parity_test.go`：同一个契约层的两种
+  线格式实现（httpx 与 grpcx）对同一批 `api.Message` 必须给出同样的结果，
+  钉住「换传输不换语义」。
 
 #### 依赖钉版：为什么 exclude 压不住、必须用 replace
 
@@ -6076,12 +6095,24 @@ message ShowAddTaskParams {
 
 // Message 是服务端推送的一条消息。事件与控制消息合并在同一条流里。
 message Message {
+  // 消息类别，显式携带。
+  //
+  // 载荷缺席时（oneof 未设置）类别不能丢：api.Message.Event 与
+  // api.Message.ShowAddTask 都是指针，契约上允许为 nil。只靠 oneof 的
+  // 哪一臂表达类别做不到这一点——载荷缺席时类别就没了，「这条消息是
+  // event，但它没有事件载荷」与「这条消息什么都不是」分不开。
+  //
+  // 显式带类别还让未知类别能原样往返：载荷类型是有限的，未知类别只能
+  // 靠这一个字段表达。
+  string kind = 1;
+
+  // payload 只承载载荷，类别看上面的 kind。
   oneof payload {
-    Event event = 1;
-    bool show = 2;
-    ShowAddTaskParams show_add_task = 3;
-    string language = 4;
-    bool close = 5;
+    Event event = 2;
+    bool show = 3;
+    ShowAddTaskParams show_add_task = 4;
+    string language = 5;
+    bool close = 6;
   }
 }
 ```
@@ -6211,6 +6242,22 @@ import (
 //
 // 每张映射表都有真实调用点：状态走 Task，筛选与排序走 ListRequest，
 // 代理模式走 Settings 与 AuthOptions，协议种类走 AddTaskRequest。
+//
+// 映射表里的空串条目（「"" → UNSPECIFIED」）表示的是**未设置**，不是
+// 「空串是某个合法状态值」：契约层的零值就是空串，它对应 proto3 的
+// UNSPECIFIED（没有状态 / 不过滤 / 默认排序）。
+//
+// proto3 的枚举有两个固有限制，这里都改不掉，只能写明：
+//
+//  1. 枚举带不了未知值。契约层出现表里没有的取值时（比如
+//     api.Status("Verifying")），这里会静默降级成 UNSPECIFIED，原值在
+//     对端就变成了空串——httpx 那边走 JSON，原样透传。internal/api 侧的
+//     枚举取值被测试锁住，线上不会出现表外取值，所以这个降级碰不到。
+//  2. repeated 字段在空的时候不上线传输，反序列化后必然是 nil，Go 侧
+//     分不出「空切片」与「没设置」。所以 taskToPB 用 slices.Clone 原样
+//     克隆（非 nil 的空切片仍是空切片），taskFromPB 用 nilIfEmpty 归一成
+//     nil。httpx 那边 JSON 的 [] 解码成非 nil 的空切片，两种传输在这个
+//     边角上仍然不同——改成 nilIfEmpty 是行为上的空操作，解决不了分歧。
 
 // ---- 状态枚举映射 ----
 
@@ -6640,65 +6687,76 @@ func eventFromPB(e *pb.Event) api.Event {
 }
 
 // messageToPB 把契约层消息转成 proto 消息。
+//
+// 类别总是显式写进 kind 字段：载荷缺席时（oneof 未设置）类别不能丢。
+//
+// api.Message.Event 与 api.Message.ShowAddTask 都是指针，契约上允许为 nil
+// （rpc 共享客户端的 dispatch 就显式判过 msg.Event != nil），所以载荷为
+// nil 时**故意不设 oneof**，让对端能分辨「类别是 event」与「类别是 event
+// 但没有事件载荷」——httpx 传输靠 JSON 的 omitempty 表达同一件事。
+//
+// 未知类别：只写 kind，载荷缺席。类别原样保留，不被悄悄改写成空串。
 func messageToPB(m api.Message) *pb.Message {
+	out := &pb.Message{Kind: string(m.Kind)}
 	switch m.Kind {
 	case api.MessageKindEvent:
-		// api.Message.Event 是指针，契约上允许为 nil（rpc 共享客户端的
-		// dispatch 就显式判过 msg.Event != nil），这里不能直接解引用。
 		if m.Event == nil {
-			return &pb.Message{Payload: &pb.Message_Event{Event: &pb.Event{}}}
+			return out
 		}
-		return &pb.Message{Payload: &pb.Message_Event{Event: eventToPB(*m.Event)}}
+		out.Payload = &pb.Message_Event{Event: eventToPB(*m.Event)}
 	case api.MessageKindShow:
-		return &pb.Message{Payload: &pb.Message_Show{Show: true}}
+		out.Payload = &pb.Message_Show{Show: true}
 	case api.MessageKindShowAddTask:
-		p := m.ShowAddTask
-		if p == nil {
-			p = &api.ShowAddTaskParams{}
+		if m.ShowAddTask == nil {
+			return out
 		}
-		return &pb.Message{Payload: &pb.Message_ShowAddTask{ShowAddTask: &pb.ShowAddTaskParams{
-			Url:     p.URL,
-			Name:    p.Name,
-			Ua:      p.UA,
-			Cookies: p.Cookies,
-		}}}
+		out.Payload = &pb.Message_ShowAddTask{ShowAddTask: &pb.ShowAddTaskParams{
+			Url:     m.ShowAddTask.URL,
+			Name:    m.ShowAddTask.Name,
+			Ua:      m.ShowAddTask.UA,
+			Cookies: m.ShowAddTask.Cookies,
+		}}
 	case api.MessageKindLanguage:
-		return &pb.Message{Payload: &pb.Message_Language{Language: m.Language}}
+		out.Payload = &pb.Message_Language{Language: m.Language}
 	case api.MessageKindClose:
-		return &pb.Message{Payload: &pb.Message_Close{Close: true}}
+		out.Payload = &pb.Message_Close{Close: true}
 	default:
-		return &pb.Message{}
+		// 未知类别：载荷缺席，只保留 kind。
 	}
+	return out
 }
 
 // messageFromPB 把 proto 消息转回契约层消息。
+//
+// 类别取自 kind 字段，不从 oneof 的类型反推：载荷缺席时类别仍然要保留；
+// 载荷类型与类别对不上时也以 kind 为准（kind 是显式的类别来源）。
+// oneof 缺席时载荷保持 nil——这正是 messageToPB 表达「载荷缺席」的方式。
 func messageFromPB(m *pb.Message) api.Message {
 	if m == nil {
 		return api.Message{}
 	}
+	out := api.Message{Kind: api.MessageKind(m.GetKind())}
 	switch p := m.GetPayload().(type) {
 	case *pb.Message_Event:
-		ev := eventFromPB(p.Event)
-		return api.Message{Kind: api.MessageKindEvent, Event: &ev}
+		if p.Event != nil {
+			ev := eventFromPB(p.Event)
+			out.Event = &ev
+		}
 	case *pb.Message_Show:
-		return api.Message{Kind: api.MessageKindShow}
+		// show 没有载荷，类别已经在 kind 里。
 	case *pb.Message_ShowAddTask:
-		return api.Message{
-			Kind: api.MessageKindShowAddTask,
-			ShowAddTask: &api.ShowAddTaskParams{
-				URL:     p.ShowAddTask.GetUrl(),
-				Name:    p.ShowAddTask.GetName(),
-				UA:      p.ShowAddTask.GetUa(),
-				Cookies: p.ShowAddTask.GetCookies(),
-			},
+		out.ShowAddTask = &api.ShowAddTaskParams{
+			URL:     p.ShowAddTask.GetUrl(),
+			Name:    p.ShowAddTask.GetName(),
+			UA:      p.ShowAddTask.GetUa(),
+			Cookies: p.ShowAddTask.GetCookies(),
 		}
 	case *pb.Message_Language:
-		return api.Message{Kind: api.MessageKindLanguage, Language: p.Language}
+		out.Language = p.Language
 	case *pb.Message_Close:
-		return api.Message{Kind: api.MessageKindClose}
-	default:
-		return api.Message{}
+		// close 没有载荷，类别已经在 kind 里。
 	}
+	return out
 }
 
 // formatTime 把时间转成 RFC3339 字符串。
@@ -6977,20 +7035,114 @@ func TestMessageRoundTrip(t *testing.T) {
 //
 // api.Message.Event 是指针，契约上允许为 nil；messageToPB 直接解引用会
 // panic。
+//
+// 修好之后（I3）：载荷为 nil 时**故意不设 oneof**，类别靠 kind 字段
+// 表达。这样「类别是 event」与「类别是 event 但没有事件载荷」才分得开，
+// 客户端的 `if msg.Event != nil` 判断才有意义。
 func TestMessageToPBHandlesNilEvent(t *testing.T) {
 	got := messageToPB(api.Message{Kind: api.MessageKindEvent})
 	if got == nil {
 		t.Fatal("nil 事件也应当转成一个 proto 消息")
 	}
-	if got.GetEvent() == nil {
-		t.Fatal("nil 事件应当转成空事件，而不是丢掉消息类别")
+	if got.GetKind() != string(api.MessageKindEvent) {
+		t.Fatalf("消息类别应当保留: %q", got.GetKind())
+	}
+	if got.GetPayload() != nil {
+		t.Fatal("载荷缺席时不该设 oneof")
 	}
 	back := messageFromPB(got)
 	if back.Kind != api.MessageKindEvent {
 		t.Fatalf("消息类别应当保留: %q", back.Kind)
 	}
-	if back.Event == nil {
-		t.Fatal("回转后的事件指针不应为 nil")
+	if back.Event != nil {
+		t.Fatalf("回转后的事件指针应当仍是 nil: %+v", back.Event)
+	}
+}
+
+// TestMessageRoundTripMatrix 是消息往返的完整矩阵：每一行都要断言类别、
+// 载荷的在场与缺席都对。
+//
+// 载荷「缺席」和「在场但为空」是两件事：httpx 传输靠 JSON 的 omitempty
+// 表达前者，gRPC 这边靠「不设 oneof」表达前者。两种传输必须一致。
+func TestMessageRoundTripMatrix(t *testing.T) {
+	cases := []struct {
+		name string
+		in   api.Message
+
+		wantKind        api.MessageKind
+		wantEvent       bool
+		wantShowAddTask bool
+		wantLanguage    string
+	}{
+		{
+			name:     "事件但没有事件载荷",
+			in:       api.Message{Kind: api.MessageKindEvent},
+			wantKind: api.MessageKindEvent,
+		},
+		{
+			name:      "带载荷的事件",
+			in:        api.Message{Kind: api.MessageKindEvent, Event: &api.Event{Why: "progress", SpeedBPS: 1024}},
+			wantKind:  api.MessageKindEvent,
+			wantEvent: true,
+		},
+		{
+			name:     "弹窗但没有弹窗参数",
+			in:       api.Message{Kind: api.MessageKindShowAddTask},
+			wantKind: api.MessageKindShowAddTask,
+		},
+		{
+			name: "带参数的弹窗",
+			in: api.Message{Kind: api.MessageKindShowAddTask, ShowAddTask: &api.ShowAddTaskParams{
+				URL: "http://x", Name: "n", UA: "ua", Cookies: "c",
+			}},
+			wantKind:        api.MessageKindShowAddTask,
+			wantShowAddTask: true,
+		},
+		{
+			name:     "显示窗口",
+			in:       api.Message{Kind: api.MessageKindShow},
+			wantKind: api.MessageKindShow,
+		},
+		{
+			name:         "语言变更",
+			in:           api.Message{Kind: api.MessageKindLanguage, Language: "zh"},
+			wantKind:     api.MessageKindLanguage,
+			wantLanguage: "zh",
+		},
+		{
+			name:     "退出",
+			in:       api.Message{Kind: api.MessageKindClose},
+			wantKind: api.MessageKindClose,
+		},
+		{
+			name:     "未知类别",
+			in:       api.Message{Kind: api.MessageKind("bogus")},
+			wantKind: api.MessageKind("bogus"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := messageFromPB(messageToPB(tc.in))
+			if got.Kind != tc.wantKind {
+				t.Fatalf("类别往返不一致: got = %q, want = %q", got.Kind, tc.wantKind)
+			}
+			if (got.Event != nil) != tc.wantEvent {
+				t.Fatalf("事件载荷的在场状态不对: got = %+v, want 有载荷 = %v", got.Event, tc.wantEvent)
+			}
+			if (got.ShowAddTask != nil) != tc.wantShowAddTask {
+				t.Fatalf("弹窗参数的在场状态不对: got = %+v, want 有载荷 = %v", got.ShowAddTask, tc.wantShowAddTask)
+			}
+			if got.Language != tc.wantLanguage {
+				t.Fatalf("语言往返不一致: got = %q, want = %q", got.Language, tc.wantLanguage)
+			}
+			// 有载荷时内容也要原样带过去。
+			if tc.wantEvent && got.Event.Why != tc.in.Event.Why {
+				t.Fatalf("事件内容不一致: %+v", got.Event)
+			}
+			if tc.wantShowAddTask && *got.ShowAddTask != *tc.in.ShowAddTask {
+				t.Fatalf("弹窗参数内容不一致: %+v", got.ShowAddTask)
+			}
+		})
 	}
 }
 
@@ -7574,12 +7726,25 @@ type Client struct {
 	// closed 标记客户端是否已关闭。
 	closed atomic.Bool
 
+	// mu 保护 streams。
+	//
+	// 注册与 Close 扫表必须互斥：流要是注册在 Close 扫过之后，就再没人
+	// 取消它了。
+	mu sync.Mutex
+	// streams 是当前活动消息流。Close 靠它们把流停掉。
+	streams map[*stream]struct{}
+
 	// closeOnce 保证底层连接只关一次。
 	//
 	// grpc.ClientConn.Close() 第二次调用返回 ErrClientConnClosing（非 nil
 	// 错误），而 rpc.Transport 的契约明确要求 Close 幂等，所以必须用
 	// sync.Once 包住。
 	closeOnce sync.Once
+}
+
+// stream 是一次活动消息流的状态。cancel 停掉对应的流。
+type stream struct {
+	cancel context.CancelFunc
 }
 
 // Dial 按地址建立 gRPC 连接。token 随每次调用发送。
@@ -7595,16 +7760,11 @@ func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error) {
 	}
 	_ = conn.Close()
 
-	// dialer 用 gRPC 传进来的 ctx 建连：一次超时的调用不该留下一个还在
-	// 建连的 socket goroutine。
-	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
-		return addr.DialContext(ctx, a)
-	}
 	// 显式用 passthrough 解析器：grpc.NewClient 默认走 dns 解析器，
-	// 而我们的地址是 unix socket / host:port，由上面的 dialer 负责解析。
+	// 而我们的地址是 unix socket / host:port，由 dialer 负责解析。
 	cc, err := grpc.NewClient("passthrough:///lgdm",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(dialer),
+		grpc.WithContextDialer(dialer(a)),
 		grpc.WithUnaryInterceptor(clientUnaryToken(token)),
 		grpc.WithStreamInterceptor(clientStreamToken(token)),
 	)
@@ -7612,6 +7772,17 @@ func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error) {
 		return nil, fmt.Errorf("grpcx: 建立连接: %w", err)
 	}
 	return &Client{conn: cc, cli: pb.NewDownloadServiceClient(cc)}, nil
+}
+
+// dialer 返回 gRPC 用的建连函数。
+//
+// 必须用 gRPC 传进来的 ctx 建连：一次超时的调用不该留下一个还在建连的
+// socket goroutine。丢掉 ctx（写成 addr.Dial）的话，建连会一路挂到操作
+// 系统的 TCP 超时（默认两分钟）才返回，而不是跟着调用方的超时走。
+func dialer(a addr.Addr) func(context.Context, string) (net.Conn, error) {
+	return func(ctx context.Context, _ string) (net.Conn, error) {
+		return addr.DialContext(ctx, a)
+	}
 }
 
 // clientUnaryToken 给一元调用附加 token。
@@ -7810,15 +7981,36 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 	if err := c.checkOpen(); err != nil {
 		return nil, err
 	}
-	stream, err := c.cli.StreamMessages(ctx, &pb.Empty{})
+	// 流的 ctx 单独派生：Close 要能只停掉流而不影响调用方自己的 ctx。
+	streamCtx, cancel := context.WithCancel(ctx)
+	rpcStream, err := c.cli.StreamMessages(streamCtx, &pb.Empty{})
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("grpcx: 打开消息流: %w", err)
 	}
+	// 登记进活动流表：Close 靠它把流停掉。
+	st := &stream{cancel: cancel}
+	c.mu.Lock()
+	if c.closed.Load() {
+		// Close 刚刚跑过：这条流没人会取消它，现在就自己收手。
+		c.mu.Unlock()
+		cancel()
+		return nil, errors.New("grpcx: 客户端已关闭")
+	}
+	if c.streams == nil {
+		c.streams = make(map[*stream]struct{})
+	}
+	c.streams[st] = struct{}{}
+	c.mu.Unlock()
+
 	out := make(chan api.Message, streamBuffer)
 	go func() {
 		defer close(out)
+		// 退出时把自己从活动流表里摘掉，表才不会无限增长。
+		defer c.clearStream(st)
+		defer cancel()
 		for {
-			msg, err := stream.Recv()
+			msg, err := rpcStream.Recv()
 			if err != nil {
 				// 流结束（服务端收手、连接断开、ctx 取消）都在这里收尾：
 				// 关闭 out，读循环随之知道消息流没了。
@@ -7826,7 +8018,12 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 			}
 			select {
 			case out <- messageFromPB(msg):
-			case <-ctx.Done():
+			case <-streamCtx.Done():
+				// ctx 被取消（Close 或调用方）：立刻收手。
+				//
+				// 这一支不能省：缓冲满时 goroutine 阻塞在 out <- 上，
+				// 这时 conn.Close() 只让 rpcStream.Recv() 报错，管不到
+				// 已经卡在发送上的 goroutine——不取消 ctx 它就永久泄漏。
 				return
 			}
 		}
@@ -7834,21 +8031,40 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 	return out, nil
 }
 
-// Close 关闭底层 gRPC 连接。必须幂等——Close 可能被重复调用。
+// Close 释放底层连接与流。必须幂等——Close 可能被重复调用。
 //
-// 连接一关，所有还在跑的 RPC 与流都会随之取消，所以不需要像 httpx 那样
-// 单独维护活动流列表。
+// 先取消所有活动消息流，再关底层连接。只关连接是不够的：消息流的
+// goroutine 可能正阻塞在往缓冲通道发送上（缓冲 64 条满了、调用方消费
+// 不过来），那时 conn.Close() 只会让流的下一次 Recv 报错，管不到已经卡在
+// 发送上的 goroutine——不取消流的 ctx，它就会永久泄漏。
 func (c *Client) Close() error {
 	if c == nil {
 		return nil
 	}
 	c.closeOnce.Do(func() {
+		c.mu.Lock()
 		c.closed.Store(true)
+		sts := make([]*stream, 0, len(c.streams))
+		for st := range c.streams {
+			sts = append(sts, st)
+		}
+		c.streams = nil
+		c.mu.Unlock()
+		for _, st := range sts {
+			st.cancel()
+		}
 		if c.conn != nil {
 			_ = c.conn.Close()
 		}
 	})
 	return nil
+}
+
+// clearStream 清掉已结束的活动流，避免活动流表无限增长。
+func (c *Client) clearStream(st *stream) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.streams, st)
 }
 
 // checkOpen 检查客户端是否已关闭或未初始化。
@@ -7906,6 +8122,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -7948,6 +8165,15 @@ func newMockHandler() *mockHandler {
 		eventsCalled: make(chan struct{}),
 		unsubed:      make(chan struct{}),
 	}
+}
+
+// newMockHandlerBuf 造一个事件通道缓冲条数可指定的 mockHandler。
+//
+// 灌缓冲的测试要一次塞进几十条事件，默认的 8 条缓冲不够。
+func newMockHandlerBuf(n int) *mockHandler {
+	h := newMockHandler()
+	h.events = make(chan api.Event, n)
+	return h
 }
 
 func (m *mockHandler) Call(ctx context.Context, method string, in, out any) error {
@@ -8363,6 +8589,22 @@ func TestServeStopsOnContextCancelWithoutStream(t *testing.T) {
 //
 // 事件通道关闭只停掉那一侧，控制消息流要继续——否则同一套业务侧实现在
 // 两种传输下行为不一致。
+//
+// 测试要绕开一个陷阱：服务端同时盯着 events（已关闭 → 永远就绪）与
+// controls（有缓冲消息），两个 case 都 ready 时 Go 随机选一个。所以
+// 「关掉事件通道之后立刻发一条控制消息」这种写法是 flaky 的——坏实现
+// （整体收手）有一半概率先看到 controls，把消息送出去，测试就误判为通过。
+//
+// 这里的写法让服务端的状态变化可观测：
+//
+//  1. 先发第一条控制消息并等它被收到——证明服务端活着、正在正常服务；
+//  2. 关闭事件通道；
+//  3. 断言消息流**还活着**（坏实现此时已经收手、流已经结束）；
+//  4. 再发第二条控制消息，断言它能被收到。
+//
+// 第 3 步是关键的：它把「服务端已经看到事件通道关闭」这件事变成可观测
+// 的事实，服务端处理完关闭之后，第 4 步的第二条消息就只能走 controls 那
+// 一侧，坏实现在第 3 步就已经把流收掉了。
 func TestStreamMessagesContinuesAfterEventsClosed(t *testing.T) {
 	h := newMockHandler()
 	a := startServer(t, h, testToken)
@@ -8372,15 +8614,40 @@ func TestStreamMessagesContinuesAfterEventsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("打开消息流失败: %v", err)
 	}
-	// 事件侧关闭。
-	close(h.events)
-	// 控制侧仍然有消息。
-	h.controls <- api.Message{Kind: api.MessageKindLanguage, Language: "en"}
 
+	// 第一条控制消息：证明服务端在正常服务 select。
+	h.controls <- api.Message{Kind: api.MessageKindLanguage, Language: "en"}
 	select {
 	case msg := <-stream:
 		if msg.Kind != api.MessageKindLanguage || msg.Language != "en" {
-			t.Fatalf("应当收到控制消息，实际: %+v", msg)
+			t.Fatalf("应当收到第一条控制消息，实际: %+v", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("没有收到第一条控制消息")
+	}
+
+	// 事件侧关闭。
+	close(h.events)
+
+	// 事件侧关闭之后，流必须还活着：控制侧仍然有消息要送。
+	//
+	// 这一段等待是必要的：等服务端处理完「事件通道已关闭」这个事实，
+	// 后面那条控制消息才不会和它撞在同一个 select 里被随机挑走。
+	select {
+	case _, ok := <-stream:
+		if !ok {
+			t.Fatal("事件通道关闭后消息流就结束了（控制侧被一起掐掉了）")
+		}
+	case <-time.After(200 * time.Millisecond):
+		// 流还活着，符合预期。
+	}
+
+	// 第二条控制消息：事件侧关闭之后仍然要能送到。
+	h.controls <- api.Message{Kind: api.MessageKindShow}
+	select {
+	case msg := <-stream:
+		if msg.Kind != api.MessageKindShow {
+			t.Fatalf("应当收到第二条控制消息，实际: %+v", msg)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("事件通道关闭后控制消息流没有继续")
@@ -8449,6 +8716,180 @@ func TestServerPropagatesBusinessError(t *testing.T) {
 		t.Fatalf("错误里应当带上业务侧的原因，实际: %v", err)
 	}
 }
+
+// TestClientCloseStopsBlockedStreamGoroutine 是 I2 的回归测试。
+//
+// 消息流的 goroutine 可能阻塞在往缓冲通道发送上：缓冲 64 条满了、调用方
+// 消费不过来，它就卡在 out <- msg 上。这时 conn.Close() 只会让流的下一次
+// Recv 报错——goroutine 根本不在 Recv 里——select 的 ctx.Done() 分支也
+// 不会触发，因为 ctx 是调用方传进来的，Close 从不取消它。于是这个
+// goroutine 永久泄漏。
+//
+// 修法是 Close 先取消所有活动流的 ctx，所以这里断言：Close 之后，卡在
+// 发送上的流 goroutine 都要退出。
+func TestClientCloseStopsBlockedStreamGoroutine(t *testing.T) {
+	before := countStreamGoroutines()
+	for i := 0; i < 5; i++ {
+		// 事件通道的缓冲要够大，一次把 64 条缓冲灌满。
+		h := newMockHandlerBuf(streamBuffer + 8)
+		a := startServer(t, h, testToken)
+		c, err := Dial(context.Background(), a, testToken)
+		if err != nil {
+			t.Fatalf("连接失败: %v", err)
+		}
+		stream, err := c.Stream(context.Background())
+		if err != nil {
+			t.Fatalf("打开消息流失败: %v", err)
+		}
+		// 多灌一条：缓冲填满之后，客户端的 goroutine 就卡在发送上了。
+		for j := 0; j < streamBuffer+1; j++ {
+			h.events <- api.Event{Why: "fill"}
+		}
+		waitFor(t, "客户端的消息缓冲没有被填满", func() bool {
+			return len(stream) == streamBuffer
+		})
+		// 给第 65 条留出到达客户端的时间：到了之后 goroutine 就卡在
+		// out <- 上（缓冲已满），这正是会泄漏的姿势。
+		time.Sleep(100 * time.Millisecond)
+		if err := c.Close(); err != nil {
+			t.Fatalf("关闭失败: %v", err)
+		}
+	}
+	waitFor(t, "Close 之后还有残留的流 goroutine", func() bool {
+		return countStreamGoroutines() <= before
+	})
+}
+
+// TestStreamAfterCloseReturnsError 验证关闭之后开流立刻回错误。
+func TestStreamAfterCloseReturnsError(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+	if err := c.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+	if _, err := c.Stream(context.Background()); err == nil {
+		t.Fatal("关闭之后的开流应当返回错误")
+	}
+}
+
+// TestDialFailsWithinTimeoutWhenServerAbsent 是 E1 的回归测试。
+//
+// 服务端没在监听时，带超时的 ctx 必须让 Dial 在超时内返回错误，而不是
+// 挂住：建连要跟着 ctx 走，不能一路挂到操作系统的 TCP 超时。
+func TestDialFailsWithinTimeoutWhenServerAbsent(t *testing.T) {
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "missing.sock")}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if _, err := Dial(ctx, a, testToken); err == nil {
+		t.Fatal("服务没起来时 Dial 应当失败")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Dial 挂住了，没有跟着 ctx 的超时走: %v", elapsed)
+	}
+}
+
+// TestDialerRespectsContext 钉住 gRPC 的 dialer 必须用 gRPC 传进来的 ctx
+// 建连。
+//
+// 少了 ctx 的话建连不会跟着调用方的超时走：一次超时的调用会留下一个还在
+// 建连的 socket goroutine，「服务端没起来」时调用方拿到的超时也比预期晚。
+// 这里用一个已经取消的 ctx 建连：走 ctx 的实现回的是 ctx 的错，丢掉 ctx
+// 的实现会真的去连一次，回的是连接错误。
+func TestDialerRespectsContext(t *testing.T) {
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "missing.sock")}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := dialer(a)(ctx, "")
+	if err == nil {
+		t.Fatal("ctx 取消之后建连应当失败")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("建连应当跟着 ctx 取消走，实际: %v", err)
+	}
+}
+
+// TestCallRejectsWrongTypesForEveryMethod 是 E6 的回归测试。
+//
+// Call 按方法分派，每个方法各自校验入参与出参的类型。漏掉任何一处
+// 检查，类型不对就会变成「静默的成功」——调用方看不出自己传错了类型，
+// 错误要到业务逻辑不对的时候才暴露。
+//
+// 这里把每个方法的两种类型错误都过一遍。
+func TestCallRejectsWrongTypesForEveryMethod(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+
+	cases := []struct {
+		method string
+		in     any
+		out    any
+	}{
+		{api.MethodList, &api.ListParams{}, &api.ListResult{}},
+		{api.MethodAdd, &api.AddTaskInput{}, &api.Task{}},
+		{api.MethodStart, &api.TaskRef{}, &api.Empty{}},
+		{api.MethodPause, &api.TaskRef{}, &api.Empty{}},
+		{api.MethodDelete, &api.TaskRef{}, &api.Empty{}},
+		{api.MethodIsPreparing, &api.TaskRef{}, &api.BoolResult{}},
+		{api.MethodProbe, &api.ProbeParams{}, &api.ProbeResult{}},
+		{api.MethodGetSettings, &api.Empty{}, &api.Settings{}},
+		{api.MethodSaveSettings, &api.Settings{}, &api.Empty{}},
+		{api.MethodBTInfo, &api.BTInfoParams{}, &api.BTDetail{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method, func(t *testing.T) {
+			// 入参类型不对。
+			err := c.Call(context.Background(), tc.method, "错的类型", tc.out)
+			if err == nil {
+				t.Error("入参类型不对时应当返回错误")
+			}
+			// 出参类型不对。
+			err = c.Call(context.Background(), tc.method, tc.in, "错的类型")
+			if err == nil {
+				t.Error("出参类型不对时应当返回错误")
+			}
+		})
+	}
+}
+
+// waitFor 反复检查 cond，直到它成立或超时。
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("等待超时: %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// countStreamGoroutines 统计还活着的消息流 goroutine 数量。
+//
+// 靠栈里的函数名定位，不看 runtime.NumGoroutine 的总数：gRPC 自己的后台
+// goroutine 什么时候退出不受本测试控制，算进总数里就是噪声。
+func countStreamGoroutines() int {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	count := 0
+	for _, block := range strings.Split(string(buf), "\n\ngoroutine ") {
+		if strings.Contains(block, "grpcx.(*Client).Stream") {
+			count++
+		}
+	}
+	return count
+}
 ```
 
 
@@ -8495,7 +8936,189 @@ func TestTransportContract(t *testing.T) {
 ```
 
 
-- [ ] **Step 10: 建 `internal/rpc/registry.go`（传输注册表）**
+- [ ] **Step 10: 写跨传输一致性测试（修复轮 1）**
+
+两种传输是同一个契约层（internal/api）的两种线格式实现，行为必须一致：
+同一批 `api.Message` 过一遍 httpx、再过一遍 grpcx，结果要一样。
+
+这条测试放在 `internal/rpc/grpcx/parity_test.go`（外部测试包 `grpcx_test`）：
+`grpcx` 的非测试代码不能 import `internal/rpc/httpx`，但外部测试包可以——
+Go 不因此成环（`httpx` 不 import `grpcx`）。
+
+```go
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
+// 这是外部测试包：grpcx 自己不能 import internal/rpc/httpx（虽然不成环，
+// 但传输实现之间不该互相依赖），外部测试包可以。
+//
+// 这里放跨传输一致性测试：同一批 api.Message 过一遍 httpx、再过一遍
+// grpcx，两边的结果必须一样。两种传输是同一个契约层（internal/api）的
+// 两种线格式实现，行为不一致就意味着「换传输就换语义」——UI 侧的
+// nil 判断（msg.Event != nil、msg.ShowAddTask == nil）在其中一边会失效。
+package grpcx_test
+
+import (
+	"context"
+	"errors"
+	"os"
+	"path/filepath"
+	"reflect"
+	"testing"
+	"time"
+
+	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/rpc/addr"
+	"lgo_download_manager/internal/rpc/grpcx"
+	"lgo_download_manager/internal/rpc/httpx"
+)
+
+// parityToken 是两个服务共用的 token。
+const parityToken = "parity-token"
+
+// parityHandler 是跨传输一致性测试用的业务侧实现。
+//
+// grpcx.Handler 与 httpx.Handler 的方法集逐字一致，一个实现同时喂给两边。
+type parityHandler struct {
+	controls chan api.Message
+}
+
+func (h *parityHandler) Call(_ context.Context, method string, _, _ any) error {
+	return errors.New("parity: 这个测试不该调用一元方法: " + method)
+}
+
+// Events 返回一个永远不会有消息的事件流：这个测试只关心控制消息。
+func (h *parityHandler) Events() (<-chan api.Event, func()) {
+	return make(chan api.Event), func() {}
+}
+
+func (h *parityHandler) Controls() <-chan api.Message { return h.controls }
+
+// TestMessageRoundTripMatchesHTTPTransport 是 I3 的跨传输一致性测试。
+//
+// 每一行都要在两种传输下得到同样的结果：类别不变、载荷的在场与缺席不变。
+func TestMessageRoundTripMatchesHTTPTransport(t *testing.T) {
+	inputs := []api.Message{
+		// 类别是事件，但事件载荷缺席。
+		{Kind: api.MessageKindEvent},
+		// 类别是事件，事件载荷在场。
+		{Kind: api.MessageKindEvent, Event: &api.Event{Why: "progress", SpeedBPS: 1024}},
+		// 类别是弹窗，但弹窗参数缺席。
+		{Kind: api.MessageKindShowAddTask},
+		// 类别是弹窗，弹窗参数在场。
+		{Kind: api.MessageKindShowAddTask, ShowAddTask: &api.ShowAddTaskParams{
+			URL: "http://x", Name: "n", UA: "ua", Cookies: "c",
+		}},
+		{Kind: api.MessageKindShow},
+		{Kind: api.MessageKindLanguage, Language: "zh"},
+		{Kind: api.MessageKindClose},
+		// 未知类别也必须原样保留。
+		{Kind: api.MessageKind("bogus")},
+	}
+
+	gotGRPC := roundTripGRPC(t, inputs)
+	gotHTTP := roundTripHTTP(t, inputs)
+
+	for i, in := range inputs {
+		if !reflect.DeepEqual(gotGRPC[i], gotHTTP[i]) {
+			t.Errorf("第 %d 条消息两种传输的结果不一致:\n grpcx = %+v\n  http = %+v\n 输入 = %+v",
+				i, gotGRPC[i], gotHTTP[i], in)
+		}
+		if !reflect.DeepEqual(gotGRPC[i], in) {
+			t.Errorf("第 %d 条消息过 grpcx 之后变了:\n got = %+v\nwant = %+v", i, gotGRPC[i], in)
+		}
+	}
+}
+
+// roundTripGRPC 把一批消息过一遍 gRPC 传输，拿回客户端看到的样子。
+func roundTripGRPC(t *testing.T, inputs []api.Message) []api.Message {
+	t.Helper()
+	h := &parityHandler{controls: make(chan api.Message, len(inputs))}
+	for _, m := range inputs {
+		h.controls <- m
+	}
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "lgdm.sock")}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = grpcx.Serve(ctx, a, parityToken, h) }()
+	waitSocket(t, a)
+
+	c, err := grpcx.Dial(context.Background(), a, parityToken)
+	if err != nil {
+		t.Fatalf("gRPC 连接失败: %v", err)
+	}
+	defer c.Close()
+	stream, err := c.Stream(context.Background())
+	if err != nil {
+		t.Fatalf("gRPC 开流失败: %v", err)
+	}
+	return collect(t, stream, len(inputs), "gRPC")
+}
+
+// roundTripHTTP 把一批消息过一遍 httpx 传输，拿回客户端看到的样子。
+func roundTripHTTP(t *testing.T, inputs []api.Message) []api.Message {
+	t.Helper()
+	h := &parityHandler{controls: make(chan api.Message, len(inputs))}
+	for _, m := range inputs {
+		h.controls <- m
+	}
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "lgdm.sock")}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = httpx.Serve(ctx, a, parityToken, h) }()
+	waitSocket(t, a)
+
+	c, err := httpx.Dial(context.Background(), a, parityToken)
+	if err != nil {
+		t.Fatalf("HTTP 连接失败: %v", err)
+	}
+	defer c.Close()
+	stream, err := c.Stream(context.Background())
+	if err != nil {
+		t.Fatalf("HTTP 开流失败: %v", err)
+	}
+	return collect(t, stream, len(inputs), "HTTP")
+}
+
+// collect 从消息流里收 n 条消息。
+func collect(t *testing.T, stream <-chan api.Message, n int, which string) []api.Message {
+	t.Helper()
+	out := make([]api.Message, 0, n)
+	for len(out) < n {
+		select {
+		case msg, ok := <-stream:
+			if !ok {
+				t.Fatalf("%s: 消息流提前结束，只收到 %d 条", which, len(out))
+			}
+			out = append(out, msg)
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: 只收到 %d 条消息", which, len(out))
+		}
+	}
+	return out
+}
+
+// waitSocket 等 unix socket 文件出现：文件出现即表示服务已经能连。
+func waitSocket(t *testing.T, a addr.Addr) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(a.Address); err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("服务没有在超时前就绪: %v", a)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+```
+
+
+- [ ] **Step 11: 建 `internal/rpc/registry.go`（传输注册表）**
 
 ```go
 // This Source Code Form is subject to the terms of the Mozilla Public
@@ -8738,7 +9361,7 @@ func TestRegistryBadAddr(t *testing.T) {
 ```
 
 
-- [ ] **Step 11: 跑测试**
+- [ ] **Step 12: 跑测试**
 
 Run: `go test ./internal/rpc/... ./internal/appservice/`
 Expected: PASS
@@ -8748,7 +9371,15 @@ Expected: PASS
 这两条分别由 `TestEndToEndCallAndStream` 与
 `TestClientCloseStopsStreamAndServerStream` 覆盖。
 
-- [ ] **Step 12: 提交**
+修复轮 1 额外要跑的两条：
+
+- `go test ./internal/rpc/grpcx/ -count=20 -run TestStreamMessagesContinuesAfterEventsClosed`
+  —— 这条测试原先是 flaky 的（坏实现下 50 次错 25 次），必须确认既不假阳性
+  也不假阴性。
+- `go test ./internal/rpc/grpcx/ -run TestMessageRoundTripMatchesHTTPTransport`
+  —— 跨传输一致性：httpx 与 grpcx 对同一批 `api.Message` 的结果必须一样。
+
+- [ ] **Step 13: 提交**
 
 ```bash
 git add proto buf.yaml buf.gen.yaml scripts/gen_proto.sh internal/rpc/grpcx internal/rpc/registry.go internal/rpc/registry_test.go go.mod go.sum
