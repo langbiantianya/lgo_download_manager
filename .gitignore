@@ -1,7 +1,10 @@
-lgdm
-lgdm.exe
-lgo_download_manager
-lgo_download_manager.exe
+# 构建产物：只可能出现在仓库根，用前导斜杠锚定。
+# 注意不能写成裸 "lgdm"——git 的无斜杠模式会匹配任意层级的同名文件或目录，
+# 会把 proto/lgdm/v1/lgdm.proto（gRPC 契约源文件）一起忽略掉。
+/lgdm
+/lgdm.exe
+/lgo_download_manager
+/lgo_download_manager.exe
 bin/
 dist/
 # 手工跑 flatpak-builder 时建在仓库根的状态/缓存目录(脚本用 --state-dir 放进 dist/)
