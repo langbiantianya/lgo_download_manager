@@ -50,11 +50,44 @@ func New(st *store.Store, sc *scheduler.Scheduler) *Service {
 	}
 }
 
-// SetSettings 更新服务持有的权威设置快照。
+// SetSettings 更新服务持有的权威设置快照，并把设置应用到调度器。
+//
+// 「应用到调度器」这一段是从旧的 internal/uimgr.Manager.SetSettings 搬
+// 过来的：用户在 UI 的「设置」里改并发上限/预分配/限速/BT 配置后，这
+// 些参数要立刻生效，而不是等到下次启动。放在这里而不是 uimgr，是因为
+// 「保存设置」这条路径现在完全在 appservice 内部（uimgr 不再参与分派）。
 func (s *Service) SetSettings(cur store.Settings) {
 	s.mu.Lock()
 	s.settings = cur
 	s.mu.Unlock()
+	s.applyToScheduler(cur)
+}
+
+// applyToScheduler 把设置推给调度器。调度器为空时什么都不做——
+// 契约测试里存在不带调度器的 Service。
+func (s *Service) applyToScheduler(cur store.Settings) {
+	if s.sc == nil {
+		return
+	}
+	// 并发上限推到 scheduler：改小之后超限的任务留在 Pending；改大之后
+	// promotePending 会把之前排队的任务提上来。
+	s.sc.SetMaxConcurrent(cur.EffectiveMaxConcurrent())
+	s.sc.SetPrealloc(cur.Prealloc)
+	s.sc.SetDownloadLimitKiB(cur.DownloadLimitKiB)
+	// BitTorrent 设置同步：限速立即生效，端口/DHT/PEX 等在客户端可安全
+	// 重建时生效（见 scheduler.SetBittorrentConfig）。
+	s.sc.SetBittorrentConfig(scheduler.BittorrentConfigFrom(cur))
+}
+
+// ValidateFileExistence 校验运行中任务的落地文件是否还在。
+//
+// 业务进程在 UI 会话存活期间按周期调用它（见 internal/uimgr）：下载中的
+// 任务对应的文件被用户删掉时，任务要落到「文件缺失」状态而不是永远挂着。
+func (s *Service) ValidateFileExistence() {
+	if s.sc == nil {
+		return
+	}
+	s.sc.ValidateFileExistence()
 }
 
 // Settings 返回当前权威设置快照。

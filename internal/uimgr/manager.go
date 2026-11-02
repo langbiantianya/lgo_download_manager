@@ -4,17 +4,20 @@
 //
 // Copyright (c) 2026 langbiantianya
 
-// Package uimgr 管理 Fyne UI 子进程的生命周期与 IPC 会话。
-// 它运行在业务主进程中：负责生成 socket、spawn UI 子进程（自我复刻）、
-// 校验握手、把 scheduler 事件推给 UI、并把 UI 的远程调用映射到
-// scheduler/store/settings。
+// Package uimgr 管理 Fyne UI 子进程的生命周期，并在业务主进程里对外
+// 提供业务接口服务。
+//
+// 它运行在业务主进程中：负责生成监听地址与 token、spawn UI 子进程
+// （自我复刻）、用 rpc.Serve 起传输层服务（gRPC 或 net/http），并把
+// 控制消息（显示窗口 / 弹对话框 / 语言变更 / 退出）推进业务服务的控制
+// 通道。业务调用本身由 internal/appservice 承担——本包不再自己实现
+// 线协议，只做「进程与通道」的装配。
 package uimgr
 
 import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -24,41 +27,59 @@ import (
 	"sync"
 	"time"
 
-	"lgo_download_manager/internal/bittorrent"
-	"lgo_download_manager/internal/ipc"
+	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/appservice"
 	"lgo_download_manager/internal/logging"
-	"lgo_download_manager/internal/protocol"
-	"lgo_download_manager/internal/scheduler"
-	"lgo_download_manager/internal/settings"
+	"lgo_download_manager/internal/rpc"
+	addrpkg "lgo_download_manager/internal/rpc/addr"
 	"lgo_download_manager/internal/store"
 )
 
 const (
 	// validateEvery 为文件存在性轮询间隔（原 UI 窗口聚焦 ticker 的周期）。
 	validateEvery = 10 * time.Second
-	// handshakeTimeout 为等待 UI hello 与进程连接的最长时间。
-	handshakeTimeout = 20 * time.Second
 	// closeGrace 为收到退出指令后等待子进程自行退出的时间。
 	closeGrace = 2 * time.Second
+	// listenTimeout 是等待传输层监听就绪的上限。
+	listenTimeout = 3 * time.Second
+	// socketSuffixLen 是 unix socket 文件名里随机后缀的长度（hex 字符）。
+	//
+	// macOS 的 sockaddr_un 只有 104 字节，socket 路径放不下完整的长
+	// 随机串；16 个 hex 字符（8 字节随机数）足够区分同机上的多个实例。
+	socketSuffixLen = 16
 )
+
+// EnvRPCListen 是业务进程自己的监听地址环境变量。命令行 --rpc-listen
+// 会写进这个变量，uimgr 在 Start() 时读取它；缺省时自动生成 unix
+// socket 路径。
+//
+// 它不在 internal/rpc 里：那是「通道协议」的约定，而这是业务进程侧的
+// 配置项（业务进程读自己的地址，再把地址透传给 UI 子进程）。
+const EnvRPCListen = "LDM_RPC_LISTEN"
 
 // Manager 拥有一个（至多一个）UI 子进程会话。
 type Manager struct {
-	st *store.Store
-	sc *scheduler.Scheduler
+	// svc 是业务侧应用服务：契约层的 Handler 实现，也是传输层服务的
+	// 业务后端。控制消息经它推给 UI。
+	svc *appservice.Service
 
 	mu       sync.Mutex
 	settings store.Settings
 	curLang  string // 上次推给 UI 的语言，用于 SetLanguage 判变更
 
-	uiSock string
-	token  string
+	addr      string // 监听地址（unix 路径或 host:port）
+	transport string // 传输协议名（grpc / http）
+	token     string // 握手 token
 
 	cmd    *exec.Cmd
-	conn   *ipc.Conn
 	cancel context.CancelFunc
 	waitCh chan struct{} // 会话结束通知
 	gen    uint64        // 会话代号：清理路径据此识别自己是否仍属当前会话
+
+	// sessionActive 表示 UI 会话已经建立（子进程已拉起且未结束）。
+	// 控制消息在会话不存在时必须报错——main.go 依赖这个错误把
+	// 「扩展请求没被接收」如实告诉浏览器，让它退到下一条通道。
+	sessionActive bool
 
 	onExit   func()     // UI 会话结束后回调（业务侧日志/状态）
 	exitOnce *sync.Once // 每个会话一个，保证 onExit 只触发一次
@@ -68,31 +89,50 @@ type Manager struct {
 	onLanguageChanged func(lang string)
 }
 
-// New 创建 UI 管理器。
-func New(st *store.Store, sc *scheduler.Scheduler) *Manager {
-	return &Manager{
-		st: st,
-		sc: sc,
+// New 创建 UI 管理器。svc 是业务侧应用服务。
+//
+// 构造时把 appservice 的语言变更回调接到本管理器的 SetLanguage 上：UI
+// 在「设置」里保存新语言时，appservice 先落库再回调这里，由它触发本地
+// 化刷新并把权威语言推给 UI 子进程——与旧实现（dispatch 的 save_settings
+// 分支 → SetSettings → SetLanguage）等价。
+func New(svc *appservice.Service) *Manager {
+	m := &Manager{
+		svc:       svc,
+		transport: transportFromEnv(),
 		onExit: func() {
 			logging.Println("uimgr: UI session ended; business keeps running")
 		},
 	}
+	if svc != nil {
+		svc.OnLanguageChanged = m.SetLanguage
+	}
+	return m
+}
+
+// transportFromEnv 决定用哪种传输协议服务 UI 通道：环境变量
+// LDM_UI_TRANSPORT 优先（grpc / http），缺省是 grpc。
+//
+// 取值非法时原样返回，由 Start() 报错——静默回退会让「我明明指定了
+// http 却跑成 grpc」这类问题很难排查。
+func transportFromEnv() string {
+	v := strings.TrimSpace(os.Getenv(rpc.EnvUITransport))
+	if v == "" {
+		return rpc.TransportGRPC
+	}
+	return v
 }
 
 // SetSettings 更新管理器持有的权威设置（业务进程内共享）。
+//
+// 权威快照同时进 appservice：它会把设置应用到调度器（并发上限、
+// 预分配、限速、BT 配置），与旧实现一致。
 func (m *Manager) SetSettings(s store.Settings) {
 	m.mu.Lock()
 	m.settings = s
 	m.mu.Unlock()
-	// 把并发上限推到 scheduler:用户在「设置」里改 MaxConcurrent 后,
-	// 下次保存就会触发 promotePending——可能提升之前因超出限额而
-	// 排队的 Pending 任务。
-	m.sc.SetMaxConcurrent(s.EffectiveMaxConcurrent())
-	m.sc.SetPrealloc(s.Prealloc)
-	m.sc.SetDownloadLimitKiB(s.DownloadLimitKiB)
-	// BitTorrent 设置同步:限速立即生效,端口/DHT/PEX 等在客户端可安全
-	// 重建时生效(见 scheduler.SetBittorrentConfig)。
-	m.sc.SetBittorrentConfig(scheduler.BittorrentConfigFrom(s))
+	if m.svc != nil {
+		m.svc.SetSettings(s)
+	}
 }
 
 // Settings 返回当前权威设置的副本。
@@ -102,62 +142,60 @@ func (m *Manager) Settings() store.Settings {
 	return m.settings
 }
 
-// SetLanguage 把业务进程的权威 Language 推到 UI 子进程。当 Language
-// 变化时(用户在「设置」里切语言)发送 MsgLanguage 让 UI 立即重译;
-// 业务进程每次保存设置时都调用一次,UI 子进程还没起的场景由 InitData
-// 携带的 Language 处理,本方法对 Running()==false 直接 no-op。
+// SetLanguage 把业务进程的权威 Language 推给 UI 子进程。当 Language
+// 变化时(用户在「设置」里切语言)推一条 MessageKindLanguage 控制消息,
+// 让 UI 立即重译;UI 子进程还没起来的场景由握手时的 get_settings 快照
+// 处理,本方法对没有会话的情况照样推消息——控制通道有缓冲,UI 连上来
+// 之后会收到。
 //
-// 变化时除了推 MsgLanguage,还会回调 onLanguageChanged——供业务侧
+// 变化时除了推控制消息,还会回调 onLanguageChanged——供业务侧
 // 同步刷新托盘等不在 UI 进程内的本地化界面。
 func (m *Manager) SetLanguage(lang string) {
 	m.mu.Lock()
 	changed := m.curLang != lang
 	m.curLang = lang
-	ch := m.conn
 	hook := m.onLanguageChanged
 	m.mu.Unlock()
-	if changed {
-		// 本地先刷新(ilocale.Set 在 main.go 的 hook 里做),再让 UI
-		// 子进程跟着刷新——两条路径独立,先后顺序对正确性没影响,
-		// 但先本地后 UI 让窗口重新可见时已经显示新语言。
-		if hook != nil {
-			hook(lang)
-		}
-	}
-	if !changed || !m.Running() || ch == nil {
+	if !changed {
 		return
 	}
-	enc, err := ipc.Encode(ipc.LanguageData{Language: lang})
-	if err != nil {
-		return
+	// 本地先刷新(ilocale.Set 在 main.go 的 hook 里做),再让 UI
+	// 子进程跟着刷新——两条路径独立,先后顺序对正确性没影响,
+	// 但先本地后 UI 让窗口重新可见时已经显示新语言。
+	if hook != nil {
+		hook(lang)
 	}
-	enc.Type = ipc.MsgLanguage
-	_ = ch.Send(enc)
+	m.pushControl(api.Message{Kind: api.MessageKindLanguage, Language: lang})
 }
 
 // OnExit 注册 UI 会话结束回调。
 func (m *Manager) OnExit(f func()) {
+	m.mu.Lock()
 	m.onExit = f
+	m.mu.Unlock()
 }
 
 // OnLanguageChanged 注册语言变更回调。f 在 SetLanguage 检测到实际
 // 切换时调用,lang 参数是新的 BCP-47 标签。仅供业务侧把托盘等非 Fyne
-// 通道的本地化 UI 同步刷新——UI 子进程自身的翻译走 MsgLanguage。
+// 通道的本地化 UI 同步刷新——UI 子进程自身的翻译走控制消息。
 func (m *Manager) OnLanguageChanged(f func(lang string)) {
+	m.mu.Lock()
 	m.onLanguageChanged = f
+	m.mu.Unlock()
 }
 
-// Running 报告 UI 子进程会话是否存活。
+// Running 报告 UI 子进程会话是否存活（已拉起且未结束）。
 func (m *Manager) Running() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.conn != nil
+	return m.sessionActive
 }
 
-// Open 确保 UI 可见：已有会话则发送 show；否则 spawn 一个新 UI 子进程。
+// Open 确保 UI 可见：已有会话则发送 show 控制消息；否则 spawn 一个新
+// UI 子进程。
 func (m *Manager) Open() {
 	if m.Running() {
-		_ = m.send(ipc.Message{Type: ipc.MsgShow})
+		m.pushControl(api.Message{Kind: api.MessageKindShow})
 		return
 	}
 	if err := m.Start(); err != nil {
@@ -165,68 +203,91 @@ func (m *Manager) Open() {
 	}
 }
 
-// Start 生成 socket 并拉起 UI 子进程（同一可执行文件的自我复刻）。
+// Start 生成监听地址与 token、起传输层服务并拉起 UI 子进程（同一可
+// 执行文件的自我复刻）。
+//
+// 顺序很关键：先让传输层监听就绪，再拉子进程。UI 子进程连不上业务
+// 进程就直接退出（rpc.Dial 不重试），先拉子进程的话它会「出生即死」。
 func (m *Manager) Start() error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	// conn 非 nil 表示已有可用会话；cancel 非 nil 表示会话正在握手
-	// （子进程已拉起但尚未挂上连接），两种情况都不允许再拉起第二个
-	// UI 子进程，否则会留下一个无人回收的窗口。
-	if m.conn != nil || m.cancel != nil {
+	if m.cancel != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("uimgr: UI already running")
 	}
-
-	sock, err := m.makeSocketPath()
+	if m.svc == nil {
+		m.mu.Unlock()
+		return fmt.Errorf("uimgr: 缺少业务服务（appservice）")
+	}
+	addr, err := m.resolveAddr()
 	if err != nil {
+		m.mu.Unlock()
 		return err
 	}
 	token, err := randomToken()
 	if err != nil {
+		m.mu.Unlock()
 		return err
 	}
-
-	ln, err := ipc.Listen(sock)
-	if err != nil {
-		return err
+	switch m.transport {
+	case rpc.TransportGRPC, rpc.TransportHTTP:
+	default:
+		m.mu.Unlock()
+		return fmt.Errorf("uimgr: 未知传输协议 %q（可选：%s、%s）", m.transport, rpc.TransportGRPC, rpc.TransportHTTP)
 	}
-	// Listen 成功之后的任何失败都要关掉监听并删掉 socket 文件，
-	// 否则会留下一个无人监听的残留路径。
-	fail := func(err error) error {
-		ln.Close()
-		_ = os.Remove(sock)
-		return err
-	}
-
 	self, err := os.Executable()
 	if err != nil {
-		return fail(fmt.Errorf("uimgr: resolve self executable: %w", err))
+		m.mu.Unlock()
+		return fmt.Errorf("uimgr: resolve self executable: %w", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.gen++
+	gen := m.gen
+	m.addr = addr
+	m.token = token
+	m.cancel = cancel
+	m.cmd = nil
+	m.sessionActive = false
+	m.exitOnce = &sync.Once{}
+	m.waitCh = make(chan struct{})
+	m.mu.Unlock()
+
+	// 传输层服务在后台跑：它绑定监听、接管业务调用与消息流。
+	go m.serve(ctx, gen, addr, token, m.transport)
+	a, err := addrpkg.Parse(addr)
+	if err != nil {
+		cancel()
+		m.finishSession(gen)
+		return fmt.Errorf("uimgr: 解析监听地址 %q: %w", addr, err)
+	}
+	if err := waitListening(ctx, a, listenTimeout); err != nil {
+		cancel()
+		m.finishSession(gen)
+		return fmt.Errorf("uimgr: 监听 %s 未就绪: %w", addr, err)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.Command(self)
 	cmd.Env = append(os.Environ(),
-		ipc.EnvUIChild+"=1",
-		ipc.EnvUISocket+"="+sock,
-		ipc.EnvUIToken+"="+token,
+		rpc.EnvUIChild+"=1",
+		rpc.EnvUIListen+"="+addr,
+		rpc.EnvUIToken+"="+token,
+		rpc.EnvUITransport+"="+m.transport,
 	)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Start(); err != nil {
 		cancel()
-		return fail(fmt.Errorf("uimgr: spawn UI child: %w", err))
+		m.finishSession(gen)
+		return fmt.Errorf("uimgr: spawn UI child: %w", err)
 	}
 
-	m.gen++
-	gen := m.gen
-	m.uiSock = sock
-	m.token = token
-	m.cancel = cancel
+	m.mu.Lock()
 	m.cmd = cmd
-	m.exitOnce = &sync.Once{}
+	m.sessionActive = true
+	m.mu.Unlock()
 
-	// 子进程的唯一回收点：Wait 必须被且仅被调用一次。无论握手/init
-	// 是否成功，进程消亡都会在这里被回收（失败路径另行 Kill），
-	// 避免未完成握手的 UI 子进程变成无主进程、带着窗口一直存活。
+	// 子进程的唯一回收点：Wait 必须被且仅被调用一次。无论服务是否正常，
+	// 进程消亡都会在这里被回收（失败路径另行 Kill），避免子进程变成无主
+	// 进程、带着窗口一直存活。
 	// 这里只捕获局部 cmd，不再读写 m.cmd，消除与 finishSession 的竞态。
 	go func() {
 		err := cmd.Wait()
@@ -234,9 +295,41 @@ func (m *Manager) Start() error {
 		cancel()
 	}()
 
-	// 接受握手（后台，不阻塞业务启动流程）。
-	go m.acceptLoop(ln, ctx, gen)
 	return nil
+}
+
+// serve 在监听地址上启动传输层服务。它是会话 gen 的唯一结束者：
+// rpc.Serve 返回（服务出错或 ctx 取消）时结束会话。
+func (m *Manager) serve(ctx context.Context, gen uint64, addr, token, transport string) {
+	defer m.finishSession(gen)
+	// 业务侧文件存在性轮询（原 UI 焦点 ticker，随会话启停）。
+	go m.validateLoop(ctx)
+	err := rpc.Serve(ctx, rpc.ServerOptions{
+		Transport: transport,
+		Addr:      addr,
+		Token:     token,
+	}, m.svc)
+	if err != nil {
+		logging.Printf("uimgr: rpc serve: %v", err)
+		// 服务起不来时子进程连不上：把它收掉，别留一个孤儿窗口。
+		m.killChild(gen)
+	}
+}
+
+// validateLoop 在 UI 会话存活期间定期做文件存在性校验。
+func (m *Manager) validateLoop(ctx context.Context) {
+	t := time.NewTicker(validateEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if m.svc != nil {
+				m.svc.ValidateFileExistence()
+			}
+		}
+	}
 }
 
 // killChild 终止会话 gen 的 UI 子进程（若它仍属于该会话）。被 Kill 的
@@ -252,82 +345,9 @@ func (m *Manager) killChild(gen uint64) {
 	_ = cmd.Process.Kill()
 }
 
-// acceptLoop 接受一次 UI 子进程连接并驱动会话。它是会话 gen 的唯一
-// 结束者：无论握手成败，返回时都会 finishSession，并在失败路径主动
-// 结束子进程。
-func (m *Manager) acceptLoop(ln net.Listener, ctx context.Context, gen uint64) {
-	defer ln.Close()
-	// 子进程早退或会话被 Close 关停时关掉监听，避免 Accept 永久阻塞。
-	stopped := make(chan struct{})
-	defer close(stopped)
-	go func() {
-		select {
-		case <-ctx.Done():
-			ln.Close()
-		case <-stopped:
-		}
-	}()
-	// 子进程必须在 budget 内完成连接与握手，否则同样是失败路径：
-	// 关掉监听让 Accept 返回，从而 Kill 掉可能已经僵死的子进程并结束
-	// 会话，而不是让会话永远停在「正在启动」。
-	deadline := time.AfterFunc(handshakeTimeout, func() { ln.Close() })
-	defer deadline.Stop()
-	defer m.finishSession(gen)
-
-	conn, err := ln.Accept()
-	if err != nil {
-		m.killChild(gen)
-		return
-	}
-	ch := ipc.NewConn(conn)
-	if err := m.handshake(ch); err != nil {
-		logging.Printf("uimgr: handshake failed: %v", err)
-		ch.Close()
-		m.killChild(gen)
-		return
-	}
-	// 握手已完成：连接/握手预算不再适用（后续读取由各自的 deadline 管）。
-	deadline.Stop()
-
-	// 推送初始快照（权威设置）。负载已序列化，直接拼帧发出去。
-	initMsg, err := ipc.Encode(ipc.InitData{Settings: m.Settings()})
-	if err == nil {
-		err = ch.SendPayload(ipc.MsgInit, initMsg.Data)
-	}
-	if err != nil {
-		logging.Printf("uimgr: send init: %v", err)
-		ch.Close()
-		m.killChild(gen)
-		return
-	}
-
-	m.mu.Lock()
-	if m.gen != gen {
-		// 会话已在握手期间被回收：不要再把连接挂到管理器上。
-		m.mu.Unlock()
-		ch.Close()
-		return
-	}
-	waitCh := make(chan struct{})
-	m.conn = ch
-	m.waitCh = waitCh
-	m.mu.Unlock()
-
-	// 业务侧文件存在性轮询（原 UI 焦点 ticker，随会话启停）。
-	go m.validateLoop(ctx)
-
-	// 事件转发与调用处理并行跑在同一个 conn 上。
-	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() { defer wg.Done(); m.serveCalls(ch, ctx) }()
-	go func() { defer wg.Done(); m.forwardEvents(ch, ctx) }()
-	wg.Wait()
-	close(waitCh)
-}
-
-// finishSession 结束会话 gen：清空 conn/cmd/取消函数并移除 socket 文件。
-// 只有仍是当前会话的调用会生效——重复清理、已被新会话取代的清理都是
-// 空操作；onExit 因此每个会话只触发一次。
+// finishSession 结束会话 gen：清空子进程/取消函数/监听地址并置
+// sessionActive 为 false。只有仍是当前会话的调用会生效——重复清理、
+// 已被新会话取代的清理都是空操作；onExit 因此每个会话只触发一次。
 func (m *Manager) finishSession(gen uint64) {
 	m.mu.Lock()
 	if m.gen != gen {
@@ -335,314 +355,52 @@ func (m *Manager) finishSession(gen uint64) {
 		return
 	}
 	m.gen++ // 使本会话的后续清理失效
-	ch := m.conn
+	waitCh := m.waitCh
 	once := m.exitOnce
 	onExit := m.onExit
-	m.conn = nil
-	m.exitOnce = nil
 	m.waitCh = nil
+	m.sessionActive = false
 	if m.cancel != nil {
 		m.cancel()
-	}
-	m.cancel = nil
-	if m.uiSock != "" {
-		_ = os.Remove(m.uiSock)
-		m.uiSock = ""
+		m.cancel = nil
 	}
 	m.cmd = nil
+	m.addr = ""
+	m.token = ""
 	m.mu.Unlock()
 
-	if ch != nil {
-		_ = ch.Close()
+	if waitCh != nil {
+		close(waitCh)
 	}
 	if once != nil && onExit != nil {
 		once.Do(onExit)
 	}
 }
 
-// handshake 等待 UI 的 hello 并校验 token。
-func (m *Manager) handshake(ch *ipc.Conn) error {
-	ch.SetReadDeadline(time.Now().Add(handshakeTimeout))
-	defer ch.SetReadDeadline(time.Time{})
-	msg, err := ch.Recv()
-	if err != nil {
-		return err
-	}
-	if msg.Type != ipc.MsgHello {
-		return fmt.Errorf("uimgr: expected %s, got %s", ipc.MsgHello, msg.Type)
-	}
-	var hello ipc.HelloData
-	if err := json.Unmarshal(msg.Data, &hello); err != nil {
-		return fmt.Errorf("uimgr: decode hello: %w", err)
-	}
-	m.mu.Lock()
-	tok := m.token
-	m.mu.Unlock()
-	if hello.Token == "" || hello.Token != tok {
-		return fmt.Errorf("uimgr: bad handshake token")
-	}
-	return nil
-}
-
-// serveCalls 处理 UI 的远程调用并逐个应答。
-func (m *Manager) serveCalls(ch *ipc.Conn, ctx context.Context) {
-	for {
-		msg, err := ch.Recv()
-		if err != nil {
-			return
-		}
-		if msg.Type != ipc.MsgCall {
-			continue
-		}
-		var call ipc.CallData
-		if err := json.Unmarshal(msg.Data, &call); err != nil {
-			reply, _ := ipc.Reply(msg.ID, false, "decode call: "+err.Error(), nil)
-			_ = ch.Send(reply)
-			continue
-		}
-		result, rerr := m.dispatch(call.Method, call.Params)
-		reply, merr := ipc.Reply(msg.ID, rerr == nil, errString(rerr), result)
-		if merr != nil {
-			return
-		}
-		if err := ch.Send(reply); err != nil {
-			return
-		}
-	}
-}
-
-func errString(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
-}
-
-// dispatch 把一种远程方法映射到 scheduler/store/settings。
-func (m *Manager) dispatch(method string, raw json.RawMessage) (any, error) {
-	switch method {
-	case ipc.MethodList:
-		var p ipc.ListParams
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return nil, err
-		}
-		return m.sc.List(store.StatusFilter(p.Filter), store.TaskSort(p.Sort))
-
-	case ipc.MethodAdd:
-		var p ipc.AddParams
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return nil, err
-		}
-		kind := p.Protocol
-		if kind == "" {
-			var derr error
-			kind, derr = protocol.DetectKind(p.URL, "")
-			if derr != nil {
-				return nil, derr
-			}
-		}
-		return m.sc.Add(scheduler.AddTaskInput{
-			URL:          p.URL,
-			SavePath:     p.SavePath,
-			Protocol:     kind,
-			Auth:         p.Auth,
-			ChunkCount:   p.ChunkCount,
-			MinChunkSize: p.MinChunkSize,
-		})
-
-	case ipc.MethodStart:
-		var p ipc.TaskParams
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return nil, err
-		}
-		return nil, m.sc.Start(p.ID)
-
-	case ipc.MethodPause:
-		var p ipc.TaskParams
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return nil, err
-		}
-		return nil, m.sc.Pause(p.ID)
-
-	case ipc.MethodIsPreparing:
-		var p ipc.TaskParams
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return nil, err
-		}
-		return m.sc.IsPreparing(p.ID), nil
-	case ipc.MethodDelete:
-		var p ipc.TaskParams
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return nil, err
-		}
-		return nil, m.sc.Delete(p.ID)
-
-	case ipc.MethodSaveSettings:
-		var s store.Settings
-		if err := json.Unmarshal(raw, &s); err != nil {
-			return nil, err
-		}
-		if err := settings.Save(m.st, s); err != nil {
-			return nil, err
-		}
-		m.SetSettings(s)
-		// 语言单独推一份精简消息,避免每次设置保存都序列化整份 settings。
-		// SetLanguage 内部按 curLang 判变更,同语言下不产生 IPC。
-		m.SetLanguage(s.Language)
-		return struct{}{}, nil
-
-	case ipc.MethodProbe:
-		var p ipc.ProbeParams
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return nil, err
-		}
-		size, err := m.probe(p.URL)
-		if err != nil {
-			return nil, err
-		}
-		return ipc.ProbeResult{TotalSize: size}, nil
-
-	case ipc.MethodBTInfo:
-		var p ipc.BTInfoParams
-		if err := json.Unmarshal(raw, &p); err != nil {
-			return nil, err
-		}
-		// BT 详情是实时快照,直接从 scheduler 的句柄登记表取;
-		// 任务不在运行时返回错误,UI 据此显示「会话已结束」。
-		return m.sc.BTTaskDetail(p.TaskID)
-
-	default:
-		return nil, fmt.Errorf("uimgr: unknown method %q", method)
-	}
-}
-
-// probe 在业务进程内探测 URL 目标大小（复用业务侧代理配置）。
-func (m *Manager) probe(raw string) (int64, error) {
-	kind, err := protocol.DetectKind(raw, "")
-	if err != nil {
-		return 0, err
-	}
-	// BitTorrent:.torrent 种子文件可以解析出精确体积;磁力链接在没有
-	// peer 之前拿不到元数据,这里直接返回「未知」(0, nil),让对话框
-	// 不显示体积而不是弹一个错误。
-	if kind == protocol.ProtoBT {
-		return m.probeBittorrent(raw)
-	}
-	s := m.Settings()
-	driver, err := protocol.New(raw, kind, protocol.Auth{AuthOptions: protocol.AuthOptions{
-		UserAgent:          s.UserAgent,
-		Cookies:            s.Cookies,
-		FTPPassive:         s.FTPPassive,
-		ProxyMode:          s.ProxyMode,
-		ProxyURL:           s.ProxyURL,
-		ProxyBypass:        s.ProxyBypass,
-		ProxyAutoConfigURL: s.ProxyAutoConfigURL,
-	}})
-	if err != nil {
-		return 0, err
-	}
-	defer driver.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	caps, err := driver.Probe(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return caps.TotalSize, nil
-}
-
-// probeBittorrent 解析 .torrent 种子文件的总体积。磁力链接缺元数据,
-// 返回 0(体积未知)。任何取种子的失败都当作「未知」而不是错误——
-// 体积预览不该拦住用户添加任务。
-func (m *Manager) probeBittorrent(raw string) (int64, error) {
-	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(raw)), "magnet:") {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		data, err := bittorrent.FetchTorrentFile(ctx, raw, protocol.HTTPProxyFunc())
-		if err != nil {
-			logging.Printf("uimgr: probe torrent file: %v", err)
-			return 0, nil
-		}
-		if _, total, perr := bittorrent.TorrentFileInfo(data); perr == nil {
-			return total, nil
-		} else {
-			logging.Printf("uimgr: parse torrent file: %v", perr)
-		}
-	}
-	return 0, nil
-}
-
-// forwardEvents 把 scheduler 事件转换成 EventData 推给 UI。
-func (m *Manager) forwardEvents(ch *ipc.Conn, ctx context.Context) {
-	evCh, unsub := m.sc.Subscribe()
-	defer unsub()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case ev := <-evCh:
-			msg, err := ipc.Encode(ipc.EventData{
-				Why:      ev.Why,
-				Task:     ev.Task,
-				SpeedBPS: ev.SpeedBPS,
-			})
-			if err != nil {
-				continue
-			}
-			// 负载已序列化，直接拼帧发送，避免整包再 marshal 一次。
-			if err := ch.SendPayload(ipc.MsgEvent, msg.Data); err != nil {
-				return
-			}
-		}
-	}
-}
-
-// validateLoop 在 UI 会话存活期间定期做文件存在性校验。
-func (m *Manager) validateLoop(ctx context.Context) {
-	t := time.NewTicker(validateEvery)
-	defer t.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-t.C:
-			m.sc.ValidateFileExistence()
-		}
-	}
-}
-
-// Close 关闭 UI 子进程：先安排超时强杀，再发 MsgClose 等其自行退出。
+// Close 关闭 UI 子进程：先推 close 控制消息，再安排超时强杀。
 func (m *Manager) Close() {
 	m.mu.Lock()
 	gen := m.gen
-	ch := m.conn
 	cmd := m.cmd
 	m.mu.Unlock()
 
-	if ch != nil {
-		// 兜底 Kill 必须先于 Send 排上定时器：Send 是持 wmu 的阻塞写，
-		// 子进程僵死时可能永不返回，只有定时器能保证退出一定发生，
-		// 不至于吃掉 main 的 5s 退出预算。
-		var killTimer *time.Timer
-		if cmd != nil && cmd.Process != nil {
-			killTimer = time.AfterFunc(closeGrace, func() { _ = cmd.Process.Kill() })
-		}
-		_ = ch.Send(ipc.Message{Type: ipc.MsgClose})
-		// 给 UI 一段窗口期自行退出。
+	m.pushControl(api.Message{Kind: api.MessageKindClose})
+
+	if cmd != nil && cmd.Process != nil {
+		// 兜底 Kill 必须先于等待排上定时器:子进程僵死时可能永不退出,
+		// 只有定时器能保证退出一定发生,不至于吃掉 main 的 5s 退出预算。
+		killTimer := time.AfterFunc(closeGrace, func() { _ = cmd.Process.Kill() })
 		select {
 		case <-time.After(closeGrace):
 		case <-m.waitDone():
 		}
-		if killTimer != nil {
-			killTimer.Stop()
-		}
-	}
-	if cmd != nil && cmd.Process != nil {
+		killTimer.Stop()
 		_ = cmd.Process.Kill()
 	}
 	m.finishSession(gen)
 }
 
+// waitDone 返回会话结束通知通道。会话不在时返回一个已关闭的通道。
 func (m *Manager) waitDone() <-chan struct{} {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -654,73 +412,42 @@ func (m *Manager) waitDone() <-chan struct{} {
 	return m.waitCh
 }
 
-// send 发送一条消息（并发安全）。
-func (m *Manager) send(msg ipc.Message) error {
-	m.mu.Lock()
-	ch := m.conn
-	m.mu.Unlock()
-	if ch == nil {
-		return fmt.Errorf("uimgr: no active UI connection")
-	}
-	return ch.Send(msg)
-}
-
 // SendShowAddTask 让 UI 弹出「新建下载任务」对话框。
 //
 // 行为:
-//   - UI 已运行:立刻把参数序列化后发出,UI 端读完显示主窗口并打开对话框;
-//   - UI 未运行:Start() 拉起一个子进程后,在握手/初始化预算内等待 conn
-//     挂上,然后再 send——冷启动下 Start() 立刻返回,但 acceptLoop 的握手
-//     仍是异步的,不等待就几乎一定丢失首条消息。
+//   - UI 会话已在:立刻把参数推进控制消息通道,UI 端读到后显示主窗口并
+//     打开对话框;
+//   - UI 会话不在:先拉起一个 UI 子进程再推消息——与旧实现一致。托盘
+//     常驻(--autostart)与冷启动两种场景下,lgom:// 转发都要能弹对话框;
+//     控制通道有缓冲,消息会等 UI 连上来之后送达。
 //
-// 业务进程 lgom:// URL 转发路径用它替代原先直接 Add/Start,避免误触;
-// 仅在所有路径都失败时返回 error,由调用方决定是否回退到旧行为。
-func (m *Manager) SendShowAddTask(p ipc.ShowAddTaskParams) error {
+// 拉不起 UI 时返回错误——调用方(main.go)据此告诉浏览器「请求没被接收」,
+// 浏览器退到 lgom:// URL 通道。
+func (m *Manager) SendShowAddTask(p api.ShowAddTaskParams) error {
 	if !m.Running() {
 		if err := m.Start(); err != nil {
 			return fmt.Errorf("uimgr: cannot start UI for show_add_task: %w", err)
 		}
-		// 等待握手 + init 完成(conn 在 acceptLoop 中设置);握手上限是
-		// handshakeTimeout=20s,留 30s 余量足够覆盖实际路径。
-		if err := m.waitConnReady(30 * time.Second); err != nil {
-			return err
-		}
 	}
-	enc, err := ipc.Encode(p)
-	if err != nil {
-		return fmt.Errorf("uimgr: encode show_add_task: %w", err)
-	}
-	enc.Type = ipc.MsgShowAddTask
-	if err := m.send(enc); err != nil {
-		return err
-	}
+	m.pushControl(api.Message{Kind: api.MessageKindShowAddTask, ShowAddTask: &p})
 	return nil
 }
 
-// waitConnReady 阻塞直到 m.conn 非空或超时/被取消。Running() 已 true 时
-// 立即返回 nil。用于 SendShowAddTask 等「先要 UI 起来才能发消息」的场景。
-func (m *Manager) waitConnReady(timeout time.Duration) error {
-	if m.Running() {
-		return nil
+// pushControl 往业务服务的控制通道推一条消息。
+func (m *Manager) pushControl(msg api.Message) {
+	if m.svc == nil {
+		return
 	}
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	tick := time.NewTicker(20 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		if m.Running() {
-			return nil
-		}
-		select {
-		case <-deadline.C:
-			return fmt.Errorf("uimgr: UI connection not ready within %s", timeout)
-		case <-tick.C:
-		}
-	}
+	m.svc.PushControl(msg)
 }
 
-// makeSocketPath 生成带随机后缀的 socket 路径（用户缓存目录）。
-func (m *Manager) makeSocketPath() (string, error) {
+// resolveAddr 决定监听地址：环境变量 LDM_RPC_LISTEN 优先，
+// 最后是自动生成的 unix socket 路径。
+func (m *Manager) resolveAddr() (string, error) {
+	if v := strings.TrimSpace(os.Getenv(EnvRPCListen)); v != "" {
+		warnIfExposed(v)
+		return v, nil
+	}
 	dir, err := os.UserCacheDir()
 	if err != nil || dir == "" {
 		dir = os.TempDir()
@@ -733,7 +460,53 @@ func (m *Manager) makeSocketPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(sub, "ui-"+suffix[:8]+".sock"), nil
+	return "unix:" + filepath.Join(sub, "ui-"+suffix[:socketSuffixLen]+".sock"), nil
+}
+
+// warnIfExposed 在监听地址不是回环地址时告警。TCP 模式下 token 是
+// 唯一防线，用户应当知道接口对谁可见。
+func warnIfExposed(addr string) {
+	a, err := addrpkg.Parse(addr)
+	if err != nil || a.Network != "tcp" {
+		return
+	}
+	host, _, err := net.SplitHostPort(a.Address)
+	if err != nil {
+		return
+	}
+	if host == "" || host == "localhost" {
+		return
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return
+	}
+	logging.Printf("uimgr: 监听地址 %s 不是回环地址，UI 接口对本机网络可见（凭 token 鉴权）", addr)
+}
+
+// waitListening 反复尝试连接监听地址，直到连上或超时。
+//
+// 传输层的 Serve 在自己的 goroutine 里绑定端口，而 UI 子进程连不上就
+// 直接退出（rpc.Dial 不重试）。所以拉子进程之前必须确认监听已经就绪。
+// 探测用的连接立刻关掉：服务端会当作一个空连接收掉，不影响业务。
+func waitListening(ctx context.Context, a addrpkg.Addr, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var last error
+	for {
+		conn, err := addrpkg.DialContext(ctx, a)
+		if err == nil {
+			_ = conn.Close()
+			return nil
+		}
+		last = err
+		if time.Now().After(deadline) {
+			return last
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
 }
 
 // randomToken 生成 32 字节随机 hex 串。
