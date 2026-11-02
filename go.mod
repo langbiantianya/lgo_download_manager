@@ -18,7 +18,6 @@ require (
 require (
 	github.com/BurntSushi/toml v1.6.0 // indirect
 	github.com/FyshOS/fancyfs v0.0.1 // indirect
-	github.com/KyleBanks/depth v1.2.1 // indirect
 	github.com/RoaringBitmap/roaring v1.2.3 // indirect
 	github.com/alecthomas/atomic v0.1.0-alpha2 // indirect
 	github.com/anacrolix/btree v0.0.0-20251201064447-d86c3fa41bd8 // indirect
@@ -60,10 +59,6 @@ require (
 	github.com/go-llsqlite/crawshaw v0.5.6-0.20250312230104-194977a03421 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
-	github.com/go-openapi/jsonpointer v0.19.5 // indirect
-	github.com/go-openapi/jsonreference v0.20.0 // indirect
-	github.com/go-openapi/spec v0.20.6 // indirect
-	github.com/go-openapi/swag v0.19.15 // indirect
 	github.com/go-sourcemap/sourcemap v2.1.3+incompatible // indirect
 	github.com/go-text/render v0.2.1 // indirect
 	github.com/go-text/typesetting v0.3.4 // indirect
@@ -76,10 +71,8 @@ require (
 	github.com/hack-pad/go-indexeddb v0.3.2 // indirect
 	github.com/hack-pad/safejs v0.1.0 // indirect
 	github.com/huandu/xstrings v1.3.2 // indirect
-	github.com/josharian/intern v1.0.0 // indirect
 	github.com/jsummers/gobmp v0.0.0-20230614200233-a9de23ed2e25 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.3 // indirect
-	github.com/mailru/easyjson v0.7.6 // indirect
 	github.com/mattn/go-isatty v0.0.24 // indirect
 	github.com/mattn/go-runewidth v0.0.24 // indirect
 	github.com/minio/sha256-simd v1.0.0 // indirect
@@ -114,8 +107,6 @@ require (
 	github.com/srwiley/oksvg v0.0.0-20221011165216-be6e8873101c // indirect
 	github.com/srwiley/rasterx v0.0.0-20220730225603-2ab79fcdd4ef // indirect
 	github.com/stretchr/testify v1.12.1 // indirect
-	github.com/swaggo/files v1.0.1 // indirect
-	github.com/swaggo/swag v1.8.1 // indirect
 	github.com/tidwall/btree v1.8.1 // indirect
 	github.com/wlynxg/anet v0.0.3 // indirect
 	github.com/yuin/goldmark v1.8.2 // indirect
@@ -128,9 +119,7 @@ require (
 	golang.org/x/exp v0.0.0-20251113190631-e25ba8c21ef6 // indirect
 	golang.org/x/image v0.24.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/tools v0.39.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20261026165753-2ffab32bce7e // indirect
-	gopkg.in/yaml.v2 v2.4.0 // indirect
 	lukechampine.com/blake3 v1.1.6 // indirect
 	modernc.org/libc v1.74.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
@@ -140,36 +129,41 @@ require (
 
 require (
 	github.com/dop251/goja v0.0.0-20261028213108-85be1416108e
-	github.com/swaggo/http-swagger v1.3.4
+	github.com/swaggo/files v1.0.1
 	golang.org/x/sys v0.48.0
 	golang.org/x/text v0.43.0
 	google.golang.org/grpc v1.85.0
 	google.golang.org/protobuf v1.36.12
 )
 
-// 排除 x/tools 的这两个新版本：它们会经由 golang.org/x/net 把 x/net 抬到
-// v0.56/v0.59，而 x/net v0.56 起的 httpproxy 改了环境变量优先级
-//（小写 http_proxy 优先于大写 HTTP_PROXY），会打破 internal/protocol 里
-// TestProxyFuncSystemModeReturnsEnv 的预期。x/tools 只被 swaggo/swag 间接
-// 用到（go/loader），v0.39.0 已足够。
-exclude (
-	golang.org/x/tools v0.47.0
-	golang.org/x/tools v0.51.0
-)
-
 // 把 x/net 钉回 v0.47.0。
 //
-// 原因和上面的 exclude 是同一个：x/net v0.56 起 httpproxy 改了大小写环
-// 境变量的优先级（小写 http_proxy 优先于大写 HTTP_PROXY），与 Go 标准库
-// http.ProxyFromEnvironment 的大写优先行为不一致，会悄悄改变 internal/
-// protocol 的代理环境变量解析语义，打破 TestProxyFuncSystemModeReturnsEnv。
+// 为什么必须钉：google.golang.org/grpc v1.85.0 的 go.mod 直接 require
+// golang.org/x/net v0.60.0，go 的 MVS 会照单全收。而 x/net v0.58.0 起的
+// httpproxy 把大小写环境变量的优先级翻了过来（httpproxy.FromEnvironment 里
+// 从 getEnvAny("HTTP_PROXY", "http_proxy") 改成 getEnvAny("http_proxy",
+// "HTTP_PROXY")，小写优先），与 Go 标准库 http.ProxyFromEnvironment 的大写
+// 优先行为不一致（Go 1.26 自带的 vendor 副本仍是 uppercase 优先），会悄悄
+// 改变 internal/protocol 的代理环境变量解析语义，打破
+// TestProxyFuncSystemModeReturnsEnv：机器上同时存在 HTTP_PROXY 与
+// http_proxy 时，用例只把 HTTP_PROXY 改成 7890，不带 replace 的话
+// httpproxy 会取到 http_proxy 的 7897，实测该用例失败并报
+// "proxy Host = 127.0.0.1:7897, want 127.0.0.1:7890"。
 //
-// 但 exclude 在这里压不住：google.golang.org/grpc v1.85.0 的 go.mod 直接
-// require golang.org/x/net v0.60.0（不是经由 x/tools 间接抬上来的），
-// 排除 x/tools 的任何版本都拦不住它。exclude 还会让 go 命令改选「下一个
-// 可用版本」（实测选到了 v0.58.0），同样在 v0.56 以上。
+// 为什么用 replace 而不是 exclude：exclude 只对「被排除模块自己引入的那条
+// 边」生效，管不到 grpc 直接 require 的 x/net v0.60.0 这条边——实测把那两条
+// x/tools 的 exclude 加回来，x/net 仍然是 v0.60.0。而且 exclude 的语义是
+// 「改选下一个更高的可用版本」，实测排除 x/net v0.60.0 后会选到 v0.58.0，
+// 正好落在小写优先的那一档，依然过不了上面那个用例。只有 replace 能无条件
+// 把生效版本硬钉到指定版本。
 //
-// 所以只能用 replace 硬钉。grpc 实际 import 的 x/net 包只有 http2、
-// http2/hpack、http/httpproxy、trace，v0.47.0 全都有，实测构建与全部
-// 测试通过。
+// 钉住是安全的：grpc 实际 import 的 x/net 包只有 http2、http2/hpack、
+// http/httpproxy、trace，v0.47.0 全都有，实测构建、vet 与全部测试通过。
+//
+// 之前这里还配过针对 golang.org/x/tools v0.47.0 / v0.51.0 的 exclude，用来
+// 拦 http-swagger → swaggo/swag → x/tools → x/net 这条抬升链。Swagger 文档
+// 页改用 swaggo/files 自写 handler 后，http-swagger 与 swaggo/swag 已退出
+// 依赖图，x/tools 不再被本仓库的任何包 import，它的 requirement 也不再参与
+// 本仓库的版本选择——实测删掉这两条 exclude 后，go list -m all 的完整模块
+// 列表与保留 exclude 时逐行相同，两条 exclude 已是死代码，故删除。
 replace golang.org/x/net => golang.org/x/net v0.47.0
