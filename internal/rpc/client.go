@@ -164,9 +164,11 @@ func (c *client) dispatch(msg api.Message) {
 		c.hookMu.Lock()
 		h := c.onShowAddTask
 		if h == nil {
-			if len(c.showAddTaskQ) < 1 {
-				c.showAddTaskQ = append(c.showAddTaskQ, *msg.ShowAddTask)
-			}
+			// 队列容量 1，后到的覆盖先到的：同一会话内连续 lgom://
+			// 转发是异常路径，堆积一队陈旧 URL 只会让用户看到一堆过时
+			// 的对话框；保留最新一条与旧实现（internal/ui 的
+			// showAddTaskQ）语义一致，也保证「注册钩子后只补发一次」。
+			c.showAddTaskQ = []api.ShowAddTaskParams{*msg.ShowAddTask}
 			c.hookMu.Unlock()
 			return
 		}

@@ -286,3 +286,102 @@ func TestClientUnsubscribeThenBroadcast(t *testing.T) {
 	tr.events <- api.Message{Kind: api.MessageKindEvent, Event: &api.Event{Why: "x"}}
 	time.Sleep(100 * time.Millisecond)
 }
+
+// TestClientLateShowAddTaskKeepsLatest 锁定「钩子注册前的多条
+// show_add_task 只保留最新一条」。
+//
+// 旧实现（internal/ui 的 ipcClient）用容量 1 的队列 + 覆盖策略，
+// 任务 4 的共享客户端改成了「只收第一条、后来的丢弃」——语义反了：
+// 冷启动时业务侧连发两条 lgom:// 转发，用户最后点的那个反而被丢掉。
+// 这里把覆盖策略钉死，同时保证补发仍然只有一条。
+func TestClientLateShowAddTaskKeepsLatest(t *testing.T) {
+	tr := &fakeTransport{events: make(chan api.Message, 4)}
+	c, err := newClient(context.Background(), tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, u := range []string{"https://x/first", "https://x/second", "https://x/third"} {
+		tr.events <- api.Message{
+			Kind:        api.MessageKindShowAddTask,
+			ShowAddTask: &api.ShowAddTaskParams{URL: u},
+		}
+	}
+
+	// 等读循环把三条都消化掉：队列里最终只剩最后一条。
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		c.hookMu.Lock()
+		n := len(c.showAddTaskQ)
+		last := ""
+		if n > 0 {
+			last = c.showAddTaskQ[0].URL
+		}
+		c.hookMu.Unlock()
+		if last == "https://x/third" {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("队列没有收敛到最新一条，当前 %d 条，末尾 %q", n, last)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	got := make(chan api.ShowAddTaskParams, 4)
+	c.SetOnShowAddTask(func(p api.ShowAddTaskParams) { got <- p })
+	select {
+	case p := <-got:
+		if p.URL != "https://x/third" {
+			t.Fatalf("补发的是 %q，want 最新一条 https://x/third", p.URL)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("迟到的 show_add_task 没有被补发")
+	}
+	select {
+	case p := <-got:
+		t.Fatalf("补发了多余的一条: %+v（队列容量应为 1）", p)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+// TestClientBroadcastUnsubscribeRace 是旧
+// internal/ui 的 TestIpcClient_BroadcastUnsubscribeRace 的等价护栏：
+// 订阅/退订与广播并发时不得 panic（向已关闭的通道发送会直接 panic）。
+//
+// 旧实现的 broadcast 把订阅者快照复制到锁外再发送，退订正好落在窗口里
+// 就会撞上 "send on closed channel"；共享客户端把发送与关闭都放在
+// subMu 下互斥。这条用例只有在 -race 下才会暴露数据竞争，功能性 panic
+// 则不加 race 也能抓。
+func TestClientBroadcastUnsubscribeRace(t *testing.T) {
+	tr := &fakeTransport{events: make(chan api.Message, 4)}
+	c, err := newClient(context.Background(), tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const (
+		subscribers = 64
+		rounds      = 500
+	)
+	for round := 0; round < rounds; round++ {
+		unsubAll := make([]func(), 0, subscribers)
+		for i := 0; i < subscribers; i++ {
+			_, unsub := c.Subscribe()
+			unsubAll = append(unsubAll, unsub)
+		}
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				c.broadcast(api.Event{Why: "race"})
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for _, u := range unsubAll {
+				u()
+			}
+		}()
+		wg.Wait()
+	}
+}
