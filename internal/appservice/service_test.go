@@ -283,11 +283,14 @@ func TestSaveSettingsTriggersLanguageCallbackAfterPersist(t *testing.T) {
 func TestControlsBufferSurvivesUntilUIConnects(t *testing.T) {
 	s := New(nil, nil)
 
-	// 无消费者时先推满一个缓冲周期的量。容量从通道自身取，而不是写死 16：
-	// 写死的话「以后把缓冲调大」会被判成回归，而真正该抓的是「调小 / 无缓冲」。
+	// 下界用字面量 16，不写 ControlBuffer：写成常量的话，把常量本身调小
+	// （16→1）时断言基数会跟着变小，退化照样全绿——实测确实如此。
+	// 下界只拦「变小」，调大不会误报。
+	const minBuffer = 16
 	n := cap(s.Controls())
-	if n <= 0 {
-		t.Fatalf("控制通道没有缓冲（cap=%d）——UI 连上来之前推的消息会丢", n)
+	if n < minBuffer {
+		t.Fatalf("控制通道缓冲被调小（cap=%d < %d）——UI 连上来之前攒消息的余量不够",
+			n, minBuffer)
 	}
 	for i := 0; i < n; i++ {
 		s.PushControl(api.Message{Kind: api.MessageKindShow})

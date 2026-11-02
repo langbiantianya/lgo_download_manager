@@ -10857,7 +10857,7 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
    	if !changed {
    		return
    	}
-   	m.svc.PushControl(api.Message{Kind: api.MessageKindLanguage, Language: lang})
+   	m.pushControl(api.Message{Kind: api.MessageKindLanguage, Language: lang})
    }
    ```
 
@@ -11226,6 +11226,30 @@ UNSPECIFIED；proto3 的 repeated 字段没有「null」状态，只有「空」
     	// BitTorrent 设置同步：限速立即生效，端口/DHT/PEX 等在客户端可安全
     	// 重建时生效（见 scheduler.SetBittorrentConfig）。
     	s.sc.SetBittorrentConfig(scheduler.BittorrentConfigFrom(cur))
+    }
+    ```
+
+    另外把控制通道的缓冲容量提成具名常量，别让它散落在构造函数里——它是
+    「UI 连上来之前推的消息不丢」这条保证的唯一来源，需要有名字、有注释、
+    有测试：
+
+    ```go
+    // ControlBuffer 是控制通道的缓冲容量。
+    //
+    // 它决定了「UI 子进程还没连上来」这段窗口里能攒下多少条控制消息。
+    // 最典型的是 show_add_task：业务侧拉起 UI 后立刻推消息，此时通道上还没有
+    // 消费者；缓冲为 0 的话这条消息会当场被丢弃，而调用方仍收到「已送达」。
+    //
+    // 16 是经验值——正常冷启动最多攒一两条（show / show_add_task / language），
+    // 留足余量是为了容忍异常情况下的短时积压。
+    const ControlBuffer = 16
+
+    func New(st *store.Store, sc *scheduler.Scheduler) *Service {
+    	return &Service{
+    		st:       st,
+    		sc:       sc,
+    		controls: make(chan api.Message, ControlBuffer),
+    	}
     }
     ```
 

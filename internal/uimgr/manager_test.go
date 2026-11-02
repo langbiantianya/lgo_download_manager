@@ -178,6 +178,35 @@ func TestSendShowAddTask_StartFailureReturnsErrorNoMessage(t *testing.T) {
 	}
 }
 
+// TestSendShowAddTask_SessionDiesInSpawnWindow 守住 ensureSession 里对
+// waitSpawnAlive 的接线：UI 拉起后**在观察窗口内就结束**时，必须报错且
+// 不推消息。
+//
+// 少了这层，「启动即崩」会静默退化成「已送达」——浏览器被告知请求被接收，
+// 对话框却永远不出现。这条用例走「立即结束」分支，所以不花窗口时间。
+func TestSendShowAddTask_SessionDiesInSpawnWindow(t *testing.T) {
+	svc := appservice.New(nil, scheduler.New(nil))
+	m := New(svc)
+	m.startSession = func() error {
+		m.mu.Lock()
+		m.sessionActive = true
+		ch := make(chan struct{})
+		m.waitCh = ch
+		m.mu.Unlock()
+		close(ch) // 模拟会话在观察窗口内结束
+		return nil
+	}
+
+	if err := m.SendShowAddTask(api.ShowAddTaskParams{URL: "https://example.com/x"}); err == nil {
+		t.Fatal("会话在启动窗口内结束时应当报错")
+	}
+	select {
+	case msg := <-svc.Controls():
+		t.Fatalf("会话已结束，不该推消息，却收到 %+v", msg)
+	default:
+	}
+}
+
 // TestSendShowAddTask_NoSession_ReturnsError 验证拉起路径真的失败时
 // （已有会话的状态却调 Start）如实报错。
 //
@@ -427,6 +456,16 @@ func TestNewWiresLanguageCallback(t *testing.T) {
 
 	if len(got) != 1 || got[0] != "ja" {
 		t.Fatalf("appservice 的语言回调没有传到 uimgr，钩子收到 %v", got)
+	}
+	// 光有 hook 不够：UI 子进程自身要靠控制消息重译。这条断言把
+	// 「SetLanguage 推 MessageKindLanguage」也钉进接线用例。
+	select {
+	case msg := <-svc.Controls():
+		if msg.Kind != api.MessageKindLanguage || msg.Language != "ja" {
+			t.Fatalf("控制消息不对: %+v", msg)
+		}
+	default:
+		t.Fatal("语言变更没有推进控制通道")
 	}
 }
 
