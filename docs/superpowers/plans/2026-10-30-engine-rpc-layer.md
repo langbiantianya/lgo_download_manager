@@ -11883,6 +11883,22 @@ git add -A
 git commit -m "refactor(ipc): 删除自定义 JSON 帧协议"
 ```
 
+#### Task 11 实施记录（已完成）
+
+- 删掉的是 4 个文件：`channel.go` / `net.go` / `payload.go` / `protocol.go`。
+- `main.go` 的改动只有三处：顶部注释里的 `ipc.EnvUIChild` → `rpc.EnvUIChild`、
+  import 换成 `internal/rpc`、分派处换常量。顺带把注释里「连接业务 socket」
+  改成「通过 gRPC 或 net/http 传输连回」——socket 只是默认实现，不是全部。
+- 删包带出两处**指向已删除包的注释**，一并修掉：
+  `internal/urllauncher/urllauncher_unix.go` 的「权限与 ipc.Listen 一致」改指
+  `rpc/addr.Listen`；`internal/api/methods.go` 的「沿用旧 IPC 协议（internal/ipc）
+  的取值」改成「沿用已删除的旧 IPC 协议的取值」。
+- 验收：`go test ./...` 全绿；真实 GUI 在 grpc 与 http 两种传输下各跑一次，
+  子进程都能被正确识别（不再出现 `missing socket/token env`）并干净退出；
+  全仓 `grep -rn "internal/ipc" --include=*.go` 与 `grep -rn "\bipc\."` 均无输出。
+- 至此 Task 9 留下的「跨包常量一致性靠巧合」隐患消除：UI 通道的环境变量只剩
+  `internal/rpc` 一个来源，`TestEnvUIConstantsAreTheDocumentedContract` 直接钉住它。
+
 ---
 
 ### Task 12: 拆分 `internal/engine` 并补边界测试
