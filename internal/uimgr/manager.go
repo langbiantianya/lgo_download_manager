@@ -42,6 +42,12 @@ const (
 	closeGrace = 2 * time.Second
 	// listenTimeout 是等待传输层监听就绪的上限。
 	listenTimeout = 3 * time.Second
+	// spawnGrace 是拉起 UI 子进程后，观察它「有没有立刻死掉」的窗口。
+	//
+	// 旧实现靠等握手（上限 30s）判断 UI 到底起没起来。新架构里没有
+	// 「会话就绪」信号，但启动即崩是最常见的失败形态；用一个小窗口
+	// 覆盖它，别在这类失败上骗调用方「消息已送达」。
+	spawnGrace = 500 * time.Millisecond
 	// socketSuffixLen 是 unix socket 文件名里随机后缀的长度（hex 字符）。
 	//
 	// macOS 的 sockaddr_un 只有 104 字节，socket 路径放不下完整的长
@@ -428,9 +434,29 @@ func (m *Manager) SendShowAddTask(p api.ShowAddTaskParams) error {
 		if err := m.Start(); err != nil {
 			return fmt.Errorf("uimgr: cannot start UI for show_add_task: %w", err)
 		}
+		// 旧实现拉起后还要等握手完成（上限 30s），握不上就报错。新架构
+		// 里没有「会话就绪」这个信号，但最常见的失败形态是子进程启动即
+		// 崩（Fyne 初始化失败、缺图形库、权限问题）——用一个小窗口盯住它，
+		// 至少不会在这类失败上骗浏览器「已接收」。
+		if err := m.waitSpawnAlive(); err != nil {
+			return err
+		}
 	}
 	m.pushControl(api.Message{Kind: api.MessageKindShowAddTask, ShowAddTask: &p})
 	return nil
+}
+
+// waitSpawnAlive 观察刚拉起的子进程一小会儿，看它是不是立刻就退出了。
+//
+// 正常启动要走几秒，本窗口过后把消息留在控制通道的缓冲里即可——UI 连上
+// 之后会收到。返回错误表示子进程在窗口内就退出了，这条消息不可能送达。
+func (m *Manager) waitSpawnAlive() error {
+	select {
+	case <-m.waitDone():
+		return fmt.Errorf("uimgr: UI 子进程启动后立即退出，show_add_task 未送达")
+	case <-time.After(spawnGrace):
+		return nil
+	}
 }
 
 // pushControl 往业务服务的控制通道推一条消息。
