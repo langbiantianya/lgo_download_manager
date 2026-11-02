@@ -18,6 +18,8 @@ info:
     消息流端点 /lgdm.v1.DownloadService/stream_messages 返回 NDJSON，
     每行一个消息对象，事件与控制消息合并在同一条流里。
 
+    请求体一律可选：空请求体等价于 {}，服务端不因为 body 为空而报错。
+
     文档端点（/openapi.yaml、/openapi.json、/docs）不参与 token 校验：
     它们只暴露接口形状，不暴露任务数据。
 servers:
@@ -33,7 +35,7 @@ paths:
       summary: 查询任务列表
       operationId: list
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/ListParams" }
@@ -52,7 +54,7 @@ paths:
       summary: 添加下载任务
       operationId: add
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/AddTaskInput" }
@@ -71,7 +73,7 @@ paths:
       summary: 启动任务
       operationId: start
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/TaskRef" }
@@ -90,7 +92,7 @@ paths:
       summary: 暂停任务
       operationId: pause
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/TaskRef" }
@@ -109,7 +111,7 @@ paths:
       summary: 删除任务
       operationId: delete
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/TaskRef" }
@@ -128,7 +130,7 @@ paths:
       summary: 报告任务是否处于「已预留 slot 但引擎未启动」的准备阶段
       operationId: isPreparing
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/TaskRef" }
@@ -147,7 +149,7 @@ paths:
       summary: 探测 URL 目标大小
       operationId: probe
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/ProbeParams" }
@@ -166,7 +168,7 @@ paths:
       summary: 读取权威设置快照
       operationId: getSettings
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/Empty" }
@@ -185,7 +187,7 @@ paths:
       summary: 持久化设置
       operationId: saveSettings
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/Settings" }
@@ -204,7 +206,7 @@ paths:
       summary: 查询 BT 任务实时详情
       operationId: btInfo
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/BTInfoParams" }
@@ -223,7 +225,7 @@ paths:
       summary: 订阅消息流（进度事件 + 控制消息）
       operationId: streamMessages
       requestBody:
-        required: true
+        required: false
         content:
           application/json:
             schema: { $ref: "#/components/schemas/Empty" }

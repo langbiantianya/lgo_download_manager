@@ -10,9 +10,11 @@ import (
 	_ "embed"
 	"encoding/json"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 
-	httpSwagger "github.com/swaggo/http-swagger"
+	swaggerFiles "github.com/swaggo/files"
 	"go.yaml.in/yaml/v3"
 )
 
@@ -48,6 +50,39 @@ func yamlToJSON(data []byte) ([]byte, error) {
 	return json.Marshal(v)
 }
 
+// docsPrefix 是文档页静态资源的前缀。
+//
+// 它是**写死**的常量，不看请求里的任何东西。这一点很关键：先前用
+// httpSwagger.WrapHandler 提供的静态资源，它是包级单例，内部用 sync.Once
+// 把**进程级**的 swaggerFiles.Handler.Prefix 锁成「首个到达请求」解析出的
+// 前缀。http-swagger 的路径正则 ^(.*/)([^?].*)?[?|.]*$ 在「目录路径 + 查询串」
+// 上会把前缀回退成 "/"，于是一次 GET /docs/?x=1 就能让本进程内
+// /docs/swagger-ui.css 之类的资源**永久** 404。
+//
+// 现在前缀固定、白名单固定，谁先打都不影响。
+const docsPrefix = "/docs/"
+
+// docsAsset 描述一个允许从 /docs/ 提供的静态资源。
+type docsAsset struct {
+	// name 是资源名：请求路径去掉 docsPrefix 之后剩下的部分。
+	name string
+	// contentType 是响应的 Content-Type。
+	contentType string
+}
+
+// docsAssets 是文档页静态资源的白名单：只有这里列出的资源能从 /docs/ 拿到，
+// 其余一律 404。
+//
+// 清单只收本页自己真正引用的资源。swagger-ui 发行版自带的 index.html 与
+// swagger-initializer.js 不在其中——它们指向公网的 petstore.swagger.io，
+// 本机工具的文档页不该依赖公网，也不该把上游的首页当成本项目的首页。
+var docsAssets = []docsAsset{
+	{name: "swagger-ui.css", contentType: "text/css; charset=utf-8"},
+	{name: "swagger-ui-bundle.js", contentType: "text/javascript; charset=utf-8"},
+	{name: "swagger-ui-standalone-preset.js", contentType: "text/javascript; charset=utf-8"},
+	{name: "favicon-32x32.png", contentType: "image/png"},
+}
+
 // registerDocs 注册文档端点。它们不参与 token 校验——只暴露接口形状，
 // 不暴露任务数据。文档端点只接受 GET，其他方法回 405 并带上 Allow 头。
 func registerDocs(mux *http.ServeMux) {
@@ -58,13 +93,62 @@ func registerDocs(mux *http.ServeMux) {
 	mux.Handle("/openapi.json", getOnly(serveOpenAPIJSON(openAPIJSON)))
 	// /docs 自己渲染页面：静态资源用绝对路径引，避免 /docs 被当成「文件」
 	// 时相对路径解析到 / 下面去。资源本体由 /docs/ 提供。
-	mux.Handle("/docs", getOnly(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		_, _ = w.Write([]byte(swaggerPage))
-	})))
-	// /docs/ 交给 http-swagger：它把 swagger-ui 静态资源（已嵌进二进制）
-	// 从内存文件系统里吐出来，不依赖公网 CDN。
-	mux.Handle("/docs/", getOnly(httpSwagger.WrapHandler))
+	mux.Handle("/docs", getOnly(http.HandlerFunc(writeSwaggerPage)))
+	// /docs/ 既是静态资源的挂载点，也是页面本身的第二个入口（/docs/ 与
+	// /docs 返回同一个页面，避免尾斜杠差异带来 301 契约漂移）。
+	mux.Handle(docsPrefix, getOnly(http.HandlerFunc(serveDocsSubtree)))
+}
+
+// serveDocsSubtree 处理 /docs/ 下的请求：
+//
+//   - 路径正好是 /docs/ → 返回本页自己的页面（与 /docs 相同）；
+//   - 路径命中白名单 → 返回对应的静态资源；
+//   - 其余 → 404。
+//
+// 前缀取自写死的 docsPrefix，与「谁先到」无关。
+func serveDocsSubtree(w http.ResponseWriter, r *http.Request) {
+	rest, ok := strings.CutPrefix(r.URL.Path, docsPrefix)
+	if !ok {
+		writeError(w, http.StatusNotFound, "未知路径 "+r.URL.Path)
+		return
+	}
+	if rest == "" {
+		writeSwaggerPage(w, r)
+		return
+	}
+	for _, a := range docsAssets {
+		if a.name == rest {
+			serveDocsAsset(w, r, a)
+			return
+		}
+	}
+	writeError(w, http.StatusNotFound, "没有这个文档资源 "+rest)
+}
+
+// serveDocsAsset 把白名单里的静态资源吐出来。资源本体在 swaggo/files 的
+// 内存文件系统里（编译进二进制，不依赖公网）。用 http.ServeContent 而不是
+// 直接 Write，是为了顺带带上 Content-Length、Last-Modified 与 Range 支持。
+func serveDocsAsset(w http.ResponseWriter, r *http.Request, a docsAsset) {
+	f, err := swaggerFiles.FS.OpenFile(swaggerFiles.CTX, "/"+a.name, os.O_RDONLY, 0o644)
+	if err != nil {
+		// 资源读不出来是打包时出的问题，不是调用方的错。
+		writeError(w, http.StatusInternalServerError, "读不出文档资源 "+a.name)
+		return
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "读不出文档资源 "+a.name)
+		return
+	}
+	w.Header().Set("Content-Type", a.contentType)
+	http.ServeContent(w, r, a.name, info.ModTime(), f)
+}
+
+// writeSwaggerPage 写出离线的 Swagger UI 页面。
+func writeSwaggerPage(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(swaggerPage))
 }
 
 // serveOpenAPIJSON 把规范以 JSON 形式吐出来。取 JSON 的方式由参数传入，
@@ -101,6 +185,10 @@ func getOnly(h http.Handler) http.Handler {
 // 资源用绝对路径（/docs/swagger-ui.css）而不是相对路径（./swagger-ui.css）：
 // 页面挂在 /docs（无尾斜杠）时，浏览器会把 /docs 当成「文件」，其父目录是
 // /，相对路径会解析到 /swagger-ui.css —— 404。
+//
+// 页面引用的资源必须与 docsAssets 白名单一一对应：openapi_test.go 里的
+// TestDocsPageReferencesLocalAssets 与 TestDocsAssetsMatchPageReferences
+// 守着这条不变量。
 const swaggerPage = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>

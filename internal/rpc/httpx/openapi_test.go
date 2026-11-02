@@ -9,9 +9,13 @@ package httpx
 import (
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -111,6 +115,205 @@ func TestOpenAPIEndpointsDeclareErrorResponses(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestOpenAPIPathSchemasMatchAPISpec 核对「路径 → schema」的映射：每个方法
+// 的请求体与 200 响应必须指向 api.Spec 里声明的那个 DTO。
+//
+// 只核对路径集合是不够的——路径挂错 schema（把 list 的请求体写成 TaskRef、
+// 把 add 的响应写成 BoolResult）一样没人管。这里把两头对上。
+func TestOpenAPIPathSchemasMatchAPISpec(t *testing.T) {
+	doc := parseSpec(t)
+	paths := specPaths(t, doc)
+	for _, m := range api.AllMethods {
+		spec := api.Spec(m)
+		if spec == nil {
+			t.Fatalf("api.Spec(%q) 是 nil", m)
+		}
+		p := servicePrefix + m
+		item, ok := paths[p].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 的定义不是对象", p)
+		}
+		post, ok := item["post"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 post 定义", p)
+		}
+
+		// 请求体 → api.Spec(method).NewIn()
+		rb, ok := post["requestBody"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 requestBody 定义", p)
+		}
+		wantIn := dtoTypeName(spec.NewIn())
+		gotIn := contentSchemaNames(t, rb["content"])
+		if !sameSet([]string{wantIn}, gotIn) {
+			t.Fatalf("路径 %q 的请求体 schema 不对：规范里是 %v，api.Spec 说是 %q", p, gotIn, wantIn)
+		}
+
+		// 200 响应 → api.Spec(method).NewOut()
+		responses, ok := post["responses"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 responses 定义", p)
+		}
+		ok200, ok := responses["200"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 200 响应定义", p)
+		}
+		wantOut := dtoTypeName(spec.NewOut())
+		if m == api.MethodStreamMessages {
+			// 流式端点的响应是 NDJSON 的消息行（api.Message），不是
+			// api.Spec 里的 NewOut（那是 api.Empty）。显式特判。
+			wantOut = "Message"
+		}
+		gotOut := contentSchemaNames(t, ok200["content"])
+		if !sameSet([]string{wantOut}, gotOut) {
+			t.Fatalf("路径 %q 的 200 响应 schema 不对：规范里是 %v，应当是 %q", p, gotOut, wantOut)
+		}
+	}
+}
+
+// contentSchemaNames 收集 content 下各媒体类型的 schema 名（$ref 的末段）。
+func contentSchemaNames(t *testing.T, content any) []string {
+	t.Helper()
+	m, ok := content.(map[string]any)
+	if !ok {
+		t.Fatalf("content 不是对象: %#v", content)
+	}
+	out := make([]string, 0, len(m))
+	for _, v := range m {
+		cm, ok := v.(map[string]any)
+		if !ok {
+			t.Fatalf("content 的成员不是对象: %#v", v)
+		}
+		sm, ok := cm["schema"].(map[string]any)
+		if !ok {
+			t.Fatalf("content 的成员没有 schema: %#v", cm)
+		}
+		ref, ok := sm["$ref"].(string)
+		if !ok {
+			t.Fatalf("schema 不是 $ref: %#v", sm)
+		}
+		out = append(out, ref[strings.LastIndex(ref, "/")+1:])
+	}
+	sort.Strings(out)
+	return out
+}
+
+// dtoTypeName 返回 DTO 指针的类型名。
+func dtoTypeName(v any) string {
+	t := reflect.TypeOf(v)
+	for t != nil && t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t == nil {
+		return ""
+	}
+	return t.Name()
+}
+
+// TestOpenAPIRequestBodiesAreOptional 验证规范没有把请求体标成必填：
+// 服务端容忍空请求体（EOF 不算错），get_settings / stream_messages 的
+// 入参本来就是 api.Empty。
+func TestOpenAPIRequestBodiesAreOptional(t *testing.T) {
+	doc := parseSpec(t)
+	paths := specPaths(t, doc)
+	for _, m := range api.AllMethods {
+		p := servicePrefix + m
+		item, _ := paths[p].(map[string]any)
+		post, _ := item["post"].(map[string]any)
+		rb, ok := post["requestBody"].(map[string]any)
+		if !ok {
+			t.Fatalf("路径 %q 缺少 requestBody 定义", p)
+		}
+		raw, ok := rb["required"]
+		if !ok {
+			continue // 缺省即 false
+		}
+		if b, ok := raw.(bool); !ok || b {
+			t.Fatalf("路径 %q 的 requestBody 不该是必填（规范里是 %v）", p, raw)
+		}
+	}
+}
+
+// TestOpenAPIMessageKindEnumMatchesAPI 验证规范里 Message.kind 的 enum
+// 集合与 internal/api 的 MessageKind* 常量集合完全相同。
+//
+// 常量没法用反射枚举，这里直接解析 internal/api/message.go 的源码——
+// 这样 api 那边新增或改掉一个 MessageKind 常量时，这条测试会红。
+func TestOpenAPIMessageKindEnumMatchesAPI(t *testing.T) {
+	doc := parseSpec(t)
+	schemas := specSchemas(t, doc)
+	msg, ok := schemas["Message"].(map[string]any)
+	if !ok {
+		t.Fatal("规范缺少 schema \"Message\"")
+	}
+	props, ok := msg["properties"].(map[string]any)
+	if !ok {
+		t.Fatal("schema \"Message\" 没有 properties")
+	}
+	kind, ok := props["kind"].(map[string]any)
+	if !ok {
+		t.Fatal("schema \"Message\" 没有 kind 字段")
+	}
+	rawEnum, ok := kind["enum"].([]any)
+	if !ok {
+		t.Fatal("schema \"Message\" 的 kind 没有 enum")
+	}
+	got := make([]string, 0, len(rawEnum))
+	for _, v := range rawEnum {
+		s, ok := v.(string)
+		if !ok {
+			t.Fatalf("enum 的成员不是字符串: %#v", v)
+		}
+		got = append(got, s)
+	}
+	sort.Strings(got)
+
+	want := apiMessageKindConsts(t)
+	if len(want) == 0 {
+		t.Fatal("没从 internal/api/message.go 里解析出 MessageKind 常量")
+	}
+	if !sameSet(want, got) {
+		t.Fatalf("Message.kind 的 enum 与 api 的 MessageKind 常量不一致:\n规范 = %v\napi  = %v", got, want)
+	}
+}
+
+// apiMessageKindConsts 解析 internal/api/message.go，取出全部 MessageKind*
+// 常量的取值。
+func apiMessageKindConsts(t *testing.T) []string {
+	t.Helper()
+	const src = "../../api/message.go"
+	fset := token.NewFileSet()
+	f, err := parser.ParseFile(fset, src, nil, 0)
+	if err != nil {
+		t.Fatalf("解析 %s 失败: %v", src, err)
+	}
+	var out []string
+	for _, decl := range f.Decls {
+		gd, ok := decl.(*ast.GenDecl)
+		if !ok || gd.Tok != token.CONST {
+			continue
+		}
+		for _, spec := range gd.Specs {
+			vs, ok := spec.(*ast.ValueSpec)
+			if !ok || len(vs.Values) != len(vs.Names) {
+				continue
+			}
+			for i, name := range vs.Names {
+				if !strings.HasPrefix(name.Name, "MessageKind") {
+					continue
+				}
+				lit, ok := vs.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					t.Fatalf("常量 %s 的值不是字符串字面量", name.Name)
+				}
+				out = append(out, strings.Trim(lit.Value, `"`))
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // TestOpenAPISchemasMatchDTO 双向核对 schema 的属性与 DTO 的 JSON 字段。
@@ -311,8 +514,28 @@ func TestDocsEndpointsRejectNonGet(t *testing.T) {
 	}
 }
 
+// pageRefRe 抽出文档页里的资源引用：<script ... src="..."> 与
+// <link ... href="..."> 的**属性值**。
+//
+// 只认属性值，不做整页子串匹配：一行 HTML 注释不该能满足断言。匹配时
+// 跳过 HTML 注释（注释里的内容不算页面引用）。
+var pageRefRe = regexp.MustCompile(`(?is)<(?:script|link)\b[^>]*?\b(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+
+// pageSpecURLRe 抽出 SwaggerUIBundle 配置里的 url 选项：规范本体的地址。
+// 它不是 HTML 属性，但同样是页面引用的资源，必须一起守住。
+var pageSpecURLRe = regexp.MustCompile(`(?m)\burl\s*:\s*(?:"([^"]*)"|'([^']*)')`)
+
+// htmlCommentRe 匹配 HTML 注释。
+var htmlCommentRe = regexp.MustCompile(`(?s)<!--.*?-->`)
+
+// pageLocalPrefixes 是页面里允许引用的本地路径前缀。
+var pageLocalPrefixes = []string{"/docs/", "/openapi.json", "/openapi.yaml"}
+
 // TestDocsPageReferencesLocalAssets 验证文档页不引外链资源：静态资源走
-// 绝对路径 /docs/...，规范本体走同源 /openapi.json。
+// 同源绝对路径 /docs/...，规范本体走同源 /openapi.json。
+//
+// 判定只看属性值，不做子串匹配；协议相对 URL（//cdn...）、大写 scheme、
+// data: URI、相对路径都必须被逮住。
 func TestDocsPageReferencesLocalAssets(t *testing.T) {
 	mux := docsMux()
 	rec := doGet(mux, "/docs")
@@ -320,17 +543,186 @@ func TestDocsPageReferencesLocalAssets(t *testing.T) {
 		t.Fatalf("应当 200, got %d", rec.Code)
 	}
 	page := rec.Body.String()
+
+	// 兜底：整页不该出现任何 http(s) 链接。这一条挡不住协议相对 URL，
+	// 但能挡住最常见的 CDN 回潮。
 	if strings.Contains(page, "http://") || strings.Contains(page, "https://") {
 		t.Fatalf("文档页里有外链资源:\n%s", page)
 	}
-	for _, want := range []string{"/docs/swagger-ui.css", "/docs/swagger-ui-bundle.js", "/openapi.json"} {
-		if !strings.Contains(page, want) {
-			t.Fatalf("文档页里没有引用 %q:\n%s", want, page)
+
+	refs := pageRefs(page)
+	if len(refs) == 0 {
+		t.Fatalf("文档页里没解析出任何资源引用:\n%s", page)
+	}
+	for _, ref := range refs {
+		checkLocalRef(t, ref)
+	}
+
+	// 正向断言：页面引用的资源集合必须**恰好**是期望的那些。
+	// 少一个说明功能坏了，多一个说明有人塞进了没登记的资源。
+	want := []string{
+		"/docs/swagger-ui.css",
+		"/docs/swagger-ui-bundle.js",
+		"/docs/swagger-ui-standalone-preset.js",
+		"/docs/favicon-32x32.png",
+		"/openapi.json",
+	}
+	got := append([]string(nil), refs...)
+	sort.Strings(got)
+	if !sameSet(want, got) {
+		t.Fatalf("文档页引用的资源不对:\n实际 = %v\n期望 = %v", got, want)
+	}
+}
+
+// pageRefs 抽出页面引用的全部资源地址：script/link 的 src/href 属性值，
+// 外加 SwaggerUIBundle 配置里的规范地址。
+func pageRefs(page string) []string {
+	stripped := htmlCommentRe.ReplaceAllString(page, "")
+	var out []string
+	for _, m := range pageRefRe.FindAllStringSubmatch(stripped, -1) {
+		out = append(out, firstNonEmpty(m[1], m[2]))
+	}
+	for _, m := range pageSpecURLRe.FindAllStringSubmatch(stripped, -1) {
+		out = append(out, firstNonEmpty(m[1], m[2]))
+	}
+	return out
+}
+
+// checkLocalRef 判定一个资源引用必须是同源的本地绝对路径。
+func checkLocalRef(t *testing.T, ref string) {
+	t.Helper()
+	switch {
+	case ref == "":
+		t.Fatal("页面里有空的资源引用")
+	case !strings.HasPrefix(ref, "/"):
+		t.Fatalf("资源引用 %q 不是绝对路径（相对路径在 /docs 下会解析到 / 下面去）", ref)
+	case strings.HasPrefix(ref, "//"):
+		t.Fatalf("资源引用 %q 是协议相对 URL", ref)
+	case strings.Contains(ref, ":"):
+		t.Fatalf("资源引用 %q 带 scheme（http:/https:/data: 等）", ref)
+	}
+	for _, p := range pageLocalPrefixes {
+		if strings.HasPrefix(ref, p) {
+			return
 		}
 	}
-	// 相对路径引资源会在 /docs（无尾斜杠）下解析到 / 下面去，必须避免。
-	if strings.Contains(page, `"./swagger-ui`) || strings.Contains(page, `'/swagger-ui`) {
-		t.Fatalf("文档页用了相对路径引资源:\n%s", page)
+	t.Fatalf("资源引用 %q 不在允许的本地路径前缀里（允许：%v）", ref, pageLocalPrefixes)
+}
+
+// firstNonEmpty 返回第一个非空字符串。
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// TestDocsAssetsMatchPageReferences 双向核对白名单与页面引用：页面引用的
+// 每个静态资源都要在白名单里，白名单里的每个资源都要被页面引用。
+func TestDocsAssetsMatchPageReferences(t *testing.T) {
+	page := doGet(docsMux(), "/docs").Body.String()
+	referenced := map[string]bool{}
+	for _, ref := range pageRefs(page) {
+		if !strings.HasPrefix(ref, docsPrefix) {
+			continue
+		}
+		referenced[strings.TrimPrefix(ref, docsPrefix)] = true
+	}
+	for _, a := range docsAssets {
+		if !referenced[a.name] {
+			t.Fatalf("白名单里的资源 %q 没有被文档页引用", a.name)
+		}
+	}
+	for name := range referenced {
+		found := false
+		for _, a := range docsAssets {
+			if a.name == name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("文档页引用了白名单外的资源 %q", name)
+		}
+	}
+}
+
+// TestDocsStaticAssetsHaveFixedPrefix 是静态资源前缀的回归测试。
+//
+// 先前静态资源由 httpSwagger.WrapHandler 提供，它是包级单例，内部用
+// sync.Once 把**进程级**的 swaggerFiles.Handler.Prefix 锁成「首个到达请求」
+// 解析出的前缀。一次 GET /docs/?x=1 就能把前缀锁成 "/" ，此后本进程内的
+// 静态资源全部 404。现在前缀是写死的，谁先打都不影响。
+func TestDocsStaticAssetsHaveFixedPrefix(t *testing.T) {
+	mux := docsMux()
+	// 先打带查询串的目录请求。
+	rec := doGet(mux, "/docs/?x=1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /docs/?x=1 应当 200, got %d", rec.Code)
+	}
+	// 再打静态资源：必须仍然是 200 且有内容。
+	for _, a := range docsAssets {
+		rec := doGet(mux, docsPrefix+a.name)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s 应当 200, got %d", docsPrefix+a.name, rec.Code)
+		}
+		if rec.Body.Len() == 0 {
+			t.Fatalf("GET %s 的响应体是空的", docsPrefix+a.name)
+		}
+		if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, a.contentType) {
+			t.Fatalf("GET %s 的 Content-Type 不对: %q（期望 %q）", docsPrefix+a.name, ct, a.contentType)
+		}
+	}
+	// 换个顺序再来一遍：资源先到，结果必须一样。
+	mux2 := docsMux()
+	for _, a := range docsAssets {
+		if rec := doGet(mux2, docsPrefix+a.name); rec.Code != http.StatusOK {
+			t.Fatalf("GET %s 应当 200, got %d", docsPrefix+a.name, rec.Code)
+		}
+	}
+	if rec := doGet(mux2, "/docs/?x=2"); rec.Code != http.StatusOK {
+		t.Fatalf("GET /docs/?x=2 应当 200, got %d", rec.Code)
+	}
+}
+
+// TestDocsPathContract 核对文档端点的实际行为与端点契约一致。
+func TestDocsPathContract(t *testing.T) {
+	mux := docsMux()
+	cases := []struct {
+		path        string
+		wantCode    int
+		contentType string
+	}{
+		{"/docs", http.StatusOK, "text/html"},
+		{"/docs/", http.StatusOK, "text/html"},
+		{"/openapi.yaml", http.StatusOK, "application/yaml"},
+		{"/openapi.json", http.StatusOK, "application/json"},
+		{"/docs/swagger-ui.css", http.StatusOK, "text/css"},
+		{"/docs/swagger-ui-bundle.js", http.StatusOK, "javascript"},
+		// 白名单外的路径一律 404。/docs/doc.json 先前由 http-swagger 内建
+		// 路径处理，稳定吐 500；/docs/index.html 与 /docs/swagger-initializer.js
+		// 是 swagger-ui 自带的资源，不该被端出去。
+		{"/docs/doc.json", http.StatusNotFound, ""},
+		{"/docs/index.html", http.StatusNotFound, ""},
+		{"/docs/swagger-initializer.js", http.StatusNotFound, ""},
+		{"/docs/nope.txt", http.StatusNotFound, ""},
+	}
+	for _, c := range cases {
+		rec := doGet(mux, c.path)
+		if rec.Code != c.wantCode {
+			t.Fatalf("GET %s 应当 %d, got %d", c.path, c.wantCode, rec.Code)
+		}
+		if c.contentType != "" {
+			if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, c.contentType) {
+				t.Fatalf("GET %s 的 Content-Type 不对: %q（期望含 %q）", c.path, ct, c.contentType)
+			}
+		}
+	}
+	// /docs 与 /docs/ 必须是同一个页面：尾斜杠差异不该造成契约漂移。
+	if a, b := doGet(mux, "/docs").Body.String(), doGet(mux, "/docs/").Body.String(); a != b {
+		t.Fatal("/docs 与 /docs/ 返回的页面不一致")
 	}
 }
 
@@ -508,7 +900,7 @@ func expectShape(t reflect.Type) schemaShape {
 		return schemaShape{kind: "boolean"}
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
-		return schemaShape{kind: "integer"}
+		return schemaShape{kind: "integer", format: integerFormat(t)}
 	case reflect.Float32, reflect.Float64:
 		return schemaShape{kind: "number"}
 	case reflect.Slice, reflect.Array:
@@ -518,6 +910,22 @@ func expectShape(t reflect.Type) schemaShape {
 		return schemaShape{ref: t.Name()}
 	default:
 		return schemaShape{}
+	}
+}
+
+// integerFormat 返回整数类型在 OpenAPI 里应当声明的 format。
+//
+// int64 必须写 int64、int32 必须写 int32——把 int64 写成 int32 会让生成
+// 出来的客户端按 32 位宽度截断。Go 的 int 与更窄的整型宽度不稳定（int
+// 随平台变），不强制声明 format。
+func integerFormat(t reflect.Type) string {
+	switch t.Kind() {
+	case reflect.Int64:
+		return "int64"
+	case reflect.Int32:
+		return "int32"
+	default:
+		return ""
 	}
 }
 
@@ -542,6 +950,16 @@ func checkShape(t *testing.T, field string, want, got schemaShape) {
 		}
 	} else if got.format == "date-time" {
 		t.Fatalf("字段 %s 不是时间戳，不该声明 format: date-time", field)
+	}
+	if want.kind == "integer" {
+		switch {
+		case want.format != "":
+			if got.format != want.format {
+				t.Fatalf("字段 %s 应当声明 format: %s，规范里是 %q", field, want.format, got.format)
+			}
+		case got.format != "" && got.format != "int32" && got.format != "int64":
+			t.Fatalf("字段 %s 的 format %q 不是合法的整数 format", field, got.format)
+		}
 	}
 	if want.kind == "array" {
 		if got.items == nil {
