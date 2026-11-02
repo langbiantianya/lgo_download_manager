@@ -3908,7 +3908,7 @@ Task 6（见 Task 6 的 B6 与 Step 3）。代码块按「计划 == 实现」的
 > | 条目 | 问题 | 落法 |
 > |---|---|---|
 > | I1 | 规范里的「路径 → schema」映射无人看守：把 `list` 的请求体改成 `TaskRef`、把 `add` 的 200 响应改成 `BoolResult`，全部测试仍绿 | 新增 `TestOpenAPIPathSchemasMatchAPISpec`：逐个方法比对 `requestBody` 与 200 响应的 `$ref` 末段，与 `api.Spec(method).NewIn()`/`NewOut()` 的类型名对上（`stream_messages` 显式特判为 `Message`） |
-> | I2 | 「防 CDN 回潮」的护栏形同虚设：协议相对 URL、大写 scheme、`data:` URI、相对路径都能绕过；正向断言还能被一行 HTML 注释满足 | `TestDocsPageReferencesLocalAssets` 改成用 `regexp` 抽 `<script src>` / `<link href>` 的**属性值**（跳过 HTML 注释），逐个判定必须是本地绝对路径且不带 scheme；正向断言改成「引用集合**恰好**等于期望集合」 |
+> | I2 | 「防 CDN 回潮」的护栏形同虚设：协议相对 URL、大写 scheme、`data:` URI、相对路径都能绕过；正向断言还能被一行 HTML 注释满足 | `TestDocsPageReferencesLocalAssets` 改成用 `regexp` 抽资源引用的**属性值**（跳过 HTML 注释），逐个判定必须是本地绝对路径且不带 scheme；正向断言改成「引用集合**恰好**等于期望集合」。复审又补了两处：抽取扩到**所有可能发起网络请求的属性**（`src`/`href`/`data`/`action`/`poster`/`srcset`/`formaction`）与标签（`script`/`link`/`img`/`iframe`/`video`/`audio`/`source`/`embed`/`object`/`form`/`input`/`track`），属性值带不带引号都抽得到；另加一条「整页不许出现协议相对 URL」的兜底断言与一条护栏自检 `TestDocsPageRejectsExternalReferences` |
 > | I3 | `httpSwagger.WrapHandler` 是包级单例，`sync.Once` 把进程级的 `swaggerFiles.Handler.Prefix` 锁成首个请求的前缀：一次 `GET /docs/?x=1` 就让静态资源永久 404 | 弃用 `httpSwagger.WrapHandler`，改为自己按**固定前缀 `/docs/` + 白名单**从 `swaggo/files` 的内存文件系统取资源；`/docs/` 与 `/docs` 返回同一个页面；白名单外的路径一律 404 |
 > | I4 | 文档端点契约与实测对不上：`/docs/` 实际是 301，`/docs/doc.json` 稳定吐 500 | `/docs/` 改成 200 页面、`/docs/doc.json` 改成 404；本节的端点契约表同步更新 |
 >
@@ -5652,7 +5652,7 @@ git commit -m "feat(httpx): 增加 OpenAPI 规范与 Swagger 文档页"
 | B7 | `registerDocs` 用 `mux.HandleFunc` 不限方法 | 文档端点只接受 GET，其他方法 405 + `Allow: GET`（`getOnly` 中间件），错误体沿用统一形状 |
 | B8 | `openAPIJSON` 用 `sync.Once` 缓存 | 不变；转换抽成 `yamlToJSON`，失败时返回错误，端点回 500 而不是 panic（有测试注入失败验证） |
 | B9 | 只比字段名集合 | 增加类型级护栏：按 `reflect` 推出的 Go 类型逐字段比对 OpenAPI 的 `type`（string / boolean / integer / number / array / `$ref`），`time.Time` 额外要求 `format: date-time`（修复轮 1 起，整数也校验 `format`：`int64` ↔ `int64`、`int32` ↔ `int32`） |
-| B10 | 依赖与许可证头约束 | 只 import `internal/api`、`internal/rpc/addr`、标准库与两个 swaggo 包；新文件都带 MPL-2.0 许可证头 |
+| B10 | 依赖与许可证头约束 | 只 import `internal/api`、`internal/rpc/addr`、标准库与一个 swaggo 包（`swaggo/files`）；新文件都带 MPL-2.0 许可证头 |
 | B11 | 测试清单不全 | 补齐 8 类测试：解析、方法双向覆盖、错误码声明、字段名双向核对、schema 覆盖面、类型核对、`$ref` 完整性、文档端点免鉴权 / 只收 GET / 不引外链 / 转换失败回 500。修复轮 1 又补了：路径↔`api.Spec` 的 schema 映射、`requestBody` 可选、`Message.kind` 的 enum ↔ `api.MessageKind*` 常量、文档页引用的**属性值**判定、静态资源固定前缀、白名单 ↔ 页面引用双向核对、`/docs/*` 的 404 契约 |
 
 除 B1–B11 外还有两处与初稿不同：
@@ -5667,42 +5667,43 @@ git commit -m "feat(httpx): 增加 OpenAPI 规范与 Swagger 文档页"
 
 #### 依赖说明
 
-新增两个直接依赖：
+新增一个直接依赖：
 
 ```
-github.com/swaggo/http-swagger v1.3.4   // Swagger UI 页面与静态资源（离线嵌入）
-github.com/swaggo/files v1.0.1          // swagger-ui 静态资源本体（间接）
+github.com/swaggo/files v1.0.1          // swagger-ui 静态资源本体（离线嵌入）
 ```
+
+`swaggo/files` 只提供 swagger-ui 的静态资源本体（编译进二进制的内存文件
+系统）；文档页的 HTML 与静态资源路由都是本项目自己写的（`docs.go`），没有
+引入 `http-swagger` 这类渲染器。
 
 > **修复轮 1 的变化**：`internal/rpc/httpx` 不再 import
 > `github.com/swaggo/http-swagger` 了。静态资源原先由它的包级单例
 > `httpSwagger.WrapHandler` 提供，而那个单例会把进程级的
 > `swaggerFiles.Handler.Prefix` 锁死成首个请求解析出的前缀（详见 Task 6
 > 章节的「文档端点契约」）。改成自己按固定前缀 + 白名单读
-> `github.com/swaggo/files` 的内存文件系统之后，`http-swagger` 就没用了：
-> `github.com/swaggo/files v1.0.1` 成了**直接依赖**，
-> `github.com/swaggo/http-swagger v1.3.4` 成了**没被引用的直接依赖**。
+> `github.com/swaggo/files` 的内存文件系统之后，`http-swagger` 就没用了。
 >
-> 按本轮的范围约定，`go.mod`/`go.sum` 没有动——这两行的收口（删掉没用的
-> `http-swagger`、把 `files` 从 `// indirect` 升为直接依赖）留给后续的
-> `go mod tidy`。
+> **已在 `7a8cea0` 收口**：`http-swagger` 连同它那条间接依赖链
+> （`swaggo/swag`、`go-openapi/*`）彻底退出依赖图——`go.mod` 与 `go.sum` 的
+> 依赖项里都没有它们（`go.mod` 里只剩注释提到这段历史），`go list -m all`
+> 里也查不到；`github.com/swaggo/files v1.0.1` 成了**直接依赖**（不再是
+> `// indirect`）；`go mod tidy` 现在是 no-op（跑一遍 `go.mod`/`go.sum`
+> 零改动）。
 
-它们经 `swaggo/swag` 间接用到 `golang.org/x/tools`。`golang.org/x/text v0.43.0`
-要求 `x/tools v0.51.0`，而 `x/tools v0.51.0` 要求 `x/net v0.59.0`——`x/net`
-从 v0.56 起改了 `httpproxy` 的环境变量优先级（小写 `http_proxy` 优先于大写
-`HTTP_PROXY`），会打破 `internal/protocol` 里 `TestProxyFuncSystemModeReturnsEnv`
-的预期。为免得把 `x/net`/`x/crypto`/`x/sys` 一起抬版本，`go.mod` 里排除了
-`x/tools` 的两个新版本：
+`golang.org/x/net` 仍被 `replace` 钉在 v0.47.0：grpc 的 go.mod 直接
+require `x/net v0.60.0`，而较新的 `x/net` 把 `httpproxy` 的环境变量优先级
+翻成了小写 `http_proxy` 优先，会打破 `internal/protocol` 里
+`TestProxyFuncSystemModeReturnsEnv` 的预期。`exclude` 只对「被排除模块自己
+引入的那条边」生效，管不到 grpc 直接 require 的那条边，只有 `replace` 能
+无条件把生效版本硬钉住（理由细节见 `go.mod` 里的注释）。
 
-```
-exclude (
-	golang.org/x/tools v0.47.0
-	golang.org/x/tools v0.51.0
-)
-```
-
-这样 `x/net` 仍是 v0.47.0、`x/crypto` 仍是 v0.44.0、`x/sys` 仍是 v0.47.0，
-`x/tools` 取 v0.39.0（`swaggo/swag` 只用到它的 `go/loader`）。
+原来针对 `golang.org/x/tools v0.47.0` / `v0.51.0` 的两条 `exclude` 是为了拦
+`http-swagger` → `swaggo/swag` → `x/tools` → `x/net` 这条抬升链。源头没了
+之后它们不再有作用，已随 `7a8cea0` 一并删除：`x/tools` 现在只由
+`golang.org/x/text v0.43.0` 引入，它自己的 requirement 已被模块图裁剪掉
+（`go mod graph` 里 `golang.org/x/tools@v0.51.0` 没有任何出边），不再参与
+本仓库的版本选择；本仓库也没有任何包 import 它。
 
 ---
 
