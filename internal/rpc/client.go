@@ -95,6 +95,13 @@ func newClient(ctx context.Context, tr Transport) (*client, error) {
 
 	out := &api.Settings{}
 	if err := c.call(ctx, api.MethodGetSettings, &api.Empty{}, out); err != nil {
+		// 握手失败必须把传输层关掉。
+		//
+		// 握手失败时调用方拿不到客户端，也就没有办法调 Close——这次 Dial
+		// 建立的连接/socket 会一直留着。实测每次失败的握手会漏 2 个 fd
+		// （net/http 的空闲连接池、gRPC 的 ClientConn），重试连接的场景下
+		// 会累积成 fd 泄漏。
+		_ = tr.Close()
 		return nil, fmt.Errorf("rpc: 握手失败: %w", err)
 	}
 	c.settingsMu.Lock()
