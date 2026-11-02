@@ -235,20 +235,114 @@ func TestMessageRoundTrip(t *testing.T) {
 //
 // api.Message.Event 是指针，契约上允许为 nil；messageToPB 直接解引用会
 // panic。
+//
+// 修好之后（I3）：载荷为 nil 时**故意不设 oneof**，类别靠 kind 字段
+// 表达。这样「类别是 event」与「类别是 event 但没有事件载荷」才分得开，
+// 客户端的 `if msg.Event != nil` 判断才有意义。
 func TestMessageToPBHandlesNilEvent(t *testing.T) {
 	got := messageToPB(api.Message{Kind: api.MessageKindEvent})
 	if got == nil {
 		t.Fatal("nil 事件也应当转成一个 proto 消息")
 	}
-	if got.GetEvent() == nil {
-		t.Fatal("nil 事件应当转成空事件，而不是丢掉消息类别")
+	if got.GetKind() != string(api.MessageKindEvent) {
+		t.Fatalf("消息类别应当保留: %q", got.GetKind())
+	}
+	if got.GetPayload() != nil {
+		t.Fatal("载荷缺席时不该设 oneof")
 	}
 	back := messageFromPB(got)
 	if back.Kind != api.MessageKindEvent {
 		t.Fatalf("消息类别应当保留: %q", back.Kind)
 	}
-	if back.Event == nil {
-		t.Fatal("回转后的事件指针不应为 nil")
+	if back.Event != nil {
+		t.Fatalf("回转后的事件指针应当仍是 nil: %+v", back.Event)
+	}
+}
+
+// TestMessageRoundTripMatrix 是消息往返的完整矩阵：每一行都要断言类别、
+// 载荷的在场与缺席都对。
+//
+// 载荷「缺席」和「在场但为空」是两件事：httpx 传输靠 JSON 的 omitempty
+// 表达前者，gRPC 这边靠「不设 oneof」表达前者。两种传输必须一致。
+func TestMessageRoundTripMatrix(t *testing.T) {
+	cases := []struct {
+		name string
+		in   api.Message
+
+		wantKind        api.MessageKind
+		wantEvent       bool
+		wantShowAddTask bool
+		wantLanguage    string
+	}{
+		{
+			name:     "事件但没有事件载荷",
+			in:       api.Message{Kind: api.MessageKindEvent},
+			wantKind: api.MessageKindEvent,
+		},
+		{
+			name:      "带载荷的事件",
+			in:        api.Message{Kind: api.MessageKindEvent, Event: &api.Event{Why: "progress", SpeedBPS: 1024}},
+			wantKind:  api.MessageKindEvent,
+			wantEvent: true,
+		},
+		{
+			name:     "弹窗但没有弹窗参数",
+			in:       api.Message{Kind: api.MessageKindShowAddTask},
+			wantKind: api.MessageKindShowAddTask,
+		},
+		{
+			name: "带参数的弹窗",
+			in: api.Message{Kind: api.MessageKindShowAddTask, ShowAddTask: &api.ShowAddTaskParams{
+				URL: "http://x", Name: "n", UA: "ua", Cookies: "c",
+			}},
+			wantKind:        api.MessageKindShowAddTask,
+			wantShowAddTask: true,
+		},
+		{
+			name:     "显示窗口",
+			in:       api.Message{Kind: api.MessageKindShow},
+			wantKind: api.MessageKindShow,
+		},
+		{
+			name:         "语言变更",
+			in:           api.Message{Kind: api.MessageKindLanguage, Language: "zh"},
+			wantKind:     api.MessageKindLanguage,
+			wantLanguage: "zh",
+		},
+		{
+			name:     "退出",
+			in:       api.Message{Kind: api.MessageKindClose},
+			wantKind: api.MessageKindClose,
+		},
+		{
+			name:     "未知类别",
+			in:       api.Message{Kind: api.MessageKind("bogus")},
+			wantKind: api.MessageKind("bogus"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := messageFromPB(messageToPB(tc.in))
+			if got.Kind != tc.wantKind {
+				t.Fatalf("类别往返不一致: got = %q, want = %q", got.Kind, tc.wantKind)
+			}
+			if (got.Event != nil) != tc.wantEvent {
+				t.Fatalf("事件载荷的在场状态不对: got = %+v, want 有载荷 = %v", got.Event, tc.wantEvent)
+			}
+			if (got.ShowAddTask != nil) != tc.wantShowAddTask {
+				t.Fatalf("弹窗参数的在场状态不对: got = %+v, want 有载荷 = %v", got.ShowAddTask, tc.wantShowAddTask)
+			}
+			if got.Language != tc.wantLanguage {
+				t.Fatalf("语言往返不一致: got = %q, want = %q", got.Language, tc.wantLanguage)
+			}
+			// 有载荷时内容也要原样带过去。
+			if tc.wantEvent && got.Event.Why != tc.in.Event.Why {
+				t.Fatalf("事件内容不一致: %+v", got.Event)
+			}
+			if tc.wantShowAddTask && *got.ShowAddTask != *tc.in.ShowAddTask {
+				t.Fatalf("弹窗参数内容不一致: %+v", got.ShowAddTask)
+			}
+		})
 	}
 }
 

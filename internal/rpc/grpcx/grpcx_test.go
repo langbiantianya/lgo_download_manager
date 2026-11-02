@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -53,6 +54,15 @@ func newMockHandler() *mockHandler {
 		eventsCalled: make(chan struct{}),
 		unsubed:      make(chan struct{}),
 	}
+}
+
+// newMockHandlerBuf 造一个事件通道缓冲条数可指定的 mockHandler。
+//
+// 灌缓冲的测试要一次塞进几十条事件，默认的 8 条缓冲不够。
+func newMockHandlerBuf(n int) *mockHandler {
+	h := newMockHandler()
+	h.events = make(chan api.Event, n)
+	return h
 }
 
 func (m *mockHandler) Call(ctx context.Context, method string, in, out any) error {
@@ -468,6 +478,22 @@ func TestServeStopsOnContextCancelWithoutStream(t *testing.T) {
 //
 // 事件通道关闭只停掉那一侧，控制消息流要继续——否则同一套业务侧实现在
 // 两种传输下行为不一致。
+//
+// 测试要绕开一个陷阱：服务端同时盯着 events（已关闭 → 永远就绪）与
+// controls（有缓冲消息），两个 case 都 ready 时 Go 随机选一个。所以
+// 「关掉事件通道之后立刻发一条控制消息」这种写法是 flaky 的——坏实现
+// （整体收手）有一半概率先看到 controls，把消息送出去，测试就误判为通过。
+//
+// 这里的写法让服务端的状态变化可观测：
+//
+//  1. 先发第一条控制消息并等它被收到——证明服务端活着、正在正常服务；
+//  2. 关闭事件通道；
+//  3. 断言消息流**还活着**（坏实现此时已经收手、流已经结束）；
+//  4. 再发第二条控制消息，断言它能被收到。
+//
+// 第 3 步是关键的：它把「服务端已经看到事件通道关闭」这件事变成可观测
+// 的事实，服务端处理完关闭之后，第 4 步的第二条消息就只能走 controls 那
+// 一侧，坏实现在第 3 步就已经把流收掉了。
 func TestStreamMessagesContinuesAfterEventsClosed(t *testing.T) {
 	h := newMockHandler()
 	a := startServer(t, h, testToken)
@@ -477,15 +503,40 @@ func TestStreamMessagesContinuesAfterEventsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("打开消息流失败: %v", err)
 	}
-	// 事件侧关闭。
-	close(h.events)
-	// 控制侧仍然有消息。
-	h.controls <- api.Message{Kind: api.MessageKindLanguage, Language: "en"}
 
+	// 第一条控制消息：证明服务端在正常服务 select。
+	h.controls <- api.Message{Kind: api.MessageKindLanguage, Language: "en"}
 	select {
 	case msg := <-stream:
 		if msg.Kind != api.MessageKindLanguage || msg.Language != "en" {
-			t.Fatalf("应当收到控制消息，实际: %+v", msg)
+			t.Fatalf("应当收到第一条控制消息，实际: %+v", msg)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("没有收到第一条控制消息")
+	}
+
+	// 事件侧关闭。
+	close(h.events)
+
+	// 事件侧关闭之后，流必须还活着：控制侧仍然有消息要送。
+	//
+	// 这一段等待是必要的：等服务端处理完「事件通道已关闭」这个事实，
+	// 后面那条控制消息才不会和它撞在同一个 select 里被随机挑走。
+	select {
+	case _, ok := <-stream:
+		if !ok {
+			t.Fatal("事件通道关闭后消息流就结束了（控制侧被一起掐掉了）")
+		}
+	case <-time.After(200 * time.Millisecond):
+		// 流还活着，符合预期。
+	}
+
+	// 第二条控制消息：事件侧关闭之后仍然要能送到。
+	h.controls <- api.Message{Kind: api.MessageKindShow}
+	select {
+	case msg := <-stream:
+		if msg.Kind != api.MessageKindShow {
+			t.Fatalf("应当收到第二条控制消息，实际: %+v", msg)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("事件通道关闭后控制消息流没有继续")
@@ -553,4 +604,178 @@ func TestServerPropagatesBusinessError(t *testing.T) {
 	if !strings.Contains(err.Error(), "业务侧出错了") {
 		t.Fatalf("错误里应当带上业务侧的原因，实际: %v", err)
 	}
+}
+
+// TestClientCloseStopsBlockedStreamGoroutine 是 I2 的回归测试。
+//
+// 消息流的 goroutine 可能阻塞在往缓冲通道发送上：缓冲 64 条满了、调用方
+// 消费不过来，它就卡在 out <- msg 上。这时 conn.Close() 只会让流的下一次
+// Recv 报错——goroutine 根本不在 Recv 里——select 的 ctx.Done() 分支也
+// 不会触发，因为 ctx 是调用方传进来的，Close 从不取消它。于是这个
+// goroutine 永久泄漏。
+//
+// 修法是 Close 先取消所有活动流的 ctx，所以这里断言：Close 之后，卡在
+// 发送上的流 goroutine 都要退出。
+func TestClientCloseStopsBlockedStreamGoroutine(t *testing.T) {
+	before := countStreamGoroutines()
+	for i := 0; i < 5; i++ {
+		// 事件通道的缓冲要够大，一次把 64 条缓冲灌满。
+		h := newMockHandlerBuf(streamBuffer + 8)
+		a := startServer(t, h, testToken)
+		c, err := Dial(context.Background(), a, testToken)
+		if err != nil {
+			t.Fatalf("连接失败: %v", err)
+		}
+		stream, err := c.Stream(context.Background())
+		if err != nil {
+			t.Fatalf("打开消息流失败: %v", err)
+		}
+		// 多灌一条：缓冲填满之后，客户端的 goroutine 就卡在发送上了。
+		for j := 0; j < streamBuffer+1; j++ {
+			h.events <- api.Event{Why: "fill"}
+		}
+		waitFor(t, "客户端的消息缓冲没有被填满", func() bool {
+			return len(stream) == streamBuffer
+		})
+		// 给第 65 条留出到达客户端的时间：到了之后 goroutine 就卡在
+		// out <- 上（缓冲已满），这正是会泄漏的姿势。
+		time.Sleep(100 * time.Millisecond)
+		if err := c.Close(); err != nil {
+			t.Fatalf("关闭失败: %v", err)
+		}
+	}
+	waitFor(t, "Close 之后还有残留的流 goroutine", func() bool {
+		return countStreamGoroutines() <= before
+	})
+}
+
+// TestStreamAfterCloseReturnsError 验证关闭之后开流立刻回错误。
+func TestStreamAfterCloseReturnsError(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+	if err := c.Close(); err != nil {
+		t.Fatalf("关闭失败: %v", err)
+	}
+	if _, err := c.Stream(context.Background()); err == nil {
+		t.Fatal("关闭之后的开流应当返回错误")
+	}
+}
+
+// TestDialFailsWithinTimeoutWhenServerAbsent 是 E1 的回归测试。
+//
+// 服务端没在监听时，带超时的 ctx 必须让 Dial 在超时内返回错误，而不是
+// 挂住：建连要跟着 ctx 走，不能一路挂到操作系统的 TCP 超时。
+func TestDialFailsWithinTimeoutWhenServerAbsent(t *testing.T) {
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "missing.sock")}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	start := time.Now()
+	if _, err := Dial(ctx, a, testToken); err == nil {
+		t.Fatal("服务没起来时 Dial 应当失败")
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Dial 挂住了，没有跟着 ctx 的超时走: %v", elapsed)
+	}
+}
+
+// TestDialerRespectsContext 钉住 gRPC 的 dialer 必须用 gRPC 传进来的 ctx
+// 建连。
+//
+// 少了 ctx 的话建连不会跟着调用方的超时走：一次超时的调用会留下一个还在
+// 建连的 socket goroutine，「服务端没起来」时调用方拿到的超时也比预期晚。
+// 这里用一个已经取消的 ctx 建连：走 ctx 的实现回的是 ctx 的错，丢掉 ctx
+// 的实现会真的去连一次，回的是连接错误。
+func TestDialerRespectsContext(t *testing.T) {
+	a := addr.Addr{Network: "unix", Address: filepath.Join(t.TempDir(), "missing.sock")}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := dialer(a)(ctx, "")
+	if err == nil {
+		t.Fatal("ctx 取消之后建连应当失败")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("建连应当跟着 ctx 取消走，实际: %v", err)
+	}
+}
+
+// TestCallRejectsWrongTypesForEveryMethod 是 E6 的回归测试。
+//
+// Call 按方法分派，每个方法各自校验入参与出参的类型。漏掉任何一处
+// 检查，类型不对就会变成「静默的成功」——调用方看不出自己传错了类型，
+// 错误要到业务逻辑不对的时候才暴露。
+//
+// 这里把每个方法的两种类型错误都过一遍。
+func TestCallRejectsWrongTypesForEveryMethod(t *testing.T) {
+	h := newMockHandler()
+	a := startServer(t, h, testToken)
+	c := dialClient(t, a, testToken)
+
+	cases := []struct {
+		method string
+		in     any
+		out    any
+	}{
+		{api.MethodList, &api.ListParams{}, &api.ListResult{}},
+		{api.MethodAdd, &api.AddTaskInput{}, &api.Task{}},
+		{api.MethodStart, &api.TaskRef{}, &api.Empty{}},
+		{api.MethodPause, &api.TaskRef{}, &api.Empty{}},
+		{api.MethodDelete, &api.TaskRef{}, &api.Empty{}},
+		{api.MethodIsPreparing, &api.TaskRef{}, &api.BoolResult{}},
+		{api.MethodProbe, &api.ProbeParams{}, &api.ProbeResult{}},
+		{api.MethodGetSettings, &api.Empty{}, &api.Settings{}},
+		{api.MethodSaveSettings, &api.Settings{}, &api.Empty{}},
+		{api.MethodBTInfo, &api.BTInfoParams{}, &api.BTDetail{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method, func(t *testing.T) {
+			// 入参类型不对。
+			err := c.Call(context.Background(), tc.method, "错的类型", tc.out)
+			if err == nil {
+				t.Error("入参类型不对时应当返回错误")
+			}
+			// 出参类型不对。
+			err = c.Call(context.Background(), tc.method, tc.in, "错的类型")
+			if err == nil {
+				t.Error("出参类型不对时应当返回错误")
+			}
+		})
+	}
+}
+
+// waitFor 反复检查 cond，直到它成立或超时。
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("等待超时: %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// countStreamGoroutines 统计还活着的消息流 goroutine 数量。
+//
+// 靠栈里的函数名定位，不看 runtime.NumGoroutine 的总数：gRPC 自己的后台
+// goroutine 什么时候退出不受本测试控制，算进总数里就是噪声。
+func countStreamGoroutines() int {
+	buf := make([]byte, 1<<16)
+	for {
+		n := runtime.Stack(buf, true)
+		if n < len(buf) {
+			buf = buf[:n]
+			break
+		}
+		buf = make([]byte, 2*len(buf))
+	}
+	count := 0
+	for _, block := range strings.Split(string(buf), "\n\ngoroutine ") {
+		if strings.Contains(block, "grpcx.(*Client).Stream") {
+			count++
+		}
+	}
+	return count
 }

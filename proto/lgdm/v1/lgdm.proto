@@ -274,11 +274,23 @@ message ShowAddTaskParams {
 
 // Message 是服务端推送的一条消息。事件与控制消息合并在同一条流里。
 message Message {
+  // 消息类别，显式携带。
+  //
+  // 载荷缺席时（oneof 未设置）类别不能丢：api.Message.Event 与
+  // api.Message.ShowAddTask 都是指针，契约上允许为 nil。只靠 oneof 的
+  // 哪一臂表达类别做不到这一点——载荷缺席时类别就没了，「这条消息是
+  // event，但它没有事件载荷」与「这条消息什么都不是」分不开。
+  //
+  // 显式带类别还让未知类别能原样往返：载荷类型是有限的，未知类别只能
+  // 靠这一个字段表达。
+  string kind = 1;
+
+  // payload 只承载载荷，类别看上面的 kind。
   oneof payload {
-    Event event = 1;
-    bool show = 2;
-    ShowAddTaskParams show_add_task = 3;
-    string language = 4;
-    bool close = 5;
+    Event event = 2;
+    bool show = 3;
+    ShowAddTaskParams show_add_task = 4;
+    string language = 5;
+    bool close = 6;
   }
 }

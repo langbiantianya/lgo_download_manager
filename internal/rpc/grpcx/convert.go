@@ -22,6 +22,22 @@ import (
 //
 // 每张映射表都有真实调用点：状态走 Task，筛选与排序走 ListRequest，
 // 代理模式走 Settings 与 AuthOptions，协议种类走 AddTaskRequest。
+//
+// 映射表里的空串条目（「"" → UNSPECIFIED」）表示的是**未设置**，不是
+// 「空串是某个合法状态值」：契约层的零值就是空串，它对应 proto3 的
+// UNSPECIFIED（没有状态 / 不过滤 / 默认排序）。
+//
+// proto3 的枚举有两个固有限制，这里都改不掉，只能写明：
+//
+//  1. 枚举带不了未知值。契约层出现表里没有的取值时（比如
+//     api.Status("Verifying")），这里会静默降级成 UNSPECIFIED，原值在
+//     对端就变成了空串——httpx 那边走 JSON，原样透传。internal/api 侧的
+//     枚举取值被测试锁住，线上不会出现表外取值，所以这个降级碰不到。
+//  2. repeated 字段在空的时候不上线传输，反序列化后必然是 nil，Go 侧
+//     分不出「空切片」与「没设置」。所以 taskToPB 用 slices.Clone 原样
+//     克隆（非 nil 的空切片仍是空切片），taskFromPB 用 nilIfEmpty 归一成
+//     nil。httpx 那边 JSON 的 [] 解码成非 nil 的空切片，两种传输在这个
+//     边角上仍然不同——改成 nilIfEmpty 是行为上的空操作，解决不了分歧。
 
 // ---- 状态枚举映射 ----
 
@@ -451,65 +467,76 @@ func eventFromPB(e *pb.Event) api.Event {
 }
 
 // messageToPB 把契约层消息转成 proto 消息。
+//
+// 类别总是显式写进 kind 字段：载荷缺席时（oneof 未设置）类别不能丢。
+//
+// api.Message.Event 与 api.Message.ShowAddTask 都是指针，契约上允许为 nil
+// （rpc 共享客户端的 dispatch 就显式判过 msg.Event != nil），所以载荷为
+// nil 时**故意不设 oneof**，让对端能分辨「类别是 event」与「类别是 event
+// 但没有事件载荷」——httpx 传输靠 JSON 的 omitempty 表达同一件事。
+//
+// 未知类别：只写 kind，载荷缺席。类别原样保留，不被悄悄改写成空串。
 func messageToPB(m api.Message) *pb.Message {
+	out := &pb.Message{Kind: string(m.Kind)}
 	switch m.Kind {
 	case api.MessageKindEvent:
-		// api.Message.Event 是指针，契约上允许为 nil（rpc 共享客户端的
-		// dispatch 就显式判过 msg.Event != nil），这里不能直接解引用。
 		if m.Event == nil {
-			return &pb.Message{Payload: &pb.Message_Event{Event: &pb.Event{}}}
+			return out
 		}
-		return &pb.Message{Payload: &pb.Message_Event{Event: eventToPB(*m.Event)}}
+		out.Payload = &pb.Message_Event{Event: eventToPB(*m.Event)}
 	case api.MessageKindShow:
-		return &pb.Message{Payload: &pb.Message_Show{Show: true}}
+		out.Payload = &pb.Message_Show{Show: true}
 	case api.MessageKindShowAddTask:
-		p := m.ShowAddTask
-		if p == nil {
-			p = &api.ShowAddTaskParams{}
+		if m.ShowAddTask == nil {
+			return out
 		}
-		return &pb.Message{Payload: &pb.Message_ShowAddTask{ShowAddTask: &pb.ShowAddTaskParams{
-			Url:     p.URL,
-			Name:    p.Name,
-			Ua:      p.UA,
-			Cookies: p.Cookies,
-		}}}
+		out.Payload = &pb.Message_ShowAddTask{ShowAddTask: &pb.ShowAddTaskParams{
+			Url:     m.ShowAddTask.URL,
+			Name:    m.ShowAddTask.Name,
+			Ua:      m.ShowAddTask.UA,
+			Cookies: m.ShowAddTask.Cookies,
+		}}
 	case api.MessageKindLanguage:
-		return &pb.Message{Payload: &pb.Message_Language{Language: m.Language}}
+		out.Payload = &pb.Message_Language{Language: m.Language}
 	case api.MessageKindClose:
-		return &pb.Message{Payload: &pb.Message_Close{Close: true}}
+		out.Payload = &pb.Message_Close{Close: true}
 	default:
-		return &pb.Message{}
+		// 未知类别：载荷缺席，只保留 kind。
 	}
+	return out
 }
 
 // messageFromPB 把 proto 消息转回契约层消息。
+//
+// 类别取自 kind 字段，不从 oneof 的类型反推：载荷缺席时类别仍然要保留；
+// 载荷类型与类别对不上时也以 kind 为准（kind 是显式的类别来源）。
+// oneof 缺席时载荷保持 nil——这正是 messageToPB 表达「载荷缺席」的方式。
 func messageFromPB(m *pb.Message) api.Message {
 	if m == nil {
 		return api.Message{}
 	}
+	out := api.Message{Kind: api.MessageKind(m.GetKind())}
 	switch p := m.GetPayload().(type) {
 	case *pb.Message_Event:
-		ev := eventFromPB(p.Event)
-		return api.Message{Kind: api.MessageKindEvent, Event: &ev}
+		if p.Event != nil {
+			ev := eventFromPB(p.Event)
+			out.Event = &ev
+		}
 	case *pb.Message_Show:
-		return api.Message{Kind: api.MessageKindShow}
+		// show 没有载荷，类别已经在 kind 里。
 	case *pb.Message_ShowAddTask:
-		return api.Message{
-			Kind: api.MessageKindShowAddTask,
-			ShowAddTask: &api.ShowAddTaskParams{
-				URL:     p.ShowAddTask.GetUrl(),
-				Name:    p.ShowAddTask.GetName(),
-				UA:      p.ShowAddTask.GetUa(),
-				Cookies: p.ShowAddTask.GetCookies(),
-			},
+		out.ShowAddTask = &api.ShowAddTaskParams{
+			URL:     p.ShowAddTask.GetUrl(),
+			Name:    p.ShowAddTask.GetName(),
+			UA:      p.ShowAddTask.GetUa(),
+			Cookies: p.ShowAddTask.GetCookies(),
 		}
 	case *pb.Message_Language:
-		return api.Message{Kind: api.MessageKindLanguage, Language: p.Language}
+		out.Language = p.Language
 	case *pb.Message_Close:
-		return api.Message{Kind: api.MessageKindClose}
-	default:
-		return api.Message{}
+		// close 没有载荷，类别已经在 kind 里。
 	}
+	return out
 }
 
 // formatTime 把时间转成 RFC3339 字符串。

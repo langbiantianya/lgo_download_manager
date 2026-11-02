@@ -35,12 +35,25 @@ type Client struct {
 	// closed 标记客户端是否已关闭。
 	closed atomic.Bool
 
+	// mu 保护 streams。
+	//
+	// 注册与 Close 扫表必须互斥：流要是注册在 Close 扫过之后，就再没人
+	// 取消它了。
+	mu sync.Mutex
+	// streams 是当前活动消息流。Close 靠它们把流停掉。
+	streams map[*stream]struct{}
+
 	// closeOnce 保证底层连接只关一次。
 	//
 	// grpc.ClientConn.Close() 第二次调用返回 ErrClientConnClosing（非 nil
 	// 错误），而 rpc.Transport 的契约明确要求 Close 幂等，所以必须用
 	// sync.Once 包住。
 	closeOnce sync.Once
+}
+
+// stream 是一次活动消息流的状态。cancel 停掉对应的流。
+type stream struct {
+	cancel context.CancelFunc
 }
 
 // Dial 按地址建立 gRPC 连接。token 随每次调用发送。
@@ -56,16 +69,11 @@ func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error) {
 	}
 	_ = conn.Close()
 
-	// dialer 用 gRPC 传进来的 ctx 建连：一次超时的调用不该留下一个还在
-	// 建连的 socket goroutine。
-	dialer := func(ctx context.Context, _ string) (net.Conn, error) {
-		return addr.DialContext(ctx, a)
-	}
 	// 显式用 passthrough 解析器：grpc.NewClient 默认走 dns 解析器，
-	// 而我们的地址是 unix socket / host:port，由上面的 dialer 负责解析。
+	// 而我们的地址是 unix socket / host:port，由 dialer 负责解析。
 	cc, err := grpc.NewClient("passthrough:///lgdm",
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(dialer),
+		grpc.WithContextDialer(dialer(a)),
 		grpc.WithUnaryInterceptor(clientUnaryToken(token)),
 		grpc.WithStreamInterceptor(clientStreamToken(token)),
 	)
@@ -73,6 +81,17 @@ func Dial(ctx context.Context, a addr.Addr, token string) (*Client, error) {
 		return nil, fmt.Errorf("grpcx: 建立连接: %w", err)
 	}
 	return &Client{conn: cc, cli: pb.NewDownloadServiceClient(cc)}, nil
+}
+
+// dialer 返回 gRPC 用的建连函数。
+//
+// 必须用 gRPC 传进来的 ctx 建连：一次超时的调用不该留下一个还在建连的
+// socket goroutine。丢掉 ctx（写成 addr.Dial）的话，建连会一路挂到操作
+// 系统的 TCP 超时（默认两分钟）才返回，而不是跟着调用方的超时走。
+func dialer(a addr.Addr) func(context.Context, string) (net.Conn, error) {
+	return func(ctx context.Context, _ string) (net.Conn, error) {
+		return addr.DialContext(ctx, a)
+	}
 }
 
 // clientUnaryToken 给一元调用附加 token。
@@ -271,15 +290,36 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 	if err := c.checkOpen(); err != nil {
 		return nil, err
 	}
-	stream, err := c.cli.StreamMessages(ctx, &pb.Empty{})
+	// 流的 ctx 单独派生：Close 要能只停掉流而不影响调用方自己的 ctx。
+	streamCtx, cancel := context.WithCancel(ctx)
+	rpcStream, err := c.cli.StreamMessages(streamCtx, &pb.Empty{})
 	if err != nil {
+		cancel()
 		return nil, fmt.Errorf("grpcx: 打开消息流: %w", err)
 	}
+	// 登记进活动流表：Close 靠它把流停掉。
+	st := &stream{cancel: cancel}
+	c.mu.Lock()
+	if c.closed.Load() {
+		// Close 刚刚跑过：这条流没人会取消它，现在就自己收手。
+		c.mu.Unlock()
+		cancel()
+		return nil, errors.New("grpcx: 客户端已关闭")
+	}
+	if c.streams == nil {
+		c.streams = make(map[*stream]struct{})
+	}
+	c.streams[st] = struct{}{}
+	c.mu.Unlock()
+
 	out := make(chan api.Message, streamBuffer)
 	go func() {
 		defer close(out)
+		// 退出时把自己从活动流表里摘掉，表才不会无限增长。
+		defer c.clearStream(st)
+		defer cancel()
 		for {
-			msg, err := stream.Recv()
+			msg, err := rpcStream.Recv()
 			if err != nil {
 				// 流结束（服务端收手、连接断开、ctx 取消）都在这里收尾：
 				// 关闭 out，读循环随之知道消息流没了。
@@ -287,7 +327,12 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 			}
 			select {
 			case out <- messageFromPB(msg):
-			case <-ctx.Done():
+			case <-streamCtx.Done():
+				// ctx 被取消（Close 或调用方）：立刻收手。
+				//
+				// 这一支不能省：缓冲满时 goroutine 阻塞在 out <- 上，
+				// 这时 conn.Close() 只让 rpcStream.Recv() 报错，管不到
+				// 已经卡在发送上的 goroutine——不取消 ctx 它就永久泄漏。
 				return
 			}
 		}
@@ -295,21 +340,40 @@ func (c *Client) Stream(ctx context.Context) (<-chan api.Message, error) {
 	return out, nil
 }
 
-// Close 关闭底层 gRPC 连接。必须幂等——Close 可能被重复调用。
+// Close 释放底层连接与流。必须幂等——Close 可能被重复调用。
 //
-// 连接一关，所有还在跑的 RPC 与流都会随之取消，所以不需要像 httpx 那样
-// 单独维护活动流列表。
+// 先取消所有活动消息流，再关底层连接。只关连接是不够的：消息流的
+// goroutine 可能正阻塞在往缓冲通道发送上（缓冲 64 条满了、调用方消费
+// 不过来），那时 conn.Close() 只会让流的下一次 Recv 报错，管不到已经卡在
+// 发送上的 goroutine——不取消流的 ctx，它就会永久泄漏。
 func (c *Client) Close() error {
 	if c == nil {
 		return nil
 	}
 	c.closeOnce.Do(func() {
+		c.mu.Lock()
 		c.closed.Store(true)
+		sts := make([]*stream, 0, len(c.streams))
+		for st := range c.streams {
+			sts = append(sts, st)
+		}
+		c.streams = nil
+		c.mu.Unlock()
+		for _, st := range sts {
+			st.cancel()
+		}
 		if c.conn != nil {
 			_ = c.conn.Close()
 		}
 	})
 	return nil
+}
+
+// clearStream 清掉已结束的活动流，避免活动流表无限增长。
+func (c *Client) clearStream(st *stream) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.streams, st)
 }
 
 // checkOpen 检查客户端是否已关闭或未初始化。

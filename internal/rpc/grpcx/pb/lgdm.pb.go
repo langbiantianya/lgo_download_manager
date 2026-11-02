@@ -1934,6 +1934,18 @@ func (x *ShowAddTaskParams) GetCookies() string {
 // Message 是服务端推送的一条消息。事件与控制消息合并在同一条流里。
 type Message struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
+	// 消息类别，显式携带。
+	//
+	// 载荷缺席时（oneof 未设置）类别不能丢：api.Message.Event 与
+	// api.Message.ShowAddTask 都是指针，契约上允许为 nil。只靠 oneof 的
+	// 哪一臂表达类别做不到这一点——载荷缺席时类别就没了，「这条消息是
+	// event，但它没有事件载荷」与「这条消息什么都不是」分不开。
+	//
+	// 显式带类别还让未知类别能原样往返：载荷类型是有限的，未知类别只能
+	// 靠这一个字段表达。
+	Kind string `protobuf:"bytes,1,opt,name=kind,proto3" json:"kind,omitempty"`
+	// payload 只承载载荷，类别看上面的 kind。
+	//
 	// Types that are valid to be assigned to Payload:
 	//
 	//	*Message_Event
@@ -1974,6 +1986,13 @@ func (x *Message) ProtoReflect() protoreflect.Message {
 // Deprecated: Use Message.ProtoReflect.Descriptor instead.
 func (*Message) Descriptor() ([]byte, []int) {
 	return file_lgdm_v1_lgdm_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *Message) GetKind() string {
+	if x != nil {
+		return x.Kind
+	}
+	return ""
 }
 
 func (x *Message) GetPayload() isMessage_Payload {
@@ -2033,23 +2052,23 @@ type isMessage_Payload interface {
 }
 
 type Message_Event struct {
-	Event *Event `protobuf:"bytes,1,opt,name=event,proto3,oneof"`
+	Event *Event `protobuf:"bytes,2,opt,name=event,proto3,oneof"`
 }
 
 type Message_Show struct {
-	Show bool `protobuf:"varint,2,opt,name=show,proto3,oneof"`
+	Show bool `protobuf:"varint,3,opt,name=show,proto3,oneof"`
 }
 
 type Message_ShowAddTask struct {
-	ShowAddTask *ShowAddTaskParams `protobuf:"bytes,3,opt,name=show_add_task,json=showAddTask,proto3,oneof"`
+	ShowAddTask *ShowAddTaskParams `protobuf:"bytes,4,opt,name=show_add_task,json=showAddTask,proto3,oneof"`
 }
 
 type Message_Language struct {
-	Language string `protobuf:"bytes,4,opt,name=language,proto3,oneof"`
+	Language string `protobuf:"bytes,5,opt,name=language,proto3,oneof"`
 }
 
 type Message_Close struct {
-	Close bool `protobuf:"varint,5,opt,name=close,proto3,oneof"`
+	Close bool `protobuf:"varint,6,opt,name=close,proto3,oneof"`
 }
 
 func (*Message_Event) isMessage_Payload() {}
@@ -2222,13 +2241,14 @@ const file_lgdm_v1_lgdm_proto_rawDesc = "" +
 	"\x03url\x18\x01 \x01(\tR\x03url\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x0e\n" +
 	"\x02ua\x18\x03 \x01(\tR\x02ua\x12\x18\n" +
-	"\acookies\x18\x04 \x01(\tR\acookies\"\xca\x01\n" +
-	"\aMessage\x12&\n" +
-	"\x05event\x18\x01 \x01(\v2\x0e.lgdm.v1.EventH\x00R\x05event\x12\x14\n" +
-	"\x04show\x18\x02 \x01(\bH\x00R\x04show\x12@\n" +
-	"\rshow_add_task\x18\x03 \x01(\v2\x1a.lgdm.v1.ShowAddTaskParamsH\x00R\vshowAddTask\x12\x1c\n" +
-	"\blanguage\x18\x04 \x01(\tH\x00R\blanguage\x12\x16\n" +
-	"\x05close\x18\x05 \x01(\bH\x00R\x05closeB\t\n" +
+	"\acookies\x18\x04 \x01(\tR\acookies\"\xde\x01\n" +
+	"\aMessage\x12\x12\n" +
+	"\x04kind\x18\x01 \x01(\tR\x04kind\x12&\n" +
+	"\x05event\x18\x02 \x01(\v2\x0e.lgdm.v1.EventH\x00R\x05event\x12\x14\n" +
+	"\x04show\x18\x03 \x01(\bH\x00R\x04show\x12@\n" +
+	"\rshow_add_task\x18\x04 \x01(\v2\x1a.lgdm.v1.ShowAddTaskParamsH\x00R\vshowAddTask\x12\x1c\n" +
+	"\blanguage\x18\x05 \x01(\tH\x00R\blanguage\x12\x16\n" +
+	"\x05close\x18\x06 \x01(\bH\x00R\x05closeB\t\n" +
 	"\apayload*\x9e\x01\n" +
 	"\x06Status\x12\x16\n" +
 	"\x12STATUS_UNSPECIFIED\x10\x00\x12\x12\n" +
