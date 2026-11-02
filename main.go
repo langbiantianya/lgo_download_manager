@@ -358,8 +358,8 @@ func main() {
 	})
 
 	// 默认拉起 UI(除非 -no-gui 或 --autostart)。本进程的本地 --open-url / 位置参数
-	// URL 在 uim 起来之前就已经被上面循环处理——SendShowAddTask 内部会
-	// 等待握手,首条消息不会丢失。
+	// URL 在 uim 起来之前就已经被上面循环处理——SendShowAddTask 会把消息放进
+	// 控制通道的缓冲里，UI 连上来之后照常收到（不再靠等待握手）。
 	//
 	// --autostart 是 OS 登录启动项触发的静默拉起:初始只保留调度器 +
 	// 系统托盘,等用户点托盘「显示窗口」或由扩展/URL 请求按需打开 UI。

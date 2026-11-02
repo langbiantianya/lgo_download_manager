@@ -8,6 +8,7 @@ package uimgr
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -109,13 +110,79 @@ func TestSendShowAddTask_LiveSession(t *testing.T) {
 	}
 }
 
-// TestSendShowAddTask_NoSession_ReturnsError 验证 UI 拉不起来时如实报错——
-// main.go 依赖这个错误告诉浏览器「请求没被接收」。
+// markSessionLive 把 Manager 置成「会话已建立」的样子，等价于 Start()
+// 成功之后的状态（sessionActive + 一个未关闭的 waitCh）。
+func markSessionLive(m *Manager) {
+	m.mu.Lock()
+	m.sessionActive = true
+	m.waitCh = make(chan struct{})
+	m.mu.Unlock()
+}
+
+// TestSendShowAddTask_StartsUIWhenNoSession 守住 E1 那条语义：**没有会话时
+// 先拉起 UI 再推消息**，而不是直接报错。
+//
+// 这与旧实现一致（旧 SendShowAddTask 在 !Running() 时先 Start()，
+// 拉不起来才 return err）。托盘常驻 --autostart 与冷启动两种场景下，
+// lgom:// 转发都要能弹对话框——若这里改成「没有会话直接报错」，
+// main.go 会把请求判成「未被接收」，浏览器退到 lgom:// 通道，
+// 对话框永远不出现，而所有测试照样绿。
+//
+// 用 startSession 注入，避免真的 fork 子进程。
+func TestSendShowAddTask_StartsUIWhenNoSession(t *testing.T) {
+	svc := appservice.New(nil, scheduler.New(nil))
+	m := New(svc)
+	var started int
+	m.startSession = func() error {
+		started++
+		markSessionLive(m)
+		return nil
+	}
+
+	want := api.ShowAddTaskParams{URL: "https://example.com/x", Name: "x"}
+	if err := m.SendShowAddTask(want); err != nil {
+		t.Fatalf("无会话时应先拉起 UI 再推消息，实际报错: %v", err)
+	}
+	if started != 1 {
+		t.Fatalf("没有拉起 UI（拉起函数被调用 %d 次）", started)
+	}
+	select {
+	case msg := <-svc.Controls():
+		if msg.Kind != api.MessageKindShowAddTask {
+			t.Fatalf("控制消息类别不对: %+v", msg)
+		}
+		if msg.ShowAddTask == nil || *msg.ShowAddTask != want {
+			t.Fatalf("控制消息载荷不对: %+v", msg.ShowAddTask)
+		}
+	default:
+		t.Fatal("拉起 UI 之后没有推 show_add_task")
+	}
+}
+
+// TestSendShowAddTask_StartFailureReturnsErrorNoMessage 守住 E1 的另一半：
+// 拉不起来时必须报错，且不能推消息。
+//
+// main.go 依赖这个错误把「扩展请求没被接收」如实告诉浏览器。
+func TestSendShowAddTask_StartFailureReturnsErrorNoMessage(t *testing.T) {
+	svc := appservice.New(nil, scheduler.New(nil))
+	m := New(svc)
+	m.startSession = func() error { return errors.New("拉不起来") }
+
+	if err := m.SendShowAddTask(api.ShowAddTaskParams{URL: "https://example.com/x"}); err == nil {
+		t.Fatal("UI 拉不起来时应当报错")
+	}
+	select {
+	case msg := <-svc.Controls():
+		t.Fatalf("拉起失败后不该推消息，却收到 %+v", msg)
+	default:
+	}
+}
+
+// TestSendShowAddTask_NoSession_ReturnsError 验证拉起路径真的失败时
+// （已有会话的状态却调 Start）如实报错。
 //
 // 不直接走 Start() 的拉起路径:在测试里 Start 会自我复刻拉起本测试二进制,
-// 造成一串失控的子进程。改为先把 m.cancel 设为非 nil,Start 见到已有
-// cancel 会立刻返回「uimgr: UI already running」错误,SendShowAddTask 把
-// 这个错误带回去。
+// 造成一串失控的子进程。
 func TestSendShowAddTask_NoSession_ReturnsError(t *testing.T) {
 	m := New(appservice.New(nil, scheduler.New(nil)))
 	m.mu.Lock()
@@ -277,8 +344,13 @@ func TestSpawnAliveToleratesSlowStart(t *testing.T) {
 	if err := m.waitSpawnAlive(); err != nil {
 		t.Fatalf("慢启动不该被判定为失败: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed < spawnGrace/2 {
-		t.Fatalf("应当等满观察窗口，实际只等了 %v", elapsed)
+	// 下界用字面量 450ms，不写 spawnGrace*9/10：写成常量倍数的话，
+	// 把 spawnGrace 砍半时断言基数会跟着变小，砍半的实现照样能过
+	// （实测 250ms 版本在 spawnGrace*9/10 的写法下是绿的）。
+	// 窗口变长不会误报（等得更久自然超过 450ms），变短才会红。
+	const minWait = 450 * time.Millisecond
+	if elapsed := time.Since(start); elapsed < minWait {
+		t.Fatalf("观察窗口过短：只等了 %v，期望至少 %v", elapsed, minWait)
 	}
 }
 
@@ -308,6 +380,10 @@ func TestFinishSessionClearsRunning(t *testing.T) {
 	if !m.Running() {
 		t.Fatal("前置条件不成立: 会话应为活跃")
 	}
+	// 先在会话活跃时抓住 waitCh 的引用：finishSession 之后 m.waitCh 会被置
+	// nil，而 waitDone() 对 nil 会返回「新的已关闭通道」，那样的断言检不出
+	// 「close 被删掉」——必须盯住同一个通道对象。
+	liveCh := m.waitDone()
 	m.finishSession(gen)
 
 	if m.Running() {
@@ -319,8 +395,39 @@ func TestFinishSessionClearsRunning(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("会话结束时没有触发 onExit")
 	}
+	// 原 waitCh 必须被 close——waitSpawnAlive 靠它判断「会话是否在观察窗口
+	// 内结束」。这条链断在哪一节，UI 启动检测就失效。
+	select {
+	case <-liveCh:
+	default:
+		t.Fatal("会话结束后没有 close(waitCh)——waitSpawnAlive 将永远等满窗口")
+	}
 	// 重复清理必须是空操作，且不能重复触发 onExit（每次会话一次）。
 	m.finishSession(gen)
+}
+
+// TestNewWiresLanguageCallback 守住 New() 把 appservice 的语言变更回调接到
+// SetLanguage 这条接线。
+//
+// 断了的话：用户在「设置」里切语言，appservice 会照常落库并调用
+// OnLanguageChanged，但没人把新语言推给 UI 子进程——界面语言不跟随，
+// 且是静默失败（编译、既有测试全过）。
+func TestNewWiresLanguageCallback(t *testing.T) {
+	svc := appservice.New(nil, scheduler.New(nil))
+	m := New(svc)
+
+	var got []string
+	m.OnLanguageChanged(func(lang string) { got = append(got, lang) })
+
+	// 模拟「UI 保存了设置里的语言」：appservice 走它自己的回调。
+	if svc.OnLanguageChanged == nil {
+		t.Fatal("New() 没有把语言变更回调接到 appservice")
+	}
+	svc.OnLanguageChanged("ja")
+
+	if len(got) != 1 || got[0] != "ja" {
+		t.Fatalf("appservice 的语言回调没有传到 uimgr，钩子收到 %v", got)
+	}
 }
 
 // TestEnvUIConstantsAreTheDocumentedContract 锁定 UI 通道的四个环境变量名。

@@ -93,6 +93,10 @@ type Manager struct {
 	// onLanguageChanged 在 UI 端保存语言变更后被调用,供业务侧同步刷新
 	// 其它本地化的 UI(托盘菜单/标题等)。仅在语言真正变化时触发。
 	onLanguageChanged func(lang string)
+
+	// startSession 拉起 UI 子进程。生产上指向 Start；测试注入一个假的，
+	// 以便覆盖「无会话 → 拉起 → 推消息」这条语义而不用真的 fork。
+	startSession func() error
 }
 
 // New 创建 UI 管理器。svc 是业务侧应用服务。
@@ -112,6 +116,7 @@ func New(svc *appservice.Service) *Manager {
 	if svc != nil {
 		svc.OnLanguageChanged = m.SetLanguage
 	}
+	m.startSession = m.Start
 	return m
 }
 
@@ -430,30 +435,43 @@ func (m *Manager) waitDone() <-chan struct{} {
 // 拉不起 UI 时返回错误——调用方(main.go)据此告诉浏览器「请求没被接收」,
 // 浏览器退到 lgom:// URL 通道。
 func (m *Manager) SendShowAddTask(p api.ShowAddTaskParams) error {
-	if !m.Running() {
-		if err := m.Start(); err != nil {
-			return fmt.Errorf("uimgr: cannot start UI for show_add_task: %w", err)
-		}
-		// 旧实现拉起后还要等握手完成（上限 30s），握不上就报错。新架构
-		// 里没有「会话就绪」这个信号，但最常见的失败形态是子进程启动即
-		// 崩（Fyne 初始化失败、缺图形库、权限问题）——用一个小窗口盯住它，
-		// 至少不会在这类失败上骗浏览器「已接收」。
-		if err := m.waitSpawnAlive(); err != nil {
-			return err
-		}
+	if err := m.ensureSession(); err != nil {
+		return fmt.Errorf("uimgr: cannot start UI for show_add_task: %w", err)
 	}
 	m.pushControl(api.Message{Kind: api.MessageKindShowAddTask, ShowAddTask: &p})
 	return nil
 }
 
+// ensureSession 确保 UI 会话已建立：已在就直接返回，否则拉起一个并观察它
+// 有没有立刻死掉。
+//
+// 走 startSession（而不是直接 m.Start）是为了让「无会话 → 拉起 → 推消息」
+// 这条语义可测：测试注入一个假的拉起函数，不必真的 fork 一个子进程。
+func (m *Manager) ensureSession() error {
+	if m.Running() {
+		return nil
+	}
+	if err := m.startSession(); err != nil {
+		return err
+	}
+	// 旧实现拉起后还要等握手完成（上限 30s），握不上就报错。新架构
+	// 里没有「会话就绪」这个信号，但最常见的失败形态是子进程启动即
+	// 崩（Fyne 初始化失败、缺图形库、权限问题）——用一个小窗口盯住它，
+	// 至少不会在这类失败上骗浏览器「已接收」。
+	return m.waitSpawnAlive()
+}
+
 // waitSpawnAlive 观察刚拉起的子进程一小会儿，看它是不是立刻就退出了。
 //
 // 正常启动要走几秒，本窗口过后把消息留在控制通道的缓冲里即可——UI 连上
-// 之后会收到。返回错误表示子进程在窗口内就退出了，这条消息不可能送达。
+// 之后会收到。返回错误表示会话在窗口内就结束了，这条消息不可能送达。
+//
+// 「会话结束」除了子进程退出，也包括 rpc.Serve 提前返回与并发 Close，
+// 所以文案只说会话结束，不臆断原因。
 func (m *Manager) waitSpawnAlive() error {
 	select {
 	case <-m.waitDone():
-		return fmt.Errorf("uimgr: UI 子进程启动后立即退出，show_add_task 未送达")
+		return fmt.Errorf("uimgr: UI 会话在启动窗口内结束，show_add_task 未送达")
 	case <-time.After(spawnGrace):
 		return nil
 	}
