@@ -90,24 +90,39 @@ jobs:
       # （只有运行时的 xvfb）。不装这些，`go test ./...` 连编都编不过
       # —— go-gl/gl 要 <GL/glx.h>，go-gl/glfw 要一整套 X11 与 wayland 头。
       #
-      # 包名对着 Ubuntu noble 官方索引核过（archive.ubuntu.com 的
-      # Packages 与 Contents）：
-      #   libgl1-mesa-dev → libgl-dev(GL/gl.h, libGL.so)
-      #                   → libglvnd-dev → libglx-dev(GL/glx.h)
-      #                                  → libegl-dev(EGL/egl.h)
-      #   xorg-dev        → libx11/libxcursor/libxrandr/libxinerama/
-      #                     libxi/libxxf86vm 的 -dev 包
-      #   libwayland-dev  → wayland-client.h / wayland-cursor.h /
-      #                     wayland-egl.h 与对应 .so
+      # 下面每个包对应哪个头文件，对着 Ubuntu noble 官方索引核过
+      # （archive.ubuntu.com 的 Packages 与 Contents，逐个查 filelist）：
+      #   libgl1-mesa-dev → libgl-dev（GL/gl.h, libGL.so）
+      #                   → libglvnd-dev → libglx-dev（GL/glx.h）
+      #                                  → libegl-dev（EGL/egl.h）
+      #   libx11-dev      → X11/Xlib.h、X11/XKBlib.h、X11/cursorfont.h…
+      #                   → x11proto-dev（X11/keysym.h、X11/Xatom.h、X11/Xmd.h）
+      #   libxext-dev     → X11/extensions/shape.h
+      #   libxcursor-dev  → X11/Xcursor/Xcursor.h
+      #   libxrandr-dev   → X11/extensions/Xrandr.h
+      #   libxinerama-dev → X11/extensions/Xinerama.h
+      #   libxi-dev       → X11/extensions/XInput2.h
+      #   libxxf86vm-dev  → libXxf86vm.so（链接用；glfw 运行时 dlopen 它，
+      #                     编译期不需要 Xxf86vm.h）
+      #   libwayland-dev  → wayland-client.h / wayland-cursor.h / wayland-egl.h
       #   libxkbcommon-dev→ xkbcommon/xkbcommon.h
-      # GL/glu.h 不用装：glfw3.h 里那段被 GLFW_INCLUDE_GLU 宏挡着。
+      #
+      # 两个不用装：
+      #   GL/glu.h —— glfw3.h 里那段被 GLFW_INCLUDE_GLU 宏挡着，默认不展开。
+      #   Xxf86vm.h —— glfw 只是运行时 dlopen libXxf86vm.so.1，编译期不引用。
       - name: install GL/X11/Wayland headers (Fyne needs cgo)
         run: |
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y \
             libgl1-mesa-dev \
-            xorg-dev \
+            libx11-dev \
+            libxext-dev \
+            libxcursor-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxi-dev \
+            libxxf86vm-dev \
             libwayland-dev \
             libxkbcommon-dev
 
