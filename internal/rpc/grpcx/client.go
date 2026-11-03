@@ -394,8 +394,11 @@ func (c *Client) checkOpen() error {
 
 // asPtr 把 any 转成指定类型的指针，并报告是否转换成功。
 //
-// 类型不对必须回错误而不是 panic：httpx 那边是 JSON 编解码，类型不对会
-// 在服务端返回 400；gRPC 这边直接解引用就是 panic。
+// 类型不对必须回错误而不是 panic：gRPC 这边直接解引用就是 panic。
+//
+// 两种传输的校验时机相同——都在**客户端**校验、请求发不出去：
+// httpx 那边由 Client.Call 开头的 checkCallTypes 拦（类型不对直接回错，
+// 不会走到服务端），gRPC 这边由这里的 asPtr 拦。
 func asPtr[T any](v any) (*T, bool) {
 	p, ok := v.(*T)
 	return p, ok

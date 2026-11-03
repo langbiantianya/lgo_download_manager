@@ -23,6 +23,10 @@ var openapiYAML []byte
 
 // openAPIJSON 缓存规范转成的 JSON 形式。转换只做一次：规范是嵌入的常量，
 // 结果不会变，重复解析纯属浪费。
+//
+// 失败也会被缓存——这没有问题：输入是编译期就定下来的常量，同一份输入
+// 转换的结果永远相同，转换成功与转换失败都是确定的。缓存错误与缓存成功
+// 在这里等价，不存在「第一次失败、后来又好了」的情形。
 var (
 	openAPIJSONOnce sync.Once
 	openAPIJSONData []byte

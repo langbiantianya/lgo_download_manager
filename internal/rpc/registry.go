@@ -37,6 +37,15 @@ func Serve(ctx context.Context, opts ServerOptions, h Handler) error {
 	if err != nil {
 		return err
 	}
+	// token 不能为空。
+	//
+	// 空 token 时服务端的校验逻辑（validToken / gRPC metadata 比对）会把
+	// **每一个**请求都判成未授权——包括客户端自己发出的、带着
+	// "Bearer "（空值）的那个。于是表现是「服务起来了但所有调用都 401」，
+	// 而日志里看不出是配置问题。启动期失败比运行期全线 401 好。
+	if opts.Token == "" {
+		return fmt.Errorf("rpc: 握手 token 不能为空")
+	}
 	switch opts.Transport {
 	case "", TransportGRPC:
 		return grpcx.Serve(ctx, a, opts.Token, h)

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,5 +145,29 @@ func TestRegistryBadAddr(t *testing.T) {
 	}
 	if _, err := Dial(context.Background(), TransportGRPC, "", ""); err == nil {
 		t.Fatal("空地址应当报错")
+	}
+}
+
+// TestServeRejectsEmptyToken 守住「空 token 在启动期就被拒」。
+//
+// 空 token 时服务端的校验会把每一个请求都判成未授权（包括客户端自己
+// 发的、带着 "Bearer " 空值的那个）——表现是「服务起来了但所有调用都
+// 401」，日志里看不出是配置问题。启动期失败比全线 401 好。
+func TestServeRejectsEmptyToken(t *testing.T) {
+	for _, transport := range []string{TransportGRPC, TransportHTTP} {
+		t.Run(transport, func(t *testing.T) {
+			sock := filepath.Join(t.TempDir(), "s.sock")
+			err := Serve(context.Background(), ServerOptions{
+				Transport: transport,
+				Addr:      "unix:" + sock,
+				Token:     "",
+			}, &stubHandler{})
+			if err == nil {
+				t.Fatalf("%s 传输下空 token 应当启动失败", transport)
+			}
+			if !strings.Contains(err.Error(), "token") {
+				t.Fatalf("错误信息应当点明是 token 的问题，实际是: %v", err)
+			}
+		})
 	}
 }
