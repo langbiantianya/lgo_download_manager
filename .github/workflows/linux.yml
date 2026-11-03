@@ -82,11 +82,43 @@ jobs:
           go-version: '1.26.6'
           cache: true
 
+      # 编译 internal/ui 需要 Fyne 的 OpenGL/X11/Wayland 头文件（cgo）。
+      #
+      # runner 镜像里**一个都没有**：actions/runner-images 的
+      # images/ubuntu/Ubuntu2404-Readme.md 的「Installed apt packages」
+      # 全表里 mesa / libgl1 / libegl / libx11 / xorg 相关包全部缺席
+      # （只有运行时的 xvfb）。不装这些，`go test ./...` 连编都编不过
+      # —— go-gl/gl 要 <GL/glx.h>，go-gl/glfw 要一整套 X11 与 wayland 头。
+      #
+      # 包名对着 Ubuntu noble 官方索引核过（archive.ubuntu.com 的
+      # Packages 与 Contents）：
+      #   libgl1-mesa-dev → libgl-dev(GL/gl.h, libGL.so)
+      #                   → libglvnd-dev → libglx-dev(GL/glx.h)
+      #                                  → libegl-dev(EGL/egl.h)
+      #   xorg-dev        → libx11/libxcursor/libxrandr/libxinerama/
+      #                     libxi/libxxf86vm 的 -dev 包
+      #   libwayland-dev  → wayland-client.h / wayland-cursor.h /
+      #                     wayland-egl.h 与对应 .so
+      #   libxkbcommon-dev→ xkbcommon/xkbcommon.h
+      # GL/glu.h 不用装：glfw3.h 里那段被 GLFW_INCLUDE_GLU 宏挡着。
+      - name: install GL/X11/Wayland headers (Fyne needs cgo)
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev \
+            xorg-dev \
+            libwayland-dev \
+            libxkbcommon-dev
+
       # 全量测试。这个 job 之前不存在——本分支加了契约测试、边界测试、
       # OpenAPI 一致性测试等一大把护栏，但三个 workflow 里一个 go test
       # 都没有，护栏在流水线里等于不存在：下一个提交就能悄悄打破分层
       # 约束、改歪 api.Spec 的字段映射、把 OpenAPI 与 DTO 改歪，CI 照样
       # 全绿。
+      #
+      # internal/ui 的测试不需要显示：它们用 fyne.io/fyne/v2/test 的
+      # 无头软件渲染器，实测清掉 DISPLAY/WAYLAND_DISPLAY 连跑三次全绿。
       - name: go test
         run: go test ./...
 
