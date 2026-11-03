@@ -230,6 +230,7 @@ func (c *Client) Call(ctx context.Context, method string, in, out any) error {
 			return methodErrorf(method, err)
 		}
 		r.TotalSize = res.GetTotalSize()
+		r.Filename = res.GetFilename()
 		return nil
 
 	case api.MethodGetSettings:

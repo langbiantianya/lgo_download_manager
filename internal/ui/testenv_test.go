@@ -169,7 +169,7 @@ func (nopClient) Start(string) error                           { return nil }
 func (nopClient) Pause(string) error                           { return nil }
 func (nopClient) Delete(string) error                          { return nil }
 func (nopClient) IsPreparing(string) bool                      { return false }
-func (nopClient) Probe(string) (int64, error)                  { return 0, nil }
+func (nopClient) Probe(string) (*api.ProbeResult, error)       { return &api.ProbeResult{}, nil }
 func (nopClient) BTTaskDetail(string) (*api.BTDetail, error)   { return nil, nil }
 func (nopClient) Settings() api.Settings                       { return api.Settings{} }
 func (nopClient) SaveSettings(api.Settings) error              { return nil }

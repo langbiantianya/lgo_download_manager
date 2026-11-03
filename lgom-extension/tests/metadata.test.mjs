@@ -62,10 +62,107 @@ describe('normalizeMetadata', () => {
 		assert.equal(meta.name, '中文.zip');
 	});
 
+	it('只解码一次，避免编码过的路径分隔符在清洗后重新出现', () => {
+		const meta = normalizeMetadata(
+			'https://example.com/download',
+			'%252E%252E%252Fevil.zip',
+			{},
+			FALLBACK_UA
+		);
+
+		assert.equal(meta.name, '%2E%2E%2Fevil.zip');
+	});
+
 	it('解码失败时保留原样', () => {
 		const meta = normalizeMetadata('https://example.com/a.zip', '100%.zip', {}, FALLBACK_UA);
 
 		assert.equal(meta.name, '100%.zip');
+	});
+
+	it('浏览器只给出泛化名字时优先使用 Content-Disposition', () => {
+		const meta = normalizeMetadata(
+			'https://example.com/download',
+			'download',
+			{
+				'content-disposition': `attachment; filename*=UTF-8''%E5%8F%91%E5%B8%83.zip`
+			},
+			FALLBACK_UA
+		);
+
+		assert.equal(meta.name, '发布.zip');
+	});
+
+	it('从响应头的 quoted filename 中解析文件名', () => {
+		const meta = normalizeMetadata(
+			'https://example.com/download',
+			undefined,
+			{ 'Content-Disposition': 'attachment; filename="release build; final.zip"' },
+			FALLBACK_UA
+		);
+
+		assert.equal(meta.name, 'release build; final.zip');
+	});
+
+	it('从查询参数中的文件名推导', () => {
+		const meta = normalizeMetadata(
+			'https://example.com/api/download?token=1&file=release-1.2.tar.xz',
+			undefined,
+			{},
+			FALLBACK_UA
+		);
+
+		assert.equal(meta.name, 'release-1.2.tar.xz');
+	});
+
+	it('查询参数名大小写不敏感', () => {
+		const meta = normalizeMetadata(
+			'https://example.com/download?FileName=release.zip',
+			undefined,
+			{},
+			FALLBACK_UA
+		);
+
+		assert.equal(meta.name, 'release.zip');
+	});
+
+	it('从查询参数里的 response-content-disposition 推导', () => {
+		const disposition = encodeURIComponent(`attachment; filename*=UTF-8''report%20final.pdf`);
+		const meta = normalizeMetadata(
+			`https://example.com/download?response-content-disposition=${disposition}`,
+			undefined,
+			{},
+			FALLBACK_UA
+		);
+
+		assert.equal(meta.name, 'report final.pdf');
+	});
+
+	it('路径中的百分号编码与 fragment 不会污染文件名', () => {
+		const meta = normalizeMetadata(
+			'https://example.com/files/%E4%B8%AD%E6%96%87.zip#section',
+			undefined,
+			{},
+			FALLBACK_UA
+		);
+
+		assert.equal(meta.name, '中文.zip');
+	});
+
+	it('Windows 路径只保留文件名', () => {
+		const meta = normalizeMetadata(
+			'https://example.com/download',
+			'C:\\Users\\me\\Downloads\\setup.exe',
+			{},
+			FALLBACK_UA
+		);
+
+		assert.equal(meta.name, 'setup.exe');
+	});
+
+	it('点开头的文件名不会被清成普通文件名', () => {
+		const meta = normalizeMetadata('https://example.com/download', '.env', {}, FALLBACK_UA);
+
+		assert.equal(meta.name, '.env');
 	});
 });
 

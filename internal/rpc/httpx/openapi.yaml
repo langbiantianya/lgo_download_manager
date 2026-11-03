@@ -292,6 +292,7 @@ components:
       type: object
       properties:
         total_size: { type: integer, format: int64 }
+        filename: { type: string }
     ListParams:
       type: object
       properties:

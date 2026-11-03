@@ -8,7 +8,6 @@ package ui
 
 import (
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -170,19 +169,18 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc rpc.Client, preset addT
 
 	defaultName := "download.bin"
 	if preset.URL != "" {
-		if u, err := url.Parse(preset.URL); err == nil && u.Path != "" {
-			if base := filepath.Base(u.Path); base != "" && base != "." && base != "/" {
-				defaultName = base
-			}
+		if name := urlkind.Filename(preset.URL); name != "" {
+			defaultName = name
 		}
 	}
 	// preset.Name 覆盖 URL 末端推导出的文件名(lgom:// 的 &name= 参数
 	// 比路径末尾更具体,例如镜像源常通过它指定真实文件名)。
-	if preset.Name != "" {
-		defaultName = preset.Name
+	if name := urlkind.SanitizeFilename(preset.Name); name != "" {
+		defaultName = name
 	}
 	savePathEntry := widget.NewEntry()
-	savePathEntry.SetText(uniqueSavePath(filepath.Join(GlobalSettings.DefaultSaveDir, defaultName)))
+	initialSavePath := uniqueSavePath(filepath.Join(GlobalSettings.DefaultSaveDir, defaultName))
+	savePathEntry.SetText(initialSavePath)
 	// 保存路径的标签会随 URL 形态切换:普通任务是「保存路径」(单个文件),
 	// BT 任务是「保存目录」(种子的全部文件都落在该目录之下)。
 	savePathLabel := widget.NewLabel(ilocale.T("addTask.savePath.label"))
@@ -241,7 +239,7 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc rpc.Client, preset addT
 	// autoSavePath 记录「对话框自动推导出来的保存路径」。用户一旦手动改过,
 	// 后续 URL 变化不再覆盖用户输入——这既保住了人工选择,也让 BT/BT 之间
 	// 的 URL 切换能自然刷新默认目录名。
-	autoSavePath := filepath.Join(GlobalSettings.DefaultSaveDir, defaultName)
+	autoSavePath := initialSavePath
 
 	// probeDebounce 是 URL 变化后等待多久才真正发起探测。连续键击时每敲
 	// 一个字符就发一次探测请求,会在网络上打出一串无用的请求——这里等到
@@ -253,12 +251,13 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc rpc.Client, preset addT
 	// 预览覆盖成旧值。
 	probe := &debouncer{delay: probeDebounce}
 
-	// probeSize 在后台探测 URL 对应的文件大小,并把结果显示到大小标签上。
-	// 探测失败或大小未知时清空预览(静默,大小只是个预览)。
-	probeSize := func(rawURL string, seq uint64) {
+	// probeMetadata 在后台探测 URL 对应的文件大小与服务端建议名。失败时静默；
+	// 服务端给出的 Content-Disposition 文件名比 URL 路径更权威，但只在
+	// 用户没有手动改过保存路径时回填。
+	probeMetadata := func(rawURL string, seq uint64) {
 		go func() {
-			size, perr := svc.Probe(rawURL)
-			if perr != nil || size <= 0 {
+			info, perr := svc.Probe(rawURL)
+			if perr != nil || info == nil {
 				fyne.Do(func() {
 					if probe.IsCurrent(seq) {
 						sizeLabel.SetText("")
@@ -267,8 +266,21 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc rpc.Client, preset addT
 				return
 			}
 			fyne.Do(func() {
-				if probe.IsCurrent(seq) {
-					sizeLabel.SetText(formatBytes(size))
+				if !probe.IsCurrent(seq) {
+					return
+				}
+				if info.TotalSize > 0 {
+					sizeLabel.SetText(formatBytes(info.TotalSize))
+				} else {
+					sizeLabel.SetText("")
+				}
+				if name := urlkind.SanitizeFilename(info.Filename); name != "" && !urlkind.IsBitTorrent(rawURL) {
+					nextDefault := filepath.Join(GlobalSettings.DefaultSaveDir, name)
+					if savePathEntry.Text == "" || savePathEntry.Text == autoSavePath {
+						nextDefault = uniqueSavePath(nextDefault)
+						savePathEntry.SetText(nextDefault)
+					}
+					autoSavePath = nextDefault
 				}
 			})
 		}()
@@ -311,14 +323,15 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc rpc.Client, preset addT
 		} else {
 			savePathLabel.SetText(ilocale.T("addTask.savePath.label"))
 			btHint.Hide()
-			if u, err := url.Parse(rawURL); err == nil && u.Path != "" {
-				nextDefault = filepath.Join(GlobalSettings.DefaultSaveDir, filepath.Base(u.Path))
+			if name := urlkind.Filename(rawURL); name != "" {
+				nextDefault = filepath.Join(GlobalSettings.DefaultSaveDir, name)
 			}
 		}
 		// 只在「用户没改过推导值」时刷新保存路径:否则手动选择会被 URL
 		// 的每次键入覆盖掉。
 		if savePathEntry.Text == "" || savePathEntry.Text == autoSavePath {
-			savePathEntry.SetText(uniqueSavePath(nextDefault))
+			nextDefault = uniqueSavePath(nextDefault)
+			savePathEntry.SetText(nextDefault)
 		}
 		autoSavePath = nextDefault
 	}
@@ -337,7 +350,7 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc rpc.Client, preset addT
 		}
 		// 探测合并:连续键击时只探最后一次,免得每敲一个字就发一次请求。
 		probe.Trigger(func(seq uint64) {
-			fyne.Do(func() { probeSize(urls[0], seq) })
+			fyne.Do(func() { probeMetadata(urls[0], seq) })
 		})
 	}
 
@@ -511,8 +524,8 @@ func batchTaskPath(rawURL, directory string, used map[string]struct{}) string {
 	var name string
 	if urlkind.IsBitTorrent(rawURL) {
 		name = urlkind.BittorrentDefaultDir(rawURL)
-	} else if u, err := url.Parse(rawURL); err == nil {
-		name = filepath.Base(u.Path)
+	} else {
+		name = urlkind.Filename(rawURL)
 	}
 	if name == "" || name == "." || name == "/" {
 		name = "download.bin"

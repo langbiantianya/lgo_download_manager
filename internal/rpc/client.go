@@ -28,7 +28,7 @@ type Client interface {
 	Pause(taskID string) error
 	Delete(taskID string) error
 	IsPreparing(taskID string) bool
-	Probe(url string) (int64, error)
+	Probe(url string) (*api.ProbeResult, error)
 	BTTaskDetail(taskID string) (*api.BTDetail, error)
 	Settings() api.Settings
 	SaveSettings(s api.Settings) error
@@ -335,13 +335,13 @@ func (c *client) IsPreparing(taskID string) bool {
 	return out.Value
 }
 
-// Probe 探测 URL 目标大小。
-func (c *client) Probe(url string) (int64, error) {
+// Probe 探测 URL 目标大小及服务端建议的文件名。
+func (c *client) Probe(url string) (*api.ProbeResult, error) {
 	out := &api.ProbeResult{}
 	if err := c.call(context.Background(), api.MethodProbe, &api.ProbeParams{URL: url}, out); err != nil {
-		return 0, err
+		return nil, err
 	}
-	return out.TotalSize, nil
+	return out, nil
 }
 
 // BTTaskDetail 返回 BT 任务的实时详情。

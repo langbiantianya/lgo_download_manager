@@ -887,6 +887,7 @@ func TestHTTPProbeHEAD(t *testing.T) {
 		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
 		w.Header().Set("Accept-Ranges", "bytes")
 		w.Header().Set("Server", "test")
+		w.Header().Set("Content-Disposition", `attachment; filename*=UTF-8''%E6%9C%8D%E5%8A%A1%E7%AB%AF.zip`)
 		w.Header().Set("Content-Digest", `sha-256=:`+digest+`:`)
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -905,6 +906,9 @@ func TestHTTPProbeHEAD(t *testing.T) {
 	}
 	if caps.DigestAlgorithm != "sha256" || caps.Digest != digest {
 		t.Errorf("digest = %q / %q, want sha256 / %q", caps.DigestAlgorithm, caps.Digest, digest)
+	}
+	if caps.Filename != "服务端.zip" {
+		t.Errorf("Filename = %q, want %q", caps.Filename, "服务端.zip")
 	}
 	d.Close()
 }

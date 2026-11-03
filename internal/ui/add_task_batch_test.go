@@ -35,3 +35,18 @@ func TestBatchTaskPathAvoidsCollisionsWithinSubmission(t *testing.T) {
 		t.Fatalf("first batch path should be a new available name, got %q", first)
 	}
 }
+
+func TestBatchTaskPathUsesQueryFilenameAndFallback(t *testing.T) {
+	dir := t.TempDir()
+	used := map[string]struct{}{}
+
+	got := batchTaskPath("https://example.com/download?filename=%E5%8F%91%E5%B8%83.zip", dir, used)
+	if want := filepath.Join(dir, "发布.zip"); got != want {
+		t.Fatalf("batchTaskPath query filename = %q, want %q", got, want)
+	}
+
+	got = batchTaskPath("https://example.com/", dir, used)
+	if want := filepath.Join(dir, "download.bin"); got != want {
+		t.Fatalf("batchTaskPath fallback = %q, want %q", got, want)
+	}
+}

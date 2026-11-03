@@ -274,7 +274,7 @@ func (s *Service) Call(ctx context.Context, method string, in, out any) error {
 		if !ok {
 			return fmt.Errorf("appservice: probe 参数类型不对")
 		}
-		size, err := s.probe(ctx, p.URL)
+		probe, err := s.probe(ctx, p.URL)
 		if err != nil {
 			return err
 		}
@@ -282,7 +282,8 @@ func (s *Service) Call(ctx context.Context, method string, in, out any) error {
 		if !ok {
 			return fmt.Errorf("appservice: probe 结果类型不对")
 		}
-		res.TotalSize = size
+		res.TotalSize = probe.totalSize
+		res.Filename = probe.filename
 		return nil
 
 	case api.MethodGetSettings:
@@ -345,13 +346,19 @@ func (s *Service) saveSettings(in api.Settings) error {
 //
 // ctx 由调用方传入：超时以它为基准派生，调用方取消能立即中止探测，
 // 不会让一次已取消的请求继续占住处理协程。
-func (s *Service) probe(ctx context.Context, raw string) (int64, error) {
+type probeMetadata struct {
+	totalSize int64
+	filename  string
+}
+
+func (s *Service) probe(ctx context.Context, raw string) (*probeMetadata, error) {
 	kind, err := protocol.DetectKind(raw, "")
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	if kind == protocol.ProtoBT {
-		return s.probeBittorrent(ctx, raw)
+		size, err := s.probeBittorrent(ctx, raw)
+		return &probeMetadata{totalSize: size}, err
 	}
 	cur := s.Settings()
 	driver, err := protocol.New(raw, kind, protocol.Auth{AuthOptions: protocol.AuthOptions{
@@ -364,16 +371,16 @@ func (s *Service) probe(ctx context.Context, raw string) (int64, error) {
 		ProxyAutoConfigURL: cur.ProxyAutoConfigURL,
 	}})
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 	defer driver.Close()
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	caps, err := driver.Probe(ctx)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return caps.TotalSize, nil
+	return &probeMetadata{totalSize: caps.TotalSize, filename: caps.Filename}, nil
 }
 
 // probeBittorrent 解析 .torrent 种子文件的总体积。磁力链接缺元数据，

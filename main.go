@@ -413,11 +413,12 @@ func savePathFor(s store.Settings, rawURL, name string) string {
 		}
 		return filepath.Join(saveDir, urlkind.SafeDirName(name, "bt-task"))
 	}
+	name = urlkind.SanitizeFilename(name)
 	if name == "" {
-		name = filepath.Base(rawURL)
-		if i := strings.IndexByte(name, '?'); i != -1 {
-			name = name[:i]
-		}
+		name = urlkind.Filename(rawURL)
+	}
+	if name == "" {
+		name = "download.bin"
 	}
 	return filepath.Join(saveDir, name)
 }

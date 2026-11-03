@@ -98,9 +98,10 @@ message ProbeRequest {
   string url = 1;
 }
 
-// ProbeResponse 是体积探测的结果。
+// ProbeResponse 是体积与建议文件名探测的结果。
 message ProbeResponse {
   int64 total_size = 1;
+  string filename = 2;
 }
 
 // ListRequest 是列表查询参数。filter 与 sort 用枚举而不是裸字符串：

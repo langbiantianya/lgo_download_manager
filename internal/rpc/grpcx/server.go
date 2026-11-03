@@ -228,7 +228,7 @@ func (s *server) Probe(ctx context.Context, req *pb.ProbeRequest) (*pb.ProbeResp
 	if err := s.h.Call(ctx, api.MethodProbe, &api.ProbeParams{URL: req.GetUrl()}, out); err != nil {
 		return nil, internalErr(err)
 	}
-	return &pb.ProbeResponse{TotalSize: out.TotalSize}, nil
+	return &pb.ProbeResponse{TotalSize: out.TotalSize, Filename: out.Filename}, nil
 }
 
 func (s *server) GetSettings(ctx context.Context, _ *pb.Empty) (*pb.GetSettingsResponse, error) {

@@ -494,10 +494,11 @@ func (x *ProbeRequest) GetUrl() string {
 	return ""
 }
 
-// ProbeResponse 是体积探测的结果。
+// ProbeResponse 是体积与建议文件名探测的结果。
 type ProbeResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	TotalSize     int64                  `protobuf:"varint,1,opt,name=total_size,json=totalSize,proto3" json:"total_size,omitempty"`
+	Filename      string                 `protobuf:"bytes,2,opt,name=filename,proto3" json:"filename,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -537,6 +538,13 @@ func (x *ProbeResponse) GetTotalSize() int64 {
 		return x.TotalSize
 	}
 	return 0
+}
+
+func (x *ProbeResponse) GetFilename() string {
+	if x != nil {
+		return x.Filename
+	}
+	return ""
 }
 
 // ListRequest 是列表查询参数。filter 与 sort 用枚举而不是裸字符串：
@@ -2092,10 +2100,11 @@ const file_lgdm_v1_lgdm_proto_rawDesc = "" +
 	"\fBoolResponse\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\bR\x05value\" \n" +
 	"\fProbeRequest\x12\x10\n" +
-	"\x03url\x18\x01 \x01(\tR\x03url\".\n" +
+	"\x03url\x18\x01 \x01(\tR\x03url\"J\n" +
 	"\rProbeResponse\x12\x1d\n" +
 	"\n" +
-	"total_size\x18\x01 \x01(\x03R\ttotalSize\"c\n" +
+	"total_size\x18\x01 \x01(\x03R\ttotalSize\x12\x1a\n" +
+	"\bfilename\x18\x02 \x01(\tR\bfilename\"c\n" +
 	"\vListRequest\x12-\n" +
 	"\x06filter\x18\x01 \x01(\x0e2\x15.lgdm.v1.StatusFilterR\x06filter\x12%\n" +
 	"\x04sort\x18\x02 \x01(\x0e2\x11.lgdm.v1.TaskSortR\x04sort\"3\n" +

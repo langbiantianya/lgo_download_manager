@@ -13,6 +13,8 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+
+	"lgo_download_manager/internal/urlkind"
 )
 
 // webdavDriver 基于 HTTP 语义实现 ProtocolDriver：使用 PROPFIND
@@ -99,7 +101,11 @@ func (d *webdavDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 		return d.fallbackProbe(ctx)
 	}
 
-	caps := &DriverCapabilities{SupportRange: true, TotalSize: -1}
+	caps := &DriverCapabilities{
+		SupportRange: true,
+		TotalSize:    -1,
+		Filename:     dispositionFilename(resp.Header.Values("Content-Disposition")),
+	}
 	captureValidators(caps, resp.Header)
 	for _, r := range parsed.Responses {
 		for _, ps := range r.PropStat {
@@ -114,6 +120,9 @@ func (d *webdavDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 			}
 			if caps.LastModified == "" {
 				caps.LastModified = strings.TrimSpace(ps.Prop.GetLastModified)
+			}
+			if caps.Filename == "" {
+				caps.Filename = urlkind.SanitizeFilename(ps.Prop.DisplayName)
 			}
 		}
 	}
@@ -158,6 +167,7 @@ func (d *webdavDriver) fallbackProbe(ctx context.Context) (*DriverCapabilities, 
 		TotalSize:    parseInt64(resp.Header.Get("Content-Length")),
 		SupportRange: strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes"),
 		ServerInfo:   strings.Join(resp.Header["Server"], ", "),
+		Filename:     dispositionFilename(resp.Header.Values("Content-Disposition")),
 	}
 	captureValidators(caps, resp.Header)
 	d.setValidators(caps.ETag, caps.LastModified)

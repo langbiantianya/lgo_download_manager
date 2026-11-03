@@ -152,7 +152,8 @@ type ProbeParams struct {
 
 // ProbeResult 是体积探测的结果。
 type ProbeResult struct {
-	TotalSize int64 `json:"total_size"`
+	TotalSize int64  `json:"total_size"`
+	Filename  string `json:"filename,omitempty"`
 }
 
 // BoolResult 是布尔结果。

@@ -133,6 +133,7 @@ func (s *stubHandler) Call(ctx context.Context, method string, in, out any) erro
 		out.(*api.BoolResult).Value = true
 	case api.MethodProbe:
 		out.(*api.ProbeResult).TotalSize = 4242
+		out.(*api.ProbeResult).Filename = "server-name.zip"
 	case api.MethodBTInfo:
 		s.mu.Lock()
 		*out.(*api.BTDetail) = s.btDetail
@@ -640,14 +641,14 @@ func caseIsPreparing(t *testing.T, env *contractEnv) {
 	}
 }
 
-// caseProbe 断言体积探测。
+// caseProbe 断言体积与文件名探测。
 func caseProbe(t *testing.T, env *contractEnv) {
-	size, err := env.cli.Probe("http://example.com/a")
+	info, err := env.cli.Probe("http://example.com/a")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if size != 4242 {
-		t.Fatalf("探测结果不对: %d", size)
+	if info == nil || info.TotalSize != 4242 || info.Filename != "server-name.zip" {
+		t.Fatalf("探测结果不对: %+v", info)
 	}
 	calls := env.h.callsOf(api.MethodProbe)
 	if len(calls) != 1 || calls[0].URL != "http://example.com/a" {
@@ -1041,11 +1042,11 @@ func collectContractResults(t *testing.T, transport string) map[string]string {
 
 	out["is_preparing"] = fmt.Sprintf("%v", env.cli.IsPreparing("t1"))
 
-	size, err := env.cli.Probe("http://example.com/x")
+	info, err := env.cli.Probe("http://example.com/x")
 	if err != nil {
 		t.Fatal(err)
 	}
-	out["probe"] = fmt.Sprintf("%d", size)
+	out["probe"] = mustJSON(t, "探测", info)
 
 	detail, err := env.cli.BTTaskDetail("t1")
 	if err != nil {

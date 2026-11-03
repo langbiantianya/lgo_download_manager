@@ -41,3 +41,18 @@ func TestSavePathForUsesSystemDownloadDirWhenUnset(t *testing.T) {
 		t.Fatalf("savePathFor = %q, want %q", got, want)
 	}
 }
+
+func TestSavePathForUsesFilenameCarriedByQueryOrPreset(t *testing.T) {
+	dir := t.TempDir()
+	settings := store.Settings{DefaultSaveDir: dir}
+
+	got := savePathFor(settings, "https://example.com/download?filename=%E5%8F%91%E5%B8%83.zip", "")
+	if want := filepath.Join(dir, "发布.zip"); got != want {
+		t.Fatalf("savePathFor query filename = %q, want %q", got, want)
+	}
+
+	got = savePathFor(settings, "https://example.com/download", "../../browser-name.zip")
+	if want := filepath.Join(dir, "browser-name.zip"); got != want {
+		t.Fatalf("savePathFor preset filename = %q, want %q", got, want)
+	}
+}

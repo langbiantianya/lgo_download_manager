@@ -18,6 +18,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"lgo_download_manager/internal/urlkind"
 )
 
 // chunkSize 是将响应体字节流式写入磁盘时使用的读取缓冲区大小。
@@ -573,6 +575,7 @@ func (d *httpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 		ServerInfo:   strings.Join(resp.Header["Server"], ", "),
 		SupportRange: supportsRanges(resp),
 		TotalSize:    parseInt64(resp.Header.Get("Content-Length")),
+		Filename:     dispositionFilename(resp.Header.Values("Content-Disposition")),
 	}
 	captureValidators(caps, resp.Header)
 	captureDigest(caps, resp.Header)
@@ -596,6 +599,9 @@ func (d *httpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	}
 	if rangeCaps.LastModified != "" {
 		caps.LastModified = rangeCaps.LastModified
+	}
+	if caps.Filename == "" {
+		caps.Filename = rangeCaps.Filename
 	}
 	// 只有 HEAD 的 200 响应才可信地代表完整表示摘要。1 字节 Range
 	// 响应上的 Content-Digest 可能只是该分片的摘要，不能用于整文件校验。
@@ -624,6 +630,7 @@ func (d *httpBase) probeWithRange(ctx context.Context) (*DriverCapabilities, err
 	caps := &DriverCapabilities{
 		SupportRange: resp.StatusCode == http.StatusPartialContent,
 		ServerInfo:   strings.Join(resp.Header["Server"], ", "),
+		Filename:     dispositionFilename(resp.Header.Values("Content-Disposition")),
 	}
 	captureValidators(caps, resp.Header)
 	d.setValidators(caps.ETag, caps.LastModified)
@@ -641,6 +648,16 @@ func (d *httpBase) probeWithRange(ctx context.Context) (*DriverCapabilities, err
 	// 在“探测”阶段下载到 io.Discard。
 	_, _ = io.CopyN(io.Discard, resp.Body, 1)
 	return caps, nil
+}
+
+// dispositionFilename 从可能重复或为空的响应头中取第一个有效文件名。
+func dispositionFilename(values []string) string {
+	for _, value := range values {
+		if name := urlkind.FilenameFromContentDisposition(value); name != "" {
+			return name
+		}
+	}
+	return ""
 }
 
 // supportsRanges 在服务器声明支持区间下载时返回 true。

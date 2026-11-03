@@ -159,6 +159,7 @@ type DriverCapabilities struct {
 	TotalSize       int64  // 总字节长度；未知时为 -1
 	SupportRange    bool   // 服务器是否支持 Range / FTP REST
 	ServerInfo      string // 自由形式的 banner / 服务器响应头
+	Filename        string // 服务器建议的文件名（Content-Disposition）
 	ETag            string // HTTP 响应 ETag，用于跨会话校验资源版本
 	LastModified    string // HTTP Last-Modified / FTP MDTM，用于没有强 ETag 时的版本校验
 	DigestAlgorithm string // 规范化后的摘要算法：sha256、sha512 或 md5

@@ -94,6 +94,7 @@ func (m *mockHandler) Call(ctx context.Context, method string, in, out any) erro
 			return errors.New("mock: 响应类型不对")
 		}
 		o.TotalSize = 4096
+		o.Filename = "mock.bin"
 	case api.MethodBTInfo:
 		o, ok := out.(*api.BTDetail)
 		if !ok {
