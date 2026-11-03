@@ -143,6 +143,23 @@ func TestPanicOverRealServerBecomes500(t *testing.T) {
 	}
 }
 
+// TestOriginalWriterUnwraps 确认 MaxBytesReader 拿到的是包装前的 writer。
+//
+// net/http 的「请求体超限」信号靠一个未导出方法传，包装之后就丢了。这个
+// 断言防的是「以为解包了、其实返回的还是包装后的那个」——那种写法测试
+// 全绿、超限时连接却不再关闭。
+func TestOriginalWriterUnwraps(t *testing.T) {
+	rec := httptest.NewRecorder()
+	gw := &guardWriter{ResponseWriter: rec}
+	if got := originalWriter(gw); got != http.ResponseWriter(rec) {
+		t.Fatalf("originalWriter 应当返回包装前的 writer，实际 %T", got)
+	}
+	// 没有包装时原样返回。
+	if got := originalWriter(rec); got != http.ResponseWriter(rec) {
+		t.Fatalf("没有包装时应当原样返回，实际 %T", got)
+	}
+}
+
 // TestStreamEndpointStillStreams 确认加了 recover 中间件之后，消息流
 // 端点还是能一条条吐 NDJSON——中间件不能把流式功能改坏。
 func TestStreamEndpointStillStreams(t *testing.T) {

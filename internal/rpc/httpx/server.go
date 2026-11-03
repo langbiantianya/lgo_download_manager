@@ -129,7 +129,7 @@ func serveCall(w http.ResponseWriter, r *http.Request, h Handler, method string)
 	spec := api.Spec(method)
 	in := spec.NewIn()
 	if r.Body != nil {
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		r.Body = http.MaxBytesReader(originalWriter(w), r.Body, maxRequestBody)
 		// 没有请求体（空 POST）不算错误：像 get_settings 这样的方法本来就没有参数。
 		if err := json.NewDecoder(r.Body).Decode(in); err != nil && !errors.Is(err, io.EOF) {
 			writeError(w, http.StatusBadRequest, "解码请求: "+err.Error())
@@ -245,6 +245,19 @@ func (w *guardWriter) Flush() {
 // Unwrap 让 http.ResponseController 能找到底层 writer 的能力
 // (SetReadDeadline 之类)。
 func (w *guardWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// originalWriter 取出包装前的 ResponseWriter。
+//
+// http.MaxBytesReader 靠 writer 上的一个**未导出**方法（requestTooLarge）
+// 把「请求体超限」的信号传给 net/http——那个接口外部包实现不了，只有
+// net/http 自己的 response 能满足。包装之后信号就丢了：超限时连接不会
+// 被标记成「回完就关」。所以 MaxBytesReader 要拿原 writer。
+func originalWriter(w http.ResponseWriter) http.ResponseWriter {
+	if g, ok := w.(*guardWriter); ok {
+		return g.ResponseWriter
+	}
+	return w
+}
 
 // validToken 校验 Authorization 头里的 Bearer token。
 func validToken(header, token string) bool {
