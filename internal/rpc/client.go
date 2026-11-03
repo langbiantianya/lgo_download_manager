@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/logging"
 )
 
 // callTimeout 是单次 RPC 的超时上限。
@@ -125,6 +126,18 @@ func (c *client) call(ctx context.Context, method string, in, out any) error {
 
 // readLoop 消费服务端推送的消息流。
 func (c *client) readLoop(ctx context.Context) {
+	// dispatch 会调 UI 侧注册的钩子(显示窗口、弹对话框、语言切换)。
+	// 钩子里一个 panic 会顺着 readLoop 冒到 goroutine 顶层,把整个 UI
+	// 子进程带走——界面直接消失,用户手里正在跑的下载全丢。
+	//
+	// 这里兜住:记日志、把会话标记成已断开,让上层按「UI 崩了」处理,
+	// 而不是无声无息地整个进程死掉。
+	defer func() {
+		if p := recover(); p != nil {
+			logging.Panic("rpc 消息流", p)
+			c.notifyClose()
+		}
+	}()
 	ch, err := c.tr.Stream(ctx)
 	if err != nil {
 		c.notifyClose()

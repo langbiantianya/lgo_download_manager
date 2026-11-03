@@ -24,6 +24,7 @@ import (
 	"google.golang.org/grpc/status"
 
 	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/rpc/addr"
 	"lgo_download_manager/internal/rpc/grpcx/pb"
 )
@@ -52,8 +53,9 @@ func Serve(ctx context.Context, a addr.Addr, token string, h Handler) error {
 	defer cleanup()
 
 	srv := grpc.NewServer(
-		grpc.UnaryInterceptor(unaryAuth(token)),
-		grpc.StreamInterceptor(streamAuth(token)),
+		// 拦截器的顺序：recover 在最外层，连鉴权那一步的 panic 也兜得住。
+		grpc.ChainUnaryInterceptor(unaryRecover(), unaryAuth(token)),
+		grpc.ChainStreamInterceptor(streamRecover(), streamAuth(token)),
 	)
 	pb.RegisterDownloadServiceServer(srv, &server{h: h})
 
@@ -95,6 +97,44 @@ func streamAuth(token string) grpc.StreamServerInterceptor {
 		if !checkToken(ss.Context(), token) {
 			return status.Error(codes.Unauthenticated, "无效的 token")
 		}
+		return handler(srv, ss)
+	}
+}
+
+// unaryRecover 把 handler 的 panic 转成 Internal 错误。
+//
+// grpc-go 默认**不 recover**:unary handler 里 panic 会一路冒到 server 的
+// goroutine,把整个进程带走。业务进程里还跑着所有下载任务,一次 panic
+// 就是「应用崩了、任务全丢」——而 gRPC 又是默认传输,这条路径比 httpx
+// 危险得多(httpx 那边 net/http 自带 recover,只断一条连接)。
+//
+// panic 是服务端自己的 bug,不该由业务的每个 handler 各自操心;统一在
+// 传输层兜住,客户端拿到的是一个明确的错误而不是一条断掉的连接。
+func unaryRecover() grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (resp any, err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				logging.Panic("grpcx "+info.FullMethod, p)
+				resp = nil
+				err = status.Error(codes.Internal, "服务端内部错误")
+			}
+		}()
+		return handler(ctx, req)
+	}
+}
+
+// streamRecover 把流式 handler 的 panic 转成 Internal 错误。
+//
+// 与 unaryRecover 同一道理。流已经开始之后客户端未必能收到这个状态码
+// (grpc-go 会尽力发),但至少进程活着、流被收干净。
+func streamRecover() grpc.StreamServerInterceptor {
+	return func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) (err error) {
+		defer func() {
+			if p := recover(); p != nil {
+				logging.Panic("grpcx "+info.FullMethod, p)
+				err = status.Error(codes.Internal, "服务端内部错误")
+			}
+		}()
 		return handler(srv, ss)
 	}
 }

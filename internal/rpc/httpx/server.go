@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/rpc/addr"
 )
 
@@ -50,7 +51,7 @@ func Serve(ctx context.Context, a addr.Addr, token string, h Handler) error {
 	defer cleanup()
 
 	srv := &http.Server{
-		Handler:           newMux(h, token),
+		Handler:           recoverMiddleware(newMux(h, token)),
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 
@@ -189,6 +190,61 @@ func serveStream(w http.ResponseWriter, r *http.Request, h Handler) {
 		}
 	}
 }
+
+// recoverMiddleware 把 handler 的 panic 转成 500 响应。
+//
+// net/http 自带 recover:panic 时它会关掉连接,客户端只看到 EOF 或连接
+// 重置,拿不到错误体,只能自己猜「服务端崩了」。gRPC 那边用拦截器把
+// panic 转成 Internal 错误——两种传输在这件事上应当对齐:客户端拿到
+// 的是一个明确的「服务端内部错误」。
+//
+// 响应已经开始写的时候(流式端点写过头了)就改不了,只能记日志。
+func recoverMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gw := &guardWriter{ResponseWriter: w}
+		defer func() {
+			if p := recover(); p != nil {
+				logging.Panic("httpx "+r.URL.Path, p)
+				if !gw.started {
+					writeError(gw, http.StatusInternalServerError, "服务端内部错误")
+				}
+			}
+		}()
+		next.ServeHTTP(gw, r)
+	})
+}
+
+// guardWriter 记住响应是否已经开始写。
+//
+// panic 发生时如果响应已经开始了,再写错误体只会打出
+// "superfluous response.WriteHeader call" 的警告,而且写进去的内容是错的。
+type guardWriter struct {
+	http.ResponseWriter
+	started bool
+}
+
+func (w *guardWriter) WriteHeader(code int) {
+	w.started = true
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *guardWriter) Write(b []byte) (int, error) {
+	w.started = true
+	return w.ResponseWriter.Write(b)
+}
+
+// Flush 透传:serveStream 靠 http.Flusher 逐条刷 NDJSON,少了这个方法
+// 流式端点会退化成 500「响应不支持流式输出」。
+func (w *guardWriter) Flush() {
+	w.started = true
+	if f, ok := w.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap 让 http.ResponseController 能找到底层 writer 的能力
+// (SetReadDeadline 之类)。
+func (w *guardWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // validToken 校验 Authorization 头里的 Bearer token。
 func validToken(header, token string) bool {

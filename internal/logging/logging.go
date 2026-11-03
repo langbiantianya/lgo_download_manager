@@ -26,6 +26,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -33,10 +34,10 @@ import (
 
 // 日志文件名相关常量。
 const (
-	logBaseName  = "lgdm.log"          // 当日文件名
-	retentionDays = 7                  // 历史日志保留天数
-	dateLayout   = "20060102"          // 历史文件名后缀的日期格式
-	timeFormat   = "2006-01-02T15:04:05.000Z07:00" // slog HandlerOptions 默认 time 键格式
+	logBaseName   = "lgdm.log"                      // 当日文件名
+	retentionDays = 7                               // 历史日志保留天数
+	dateLayout    = "20060102"                      // 历史文件名后缀的日期格式
+	timeFormat    = "2006-01-02T15:04:05.000Z07:00" // slog HandlerOptions 默认 time 键格式
 )
 
 var logFilePattern = regexp.MustCompile(`^lgdm\.log\.(\d{8})$`)
@@ -172,6 +173,18 @@ func Fatalf(format string, args ...any) {
 func Fatal(v ...any) {
 	L().Error(strings.TrimSuffix(fmt.Sprintln(v...), "\n"))
 	os.Exit(1)
+}
+
+// Panic 记录一次 panic:标签、panic 值与调用栈。
+//
+// 传输层用它把 handler 的 panic 变成一条错误响应,而不是让 panic 带走
+// 整个进程 —— 业务进程里还跑着所有下载任务,一次 panic 不该等于
+// 「应用崩了、任务全丢」。
+//
+// 用 Error 级别:panic 是异常,不该混在 Info 流水里。
+func Panic(tag string, v any) {
+	stack := debug.Stack()
+	L().Error(fmt.Sprintf("panic: %s: %v\n%s", tag, v, stack))
 }
 
 // formatMsg 让 %v 之类的 verb 仍然按 fmt 规则展开;最终 slog 记录的就是
