@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"unicode/utf8"
 )
 
 // ProtocolKind 是便于枚举的字符串类型，用于表示所支持的传输协议。
@@ -183,7 +184,15 @@ func SafeDirName(name, fallback string) string {
 		out = ""
 	}
 	if len(out) > maxLen {
-		out = strings.TrimSpace(out[:maxLen])
+		// 按**字节**截断会切在多字节字符中间（中文名尤其常见），产出
+		// 非法 UTF-8——目录名里出现非法字节会让后续的路径处理与
+		// 文件系统调用行为变得不可预期。改为按 rune 边界回退：
+		// 先粗截到 maxLen，再把末尾可能不完整的 UTF-8 序列去掉。
+		cut := out[:maxLen]
+		for len(cut) > 0 && !utf8.ValidString(cut) {
+			cut = cut[:len(cut)-1]
+		}
+		out = strings.TrimSpace(cut)
 	}
 	if out == "" {
 		return fallback

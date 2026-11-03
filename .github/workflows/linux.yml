@@ -42,17 +42,23 @@ jobs:
         run: |
           set -euo pipefail
           packages="
+            ./internal/api/
+            ./internal/appservice/
             ./internal/autostart/
             ./internal/bittorrent/
             ./internal/diskstat/
             ./internal/engine/
-            ./internal/ipc/
             ./internal/logging/
             ./internal/protocol/
+            ./internal/rpc/
+            ./internal/rpc/addr/
+            ./internal/rpc/grpcx/
+            ./internal/rpc/httpx/
             ./internal/scheduler/
             ./internal/settings/
             ./internal/store/
             ./internal/uimgr/
+            ./internal/urlkind/
             ./internal/urllauncher/
           "
           for os in linux darwin windows; do
@@ -62,6 +68,46 @@ jobs:
               echo "::endgroup::"
             done
           done
+
+  proto-sync:
+    name: protobuf generated code is up to date
+    runs-on: ubuntu-24.04
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.6'
+          cache: true
+
+      # 工具链**钉版本**，不用 @latest。
+      #
+      # 生成物入库（internal/rpc/grpcx/pb），所以工具链版本一变，生成物就
+      # 会跟着变——用 @latest 的话，这个 job 会自己变成 flaky 源：上游发个
+      # 新版本，重新生成就有差异，CI 红了，但代码一行没改。
+      #
+      # 钉的版本要与 go.mod 里的 google.golang.org/protobuf 对齐
+      # （v1.36.12），否则生成物与运行时库的版本可能不匹配。
+      - name: install protobuf toolchain
+        run: |
+          set -euo pipefail
+          go install github.com/bufbuild/buf/cmd/buf@v1.75.0
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+
+      # 重新生成并比对：proto/lgdm/v1/lgdm.proto 是 gRPC 契约的唯一权威源，
+      # 生成物必须与它保持同步。改了 proto 却忘了重新生成（或手工改了
+      # 生成物），这里会红。
+      - name: regenerate and diff
+        run: |
+          set -euo pipefail
+          PATH="$(go env GOPATH)/bin:$PATH" ./scripts/gen_proto.sh
+          if ! git diff --exit-code --stat internal/rpc/grpcx/pb; then
+            echo "::error::生成物与 proto/lgdm/v1/lgdm.proto 不同步，请运行 scripts/gen_proto.sh 后提交生成物"
+            exit 1
+          fi
 
   flatpak-x86_64:
     name: flatpak x86_64

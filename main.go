@@ -41,6 +41,7 @@ import (
 	"lgo_download_manager/internal/tray"
 	"lgo_download_manager/internal/ui"
 	"lgo_download_manager/internal/uimgr"
+	"lgo_download_manager/internal/urlkind"
 	"lgo_download_manager/internal/urllauncher"
 	"lgo_download_manager/internal/version"
 	"log/slog"
@@ -400,17 +401,17 @@ func main() {
 // BitTorrent 任务的保存路径是「任务目录」而不是单个文件:磁力链接按
 // 链接里的 dn(没有则 infohash 前缀)、.torrent 按去掉后缀的文件名建目录,
 // 种子内容随后下载到该目录之下。这与「新建任务」对话框里的推导规则
-// 一致(见 scheduler.BittorrentDefaultDir)。
+// 一致(见 urlkind.BittorrentDefaultDir)。
 func savePathFor(s store.Settings, rawURL, name string) string {
 	saveDir := s.DefaultSaveDir
 	if saveDir == "" {
 		saveDir = downloaddir.Default()
 	}
-	if protocol.IsBitTorrent(rawURL) {
+	if urlkind.IsBitTorrent(rawURL) {
 		if name == "" {
-			name = scheduler.BittorrentDefaultDir(rawURL)
+			name = urlkind.BittorrentDefaultDir(rawURL)
 		}
-		return filepath.Join(saveDir, protocol.SafeDirName(name, "bt-task"))
+		return filepath.Join(saveDir, urlkind.SafeDirName(name, "bt-task"))
 	}
 	if name == "" {
 		name = filepath.Base(rawURL)

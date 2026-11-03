@@ -35,8 +35,18 @@ type MethodSpec struct {
 }
 
 // Spec 返回方法名对应的请求/响应类型构造器；未知方法返回 nil。
+//
+// 返回的是**副本**：specs 是包级共享状态，直接返回 map 里的指针等于把全局
+// 可变对象交到调用方手里——谁改一下 NewIn，全进程的类型校验就都变了，
+// 而且这种改动极难排查。副本里装的是构造函数（本身不可变），拷贝成本可以
+// 忽略。
 func Spec(method string) *MethodSpec {
-	return specs[method]
+	spec, ok := specs[method]
+	if !ok {
+		return nil
+	}
+	cp := *spec
+	return &cp
 }
 
 var specs = map[string]*MethodSpec{

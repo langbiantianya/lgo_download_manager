@@ -150,8 +150,29 @@ func (s *Service) Events() (<-chan api.Event, func()) {
 	}
 }
 
+// needsScheduler 报告该方法是否依赖调度器。
+//
+// 这些方法都要读写任务队列，没有调度器就无从谈起；get_settings /
+// save_settings / probe 则不碰队列，probe 走的是 HTTP 探测。
+func needsScheduler(method string) bool {
+	switch method {
+	case api.MethodList, api.MethodAdd, api.MethodStart, api.MethodPause,
+		api.MethodDelete, api.MethodIsPreparing, api.MethodBTInfo:
+		return true
+	}
+	return false
+}
+
 // Call 执行一次契约层调用。in / out 的具体类型由 api.Spec(method) 决定。
 func (s *Service) Call(ctx context.Context, method string, in, out any) error {
+	// 需要调度器的方法在服务没有调度器时必须返回错误，不能 panic。
+	//
+	// New(nil, nil) 是合法构造——契约测试里大量用它来验证 DTO 形状，
+	// UI 的测试替身也用它。但它不该在收到真实调用时崩掉：panic 会顺着
+	// 传输层冒到服务端，把一次「配置问题」变成「进程挂掉」。
+	if s.sc == nil && needsScheduler(method) {
+		return fmt.Errorf("appservice: %s 需要调度器，但服务未配置", method)
+	}
 	switch method {
 	case api.MethodList:
 		p, ok := in.(*api.ListParams)

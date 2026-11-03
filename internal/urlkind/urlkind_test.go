@@ -6,7 +6,11 @@
 
 package urlkind
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"unicode/utf8"
+)
 
 func TestDetectKind(t *testing.T) {
 	cases := []struct {
@@ -65,14 +69,72 @@ func TestResolveURL(t *testing.T) {
 	}
 }
 
+// TestBittorrentDefaultDir 校验默认任务目录名的推导:磁力链接优先用 dn,
+// 没有 dn 用 infohash 前缀,种子文件用去掉后缀的文件名。
+//
+// 这组用例原先住在 internal/scheduler（那��有同名的薄封装）。实现迁到
+// urlkind 后薄封装被删,用例一并搬过来——覆盖不能跟着封装一起消失。
 func TestBittorrentDefaultDir(t *testing.T) {
-	if got := BittorrentDefaultDir("http://x/a.zip"); got != "" {
-		t.Fatalf("非 BT 应返回空串, got %q", got)
+	cases := []struct {
+		url  string
+		want string
+	}{
+		{"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Ubuntu%2024.04", "Ubuntu 24.04"},
+		{"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", "magnet-0123456789abcdef"},
+		{"magnet:?xt=urn:btmh:1220caf1e1c30e81cb361b9ee167c4aa64228a7fa4fa914f7d0483e0c8cc8b0bb1e1", "magnet-1220caf1e1c30e81"},
+		{"magnet:?xs=urn:btih:zzz", "magnet"},
+		{"https://example.com/files/debian-13.iso.torrent", "debian-13.iso"},
+		{"/home/user/incoming/ubuntu.torrent", "ubuntu"},
+		{"https://example.com/files/debian.iso.torrent?token=abc", "debian.iso"},
+		{"https://example.com/a.zip", ""},
 	}
-	if got := BittorrentDefaultDir("http://x/movie.torrent"); got != "movie" {
-		t.Fatalf("torrent 目录名 = %q", got)
+	for _, c := range cases {
+		if got := BittorrentDefaultDir(c.url); got != c.want {
+			t.Errorf("BittorrentDefaultDir(%q) = %q, want %q", c.url, got, c.want)
+		}
 	}
-	if got := BittorrentDefaultDir("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=My%20Movie"); got != "My Movie" {
-		t.Fatalf("磁力目录名 = %q", got)
+}
+
+// TestSafeDirNameTruncatesOnRuneBoundary 守住「截断后仍是合法 UTF-8」。
+//
+// SafeDirName 按**字节**上限 80 截断名字。按字节切会切在多字节字符中间，
+// 产出非法 UTF-8——中文种子名/文件名是常见输入，这条路径必须真的走到。
+func TestSafeDirNameTruncatesOnRuneBoundary(t *testing.T) {
+	// 40 个汉字 = 120 字节，必然超过 80 字节上限。
+	name := strings.Repeat("测试种子名称", 8)
+
+	got := SafeDirName(name, "fallback")
+
+	if !utf8.ValidString(got) {
+		t.Fatalf("截断结果不是合法 UTF-8: %q", got)
+	}
+	if len(got) > 80 {
+		t.Fatalf("截断结果 %d 字节，超过上限 80", len(got))
+	}
+	if got == "fallback" {
+		t.Fatal("不该退化成 fallback")
+	}
+	// 结果必须仍是完整的中文，不能出现半个字。
+	if !strings.HasPrefix(got, "测试") {
+		t.Fatalf("截断结果开头不对: %q", got)
+	}
+	for _, r := range got {
+		if r == '�' {
+			t.Fatalf("结果里有替换字符 U+FFFD，说明截断了多字节字符: %q", got)
+		}
+	}
+}
+
+// TestSafeDirNameKeepsShortNamesUnchanged 守住「不超长就不动」——截断逻辑
+// 不能误伤正常长度的名字。
+func TestSafeDirNameKeepsShortNamesUnchanged(t *testing.T) {
+	if got := SafeDirName("My Movie", "fb"); got != "My Movie" {
+		t.Fatalf("短名字被改动: %q", got)
+	}
+	if got := SafeDirName("  ", "fb"); got != "fb" {
+		t.Fatalf("空白名应返回 fallback, got %q", got)
+	}
+	if got := SafeDirName("a/b:c", "fb"); got != "a_b_c" {
+		t.Fatalf("非法字符未被替换: %q", got)
 	}
 }

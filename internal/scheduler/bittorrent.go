@@ -19,7 +19,6 @@ import (
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/store"
-	"lgo_download_manager/internal/urlkind"
 )
 
 // btProgressEvery 是 BT 任务的进度采样周期。BT 的字节数由客户端在连接层
@@ -757,9 +756,6 @@ func btChunkProgress(files []bittorrent.FileProgress) []int64 {
 	}
 	return out
 }
-
-// BittorrentDefaultDir 推导 BT 任务的默认目录名。实现见 urlkind。
-func BittorrentDefaultDir(rawURL string) string { return urlkind.BittorrentDefaultDir(rawURL) }
 
 // IsBittorrentTask 报告一个任务是否走 BT 下载路径。历史数据里 protocol
 // 列为空的任务按 URL 形态兜底判定。

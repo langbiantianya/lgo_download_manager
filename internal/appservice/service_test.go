@@ -316,3 +316,42 @@ func TestControlsBufferSurvivesUntilUIConnects(t *testing.T) {
 	default:
 	}
 }
+
+// TestCallWithoutSchedulerReturnsError 守住「服务没配调度器时不 panic」。
+//
+// New(nil, nil) 是合法构造（契约测试与 UI 测试替身都在用），但它收到真实
+// 调用时必须返回错误。panic 会顺着传输层冒到服务端，把一次配置问题变成
+// 进程挂掉——而 panic 比 error 难查得多。
+func TestCallWithoutSchedulerReturnsError(t *testing.T) {
+	s := New(nil, nil)
+
+	methods := []string{
+		api.MethodList,
+		api.MethodAdd,
+		api.MethodStart,
+		api.MethodPause,
+		api.MethodDelete,
+		api.MethodIsPreparing,
+		api.MethodBTInfo,
+	}
+	for _, m := range methods {
+		t.Run(m, func(t *testing.T) {
+			in := api.Spec(m).NewIn()
+			out := api.Spec(m).NewOut()
+			if err := s.Call(context.Background(), m, in, out); err == nil {
+				t.Fatalf("%s 在没有调度器时应当返回错误", m)
+			}
+		})
+	}
+}
+
+// TestCallWithoutSchedulerStillServesSettings 确认守卫没有误伤：不需要
+// 调度器的方法在同一个服务上照常工作。
+func TestCallWithoutSchedulerStillServesSettings(t *testing.T) {
+	s := New(nil, nil)
+
+	out := &api.Settings{}
+	if err := s.Call(context.Background(), api.MethodGetSettings, &api.Empty{}, out); err != nil {
+		t.Fatalf("get_settings 不需要调度器，应当成功: %v", err)
+	}
+}
