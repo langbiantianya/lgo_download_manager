@@ -6,6 +6,10 @@
 
 // Package engine 将统一的 ProtocolDriver 和字节区间规划
 // 转换为对一个预分配输出文件的并发、可恢复写入。
+//
+// 本文件只负责 Job 的生命周期与 worker 池编排；分片规划见 plan.go，
+// 单分片的下载与限速见 chunk.go，速度计算见 progress.go，重试与退避
+// 见 retry.go。
 package engine
 
 import (
@@ -14,8 +18,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math/rand/v2"
 	"os"
+
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,7 +29,6 @@ import (
 	"lgo_download_manager/internal/protocol"
 )
 
-// Progress 描述一次下载任务的进度快照。
 type Progress struct {
 	TaskID           string
 	TotalSize        int64
@@ -76,6 +79,7 @@ func (o *Options) defaults() {
 
 // silentLogger 是默认占位:写向 io.Discard,保证 engine 在调用方
 // 没传 Logger 时不会去申请默认 stdout。
+
 func silentLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
@@ -97,6 +101,7 @@ const oneMiB = 1 << 20
 // workStealingPartsPerWorker 为每个并发 worker 规划多个逻辑切片。
 // 单个连接变慢时，先完成的 worker 会直接领取后续切片，而不是陪慢连接
 // 等同一个大区间。实际并发仍由 ChunkCount 限制。
+
 const workStealingPartsPerWorker = 4
 
 type chunk struct {
@@ -111,6 +116,7 @@ type chunk struct {
 // 所有权约定：dest 由调用方持有并负责 Close（调度器在引擎 goroutine 退出时
 // 关闭它）；Job.Close() 只关闭 driver。Run 只通过 WriteAt 写入 dest，
 // 因此 dest 必须支持随机写且已按 total 预分配。
+
 func NewJob(driver protocol.ProtocolDriver, total int64, dest *os.File, opts Options) *Job {
 	opts.defaults()
 	if opts.Logger == nil {
@@ -128,228 +134,9 @@ func NewJob(driver protocol.ProtocolDriver, total int64, dest *os.File, opts Opt
 	return j
 }
 
-func (j *Job) plan() {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	j.planLocked()
-}
-
-// planLocked 是 plan 的主体，调用方须持有 j.mu。
-func (j *Job) planLocked() {
-	j.chunks = nil
-
-	if len(j.opts.ChunkSizes) > 0 {
-		for i := 0; i+1 < len(j.opts.ChunkSizes); i += 2 {
-			start := j.opts.ChunkSizes[i]
-			end := j.opts.ChunkSizes[i+1]
-			progress := start
-			if i/2 < len(j.opts.ResumeFrom) {
-				progress += j.opts.ResumeFrom[i/2]
-				if progress < start {
-					progress = start
-				}
-				if progress > end {
-					progress = end + 1
-				}
-			}
-			j.chunks = append(j.chunks, chunk{idx: i / 2, start: start, end: end, progress: progress})
-		}
-		return
-	}
-	if j.total <= 0 {
-		j.chunks = append(j.chunks, chunk{idx: 0, start: 0, end: -1})
-		return
-	}
-	// 文件小于 1 MiB：不分块，单个流式 chunk。
-	if j.total < oneMiB {
-		progress := int64(0)
-		if len(j.opts.ResumeFrom) > 0 {
-			progress = j.opts.ResumeFrom[0]
-			if progress < 0 {
-				progress = 0
-			}
-			if progress > j.total {
-				progress = j.total
-			}
-		}
-		j.chunks = append(j.chunks, chunk{idx: 0, start: 0, end: j.total - 1, progress: progress})
-		return
-	}
-
-	// 文件大于等于 1 MiB 但小于 MinChunkSize：
-	// 按 ChunkCount 等分，忽略 MinChunkSize。
-	if j.total < j.opts.MinChunkSize {
-		n := j.chunkCount
-		if n <= 0 {
-			n = 1
-		}
-		step := j.total / int64(n)
-		rem := j.total % int64(n)
-		start := int64(0)
-		for i := 0; i < n; i++ {
-			size := step
-			if i == n-1 {
-				size += rem
-			}
-			end := start + size - 1
-			c := chunk{idx: i, start: start, end: end, progress: start}
-			if i < len(j.opts.ResumeFrom) {
-				c.progress = c.start + j.opts.ResumeFrom[i]
-				if c.progress < c.start {
-					c.progress = c.start
-				}
-				if c.progress > c.end {
-					c.progress = c.end + 1
-				}
-			}
-			j.chunks = append(j.chunks, c)
-			start = end + 1
-		}
-		return
-	}
-
-	// 文件大于等于 MinChunkSize：每个 chunk 至少 MinChunkSize，
-	// 由 ChunkCount 限制最大并发数。
-	n := int(j.total / j.opts.MinChunkSize)
-	if j.total%j.opts.MinChunkSize != 0 {
-		n++
-	}
-	logicalLimit := max(j.chunkCount, 1) * workStealingPartsPerWorker
-	// 兼容旧版本任务：没有持久化 ChunkRanges 时，历史 ChunkProgress
-	// 是按 ChunkCount 个等分块记录的。此时保持旧切分，避免把偏移套到
-	// 另一套边界上；新任务以及已有范围快照仍使用可在 worker 间偷取的
-	// 细粒度逻辑切片。
-	if len(j.opts.ResumeFrom) > 0 {
-		logicalLimit = max(j.chunkCount, 1)
-	}
-	if n > logicalLimit {
-		n = logicalLimit
-	}
-	if n < 1 {
-		n = 1
-	}
-	step := j.total / int64(n)
-	rem := j.total % int64(n)
-	start := int64(0)
-	for i := 0; i < n; i++ {
-		size := step
-		if i == n-1 {
-			size += rem
-		}
-		end := start + size - 1
-		c := chunk{idx: i, start: start, end: end, progress: start}
-		if i < len(j.opts.ResumeFrom) {
-			c.progress = c.start + j.opts.ResumeFrom[i]
-			if c.progress < c.start {
-				c.progress = c.start
-			}
-			if c.progress > c.end {
-				c.progress = c.end + 1
-			}
-		}
-		j.chunks = append(j.chunks, c)
-		start = end + 1
-	}
-}
-
-// resumedBytes 返回本次会话开始前磁盘上已有的字节数。plan() 已把
-// ResumeFrom 折算进每个分片的 progress，因此这里按「分片内已完成字节」
-// 求和即可——不能直接累加 ResumeFrom/ChunkSizes，否则在流式（total<=0）
-// 或显式分片场景下会把未落盘的字节也算进去。
-func (j *Job) resumedBytes() int64 {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	var n int64
-	for i := range j.chunks {
-		if d := j.chunks[i].progress - j.chunks[i].start; d > 0 {
-			n += d
-		}
-	}
-	return n
-}
-
-// chunkConcurrencyLimit 返回分片路径允许的最大并发（受配置与实际分片数限制）。
-func (j *Job) chunkConcurrencyLimit() int {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	n := j.chunkCount
-	if n < 1 {
-		n = 1
-	}
-	if n > len(j.chunks) {
-		n = len(j.chunks)
-	}
-	if n < 1 {
-		n = 1
-	}
-	return n
-}
-
-// unfinishedIndexes 返回当前计划中尚未完成的分片下标。
-func (j *Job) unfinishedIndexes() []int {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	out := make([]int, 0, len(j.chunks))
-	for i := range j.chunks {
-		if atomic.LoadInt64(&j.chunks[i].progress) <= j.chunks[i].end {
-			out = append(out, i)
-		}
-	}
-	return out
-}
-
-// replan 按每个分片已完成的偏移重新切分剩余区间，返回新的
-// [start0,end0,start1,end1,...]。必须在所有写者停止后调用（调用方保证）。
-func (j *Job) replan() []int64 {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	resume := make([]int64, len(j.chunks))
-	ranges := make([]int64, 0, 2*len(j.chunks))
-	for i := range j.chunks {
-		d := atomic.LoadInt64(&j.chunks[i].progress) - j.chunks[i].start
-		if d < 0 {
-			d = 0
-		}
-		resume[i] = d
-		ranges = append(ranges, j.chunks[i].start, j.chunks[i].end)
-	}
-	j.opts.ChunkSizes = ranges
-	j.opts.ResumeFrom = resume
-	j.planLocked()
-	ranges = ranges[:0]
-	for i := range j.chunks {
-		ranges = append(ranges, j.chunks[i].start, j.chunks[i].end)
-	}
-	return ranges
-}
-
-// Chunks 返回当前分片进度的快照。持锁读取，避免与 plan()/replan()
-// 的切片重建竞争（调度器会在刷盘与事件路径上调用它）。
-func (j *Job) Chunks() []ChunkSnapshot {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	out := make([]ChunkSnapshot, len(j.chunks))
-	for i := range j.chunks {
-		c := &j.chunks[i]
-		out[i] = ChunkSnapshot{
-			Index:    c.idx,
-			Start:    c.start,
-			End:      c.end,
-			Progress: atomic.LoadInt64(&c.progress),
-		}
-	}
-	return out
-}
-
-type ChunkSnapshot struct {
-	Index    int
-	Start    int64
-	End      int64
-	Progress int64
-}
-
 func (j *Job) IsStopped() bool { return j.stopped.Load() }
-func (j *Job) Stop()           { j.stopped.Store(true) }
+
+func (j *Job) Stop() { j.stopped.Store(true) }
 
 func (j *Job) Run(ctx context.Context, useRange bool) error {
 	j.stopped.Store(false)
@@ -406,10 +193,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 			diff = 0
 		}
 		lastTickVal.Store(cur)
-		var bps float64
-		if dt := float64(now-prev) / float64(time.Second); dt > 0 {
-			bps = float64(diff) / dt
-		}
+		bps := speed(diff, time.Duration(now-prev))
 		if j.opts.Progress != nil {
 			j.opts.Progress(Progress{
 				TaskID:           j.opts.TaskID,
@@ -635,6 +419,7 @@ func (j *Job) Run(ctx context.Context, useRange bool) error {
 }
 
 // streamingChunk 返回流式路径当前使用的那个分片。
+
 func (j *Job) streamingChunk() *chunk {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -649,206 +434,11 @@ func (j *Job) streamingChunk() *chunk {
 //
 // 调用方须保证计划（j.chunks）在本次调用期间不变：重新规划只会在
 // 所有分片退出后（wg.Wait 之后）进行。
-func (j *Job) downloadChunk(ctx context.Context, idx int, bytesDone *atomic.Int64, chunksDone *atomic.Int32, emit func(int)) error {
-	j.mu.Lock()
-	if idx >= len(j.chunks) {
-		j.mu.Unlock()
-		return nil
-	}
-	c := &j.chunks[idx]
-	j.mu.Unlock()
-
-	consecutiveFails := 0
-	backoff := 500 * time.Millisecond
-	for {
-		if j.stopped.Load() || ctx.Err() != nil {
-			return ctx.Err()
-		}
-		start := atomic.LoadInt64(&c.progress)
-		if start > c.end {
-			j.log.Info("chunk finished", "idx", idx, "range", fmt.Sprintf("%d-%d", c.start, c.end))
-			return nil
-		}
-
-		chunkCtx, cancel := context.WithCancel(ctx)
-		var throttleErr error
-		err := j.driver.DownloadChunk(chunkCtx, start, c.end, j.dest, func(n int) {
-			if throttleErr = j.throttle(chunkCtx, n); throttleErr != nil {
-				cancel()
-				return
-			}
-			bytesDone.Add(int64(n))
-			atomic.AddInt64(&c.progress, int64(n))
-			emit(idx)
-		})
-		cancel()
-		if throttleErr != nil {
-			err = throttleErr
-		}
-		if err == nil && atomic.LoadInt64(&c.progress) <= c.end {
-			err = fmt.Errorf("chunk stopped at %d, want through %d: %w",
-				atomic.LoadInt64(&c.progress)-1, c.end, protocol.ErrUnexpectedEOF)
-		}
-
-		if err == nil {
-			chunksDone.Add(1)
-			return nil
-		}
-		if j.stopped.Load() || ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if protocol.IsTerminal(err) {
-			j.log.Warn("chunk terminal error", "idx", idx, "err", err)
-			return err
-		}
-		consecutiveFails++
-		j.log.Warn("chunk error backing off", "idx", idx, "err", err, "backoff", backoff, "fails", consecutiveFails, "maxFails", j.opts.MaxRetries)
-		if consecutiveFails >= j.opts.MaxRetries {
-			j.log.Warn("chunk giving up after consecutive failures", "idx", idx, "fails", consecutiveFails, "err", err)
-			return err
-		}
-		wait := backoff + jitter(backoff)
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
-		if waitErr := waitRetry(ctx, wait); waitErr != nil {
-			return waitErr
-		}
-	}
-}
 
 func (j *Job) Close() error { return j.driver.Close() }
 
 // maxChunkRetries 限制单 chunk 或 streaming 路径上的连续失败次数。
 // 超过此次数后,engine 把 lastErr 返回给 scheduler.fail(),任务变为 Failed。
-const maxChunkRetries = 8
-
-// maxReplanRounds 限制「失败 → 重新规划」的轮数：单个区间的总尝试次数
-// 约为 maxChunkRetries × maxReplanRounds。
-const maxReplanRounds = 3
-
-// errJobStopped 表示任务被显式 Stop()（区别于 ctx 取消导致的暂停）。
-var errJobStopped = errors.New("engine: job stopped")
-
-// jitter 返回 [0, d/2) 的随机抖动，避免多个任务在同一时刻重试形成尖峰。
-func jitter(d time.Duration) time.Duration {
-	if d <= 0 {
-		return 0
-	}
-	return time.Duration(rand.Int64N(int64(d) / 2))
-}
-
-// downloadFallbackWithRetry 是 streaming 路径（不支持 Range）下的重试包装:
-// 业务错误(4xx)立即返回让上层标记 Failed;瞬断则在重试预算内退避重连。
-func downloadFallbackWithRetry(ctx context.Context, j *Job, c *chunk, bytesDone *atomic.Int64, emit func(int), chunkIdx int) error {
-	backoff := 500 * time.Millisecond
-	consecutiveFails := 0
-	for {
-		if j.stopped.Load() || ctx.Err() != nil {
-			return ctx.Err()
-		}
-		start := atomic.LoadInt64(&c.progress)
-		readCtx, readCancel := context.WithCancel(ctx)
-		var throttleErr error
-		err := j.driver.DownloadFallback(readCtx, start, j.dest, func(n int) {
-			if throttleErr = j.throttle(readCtx, n); throttleErr != nil {
-				readCancel()
-				return
-			}
-			bytesDone.Add(int64(n))
-			atomic.AddInt64(&c.progress, int64(n))
-			emit(chunkIdx)
-		})
-		readCancel()
-		if throttleErr != nil {
-			err = throttleErr
-		}
-		if errors.Is(err, protocol.ErrResumeUnavailable) {
-			delta := atomic.LoadInt64(&c.progress) - c.start
-			if delta > 0 {
-				bytesDone.Add(-delta)
-			}
-			// 无法续传时必须明确回到绝对字节 0，而不是“当前 chunk 的
-			// 起点”；否则调用方若传入非零 c.start，会反复触发同一次失败。
-			c.start = 0
-			atomic.StoreInt64(&c.progress, 0)
-			consecutiveFails = 0
-			continue
-		}
-		if err == nil && c.end >= 0 && atomic.LoadInt64(&c.progress) <= c.end {
-			err = fmt.Errorf("stream stopped at %d, want through %d: %w",
-				atomic.LoadInt64(&c.progress)-1, c.end, protocol.ErrUnexpectedEOF)
-		}
-		if err == nil {
-			return nil
-		}
-		if j.stopped.Load() || ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if protocol.IsTerminal(err) {
-			return err
-		}
-		consecutiveFails++
-		if consecutiveFails >= j.opts.MaxRetries {
-			return err
-		}
-		j.log.Warn("streaming chunk error backing off", "err", err, "backoff", backoff, "fails", consecutiveFails, "maxFails", j.opts.MaxRetries)
-		if waitErr := waitRetry(ctx, retryDelay(err, backoff)); waitErr != nil {
-			return waitErr
-		}
-		backoff *= 2
-		if backoff > 30*time.Second {
-			backoff = 30 * time.Second
-		}
-	}
-}
-
-// throttle 在当前任务共享限速器上等待 n 个字节的令牌。rate.Limiter
-// 要求单次 WaitN 不超过 burst；这里按 burst 拆分，调用方无需关心设置。
-func (j *Job) throttle(ctx context.Context, n int) error {
-	limiter := j.opts.RateLimiter
-	if limiter == nil || n <= 0 || limiter.Limit() == rate.Inf {
-		return nil
-	}
-	burst := limiter.Burst()
-	if burst <= 0 {
-		return nil
-	}
-	for n > 0 {
-		step := min(n, burst)
-		if err := limiter.WaitN(ctx, step); err != nil {
-			return err
-		}
-		n -= step
-	}
-	return nil
-}
-
-// retryDelay 优先遵循服务端的 Retry-After；没有提示时使用带抖动的
-// 指数退避。对异常的超长提示设置上限，同时保持 ctx 可取消。
-func retryDelay(err error, backoff time.Duration) time.Duration {
-	const maxServerHint = 5 * time.Minute
-	if hint := protocol.RetryAfter(err); hint > 0 {
-		if hint > maxServerHint {
-			hint = maxServerHint
-		}
-		return hint
-	}
-	return backoff + jitter(backoff)
-}
-
-// waitRetry 使用可停止的 Timer；暂停时 time.After 留下的定时器会一直
-// 存活到原定触发时间，高并发分片同时取消时会制造一批无意义堆对象。
-func waitRetry(ctx context.Context, delay time.Duration) error {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
 
 func (j *Job) sanityCheck() error {
 	_, err := j.dest.Stat()

@@ -14,40 +14,23 @@ import (
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 
-	"lgo_download_manager/internal/bittorrent"
-	"lgo_download_manager/internal/scheduler"
-	"lgo_download_manager/internal/store"
+	"lgo_download_manager/internal/api"
 )
 
-// rowActionSvc 记录任务行上触发过的动作调用。
+// rowActionSvc 记录任务行上触发过的动作调用。其余 rpc.Client 方法由
+// nopClient 提供。
 type rowActionSvc struct {
+	nopClient
 	mu      sync.Mutex
 	deleted []string
 }
 
-func (s *rowActionSvc) List(store.StatusFilter, store.TaskSort) ([]*store.Task, error) {
-	return nil, nil
-}
-func (s *rowActionSvc) Subscribe() (<-chan scheduler.Event, func()) {
-	return make(chan scheduler.Event), func() {}
-}
-func (s *rowActionSvc) AddTask(AddTaskInput) (*store.Task, error) { return nil, nil }
-func (s *rowActionSvc) Start(string) error                        { return nil }
-func (s *rowActionSvc) Pause(string) error                        { return nil }
 func (s *rowActionSvc) Delete(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.deleted = append(s.deleted, id)
 	return nil
 }
-func (s *rowActionSvc) IsPreparing(string) bool     { return false }
-func (s *rowActionSvc) Probe(string) (int64, error) { return 0, nil }
-func (s *rowActionSvc) BTTaskDetail(string) (*bittorrent.Detail, error) {
-	return nil, nil
-}
-func (s *rowActionSvc) Settings() store.Settings          { return store.Settings{} }
-func (s *rowActionSvc) SaveSettings(store.Settings) error { return nil }
-func (s *rowActionSvc) Close() error                      { return nil }
 
 func (s *rowActionSvc) deleteCalls() []string {
 	s.mu.Lock()
@@ -88,7 +71,7 @@ func TestDelete_AsksBeforeRemoving(t *testing.T) {
 	defer w.Close()
 
 	svc := &rowActionSvc{}
-	tk := &store.Task{ID: "t1", URL: "https://example.com/a.bin", SavePath: "/tmp/a.bin"}
+	tk := &api.Task{ID: "t1", URL: "https://example.com/a.bin", SavePath: "/tmp/a.bin"}
 	row := newTaskRow(tk)
 	row.bind(tk, svc)
 
@@ -124,7 +107,7 @@ func TestDelete_CancelKeepsTask(t *testing.T) {
 	defer w.Close()
 
 	svc := &rowActionSvc{}
-	tk := &store.Task{ID: "t2", URL: "https://example.com/b.bin", SavePath: "/tmp/b.bin"}
+	tk := &api.Task{ID: "t2", URL: "https://example.com/b.bin", SavePath: "/tmp/b.bin"}
 	row := newTaskRow(tk)
 	row.bind(tk, svc)
 

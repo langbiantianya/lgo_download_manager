@@ -15,40 +15,22 @@ import (
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 
-	"lgo_download_manager/internal/bittorrent"
+	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/ilocale"
-	"lgo_download_manager/internal/scheduler"
-	"lgo_download_manager/internal/store"
 )
 
-// recordingSvc 统计 SaveSettings 调用次数。它实现了 NewMainWindow 构造
-// 期间会碰到的全部 Service 方法(List/Subscribe/Settings/SaveSettings),
-// 其余方法只在用户交互时才走到,测试不触发。
+// recordingSvc 统计 SaveSettings 调用次数。其余 rpc.Client 方法由
+// nopClient 给出无害默认值——NewMainWindow 构造期间只会碰到
+// List/Subscribe/Settings，测试也只需要观察 SaveSettings。
 type recordingSvc struct {
+	nopClient
 	saved atomic.Int32
 }
 
-func (r *recordingSvc) List(store.StatusFilter, store.TaskSort) ([]*store.Task, error) {
-	return nil, nil
-}
-func (r *recordingSvc) Subscribe() (<-chan scheduler.Event, func()) {
-	return make(chan scheduler.Event), func() {}
-}
-func (r *recordingSvc) AddTask(AddTaskInput) (*store.Task, error) { return nil, nil }
-func (r *recordingSvc) Start(string) error                        { return nil }
-func (r *recordingSvc) Pause(string) error                        { return nil }
-func (r *recordingSvc) Delete(string) error                       { return nil }
-func (r *recordingSvc) IsPreparing(string) bool                   { return false }
-func (r *recordingSvc) Probe(string) (int64, error)               { return 0, nil }
-func (r *recordingSvc) BTTaskDetail(string) (*bittorrent.Detail, error) {
-	return nil, nil
-}
-func (r *recordingSvc) Settings() store.Settings                  { return store.Settings{} }
-func (r *recordingSvc) SaveSettings(_ store.Settings) error {
+func (r *recordingSvc) SaveSettings(_ api.Settings) error {
 	r.saved.Add(1)
 	return nil
 }
-func (r *recordingSvc) Close() error { return nil }
 
 // TestSettingsPersist_SuppressBlocks 回归测试。
 //
@@ -60,8 +42,8 @@ func (r *recordingSvc) Close() error { return nil }
 // suppressPersist()==true 时直接 return。
 func TestSettingsPersist_SuppressBlocks(t *testing.T) {
 	svc := &recordingSvc{}
-	GlobalSettings = store.Settings{DefaultSaveDir: "/tmp"}
-	defer func() { GlobalSettings = store.Settings{} }()
+	GlobalSettings = api.Settings{DefaultSaveDir: "/tmp"}
+	defer func() { GlobalSettings = api.Settings{} }()
 
 	var onChangeCalls atomic.Int32
 	// 抑制态:SaveSettings 与 onChange 都必须 no-op。
@@ -78,8 +60,8 @@ func TestSettingsPersist_SuppressBlocks(t *testing.T) {
 // 时 persist 必须正常落盘——suppress 不能成为永远屏蔽的副作用。
 func TestSettingsPersist_NilSuppressAllowsWrites(t *testing.T) {
 	svc := &recordingSvc{}
-	GlobalSettings = store.Settings{DefaultSaveDir: "/tmp"}
-	defer func() { GlobalSettings = store.Settings{} }()
+	GlobalSettings = api.Settings{DefaultSaveDir: "/tmp"}
+	defer func() { GlobalSettings = api.Settings{} }()
 
 	settingsPersist(svc, nil, nil)
 	if got := svc.saved.Load(); got != 1 {
@@ -121,8 +103,8 @@ func TestBuildSettingsContent_CategorizedTabs(t *testing.T) {
 	ilocale.Set("en")
 	defer ilocale.Set(prevLang)
 
-	GlobalSettings = store.Settings{DefaultSaveDir: "/tmp"}
-	defer func() { GlobalSettings = store.Settings{} }()
+	GlobalSettings = api.Settings{DefaultSaveDir: "/tmp"}
+	defer func() { GlobalSettings = api.Settings{} }()
 
 	content := buildSettingsContent(nil, nil, nil)
 	tabs, ok := content.(*container.AppTabs)
@@ -173,8 +155,8 @@ func TestBuildSettingsContent_BTConcurrencyTogether(t *testing.T) {
 	ilocale.Set("zh-Hans")
 	defer ilocale.Set(prevLang)
 
-	GlobalSettings = store.Settings{}
-	defer func() { GlobalSettings = store.Settings{} }()
+	GlobalSettings = api.Settings{}
+	defer func() { GlobalSettings = api.Settings{} }()
 
 	content := buildSettingsContent(nil, nil, nil)
 	tabs := content.(*container.AppTabs)
@@ -218,8 +200,8 @@ func TestApplyLanguage_SuppressesSettingsPersistDuringRebuild(t *testing.T) {
 	a := test.NewApp()
 	defer test.NewApp()
 
-	GlobalSettings = store.Settings{DefaultSaveDir: "/tmp"}
-	defer func() { GlobalSettings = store.Settings{} }()
+	GlobalSettings = api.Settings{DefaultSaveDir: "/tmp"}
+	defer func() { GlobalSettings = api.Settings{} }()
 
 	// 基准:不经过 applyLanguage,直接 showSettingsPage → 无抑制,
 	// 应当观察到重建设置页触发的 SaveSettings。
@@ -251,8 +233,8 @@ func TestSaveDirEntryRejectsEmpty(t *testing.T) {
 	test.NewApp()
 	defer test.NewApp()
 
-	GlobalSettings = store.Settings{DefaultSaveDir: "/tmp/dl"}
-	defer func() { GlobalSettings = store.Settings{} }()
+	GlobalSettings = api.Settings{DefaultSaveDir: "/tmp/dl"}
+	defer func() { GlobalSettings = api.Settings{} }()
 
 	var persisted atomic.Int32
 	entry := newSaveDirEntry(func() { persisted.Add(1) })
@@ -276,5 +258,76 @@ func TestSaveDirEntryRejectsEmpty(t *testing.T) {
 	}
 	if got := persisted.Load(); got != 1 {
 		t.Fatalf("persist called %d times, want 1", got)
+	}
+}
+
+// TestBuildLanguageSelect_DoesNotOverrideLocaleOnInit 回归测试。
+//
+// Fyne 的 Select.SetSelected 会同步触发 OnChanged，而构建下拉框时用
+// SetSelected 摆当前语言是纯初始化动作。如果回调里无条件 ilocale.Set，
+// 初始值（例如 GlobalSettings.Language 为空 → 归一化成 zh-Hans）会
+// 把当前界面语言反向覆盖掉——实测表现为「已经切成英文的设置页，打开
+// 设置后又变回中文」。这里锁定：构建阶段不得改动 ilocale。
+func TestBuildLanguageSelect_DoesNotOverrideLocaleOnInit(t *testing.T) {
+	test.NewApp()
+	defer test.NewApp()
+
+	prev := ilocale.Current()
+	defer ilocale.Set(prev)
+	ilocale.Set("en")
+
+	GlobalSettings = api.Settings{} // 语言为空：归一化会落到 zh-Hans
+	defer func() { GlobalSettings = api.Settings{} }()
+
+	_ = buildLanguageSelect(func() {})
+	if got := ilocale.Current(); got != "en" {
+		t.Fatalf("构建语言下拉框后 ilocale.Current() = %q，want en（初始化不得覆盖当前语言）", got)
+	}
+}
+
+// TestLanguageSelectSwitchAppliesLocaleBeforePersist 守住「用户切语言」这条
+// 路径的两个关键语义：
+//
+//  1. 本进程的 ilocale 必须**立刻**切到新语言——契约层的语言控制消息不带
+//     语言标签（见 api.Message / rpc.Client.SetOnLanguage），UI 等不到标签；
+//     而 SaveSettings 的应答与随后的控制消息谁先到不确定，等回调再切会让
+//     界面语言落后一拍。
+//  2. persist 必须被调用一次——否则用户的选择没有落库，重启后回退。
+//
+// 这条用例驱动的是真实的下拉框回调（SetSelected → OnChanged），不是直接
+// 调内部函数。
+func TestLanguageSelectSwitchAppliesLocaleBeforePersist(t *testing.T) {
+	test.NewApp()
+
+	prevLocale := ilocale.Current()
+	prevSettings := GlobalSettings
+	t.Cleanup(func() {
+		ilocale.Set(prevLocale)
+		GlobalSettings = prevSettings
+	})
+
+	// 从中文起步，切到英文。
+	GlobalSettings.Language = "zh-Hans"
+	ilocale.Set("zh-Hans")
+
+	var persists int
+	sel := buildLanguageSelect(func() { persists++ })
+
+	enLbl := ilocale.T(ilocale.SupportedLabels["en"])
+	if enLbl == "" {
+		t.Fatal("前置条件不成立: 找不到英文的自描述标签")
+	}
+
+	// 触发用户选择。
+	sel.SetSelected(enLbl)
+
+	if got := ilocale.Current(); got != "en" {
+		t.Fatalf("切语言后本进程 locale = %q，期望 en（必须本地先切，不能等控制消息）", got)
+	}
+	if GlobalSettings.Language != "en" {
+		t.Fatalf("GlobalSettings.Language = %q，期望 en", GlobalSettings.Language)
+	}
+	if persists != 1 {
+		t.Fatalf("persist 调用 %d 次，期望恰好 1 次", persists)
 	}
 }

@@ -1,7 +1,10 @@
-lgdm
-lgdm.exe
-lgo_download_manager
-lgo_download_manager.exe
+# 构建产物：只可能出现在仓库根，用前导斜杠锚定。
+# 注意不能写成裸 "lgdm"——git 的无斜杠模式会匹配任意层级的同名文件或目录，
+# 会把 proto/lgdm/v1/lgdm.proto（gRPC 契约源文件）一起忽略掉。
+/lgdm
+/lgdm.exe
+/lgo_download_manager
+/lgo_download_manager.exe
 bin/
 dist/
 # 手工跑 flatpak-builder 时建在仓库根的状态/缓存目录(脚本用 --state-dir 放进 dist/)
@@ -20,3 +23,7 @@ downloads/
 # (每个任务存储都带 .part 文件语义),理论上不会生成它;留一条以防
 # 受限环境下某个回退路径把它落到仓库里被误提交。
 .torrent.bolt.db
+
+# 本地隔离工作区：git worktree 与 SDD 进度台账，都是临时目录，不要提交
+.worktrees/
+.superpowers/

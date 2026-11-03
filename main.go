@@ -8,11 +8,11 @@
 //
 //  1. 业务主进程（默认）：SQLite store + 下载 scheduler + 托盘 +
 //     URL 转发 socket server + UI 管理器（拉起 UI 子进程）。
-//  2. Fyne UI 子进程：由业务进程自我复刻启动，连接业务 socket 运行
-//     Fyne 界面，关闭即由操作系统回收所有内存。
+//  2. Fyne UI 子进程：由业务进程自我复刻启动，通过 gRPC 或 net/http 传输
+//     连回业务进程运行 Fyne 界面，关闭即由操作系统回收所有内存。
 //
-// 角色分派通过 ipc.EnvUIChild 环境变量完成：业务进程拉起子进程时
-// 会把 EnvUIChild=1 与 socket/token 一并注入。
+// 角色分派通过 rpc.EnvUIChild 环境变量完成：业务进程拉起子进程时会把
+// EnvUIChild=1 与监听地址/token/传输协议名一并注入。
 //
 // 浏览器接力有两条通道，扩展侧按这个优先级尝试：
 //
@@ -27,18 +27,21 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/appservice"
 	"lgo_download_manager/internal/downloaddir"
 	"lgo_download_manager/internal/handoff"
 	"lgo_download_manager/internal/ilocale"
-	"lgo_download_manager/internal/ipc"
 	"lgo_download_manager/internal/logging"
 	"lgo_download_manager/internal/protocol"
+	"lgo_download_manager/internal/rpc"
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/settings"
 	"lgo_download_manager/internal/store"
 	"lgo_download_manager/internal/tray"
 	"lgo_download_manager/internal/ui"
 	"lgo_download_manager/internal/uimgr"
+	"lgo_download_manager/internal/urlkind"
 	"lgo_download_manager/internal/urllauncher"
 	"lgo_download_manager/internal/version"
 	"log/slog"
@@ -87,8 +90,16 @@ func main() {
 	light := flag.Bool("light", false, "force lightweight mode (destroy UI on close)")
 	debug := flag.Bool("debug", false, "log to stderr instead of rotating file")
 	autostartSilent := flag.Bool("autostart", false, "invoked by OS login autostart: start hidden in tray and open the UI on demand")
+	rpcListen := flag.String("rpc-listen", "", "UI channel listen address (unix:<path> or tcp:<host:port>)")
 	flag.Parse()
 	startup := startupMode{noGUI: *noGUI, autostart: *autostartSilent}
+
+	// UI 通道的监听地址：命令行优先，其次环境变量 LDM_RPC_LISTEN，
+	// 都没有时由 uimgr 自动生成 unix socket 路径。uimgr 在 Start() 时
+	// 读取这个变量，并把最终地址透传给 UI 子进程。
+	if *rpcListen != "" {
+		os.Setenv(uimgr.EnvRPCListen, *rpcListen)
+	}
 
 	// 把 --debug 通过环境变量传给即将拉起的 UI 子进程,
 	// 让子进程日志也走 stderr,而不是悄悄落到文件里。
@@ -129,7 +140,7 @@ func main() {
 	logging.Printf("lgdm %s", version.String())
 
 	// 这样业务子进程即便被误调用也不会去解析业务 flag 或拉起 store。
-	if os.Getenv(ipc.EnvUIChild) == "1" {
+	if os.Getenv(rpc.EnvUIChild) == "1" {
 		os.Exit(ui.RunChild())
 	}
 
@@ -219,9 +230,15 @@ func main() {
 	}
 	go sc.Run(ctx)
 
-	// UI 管理器：负责拉起/管理 Fyne UI 子进程（自我复刻）。必须先于
-	// handleDownloadURL 创建,后者把 URL 转发给 UI 弹弹对话框。
-	uim := uimgr.New(st, sc)
+	// 业务侧应用服务：把 scheduler/store 的能力包装成契约层（api 包）。
+	// 传输层（gRPC / net/http）只认这一层，不直接接触数据库与调度器。
+	svc := appservice.New(st, sc)
+	svc.SetSettings(cur)
+
+	// UI 管理器：负责拉起/管理 Fyne UI 子进程（自我复刻）并对外提供
+	// 业务接口服务。必须先于 handleDownloadURL 创建,后者把 URL 转发给
+	// UI 弹弹对话框。
+	uim := uimgr.New(svc)
 	uim.SetSettings(cur)
 	// 把权威 Language 应用到当前进程的 ilocale(托盘、日志等业务侧
 	// 本地化都走这里),同时注册变更 hook:UI 在「设置」里切语言时,
@@ -231,10 +248,10 @@ func main() {
 		ilocale.Set(lang)
 		tray.Reload()
 	})
-	// 同步 curLang 到 uimgr:冷启动场景 InitData 会从 settings 携带
+	// 同步 curLang 到 uimgr:冷启动场景握手时的 get_settings 快照会携带
 	// Language,这里提前置好,避免 UI 起来后 SetLanguage 因 curLang 与
-	// s.Language 相等而误判"无变更"。运行中切语言由 dispatch → SetLanguage
-	// 处理,hook 同步刷新本进程本地化界面。
+	// s.Language 相等而误判"无变更"。运行中切语言由 save_settings →
+	// appservice → SetLanguage 处理,hook 同步刷新本进程本地化界面。
 	uim.SetLanguage(cur.Language)
 
 	// handleRequest 是「本地端口」与「lgom:// URL」两条通道共用的落地逻辑:
@@ -260,7 +277,7 @@ func main() {
 			addAndStartFromURL(sc, cur, req)
 			return nil
 		}
-		if err := uim.SendShowAddTask(ipc.ShowAddTaskParams{
+		if err := uim.SendShowAddTask(api.ShowAddTaskParams{
 			URL:     req.URL,
 			Name:    req.Name,
 			UA:      req.UA,
@@ -342,8 +359,8 @@ func main() {
 	})
 
 	// 默认拉起 UI(除非 -no-gui 或 --autostart)。本进程的本地 --open-url / 位置参数
-	// URL 在 uim 起来之前就已经被上面循环处理——SendShowAddTask 内部会
-	// 等待握手,首条消息不会丢失。
+	// URL 在 uim 起来之前就已经被上面循环处理——SendShowAddTask 会把消息放进
+	// 控制通道的缓冲里，UI 连上来之后照常收到（不再靠等待握手）。
 	//
 	// --autostart 是 OS 登录启动项触发的静默拉起:初始只保留调度器 +
 	// 系统托盘,等用户点托盘「显示窗口」或由扩展/URL 请求按需打开 UI。
@@ -384,17 +401,17 @@ func main() {
 // BitTorrent 任务的保存路径是「任务目录」而不是单个文件:磁力链接按
 // 链接里的 dn(没有则 infohash 前缀)、.torrent 按去掉后缀的文件名建目录,
 // 种子内容随后下载到该目录之下。这与「新建任务」对话框里的推导规则
-// 一致(见 scheduler.BittorrentDefaultDir)。
+// 一致(见 urlkind.BittorrentDefaultDir)。
 func savePathFor(s store.Settings, rawURL, name string) string {
 	saveDir := s.DefaultSaveDir
 	if saveDir == "" {
 		saveDir = downloaddir.Default()
 	}
-	if protocol.IsBitTorrent(rawURL) {
+	if urlkind.IsBitTorrent(rawURL) {
 		if name == "" {
-			name = scheduler.BittorrentDefaultDir(rawURL)
+			name = urlkind.BittorrentDefaultDir(rawURL)
 		}
-		return filepath.Join(saveDir, protocol.SafeDirName(name, "bt-task"))
+		return filepath.Join(saveDir, urlkind.SafeDirName(name, "bt-task"))
 	}
 	if name == "" {
 		name = filepath.Base(rawURL)

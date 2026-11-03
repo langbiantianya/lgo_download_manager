@@ -4,10 +4,15 @@
 //
 // Copyright (c) 2026 langbiantianya
 
+// 注意：本文件是测试代码，为了构造「有任务、有设置」的初始状态而 import
+// 了 internal/store（以及 internal/scheduler / internal/appservice 之一）。
+// 这是**仅测试用**的例外：internal/ui 的非测试代码必须只依赖契约层
+// （internal/api + internal/rpc + internal/urlkind），不得 import 业务侧包。
+// 见 internal/ui/boundary_test.go 与 Task 10 的 G4/G9 说明。
+
 package ui
 
 import (
-	"context"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,8 +22,8 @@ import (
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 
-	"lgo_download_manager/internal/ipc"
-	"lgo_download_manager/internal/scheduler"
+	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/rpc"
 	"lgo_download_manager/internal/store"
 )
 
@@ -33,46 +38,20 @@ func TestAddTaskDialog_BittorrentFolderSemantics(t *testing.T) {
 	defer test.NewApp()
 
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	defer st.Close()
-
 	saveDir := filepath.Join(dir, "dl")
-	if err := st.SaveSettings(store.Settings{DefaultSaveDir: saveDir, DefaultThreads: 2}); err != nil {
-		t.Fatalf("SaveSettings: %v", err)
-	}
-	GlobalSettings, _ = st.LoadSettings()
-
 	// 全零设置的 BT 开关是「未配置」状态,这里显式给一份与 settings.Load
 	// 首启默认一致的配置,模拟真实启动路径。
-	GlobalSettings.BTDHT = true
-	GlobalSettings.BTPEX = true
-
-	sc := scheduler.New(st)
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	defer func() {
-		// 与生产退出流程一致:先暂停所有任务(等写者停止),再关 BT 客户端。
-		// 否则 BT 任务的 goroutine 还会往任务目录里写文件,与临时目录
-		// 清理并发(Windows 上表现为 "The directory is not empty",
-		// 用例随机失败)。
-		pauseCtx, pauseCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = sc.PauseAll(pauseCtx)
-		pauseCancel()
-		cancel()
-		<-done
-		sc.CloseBittorrent()
-	}()
-	go func() {
-		sc.Run(ctx)
-		close(done)
-	}()
-	svc := &localServiceAdapter{sc: sc, st: st}
+	env := startUIE2E(t, rpc.TransportHTTP, store.Settings{
+		DefaultSaveDir: saveDir,
+		DefaultThreads: 2,
+		BTDHT:          true,
+		BTPEX:          true,
+	})
+	st := env.store
+	svc := env.client
 
 	const magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Ubuntu%2024.04"
-	ShowAddTaskDialogForURL(svc, ipc.ShowAddTaskParams{URL: magnet})
+	ShowAddTaskDialogForURL(svc, api.ShowAddTaskParams{URL: magnet})
 
 	wAdd := findAppWindow(a, "新建下载任务")
 	if wAdd == nil {

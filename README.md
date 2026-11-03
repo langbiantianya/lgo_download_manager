@@ -4,9 +4,9 @@
 并发的分片下载、BitTorrent（磁力链接 / `.torrent`），以及用于浏览器接力的
 两条交接通道（本地端口 / `lgom://` URL 协议）。
 
-业务进程与 UI 子进程通过 Unix socket + 长度前缀 JSON 帧通信：业务进程
-持有 SQLite 与 scheduler、UI 子进程是单独的 Fyne 进程；托盘常驻业务进程，
-随时可以重新拉起 UI。
+业务进程与 UI 子进程通过 `internal/rpc` 这一层通信（gRPC 或 net/http 两种
+传输，默认 gRPC）：业务进程持有 SQLite 与 scheduler、UI 子进程是单独的
+Fyne 进程；托盘常驻业务进程，随时可以重新拉起 UI。
 
 ## 功能特性
 
@@ -298,7 +298,7 @@ bin\lgdm-x64.exe                     bin\lgdm-arm64.exe
   PrepareToInstall`），避免 exe 被占用。
 - **升级保留数据，卸载删数据**：卸载会删掉安装目录、`lgom` 注册表键、快捷方式，
   以及用户数据目录 `%LOCALAPPDATA%\lgo_download_manager`（任务库
-  `lgdm.sqlite`、`-wal`/`-shm`、UI IPC 的 `ui-*.sock`）；覆盖安装/升级不碰它。
+  `lgdm.sqlite`、`-wal`/`-shm`、UI 通道的 `ui-*.sock`）；覆盖安装/升级不碰它。
 
 静默安装/卸载（脚本化部署用）：
 
@@ -638,6 +638,106 @@ SQLite 数据库固定为 `<config>/lgdm.sqlite`。
 业务进程通过环境变量 `LGDM_DEBUG=1` 把 `--debug` 透传给由它自我复刻拉起的
 UI 子进程，避免子进程的日志悄悄落到文件里。
 
+## 架构
+
+业务进程与 UI 子进程之间走 `internal/rpc` 这一层接口，而不是各自实现一套
+线协议。分四层，自下而上：
+
+| 层                | 位置                  | 职责                                                   |
+| ----------------- | --------------------- | ------------------------------------------------------ |
+| 契约层            | `internal/api`        | DTO 与词汇表。`list` / `add` / `probe` 等 11 个方法的请求/响应类型，两种传输共用 |
+| 接口层            | `internal/rpc`        | `Transport` / `Handler` / `Client` 三个接口，加上注册表（`rpc.Serve` / `rpc.Dial`） |
+| 传输实现          | `internal/rpc/httpx`、`internal/rpc/grpcx` | 同一套契约的两种实现：`net/http`（REST 风格路径 + JSON）与 gRPC（server-streaming） |
+| 业务侧            | `internal/appservice` | 契约层的 Handler 实现，把调用转给 `internal/scheduler` |
+
+`internal/ui` 只依赖契约层与接口层，不认识 `store` / `scheduler` /
+`protocol` 这些业务侧的具体类型；`internal/uimgr` 反过来，只做「进程与通道」
+的装配。三条依赖边界有边界测试守着（`internal/ui/boundary_test.go`、
+`internal/rpc/boundary_test.go`）。
+
+传输协议默认 **gRPC**，可以切到 **net/http**：
+
+| 传输  | 适合什么场景                                   | 特点                                       |
+| ----- | ---------------------------------------------- | ------------------------------------------ |
+| gRPC  | 默认                                            | 强类型、性能好；消息流是 server-streaming  |
+| http  | 调试、想用 curl / Swagger UI 直接调            | 路径形如 `/lgdm.v1.DownloadService/list`；消息流是 NDJSON |
+
+gRPC 的契约权威源是 `proto/lgdm/v1/lgdm.proto`，生成物在
+`internal/rpc/grpcx/pb`（用 `scripts/gen_proto.sh` 重新生成，CI 会校验同步）。
+
+### UI 通道参数
+
+业务进程拉起 UI 子进程时，通过环境变量把通道参数传下去。子进程靠这些变量
+认出「我是 UI 子进程」，并知道该去哪儿、用哪种传输连回来：
+
+| 环境变量          | 含义                                          |
+| ----------------- | --------------------------------------------- |
+| `LDM_UI_CHILD`    | 值为 `1` 表示当前进程以 UI 子进程角色运行      |
+| `LDM_UI_LISTEN`   | 业务进程的监听地址（`unix:<路径>` 或 `tcp:<主机:端口>`） |
+| `LDM_UI_TOKEN`    | 握手 token，子进程用它鉴权                     |
+| `LDM_UI_TRANSPORT`| 传输协议名：`grpc` 或 `http`                   |
+
+业务进程自己的监听地址也能用命令行或环境变量改：
+
+| 参数 / 环境变量   | 默认值          | 说明                                       |
+| ----------------- | --------------- | ------------------------------------------ |
+| `--rpc-listen`    | `""`            | UI 通道监听地址；`unix:<路径>` 或 `tcp:<主机:端口>` |
+| `LDM_RPC_LISTEN`  | 同上            | 环境变量形式的同一个设置（命令行优先）      |
+
+留空时用默认的 Unix socket（权限 `0600`，只有当前用户能连），路径在
+`$XDG_CACHE_HOME/lgo_download_manager/ui-<随机后缀>.sock` 一带。
+
+改成 TCP 时**默认只绑回环地址**；绑到非回环地址时程序会打一条告警——那种
+情况下 token 是唯一防线，同机其它人都能探测到这个端口。
+
+```sh
+# 用 TCP 监听，只绑本机
+lgdm --rpc-listen tcp:127.0.0.1:17830
+
+# 换 http 传输（调试用）
+LDM_UI_TRANSPORT=http lgdm
+```
+
+token 每次调用都强制校验，校验不过一律拒绝。
+
+### HTTP 文档端点
+
+`http` 传输下，业务进程的监听地址同时提供一份离线嵌入的 OpenAPI 文档：
+
+```sh
+LDM_UI_TRANSPORT=http lgdm --rpc-listen tcp:127.0.0.1:17830
+# 浏览器打开 http://127.0.0.1:17830/docs/
+```
+
+`/docs/` 下是 Swagger UI，静态资源直接打进二进制，页面不引用任何外链
+（断网也能用）。规范本身在 `internal/rpc/httpx/openapi.yaml`，与
+`internal/api` 的 DTO 一致性由测试守着。
+
+文档端点**不需要 token**（否则没法在浏览器里打开），业务端点仍然要。
+
+手动用 curl 调一个业务端点：
+
+```sh
+curl -i -X POST http://127.0.0.1:17830/lgdm.v1.DownloadService/list \
+  -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' -d '{}'
+```
+
+没有带对 token 时返回 **401**，这是预期行为，不是故障。
+
+### 已知局限
+
+- **消息流不自动重连**：NDJSON / gRPC server-streaming 断开后不会自己接回来，
+  下次调用仍可用，但要重新拿事件流得重启 UI 子进程。
+- **http 传输下 token 是唯一防线**：绑定到非回环地址时，接口对本机网络可见。
+- **业务错误一律 500**：契约层不做业务错误码细分，错误文本里带业务原因。
+- **枚举与空切片在两种传输下不完全一致**：proto3 的枚举带不了未知取值（gRPC
+  侧静默降级为 UNSPECIFIED），空切片与「未设置」也分不开。这些差异记在
+  `internal/rpc/contract_test.go` 的分歧表里。
+- **两种传输的响应外壳不同**：gRPC 的 RPC 必须返回具名 message，所以 `add` /
+  `get_settings` / `bt_info` 的响应在外面包了一层（`AddTaskResponse{task:…}`、
+  `GetSettingsResponse{settings:…}`、`BTDetailResponse{detail:…}`）；http 传输
+  直接返回裸 DTO。写跨传输的通用客户端时不能假设响应体结构相同。
+
 ## 浏览器扩展接力
 
 `lgom-extension/`（Chrome / Firefox MV3）拦截浏览器下载后，按下表顺序把任务交给
@@ -923,7 +1023,7 @@ BT 任务的「任务详情」窗口**不**沿用 HTTP 任务那套通用字段�
 这正是「只显示完整进度」看不出来的东西。桶值跟着 `bt_info` 的快照一起
 下发（每桶 1 字节），所以这张图每秒都跟着实际下载进度变化。
 
-面板每秒钟向业务进程取一次实时快照（IPC 方法 `bt_info`），窗口打开期间
+面板每秒钟向业务进程取一次实时快照（`bt_info` 方法），窗口打开期间
 持续刷新。这些数据是易变的（peer 数每秒都在变），刻意**不**进
 `store.Task`——那是落库的静态快照；BT 任务的句柄由 scheduler 单独登记，
 任务暂停 / 结束且不做种时句柄被摘除，面板随之显示「会话已结束」。
@@ -935,7 +1035,7 @@ BT 任务的「任务详情」窗口**不**沿用 HTTP 任务那套通用字段�
   手滑点一下就没了；
 - 「任务详情」窗口每个任务最多一个：再点一次「详情」按钮会把已经开着的
   那个置前，不会开出第二个一模一样的窗口（BT 面板每秒轮询一次，多开一个
-  既重复显示又白费一次 IPC）；不同任务各自一个，互不影响；
+  既重复显示又白费一次调用）；不同任务各自一个，互不影响；
 - 设置改动：限速立刻生效；监听端口 / DHT / PEX / 连接数上限这类客户端
   构造期参数在没有 BT 任务运行时立即重建客户端生效，否则延后到最后一个
   BT 任务结束（做种中的任务也算「在运行」）。
@@ -976,23 +1076,24 @@ BT 任务的种子元数据（info 字典）存在 `bt_metainfo` 表（`task_id`
               │  托盘 + urllauncher     │
               │  handoff(本地端口)      │
               │  uimgr.Manager          │
+              │  appservice (契约层)    │
               └────────────┬───────────┘
                            │  拉起自身 + env 注入
-                           │  (EnvUIChild=1)
+                           │  (LDM_UI_CHILD=1)
                            ▼
               ┌────────────────────────┐
               │ UI 子进程              │
-              │  Fyne + ipcClient      │
-              │  (RunChild)            │
+              │  Fyne + rpc.Client     │
+              │  (ui.RunChild)          │
               └────────────┬───────────┘
                            │
-                Unix socket + 长度前缀 JSON 帧
-                (internal/ipc)
+              internal/rpc：gRPC 或 net/http
+              （Unix socket 或 TCP + token）
 ```
 
-`uimgr.Manager` 持有当前 UI 子进程的 socket + token。业务侧的所有方法
-（add/pause/start/...）经 IPC 转发；UI 侧的 scheduler 事件经同一条 socket 反向
-推回。UI 子进程关闭后业务进程不受影响，托盘可随时重新拉起 UI。
+`uimgr.Manager` 持有当前 UI 会话的监听地址 + token，并用 `rpc.Serve` 起
+传输层服务。业务侧的所有方法（add/pause/start/...）经契约层转发；scheduler
+事件经消息流反向推回。UI 子进程关闭后业务进程不受影响，托盘可随时重新拉起 UI。
 
 ## 架构
 
@@ -1003,7 +1104,7 @@ internal/protocol/             # HTTP、HTTPS、FTP、WebDAV 驱动 + 代理 + �
   └── sysproxy/                #   跨平台系统代理检测（linux/darwin/windows/other）
 internal/bittorrent/           # BitTorrent 客户端封装（anacrolix/torrent）：共享客户端、
                                #   种子添加/元数据缓存恢复、限速、按任务的存储目录
-internal/engine/               # 分片规划、Range 下载、重试
+internal/engine/               # 分片规划、Range 下载、重试（按职责拆成 engine/plan/chunk/progress/retry 五个文件）
 internal/scheduler/            # 单任务生命周期、状态事件、进度刷盘、异步 Start
                                #   （HTTP 分片与 BT 两条下载路径的编排）
 internal/prealloc/             # 磁盘预分配辅助
@@ -1014,8 +1115,13 @@ internal/handoff/              # 浏览器扩展的本地端口通道：127.0.0.
 internal/settings/             # 首次运行默认值 / --light 覆盖 / 进程级代理同步 / 开机自启调和
 internal/autostart/            # 跨平台开机自启：HKCU Run / XDG autostart / LaunchAgent（含 Flatpak）
 internal/logging/              # log/slog 门面：轮转文件 / --debug stderr / Windows console 挂接
-internal/ipc/                  # 长度前缀 JSON 帧协议（业务↔UI 共用）
-internal/uimgr/                # UI 子进程生命周期与 IPC 会话管理
+internal/api/                  # 契约 DTO 与词汇表（11 个方法的请求/响应类型）
+internal/rpc/                  # 接口层：Transport / Handler / Client + 注册表
+  ├── addr/                    #   监听地址解析（unix:<path> / tcp:<host:port>）
+  ├── httpx/                   #   net/http 传输（REST 风格路径 + JSON，附 OpenAPI 文档）
+  └── grpcx/                   #   gRPC 传输（proto/lgdm/v1/lgdm.proto 是契约权威源）
+internal/appservice/           # 契约层的 Handler 实现：把调用转给 scheduler
+internal/uimgr/                # UI 子进程生命周期与 UI 会话管理
 internal/ui/                   # Fyne 窗口、任务列表、设置对话框、分片视图、系统托盘
 internal/tray/                 # fyne.io/systray 业务进程常驻托盘
 assets/                        # 图标（安装包快捷方式 / lgom:// DefaultIcon 都用它）
@@ -1032,29 +1138,39 @@ org.langbiantianya.LGDM.yml    # Flatpak manifest（app id / runtime / 权限 / 
 flatpak/                       # Flatpak 用的 AppStream metainfo
 ```
 
-### IPC 协议（业务 ↔ UI 子进程）
+### UI 通道协议（业务 ↔ UI 子进程）
 
-`internal/ipc` 用长度前缀 JSON 帧（4 字节 big-endian 长度头 + JSON body，
-单条消息上限 1 MiB）序列化所有跨进程消息：
+跨进程消息走 `internal/rpc`，不再是自定义的帧协议。同一条通道上有三类东西：
 
-- `MsgHello`（UI→业务）：握手 token
-- `MsgInit`（业务→UI）：权威设置快照
-- `MsgCall`（UI→业务）：`list` / `add` / `start` / `pause` / `delete` / `probe` /
-  `bt_info` / `save_settings`，返回 `MsgResult`
-- `MsgEvent`（业务→UI）：scheduler 事件（added / started / progress / paused /
-  completed / failed / updated）
-- `MsgShow`（业务→UI）：托盘「显示窗口」菜单
-- `MsgClose`（业务→UI）：业务进程退出，UI 收到后主动 `a.Quit()`
+- **调用**：UI→业务。契约层定义的 11 个方法——`list` / `add` / `start` /
+  `pause` / `delete` / `is_preparing` / `probe` / `get_settings` /
+  `save_settings` / `bt_info` / `stream_messages`。请求与响应的类型由
+  `api.Spec(method)` 钉死，两种传输在调用前都做类型校验。
+- **事件流**：业务→UI。scheduler 事件（added / started / progress / paused /
+  completed / failed / updated）在 http 传输下是 NDJSON 长连接，在 gRPC 下是
+  server-streaming。
+- **控制消息**：业务→UI。托盘「显示窗口」、语言变更、业务退出等。
 
-业务侧只用一个进程对应一个 UI 会话；UI 断开时业务侧 `cmd.Wait()` 触发
-`acceptLoop` 清理，可由托盘「显示窗口」再次拉起。
+握手用 token（`Authorization: Bearer <token>`，gRPC 走 metadata），每次调用
+都校验。
+
+panic 的处理两种传输是对齐的：业务侧 handler 里一旦 panic，传输层兜住它，
+不让 panic 带走整个进程。这条对 gRPC 尤其要紧——grpc-go 默认**不 recover**，
+panic 会一路冒到 server 的 goroutine 顶层把进程带走，而业务进程里还跑着所有
+下载任务。现在 gRPC 侧转成 `Internal` 错误，http 侧转成 500 +
+`{"ok":false,"error":…}`，客户端拿到的都是一个明确的错误，而不是一条被掐断
+的连接。UI 侧的回调钩子里 panic 也一样兜住：会话被标记成断开，上层按
+「UI 崩了」处理，界面不会无声无息地消失。
+
+业务侧只用一个进程对应一个 UI 会话；UI 断开时业务侧 `cmd.Wait()` 触发会话
+清理，可由托盘「显示窗口」再次拉起。
 
 ### 新建任务对话框
 
 「新建任务」使用独立 Fyne 窗口（不是 modal popup）：用户可以在主窗口
 和对话框之间切换，文件大小预览由 `svc.Probe` 异步探测；URL 变化时自动
 从路径末段提取文件名填入保存路径。点击「开始下载」会依次调
-`svc.AddTask` → `svc.Start`（二者都经 IPC 落到业务进程），成功后关闭
+`svc.AddTask` → `svc.Start`（二者都经 UI 通道落到业务进程），成功后关闭
 对话框。AddTask / Start 任一返回错误时弹错误对话框，保留窗口供修正。
 
 URL 是磁力链接 / `.torrent` 时对话框会切换语义：标签变成「保存目录」，
@@ -1073,7 +1189,7 @@ URL 是磁力链接 / `.torrent` 时对话框会切换语义：标签变成「�
    `WaitGroup.Wait()` 阻塞到每个 per-job goroutine 把 `Paused`
    落盘。5s 超时未完成则 `os.Exit(1)` 兜底结束进程。
 2. `cancel()` 根 ctx — scheduler.Run 退出。
-3. `uim.Close()` 发 `MsgClose`，等 2s 后强杀 UI 子进程。
+3. `uim.Close()` 推 `MessageKindClose` 控制消息，等 2s 后强杀 UI 子进程。
 4. `tray.Stop()` 退出 systray 事件循环。
 
 第 1 步必须在 `cancel()` 之前：scheduler.Run 在 ctx.Done 上会跑最后一次
@@ -1111,8 +1227,8 @@ HTTP/FTP 任务。任一 slot 释放都会让排队中的最早可用任务自�
 
 `SetMaxConcurrent(n)` 是运行时调入口：用户在「设置」调大上限时立即
 触发 promote，把累积的 Pending 任务按 FIFO 拉起；调小上限只影响后续
-新增的任务，正在跑的不会自动暂停。UI 的 `MethodSaveSettings` 经
-`uimgr.Manager.SetSettings` 把新值推到 scheduler。
+新增的任务，正在跑的不会自动暂停。UI 的 `save_settings` 经
+`appservice.SetSettings` 把新值推到 scheduler。
 
 `abortPrepare`（任务在 probe/预分配阶段被 Pause 取消的快速收尾）的
 执行顺序为「先写 store 为 Paused，再 `releaseSlot`」：必须先持久化状态，

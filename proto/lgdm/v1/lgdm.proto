@@ -1,0 +1,296 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+//
+// Copyright (c) 2026 langbiantianya
+
+syntax = "proto3";
+
+package lgdm.v1;
+
+option go_package = "lgo_download_manager/internal/rpc/grpcx/pb;pb";
+
+// DownloadService 是业务主进程暴露给 UI 子进程的下载管理服务。
+// 与 internal/api 的契约一一对应：每个 rpc 对应一个 api.Method* 常量，
+// 请求/响应消息与 api 层的 DTO 一一对应。
+//
+// 服务名与 httpx 传输的 URL 前缀（/lgdm.v1.DownloadService/）保持一致，
+// 两种传输对外暴露的方法集合因此完全相同。
+service DownloadService {
+  rpc List(ListRequest) returns (ListResponse);
+  rpc AddTask(AddTaskRequest) returns (AddTaskResponse);
+  rpc StartTask(TaskRef) returns (Empty);
+  rpc PauseTask(TaskRef) returns (Empty);
+  rpc DeleteTask(TaskRef) returns (Empty);
+  rpc IsPreparing(TaskRef) returns (BoolResponse);
+  rpc Probe(ProbeRequest) returns (ProbeResponse);
+  rpc GetSettings(Empty) returns (GetSettingsResponse);
+  rpc SaveSettings(SaveSettingsRequest) returns (Empty);
+  rpc BTTaskDetail(BTInfoRequest) returns (BTDetailResponse);
+  rpc StreamMessages(Empty) returns (stream Message);
+}
+
+// Status 反映 Task 的生命周期状态。取值与 internal/store 完全一致。
+enum Status {
+  STATUS_UNSPECIFIED = 0;
+  STATUS_PENDING = 1;
+  STATUS_DOWNLOADING = 2;
+  STATUS_PAUSED = 3;
+  STATUS_COMPLETED = 4;
+  STATUS_FAILED = 5;
+  STATUS_FILE_LOST = 6;
+}
+
+// StatusFilter 是任务列表的筛选条件。UNSPECIFIED 表示不过滤。
+enum StatusFilter {
+  STATUS_FILTER_UNSPECIFIED = 0;
+  STATUS_FILTER_ALL = 1;
+  STATUS_FILTER_PENDING = 2;
+  STATUS_FILTER_DOWNLOADING = 3;
+  STATUS_FILTER_PAUSED = 4;
+  STATUS_FILTER_COMPLETED = 5;
+  STATUS_FILTER_FAILED = 6;
+  STATUS_FILTER_FILE_LOST = 7;
+}
+
+// TaskSort 是任务列表的排序方式。UNSPECIFIED 表示默认排序。
+enum TaskSort {
+  TASK_SORT_UNSPECIFIED = 0;
+  TASK_SORT_CREATED_DESC = 1;
+  TASK_SORT_CREATED_ASC = 2;
+  TASK_SORT_NAME_ASC = 3;
+  TASK_SORT_NAME_DESC = 4;
+}
+
+// ProxyMode 是代理模式。
+enum ProxyMode {
+  PROXY_MODE_UNSPECIFIED = 0;
+  PROXY_MODE_SYSTEM = 1;
+  PROXY_MODE_DISABLED = 2;
+  PROXY_MODE_MANUAL = 3;
+}
+
+// ProtocolKind 是任务所属的传输协议。
+enum ProtocolKind {
+  PROTOCOL_KIND_UNSPECIFIED = 0;
+  PROTOCOL_KIND_HTTP = 1;
+  PROTOCOL_KIND_HTTPS = 2;
+  PROTOCOL_KIND_FTP = 3;
+  PROTOCOL_KIND_WEBDAV = 4;
+  PROTOCOL_KIND_BT = 5;
+}
+
+// Empty 是无负载请求/响应的占位类型。
+message Empty {}
+
+// TaskRef 引用单个任务。
+message TaskRef {
+  string id = 1;
+}
+
+// BoolResponse 是布尔结果。
+message BoolResponse {
+  bool value = 1;
+}
+
+// ProbeRequest 是体积探测的请求。
+message ProbeRequest {
+  string url = 1;
+}
+
+// ProbeResponse 是体积探测的结果。
+message ProbeResponse {
+  int64 total_size = 1;
+}
+
+// ListRequest 是列表查询参数。filter 与 sort 用枚举而不是裸字符串：
+// gRPC 传输的价值就在类型安全，用字符串会浪费 protobuf 的类型系统。
+// UNSPECIFIED 分别对应「不过滤」与「默认排序」，与 HTTP 传输传空字符串
+// 的语义一致。
+message ListRequest {
+  StatusFilter filter = 1;
+  TaskSort sort = 2;
+}
+
+// ListResponse 是列表查询的结果。
+message ListResponse {
+  repeated Task tasks = 1;
+}
+
+// AuthOptions 是随任务一起传递的凭据。
+message AuthOptions {
+  string username = 1;
+  string password = 2;
+  string user_agent = 3;
+  string cookies = 4;
+  string referer = 5;
+  bool ftp_passive = 6;
+  ProxyMode proxy_mode = 7;
+  string proxy_url = 8;
+  string proxy_bypass = 9;
+  string proxy_auto_config_url = 10;
+}
+
+// AddTaskRequest 是「添加下载任务」的请求。
+message AddTaskRequest {
+  string url = 1;
+  string save_path = 2;
+  ProtocolKind protocol = 3;
+  AuthOptions auth = 4;
+  int32 chunk_count = 5;
+  int64 min_chunk_size = 6;
+}
+
+// AddTaskResponse 返回新建的任务。
+message AddTaskResponse {
+  Task task = 1;
+}
+
+// Task 是任务的对外视图。
+message Task {
+  string id = 1;
+  string url = 2;
+  string save_path = 3;
+  string protocol = 4;
+  int64 total_size = 5;
+  int64 downloaded = 6;
+  bool support_range = 7;
+  string etag = 8;
+  string last_modified = 9;
+  string digest_algorithm = 10;
+  string digest = 11;
+  bool is_allocated = 12;
+  int32 chunk_count = 13;
+  int64 min_chunk_size = 14;
+  repeated int64 chunk_progress = 15;
+  repeated int64 chunk_ranges = 16;
+  Status status = 17;
+  string auth_data = 18;
+  string error_message = 19;
+  string error_kind = 20;
+  // 时间字段用 RFC3339 字符串，而不是 google.protobuf.Timestamp：
+  // 避免为一个时间戳引入额外的 proto 依赖。
+  string created_at = 21;
+  string updated_at = 22;
+  string completed_at = 23;
+  string bt_file = 24;
+}
+
+// Settings 是权威设置快照。
+message Settings {
+  string default_save_dir = 1;
+  int32 default_threads = 2;
+  int64 min_chunk_size = 3;
+  string user_agent = 4;
+  string cookies = 5;
+  bool ftp_passive = 6;
+  bool prealloc = 7;
+  TaskSort task_sort = 8;
+  ProxyMode proxy_mode = 9;
+  string proxy_url = 10;
+  string proxy_bypass = 11;
+  string proxy_auto_config_url = 12;
+  int32 download_limit_kib = 13;
+  bool light_mode = 14;
+  int32 max_concurrent = 15;
+  bool auto_start = 16;
+  string language = 17;
+  int32 bt_port = 18;
+  int32 bt_max_peers = 19;
+  int32 bt_download_limit_kib = 20;
+  int32 bt_upload_limit_kib = 21;
+  bool bt_dht = 22;
+  bool bt_pex = 23;
+  double bt_seed_ratio = 24;
+  int32 bt_max_seeding = 25;
+  int32 bt_max_concurrent = 26;
+  string bt_trackers = 27;
+}
+
+// GetSettingsResponse 返回设置快照。
+message GetSettingsResponse {
+  Settings settings = 1;
+}
+
+// SaveSettingsRequest 是保存设置的请求。
+message SaveSettingsRequest {
+  Settings settings = 1;
+}
+
+// BTInfoRequest 是 BT 详情查询的请求。
+message BTInfoRequest {
+  string task_id = 1;
+}
+
+// FileProgress 是种子内单个文件的进度。
+message FileProgress {
+  string path = 1;
+  int64 length = 2;
+  int64 completed = 3;
+}
+
+// BTDetail 是 BT 任务的实时详情快照。
+message BTDetail {
+  string name = 1;
+  string info_hash = 2;
+  int64 total = 3;
+  int64 downloaded = 4;
+  int64 uploaded = 5;
+  double speed_bps = 6;
+  double upload_bps = 7;
+  int32 peers = 8;
+  int32 total_peers = 9;
+  int32 seeders = 10;
+  int32 leechers = 11;
+  int64 piece_length = 12;
+  int32 pieces = 13;
+  int32 pieces_done = 14;
+  repeated uint32 piece_buckets = 15;
+  bool seeding = 16;
+  bool complete = 17;
+  repeated FileProgress files = 18;
+  repeated string trackers = 19;
+}
+
+// BTDetailResponse 返回 BT 详情。
+message BTDetailResponse {
+  BTDetail detail = 1;
+}
+
+// Event 是一条任务事件。
+message Event {
+  string why = 1;
+  Task task = 2;
+  double speed_bps = 3;
+}
+
+// ShowAddTaskParams 描述一次「请 UI 弹出新建下载任务对话框」的请求。
+message ShowAddTaskParams {
+  string url = 1;
+  string name = 2;
+  string ua = 3;
+  string cookies = 4;
+}
+
+// Message 是服务端推送的一条消息。事件与控制消息合并在同一条流里。
+message Message {
+  // 消息类别，显式携带。
+  //
+  // 载荷缺席时（oneof 未设置）类别不能丢：api.Message.Event 与
+  // api.Message.ShowAddTask 都是指针，契约上允许为 nil。只靠 oneof 的
+  // 哪一臂表达类别做不到这一点——载荷缺席时类别就没了，「这条消息是
+  // event，但它没有事件载荷」与「这条消息什么都不是」分不开。
+  //
+  // 显式带类别还让未知类别能原样往返：载荷类型是有限的，未知类别只能
+  // 靠这一个字段表达。
+  string kind = 1;
+
+  // payload 只承载载荷，类别看上面的 kind。
+  oneof payload {
+    Event event = 2;
+    bool show = 3;
+    ShowAddTaskParams show_add_task = 4;
+    string language = 5;
+    bool close = 6;
+  }
+}

@@ -87,7 +87,7 @@ func ListenAndServe(onURL func(url string)) error {
 		return fmt.Errorf("listen unix: %w", err)
 	}
 
-	// 权限与 ipc.Listen 保持一致(0o600):只有当前用户能连接,否则同机
+	// 权限与 rpc/addr.Listen 保持一致(0o600):只有当前用户能连接,否则同机
 	// 任意本地用户都能往下载队列里投递 URL。
 	if err := syscall.Chmod(socketPath, 0o600); err != nil {
 		ln.Close()

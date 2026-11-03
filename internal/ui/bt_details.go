@@ -18,13 +18,13 @@ import (
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
 
-	"lgo_download_manager/internal/bittorrent"
+	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/ilocale"
-	"lgo_download_manager/internal/store"
+	"lgo_download_manager/internal/rpc"
 )
 
 // btPollInterval 是 BT 详情面板的刷新周期。peer 数与上下行速度每秒都在
-// 变,1s 足够看清变化;再密只是徒增 IPC 往返。
+// 变,1s 足够看清变化;再密只是徒增往返。
 const btPollInterval = time.Second
 
 // btDetailsPanel 是「任务详情」窗口里的 BT 专属面板。
@@ -34,8 +34,8 @@ const btPollInterval = time.Second
 // 列表与文件清单。HTTP 任务走的是另一套布局(通用字段 + 分块马赛克),
 // 见 chunk_details.go。
 //
-// 面板内容来自 Service.BTTaskDetail 的实时快照:这些数据每秒都在变,
-// 刻意不落库(store.Task 是静态快照),窗口打开期间按 btPollInterval
+// 面板内容来自 rpc.Client.BTTaskDetail 的实时快照:这些数据每秒都在变,
+// 刻意不落库(api.Task 是静态快照),窗口打开期间按 btPollInterval
 // 轮询刷新。
 type btDetailsPanel struct {
 	// 标量字段的值标签。刷新只改文本,不重建 widget 树。
@@ -102,7 +102,7 @@ type btFileRow struct {
 // details_window.go),不再新开一个。
 //
 // 返回值是本次新建的面板(窗口已存在时为 nil),供测试断言渲染内容。
-func showBTDetails(t *store.Task, svc Service, parent fyne.Window) *btDetailsPanel {
+func showBTDetails(t *api.Task, svc rpc.Client, parent fyne.Window) *btDetailsPanel {
 	// 同一任务已经开着详情窗口:置前即可,别再开一个一模一样的。
 	if focusExistingDetails(t.ID) {
 		return nil
@@ -123,7 +123,7 @@ func showBTDetails(t *store.Task, svc Service, parent fyne.Window) *btDetailsPan
 }
 
 // newBTDetailsPanel 构造面板与其 widget 树。
-func newBTDetailsPanel(t *store.Task) *btDetailsPanel {
+func newBTDetailsPanel(t *api.Task) *btDetailsPanel {
 	p := &btDetailsPanel{done: make(chan struct{})}
 
 	p.lblName = widget.NewLabelWithStyle(taskName(t), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
@@ -236,7 +236,7 @@ func (p *btDetailsPanel) content() fyne.CanvasObject {
 }
 
 // poll 周期性拉取 BT 详情并刷新面板,直到窗口关闭。
-func (p *btDetailsPanel) poll(svc Service, taskID string) {
+func (p *btDetailsPanel) poll(svc rpc.Client, taskID string) {
 	// 先立刻取一次,避免面板在打开的第一秒里全是占位符。
 	p.fetch(svc, taskID)
 	ticker := time.NewTicker(btPollInterval)
@@ -253,7 +253,7 @@ func (p *btDetailsPanel) poll(svc Service, taskID string) {
 
 // fetch 取一次实时详情并刷新面板。任务不在运行时把状态切到「会话已
 // 结束」,其余字段保留最后一次采样到的值。
-func (p *btDetailsPanel) fetch(svc Service, taskID string) {
+func (p *btDetailsPanel) fetch(svc rpc.Client, taskID string) {
 	select {
 	case <-p.done:
 		return
@@ -268,7 +268,7 @@ func (p *btDetailsPanel) fetch(svc Service, taskID string) {
 }
 
 // update 用一次实时快照刷新面板。
-func (p *btDetailsPanel) update(d *bittorrent.Detail) {
+func (p *btDetailsPanel) update(d *api.BTDetail) {
 	if d == nil {
 		return
 	}
@@ -313,7 +313,7 @@ func (p *btDetailsPanel) markInactive(err error) {
 
 // updateFiles 刷新种子内的文件清单。文件数不变时只更新进度,避免重建
 // widget 树;元数据刚到(文件数从 0 变成 N)时才整体重建。
-func (p *btDetailsPanel) updateFiles(files []bittorrent.FileProgress) {
+func (p *btDetailsPanel) updateFiles(files []api.FileProgress) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(files) == len(p.fileRows) {
@@ -350,7 +350,7 @@ func (r *btFileRow) widget() fyne.CanvasObject {
 }
 
 // update 用一次文件采样刷新这一行。
-func (r *btFileRow) update(f bittorrent.FileProgress) {
+func (r *btFileRow) update(f api.FileProgress) {
 	r.name.SetText(f.Path)
 	frac := 0.0
 	if f.Length > 0 {
@@ -382,8 +382,6 @@ func btSectionLabel(id, def string) *widget.Label {
 	return widget.NewLabelWithStyle(ilocale.TS(id, def), fyne.TextAlignLeading, fyne.TextStyle{Bold: true})
 }
 
-
-
 // btFormatRatio 计算并格式化分享率(已上传 / 已下载)。
 func btFormatRatio(uploaded, downloaded int64) string {
 	if downloaded <= 0 {
@@ -393,7 +391,7 @@ func btFormatRatio(uploaded, downloaded int64) string {
 }
 
 // btStateText 把种子的状态翻译成面板上的文字。
-func btStateText(d *bittorrent.Detail) string {
+func btStateText(d *api.BTDetail) string {
 	switch {
 	case d.Seeding:
 		return ilocale.T("details.bt.state.seeding")

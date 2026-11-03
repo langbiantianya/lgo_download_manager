@@ -211,29 +211,6 @@ func TestSplitTrackers(t *testing.T) {
 	}
 }
 
-// TestBittorrentDefaultDir 校验默认任务目录名的推导:磁力链接优先用 dn,
-// 没有 dn 用 infohash 前缀,种子文件用去掉后缀的文件名。
-func TestBittorrentDefaultDir(t *testing.T) {
-	cases := []struct {
-		url  string
-		want string
-	}{
-		{"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Ubuntu%2024.04", "Ubuntu 24.04"},
-		{"magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567", "magnet-0123456789abcdef"},
-		{"magnet:?xt=urn:btmh:1220caf1e1c30e81cb361b9ee167c4aa64228a7fa4fa914f7d0483e0c8cc8b0bb1e1", "magnet-1220caf1e1c30e81"},
-		{"magnet:?xs=urn:btih:zzz", "magnet"},
-		{"https://example.com/files/debian-13.iso.torrent", "debian-13.iso"},
-		{"/home/user/incoming/ubuntu.torrent", "ubuntu"},
-		{"https://example.com/files/debian.iso.torrent?token=abc", "debian.iso"},
-		{"https://example.com/a.zip", ""},
-	}
-	for _, c := range cases {
-		if got := BittorrentDefaultDir(c.url); got != c.want {
-			t.Errorf("BittorrentDefaultDir(%q) = %q, want %q", c.url, got, c.want)
-		}
-	}
-}
-
 // TestIsBittorrentTask 校验任务是否走 BT 路径的判定:显式 protocol 优先,
 // 历史空 protocol 的行按 URL 形态兜底。
 func TestIsBittorrentTask(t *testing.T) {

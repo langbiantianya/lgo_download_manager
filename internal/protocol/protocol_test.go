@@ -456,7 +456,18 @@ func TestProxyFuncManualEmptyURLGoesDirect(t *testing.T) {
 
 func TestProxyFuncSystemModeReturnsEnv(t *testing.T) {
 	// 设置一个环境变量让 ProxyFromEnvironment 有值；测试结束后清理。
+	//
+	// 大小写两个变量都要处理：不显式清掉小写的话，宿主环境里若有
+	// http_proxy，这条用例的结果就取决于运行机器的环境——CI 上与本机上
+	// 可能不一样。
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:7890")
+	t.Setenv("http_proxy", "")
+	t.Setenv("HTTPS_PROXY", "")
+	t.Setenv("https_proxy", "")
+	t.Setenv("ALL_PROXY", "")
+	t.Setenv("all_proxy", "")
+	t.Setenv("NO_PROXY", "")
+	t.Setenv("no_proxy", "")
 	fn := proxyFunc(AuthOptions{ProxyMode: ProxyModeSystem})
 	req := httptest.NewRequest("GET", "http://example.com/file", nil)
 	got, err := fn(req)
@@ -546,7 +557,13 @@ func TestProxyFuncSystemFallsBackToSysproxy(t *testing.T) {
 
 func TestProxyFuncSystemEnvTakesPrecedence(t *testing.T) {
 	// 当 HTTP_PROXY 已设置时必须优先于 sysproxy 探测。
-	// 同时覆盖大小写，因为 httpproxy 在两者都设时优先使用小写。
+	// 同时覆盖大小写。x/net v0.47.0 的 httpproxy.FromEnvironment 用的是
+	// getEnvAny("HTTP_PROXY", "http_proxy")——**大写优先**，与 Go 标准库的
+	// http.ProxyFromEnvironment 一致。
+	//
+	// 注意 x/net v0.58.0 起改成了小写优先（getEnvAny("http_proxy",
+	// "HTTP_PROXY")），与标准库相反。本仓库把 x/net 钉在 v0.47.0 就是为了
+	// 保持与标准库一致；升级 x/net 时这条注释与相关测试都要一起看。
 	for _, name := range []string{
 		"HTTP_PROXY", "http_proxy",
 		"HTTPS_PROXY", "https_proxy",

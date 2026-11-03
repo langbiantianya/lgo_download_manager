@@ -23,11 +23,11 @@ import (
 	"fyne.io/fyne/v2/theme"
 	"fyne.io/fyne/v2/widget"
 
+	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/ilocale"
-	"lgo_download_manager/internal/ipc"
-	"lgo_download_manager/internal/protocol"
-	"lgo_download_manager/internal/scheduler"
+	"lgo_download_manager/internal/rpc"
 	"lgo_download_manager/internal/ui/nativefolder"
+	"lgo_download_manager/internal/urlkind"
 )
 
 // archiveCompressionExts 列出常见的归档/压缩单段扩展名。任何"<x>.<archive>"
@@ -118,7 +118,7 @@ func downloadPathExists(path string) bool {
 // 弹出方式为独立窗口（与任务详情一致），用户可以同时与主窗口交互。
 // URL 变更时自动从路径末尾提取文件名填入保存路径，并异步请求业务进程
 // 探测文件大小进行预览（探针复用业务侧代理配置）。
-func showAddTaskDialog(parent fyne.Window, svc Service) {
+func showAddTaskDialog(parent fyne.Window, svc rpc.Client) {
 	showAddTaskDialogWithPreset(parent, svc, addTaskPreset{})
 }
 
@@ -137,13 +137,13 @@ type addTaskPreset struct {
 	Cookies string
 }
 
-// ShowAddTaskDialogForURL 由 MsgShowAddTask 回调调用:把 IPC 负载转成
+// ShowAddTaskDialogForURL 由 show_add_task 控制消息回调调用:把载荷转成
 // 对话框预填值并打开。预期在 Fyne 事件线程上执行。
 //
 // URL 自带的 UA / Cookies 仅在该次提交中有效——它们由 showAddTaskDialog
 // 内部作为 taskAuth 的覆盖值传入,关闭/取消后即丢弃;再次点开「新建
 // 任务」时回到 GlobalSettings 的常规路径。
-func ShowAddTaskDialogForURL(svc Service, params ipc.ShowAddTaskParams) {
+func ShowAddTaskDialogForURL(svc rpc.Client, params api.ShowAddTaskParams) {
 	showAddTaskDialogWithPreset(nil, svc, addTaskPreset{
 		URL:     params.URL,
 		Name:    params.Name,
@@ -155,7 +155,7 @@ func ShowAddTaskDialogForURL(svc Service, params ipc.ShowAddTaskParams) {
 // showAddTaskDialogWithPreset 是 showAddTaskDialog 的内部实现。
 // preset 仅在窗口首次构造时被读取,运行期间用户对 urlEntry 的修改
 // 不会被覆盖。preset.Name 仅在用户未自定义保存路径时参与文件名推导。
-func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTaskPreset) {
+func showAddTaskDialogWithPreset(parent fyne.Window, svc rpc.Client, preset addTaskPreset) {
 	// 构建一个纵向布局、标签左对齐的表单。
 	makeRow := func(label string, w fyne.CanvasObject) *fyne.Container {
 		lbl := widget.NewLabel(label)
@@ -298,12 +298,12 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 			rawURL = urls[0]
 		}
 		nextDefault := filepath.Join(GlobalSettings.DefaultSaveDir, defaultName)
-		if protocol.IsBitTorrent(rawURL) {
+		if urlkind.IsBitTorrent(rawURL) {
 			// BT 任务的保存路径是「任务目录」:磁力链接用 dn 参数
 			// (没有则 infohash 前缀),.torrent 用去掉后缀的文件名。
 			savePathLabel.SetText(ilocale.T("addTask.saveDir.label"))
 			btHint.Show()
-			dirName := scheduler.BittorrentDefaultDir(rawURL)
+			dirName := urlkind.BittorrentDefaultDir(rawURL)
 			if dirName == "" {
 				dirName = "bt-task"
 			}
@@ -354,7 +354,7 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 
 	// 「开始下载」回调——校验 + 创建任务 + 关闭窗口。
 	startDownload = func() {
-		// AddTask/Start 是同步 IPC 调用；窗口要等它们返回后才真正关闭。
+		// AddTask/Start 是同步调用；窗口要等它们返回后才真正关闭。
 		// Fyne 在 UI 线程阻塞期间仍可排队后续点击/回车事件，若只靠窗口
 		// 关闭来去重，这些事件会在关闭后继续执行并创建多个相同任务。
 		// 每个对话框用独立原子门闩，第一次提交后立即禁用按钮并吞掉
@@ -401,7 +401,7 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 		if preset.Cookies != "" {
 			cookies = preset.Cookies
 		}
-		taskAuth := protocol.AuthOptions{
+		taskAuth := api.AuthOptions{
 			UserAgent: ua,
 			Cookies:   cookies,
 		}
@@ -410,13 +410,13 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc Service, preset addTask
 		var failures []string
 		var failedURLs []string
 		for _, rawURL := range urls {
-			kind, _ := protocol.DetectKind(rawURL, "")
+			kind, _ := urlkind.DetectKind(rawURL, "")
 			taskPath := savePath
 			if directory {
 				taskPath = batchTaskPath(rawURL, savePath, usedPaths)
 				usedPaths[taskPath] = struct{}{}
 			}
-			tk, err := svc.AddTask(AddTaskInput{
+			tk, err := svc.AddTask(api.AddTaskInput{
 				URL:          rawURL,
 				SavePath:     taskPath,
 				Protocol:     kind,
@@ -509,8 +509,8 @@ func parseDownloadURLs(raw string) []string {
 
 func batchTaskPath(rawURL, directory string, used map[string]struct{}) string {
 	var name string
-	if protocol.IsBitTorrent(rawURL) {
-		name = scheduler.BittorrentDefaultDir(rawURL)
+	if urlkind.IsBitTorrent(rawURL) {
+		name = urlkind.BittorrentDefaultDir(rawURL)
 	} else if u, err := url.Parse(rawURL); err == nil {
 		name = filepath.Base(u.Path)
 	}

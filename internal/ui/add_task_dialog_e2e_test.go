@@ -4,10 +4,15 @@
 //
 // Copyright (c) 2026 langbiantianya
 
+// 注意：本文件是测试代码，为了构造「有任务、有设置」的初始状态而 import
+// 了 internal/store（以及 internal/scheduler / internal/appservice 之一）。
+// 这是**仅测试用**的例外：internal/ui 的非测试代码必须只依赖契约层
+// （internal/api + internal/rpc + internal/urlkind），不得 import 业务侧包。
+// 见 internal/ui/boundary_test.go 与 Task 10 的 G4/G9 说明。
+
 package ui
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -20,65 +25,10 @@ import (
 	"fyne.io/fyne/v2/test"
 	"fyne.io/fyne/v2/widget"
 
-	"lgo_download_manager/internal/bittorrent"
-	"lgo_download_manager/internal/ipc"
-	"lgo_download_manager/internal/protocol"
-	"lgo_download_manager/internal/scheduler"
+	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/rpc"
 	"lgo_download_manager/internal/store"
 )
-
-// localServiceAdapter 直接把 scheduler.Store 包成 Service——跳过 IPC，
-// 便于在 Fyne test driver 下端到端验证 showAddTaskDialog 的行为。
-type localServiceAdapter struct {
-	sc *scheduler.Scheduler
-	st *store.Store
-}
-
-func (l *localServiceAdapter) List(filter store.StatusFilter, sort store.TaskSort) ([]*store.Task, error) {
-	return l.st.ListTasks(filter, sort)
-}
-
-func (l *localServiceAdapter) Subscribe() (<-chan scheduler.Event, func()) {
-	return l.sc.Subscribe()
-}
-
-func (l *localServiceAdapter) AddTask(in AddTaskInput) (*store.Task, error) {
-	// 与生产实现(ipcClient.AddTask)保持一致:协议由调用方显式给出;
-	// 留空时按历史行为落到 HTTP,等价于「由业务进程按 URL 兜底识别」。
-	kind := in.Protocol
-	if kind == "" {
-		kind = protocol.ProtoHTTP
-	}
-	return l.sc.Add(scheduler.AddTaskInput{
-		URL:          in.URL,
-		SavePath:     in.SavePath,
-		Protocol:     kind,
-		Auth:         in.Auth,
-		ChunkCount:   in.ChunkCount,
-		MinChunkSize: in.MinChunkSize,
-	})
-}
-
-func (l *localServiceAdapter) Start(id string) error  { return l.sc.Start(id) }
-func (l *localServiceAdapter) Pause(id string) error  { return l.sc.Pause(id) }
-func (l *localServiceAdapter) Delete(id string) error { return l.sc.Delete(id) }
-func (l *localServiceAdapter) IsPreparing(id string) bool {
-	return l.sc.IsPreparing(id)
-}
-func (l *localServiceAdapter) Probe(_ string) (int64, error) {
-	return 0, nil
-}
-func (l *localServiceAdapter) BTTaskDetail(id string) (*bittorrent.Detail, error) {
-	return l.sc.BTTaskDetail(id)
-}
-func (l *localServiceAdapter) Settings() store.Settings {
-	s, _ := l.st.LoadSettings()
-	return s
-}
-func (l *localServiceAdapter) SaveSettings(s store.Settings) error {
-	return l.st.SaveSettings(s)
-}
-func (l *localServiceAdapter) Close() error { return nil }
 
 // findAppWindow 在所有窗口中按标题子串查找。
 func findAppWindow(a fyne.App, titleSubstr string) fyne.Window {
@@ -135,26 +85,24 @@ func findButtonByText(root fyne.CanvasObject, txt string) *widget.Button {
 // TestAddTaskDialog_AddAndStart 端到端验证：弹出对话框 → 填字段 → 点击
 // 「开始下载」→ 任务被加入且状态离开 Pending。
 func TestAddTaskDialog_AddAndStart(t *testing.T) {
+	// 两种传输都跑一遍：UI 只认 rpc.Client，换线格式不该改变行为。
+	for _, transport := range testTransports {
+		t.Run(transport, func(t *testing.T) { testAddTaskDialogAddAndStart(t, transport) })
+	}
+}
+
+func testAddTaskDialogAddAndStart(t *testing.T, transport string) {
 	a := test.NewApp()
 	defer test.NewApp()
 
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "lgdm.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	defer st.Close()
-
 	saveDir := filepath.Join(dir, "dl")
-	if err := st.SaveSettings(store.Settings{
+	env := startUIE2E(t, transport, store.Settings{
 		DefaultSaveDir: saveDir,
 		DefaultThreads: 2,
 		MinChunkSize:   1 << 20,
-	}); err != nil {
-		t.Fatalf("SaveSettings: %v", err)
-	}
-	GlobalSettings, _ = st.LoadSettings()
+	})
+	st := env.store
 
 	// HTTP server：返回完整 1024 字节，并支持 Range 请求，让 Probe 成功。
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -164,20 +112,7 @@ func TestAddTaskDialog_AddAndStart(t *testing.T) {
 		w.WriteHeader(200)
 		_, _ = w.Write(body)
 	}))
-	// 等待 scheduler.Run 退出后再关 store:flushAll 在 ctx.Done 上仍会
-	ctx, cancel := context.WithCancel(context.Background())
-	sc := scheduler.New(st)
-	schedulerDone := make(chan struct{})
-	defer func() {
-		cancel()
-		<-schedulerDone
-	}()
-	go func() {
-		sc.Run(ctx)
-		close(schedulerDone)
-	}()
-
-	svc := &localServiceAdapter{sc: sc, st: st}
+	svc := env.client
 	parent := a.NewWindow("main")
 	showAddTaskDialog(parent, svc)
 
@@ -240,7 +175,7 @@ func TestAddTaskDialog_AddAndStart(t *testing.T) {
 }
 
 // TestAddTaskDialog_RapidDoubleClickAddsOneTask 回归快速双击：
-// AddTask/Start 的同步 IPC 尚未返回时，Fyne 仍会排队后续点击/回车；
+// AddTask/Start 的同步调用尚未返回时，Fyne 仍会排队后续点击/回车；
 // 第一次提交必须立刻关门闩并禁用按钮，不能让排队事件再创建同 URL、
 // 同保存路径的任务。
 func TestAddTaskDialog_RapidDoubleClickAddsOneTask(t *testing.T) {
@@ -248,21 +183,14 @@ func TestAddTaskDialog_RapidDoubleClickAddsOneTask(t *testing.T) {
 	defer test.NewApp()
 
 	dir := t.TempDir()
-	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	defer st.Close()
 
 	saveDir := filepath.Join(dir, "dl")
-	if err := st.SaveSettings(store.Settings{
+	env := startUIE2E(t, rpc.TransportHTTP, store.Settings{
 		DefaultSaveDir: saveDir,
 		DefaultThreads: 2,
 		MinChunkSize:   1 << 20,
-	}); err != nil {
-		t.Fatalf("SaveSettings: %v", err)
-	}
-	GlobalSettings, _ = st.LoadSettings()
+	})
+	st := env.store
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Accept-Ranges", "bytes")
@@ -272,19 +200,7 @@ func TestAddTaskDialog_RapidDoubleClickAddsOneTask(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	sc := scheduler.New(st)
-	done := make(chan struct{})
-	defer func() {
-		cancel()
-		<-done
-	}()
-	go func() {
-		sc.Run(ctx)
-		close(done)
-	}()
-
-	svc := &localServiceAdapter{sc: sc, st: st}
+	svc := env.client
 	showAddTaskDialog(a.NewWindow("main"), svc)
 	wAdd := findAppWindow(a, "新建下载任务")
 	if wAdd == nil {
@@ -325,25 +241,16 @@ func TestAddTaskDialog_PicksUpConfiguredUA(t *testing.T) {
 	// 我们直接构造与 showAddTaskDialog 的 startDownload 完全相同的
 	// AddTaskInput,验证 Auth 字段透传到 store.Task.AuthData。
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "lgdm.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	defer st.Close()
-
 	saveDir := filepath.Join(dir, "dl")
-	if err := st.SaveSettings(store.Settings{
+	env := startUIE2E(t, rpc.TransportHTTP, store.Settings{
 		DefaultSaveDir: saveDir,
 		DefaultThreads: 2,
 		MinChunkSize:   1 << 20,
 		// 关键字段:不是默认的 Wget/1.21.3。
 		UserAgent: "Mozilla/5.0 (X11; configured-test)",
 		Cookies:   "session=abc",
-	}); err != nil {
-		t.Fatalf("SaveSettings: %v", err)
-	}
-	GlobalSettings, _ = st.LoadSettings()
+	})
+	st := env.store
 	if GlobalSettings.UserAgent == "" {
 		t.Fatalf("precondition: GlobalSettings.UserAgent must be set after SaveSettings/LoadSettings")
 	}
@@ -355,21 +262,20 @@ func TestAddTaskDialog_PicksUpConfiguredUA(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// 用 localServiceAdapter 直连 scheduler/store,跳过 IPC;确认的是
-	// UI → ui.AddTaskInput.Auth → scheduler.Add → store.Task.AuthData
-	// 的整条链路。本测试不调 sc.Run——Start 会拉起 engine,与本测试无关。
-	sc := scheduler.New(st)
-	svc := &localServiceAdapter{sc: sc, st: st}
+	// 走真实链路：UI → api.AddTaskInput.Auth → 传输 → appservice →
+	// scheduler.Add → store.Task.AuthData。全局设置从客户端握手快照拿，
+	// 与生产里对话框读取 GlobalSettings 的路径一致。
+	svc := env.client
 
 	// 与 showAddTaskDialog 内部 startDownload 一致的 Auth 预填。
 	url := srv.URL + "/file.bin"
 	savePath := filepath.Join(saveDir, "out.bin")
-	tk, err := svc.AddTask(AddTaskInput{
+	tk, err := svc.AddTask(api.AddTaskInput{
 		URL:          url,
 		SavePath:     savePath,
 		ChunkCount:   GlobalSettings.DefaultThreads,
 		MinChunkSize: GlobalSettings.MinChunkSize,
-		Auth: protocol.AuthOptions{
+		Auth: api.AuthOptions{
 			UserAgent: GlobalSettings.UserAgent,
 			Cookies:   GlobalSettings.Cookies,
 		},
@@ -406,40 +312,17 @@ func TestAddTaskDialog_StartError_KeepsWindowOpen(t *testing.T) {
 	defer test.NewApp()
 
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "lgdm.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	defer st.Close()
-
-	if err := st.SaveSettings(store.Settings{
+	env := startUIE2E(t, rpc.TransportHTTP, store.Settings{
 		DefaultSaveDir: filepath.Join(dir, "dl"),
 		DefaultThreads: 2,
 		MinChunkSize:   1 << 20,
-	}); err != nil {
-		t.Fatalf("SaveSettings: %v", err)
-	}
-	GlobalSettings, _ = st.LoadSettings()
+	})
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
-	// 等待 scheduler.Run 退出后再关 store,避免 flushAll 写已关闭的 DB。
-	sc := scheduler.New(st)
-	schedulerDone := make(chan struct{})
-	ctx, cancel := context.WithCancel(context.Background())
-	defer func() {
-		cancel()
-		<-schedulerDone
-	}()
-	go func() {
-		sc.Run(ctx)
-		close(schedulerDone)
-	}()
-
-	svc := &errStartService{inner: &localServiceAdapter{sc: sc, st: st}}
+	svc := &errStartService{Client: env.client}
 	parent := a.NewWindow("main")
 	showAddTaskDialog(parent, svc)
 
@@ -465,41 +348,13 @@ func TestAddTaskDialog_StartError_KeepsWindowOpen(t *testing.T) {
 	}
 }
 
-// errStartService 包了一层 inner Service,把 Start 强制返回错误。
+// errStartService 直接内嵌真实客户端,只把 Start 强制返回错误——其余
+// 调用（含 AddTask 与传输）都走生产路径。
 type errStartService struct {
-	inner Service
+	rpc.Client
 }
 
-func (e *errStartService) List(f store.StatusFilter, s store.TaskSort) ([]*store.Task, error) {
-	return e.inner.List(f, s)
-}
-func (e *errStartService) Subscribe() (<-chan scheduler.Event, func()) {
-	return e.inner.Subscribe()
-}
-func (e *errStartService) AddTask(in AddTaskInput) (*store.Task, error) {
-	return e.inner.AddTask(in)
-}
-func (e *errStartService) Start(_ string) error   { return errStartFailed }
-func (e *errStartService) Pause(id string) error  { return e.inner.Pause(id) }
-func (e *errStartService) Delete(id string) error { return e.inner.Delete(id) }
-func (e *errStartService) IsPreparing(id string) bool {
-	return e.inner.IsPreparing(id)
-}
-func (e *errStartService) Probe(u string) (int64, error) {
-	return e.inner.Probe(u)
-}
-func (e *errStartService) BTTaskDetail(id string) (*bittorrent.Detail, error) {
-	return e.inner.BTTaskDetail(id)
-}
-func (e *errStartService) Settings() store.Settings            { return e.inner.Settings() }
-func (e *errStartService) SaveSettings(s store.Settings) error { return e.inner.SaveSettings(s) }
-func (e *errStartService) Close() error                        { return e.inner.Close() }
-
-type startErr string
-
-func (s startErr) Error() string { return string(s) }
-
-var errStartFailed = startErr("simulated start failure")
+func (e *errStartService) Start(string) error { return errStartFailed }
 
 // TestShowAddTaskDialogForURL_PrefillsAndOverrides 验证 lgom:// 转发的入口
 // ShowAddTaskDialogForURL:
@@ -514,29 +369,20 @@ func TestShowAddTaskDialogForURL_PrefillsAndOverrides(t *testing.T) {
 	defer test.NewApp()
 
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "lgdm.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	defer st.Close()
-
 	saveDir := filepath.Join(dir, "dl")
 	// 全局 UA/Cookies 与 URL 自带的刻意分开,用来区分覆盖路径。
 	const globalUA = "GlobalUA/1.0"
 	const globalCookies = "global=1"
 	const urlUA = "URLUA/2.0"
 	const urlCookies = "url=2"
-	if err := st.SaveSettings(store.Settings{
+	env := startUIE2E(t, rpc.TransportHTTP, store.Settings{
 		DefaultSaveDir: saveDir,
 		DefaultThreads: 2,
 		MinChunkSize:   1 << 20,
 		UserAgent:      globalUA,
 		Cookies:        globalCookies,
-	}); err != nil {
-		t.Fatalf("SaveSettings: %v", err)
-	}
-	GlobalSettings, _ = st.LoadSettings()
+	})
+	st := env.store
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Length", "0")
@@ -544,20 +390,9 @@ func TestShowAddTaskDialogForURL_PrefillsAndOverrides(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	sc := scheduler.New(st)
-	ctx, cancel := context.WithCancel(context.Background())
-	schedulerDone := make(chan struct{})
-	defer func() {
-		cancel()
-		<-schedulerDone
-	}()
-	go func() {
-		sc.Run(ctx)
-		close(schedulerDone)
-	}()
-	svc := &localServiceAdapter{sc: sc, st: st}
+	svc := env.client
 
-	params := ipc.ShowAddTaskParams{
+	params := api.ShowAddTaskParams{
 		URL:     srv.URL + "/president.iso",
 		Name:    "president.iso",
 		UA:      urlUA,
@@ -635,45 +470,25 @@ func TestShowAddTaskDialogForURL_FallsBackToGlobalWhenEmpty(t *testing.T) {
 	defer test.NewApp()
 
 	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "lgdm.db")
-	st, err := store.Open(dbPath)
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	defer st.Close()
-
 	saveDir := filepath.Join(dir, "dl")
 	const globalUA = "GlobalUA/1.0"
-	if err := st.SaveSettings(store.Settings{
+	env := startUIE2E(t, rpc.TransportHTTP, store.Settings{
 		DefaultSaveDir: saveDir,
 		DefaultThreads: 2,
 		MinChunkSize:   1 << 20,
 		UserAgent:      globalUA,
-	}); err != nil {
-		t.Fatalf("SaveSettings: %v", err)
-	}
-	GlobalSettings, _ = st.LoadSettings()
+	})
+	st := env.store
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
 	}))
 	defer srv.Close()
 
-	sc := scheduler.New(st)
-	ctx, cancel := context.WithCancel(context.Background())
-	schedulerDone := make(chan struct{})
-	defer func() {
-		cancel()
-		<-schedulerDone
-	}()
-	go func() {
-		sc.Run(ctx)
-		close(schedulerDone)
-	}()
-	svc := &localServiceAdapter{sc: sc, st: st}
+	svc := env.client
 
 	// 仅带 URL,不带 UA/Cookies——应走 GlobalSettings。
-	ShowAddTaskDialogForURL(svc, ipc.ShowAddTaskParams{URL: srv.URL + "/x.bin"})
+	ShowAddTaskDialogForURL(svc, api.ShowAddTaskParams{URL: srv.URL + "/x.bin"})
 
 	wAdd := findAppWindow(a, "新建下载任务")
 	if wAdd == nil {

@@ -757,32 +757,6 @@ func btChunkProgress(files []bittorrent.FileProgress) []int64 {
 	return out
 }
 
-// BittorrentDefaultDir 推导 BT 任务的默认目录名:磁力链接用 "dn" 参数
-// (没有则用 infohash 前缀),.torrent 用去掉后缀的文件名。UI 与命令行
-// 路径共用它,保证两者得到同一个目录名。
-func BittorrentDefaultDir(rawURL string) string {
-	if !protocol.IsBitTorrent(rawURL) {
-		return ""
-	}
-	lower := strings.ToLower(strings.TrimSpace(rawURL))
-	if strings.HasPrefix(lower, "magnet:") {
-		if name := protocol.MagnetName(rawURL); name != "" {
-			return protocol.SafeDirName(name, "")
-		}
-		if ih := protocol.MagnetInfoHash(rawURL); ih != "" {
-			if len(ih) > 16 {
-				ih = ih[:16]
-			}
-			return "magnet-" + ih
-		}
-		return "magnet"
-	}
-	if name := protocol.TorrentNameFromPath(rawURL); name != "" {
-		return protocol.SafeDirName(name, "")
-	}
-	return ""
-}
-
 // IsBittorrentTask 报告一个任务是否走 BT 下载路径。历史数据里 protocol
 // 列为空的任务按 URL 形态兜底判定。
 func IsBittorrentTask(tk *store.Task) bool {

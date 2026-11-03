@@ -7,77 +7,87 @@
 package ui
 
 import (
+	"context"
 	"os"
+	"strings"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 
-	"lgo_download_manager/internal/ipc"
+	"lgo_download_manager/internal/api"
+	"lgo_download_manager/internal/ilocale"
 	"lgo_download_manager/internal/logging"
+	"lgo_download_manager/internal/rpc"
 )
 
-// NewService 连接到业务进程的 socket、完成握手并返回 Service 接口。
-// 调用方在拿到 Service 后需自行启动后台读循环（一般通过 RunChild）。
-func NewService(socketPath, token string) (Service, error) {
-	c, _, err := dialAndHandshake(socketPath, token)
-	if err != nil {
-		return nil, err
-	}
-	return c, nil
+// applyHandshakeLanguage 把握手时拿到的权威语言同步到本进程的 ilocale。
+//
+// 权威语言随 get_settings 的设置快照一起回来：运行时切语言由「设置 →
+// 语言」在本进程先行切换，冷启动/重启后的语言只能靠这份快照，所以它
+// 必须在 NewMainWindow 之前生效。
+func applyHandshakeLanguage(c rpc.Client) {
+	ilocale.Set(c.Settings().Language)
 }
 
 // RunChild 是 UI 子进程角色的入口：
-//  1. 读取启动环境变量（ipc.EnvUIChild/EnvUISocket/EnvUIToken）。
-//  2. 连接业务 socket、握手并接收初始设置（MsgInit）。
-//  3. 启动 Fyne app，构造主窗口，把 ipcClient 作为业务服务注入。
-//  4. app.Run() 阻塞；窗口关闭（LightMode）或收到业务 MsgClose 时退出。
-//     退出后操作系统回收整个进程内存，业务进程不受影响。
+//  1. 读取启动环境变量（rpc.EnvUIChild/EnvUIListen/EnvUIToken/EnvUITransport）。
+//  2. 用 rpc.Dial 连上业务进程：握手（get_settings）与消息流都在客户端
+//     内部完成，Dial 返回时就已经可用。
+//  3. 启动 Fyne app，构造主窗口，把 rpc.Client 作为业务服务注入。
+//  4. app.Run() 阻塞；窗口关闭（LightMode）或收到业务侧 close 控制消息时
+//     退出。退出后操作系统回收整个进程内存，业务进程不受影响。
 //
 // 仅在被业务进程以正确环境变量拉起时调用；直接运行会因缺少环境变量而退出。
 func RunChild() int {
-	if os.Getenv(ipc.EnvUIChild) != "1" {
+	if os.Getenv(rpc.EnvUIChild) != "1" {
 		logging.Println("ui.RunChild: not a UI child process (missing env); exiting")
 		return 2
 	}
-	sock := os.Getenv(ipc.EnvUISocket)
-	tok := os.Getenv(ipc.EnvUIToken)
-	if sock == "" || tok == "" {
-		logging.Println("ui.RunChild: missing socket/token env; exiting")
+	listen := strings.TrimSpace(os.Getenv(rpc.EnvUIListen))
+	tok := strings.TrimSpace(os.Getenv(rpc.EnvUIToken))
+	transport := strings.TrimSpace(os.Getenv(rpc.EnvUITransport))
+	if listen == "" || tok == "" {
+		logging.Println("ui.RunChild: missing listen/token env; exiting")
 		return 2
 	}
 
-	c, _, err := dialAndHandshake(sock, tok)
+	// ctx 贯穿整个会话：握手的往返调用与读循环都挂在它上面。这里没有
+	// 可用的取消源——UI 进程退出时由 Close 收尾。
+	c, err := rpc.Dial(context.Background(), transport, listen, tok)
 	if err != nil {
-		logging.Printf("ui.RunChild: handshake failed: %v", err)
+		logging.Printf("ui.RunChild: dial failed: %v", err)
 		return 1
 	}
 
-	// 关键：必须先启动 IPC 读循环，再构造主窗口。
-	// NewMainWindow → taskList.build → refreshEmptyState → svc.List
-	// 会发起同步 IPC 请求；若 c.run 还没跑起来，request() 会阻塞等待
-	// 应答（最长 30s 后超时），UI 表现为「卡在 building main window」。
-	go c.run()
+	// 必须在构造主窗口之前把权威语言落一次，否则首帧会用默认语言渲染；
+	// 运行期的语言变更走 onLanguage 回调。
+	applyHandshakeLanguage(c)
 
 	a := app.NewWithID("com.langbiantianya.LGDM")
 	win := NewMainWindow(a, c)
 
-	// 业务托盘「显示窗口」→ 触发主窗口 fyne 事件线程上的 ShowFromTray。
+	// 控制消息的回调跑在 rpc.Client 的读循环里，UI 操作一律切回 fyne
+	// 事件线程再动 widget。
 	c.SetOnShow(func() {
 		fyne.Do(func() { win.ShowFromTray() })
 	})
 	// 业务侧收到 lgom:// 转发后 → 显示主窗口并弹出「新建下载任务」对话框,
-	// URL/Name/UA/Cookies 由参数携带。onShowAddTask 跑在 IPC 读循环里,
-	// 这里 fyne.Do 把 UI 操作切回事件线程。
-	c.SetOnShowAddTask(func(p ipc.ShowAddTaskParams) {
+	// URL/Name/UA/Cookies 由参数携带。
+	c.SetOnShowAddTask(func(p api.ShowAddTaskParams) {
 		fyne.Do(func() {
 			win.ShowFromTray()
 			ShowAddTaskDialogForURL(c, p)
 		})
 	})
-	// 语言变更:业务进程在「设置」里切语言或首启 InitData 都走这里。
-	// ilocale.Set 已经在 ipcClient.run() 里调过,这里只负责让 UI 重译
-	// 当前可见 widget(标题/工具栏/侧边栏/状态栏/任务行/设置页)。
-	// onLanguage 跑在 IPC 读循环,切回 fyne 事件线程后再写 widget。
+	// 语言变更:用户在「设置」里切语言时业务进程推 MessageKindLanguage,
+	// 这里只负责让 UI 重译当前可见 widget(标题/工具栏/侧边栏/状态栏/
+	// 任务行/设置页)。
+	//
+	// 本进程的 ilocale 已由「设置 → 语言」在写回前先行切换（见
+	// buildLanguageSelect）——契约层的语言控制消息**带着**语言标签，但
+	// rpc.Client 的 onLanguage 钩子不接收它，所以等不到。
+	// 首启的语言不走这条路径，由握手时的 settings 应用
+	// （见 applyHandshakeLanguage）。
 	c.SetOnLanguage(func() {
 		fyne.Do(func() { win.applyLanguage() })
 	})

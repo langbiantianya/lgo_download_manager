@@ -27,7 +27,7 @@ const pieceMosaicHeight = 180
 
 // pieceMosaic 把 BT 的分片级进度画成一幅热力马赛克图。
 //
-// 数据来自 bittorrent.Detail.PieceBuckets:全部分片按等宽聚合成的桶,
+// 数据来自 api.BTDetail.PieceBuckets:全部分片按等宽聚合成的桶,
 // 每桶一个字节(0=未开始,255=完整),值是桶内已下载字节的占比。颜色按
 // 完成度渐变——没开始的用输入框背景色(融进面板底色),进行中的从主题
 // 主色渐变到成功色,下载完的用成功色(绿)。

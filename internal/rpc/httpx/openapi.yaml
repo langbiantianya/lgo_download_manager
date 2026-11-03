@@ -1,0 +1,450 @@
+# lgdm HTTP 传输的接口规范。
+#
+# 这是 HTTP 这一侧接口形状的唯一真相源：路径、方法名、DTO 字段都必须与
+# internal/api 的常量与结构体一一对应。internal/rpc/httpx/openapi_test.go
+# 里的规范一致性测试负责在两边漂移时失败。
+#
+# 同步规则：新增/修改端点或 DTO 字段时必须同步改本文件。
+openapi: 3.0.3
+info:
+  title: LGDM Download Service
+  version: "1.0.0"
+  description: |
+    lgdm 业务主进程暴露给 UI 子进程的下载管理接口。
+
+    调用方需要带上 Authorization: Bearer <token> 头；token 由业务主进程
+    在拉起 UI 子进程时通过环境变量下发。
+
+    消息流端点 /lgdm.v1.DownloadService/stream_messages 返回 NDJSON，
+    每行一个消息对象，事件与控制消息合并在同一条流里。
+
+    请求体一律可选：空请求体等价于 {}，服务端不因为 body 为空而报错。
+
+    文档端点（/openapi.yaml、/openapi.json、/docs）不参与 token 校验：
+    它们只暴露接口形状，不暴露任务数据。
+servers:
+  - url: /
+    description: |
+      同源相对地址。默认部署在本机 Unix socket 上，浏览器无法直连；
+      若通过 LDM_RPC_LISTEN 指定 host:port 监听，文档页与接口同源。
+security:
+  - bearerAuth: []
+paths:
+  /lgdm.v1.DownloadService/list:
+    post:
+      summary: 查询任务列表
+      operationId: list
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ListParams" }
+      responses:
+        "200":
+          description: 任务列表
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ListResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /lgdm.v1.DownloadService/add:
+    post:
+      summary: 添加下载任务
+      operationId: add
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/AddTaskInput" }
+      responses:
+        "200":
+          description: 新建的任务
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Task" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /lgdm.v1.DownloadService/start:
+    post:
+      summary: 启动任务
+      operationId: start
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TaskRef" }
+      responses:
+        "200":
+          description: 已启动
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Empty" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /lgdm.v1.DownloadService/pause:
+    post:
+      summary: 暂停任务
+      operationId: pause
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TaskRef" }
+      responses:
+        "200":
+          description: 已暂停
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Empty" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /lgdm.v1.DownloadService/delete:
+    post:
+      summary: 删除任务
+      operationId: delete
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TaskRef" }
+      responses:
+        "200":
+          description: 已删除
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Empty" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /lgdm.v1.DownloadService/is_preparing:
+    post:
+      summary: 报告任务是否处于「已预留 slot 但引擎未启动」的准备阶段
+      operationId: isPreparing
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TaskRef" }
+      responses:
+        "200":
+          description: 准备阶段标记
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BoolResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /lgdm.v1.DownloadService/probe:
+    post:
+      summary: 探测 URL 目标大小
+      operationId: probe
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProbeParams" }
+      responses:
+        "200":
+          description: 目标大小（未知时为 0）
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ProbeResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /lgdm.v1.DownloadService/get_settings:
+    post:
+      summary: 读取权威设置快照
+      operationId: getSettings
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Empty" }
+      responses:
+        "200":
+          description: 设置快照
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Settings" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /lgdm.v1.DownloadService/save_settings:
+    post:
+      summary: 持久化设置
+      operationId: saveSettings
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Settings" }
+      responses:
+        "200":
+          description: 已保存
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Empty" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /lgdm.v1.DownloadService/bt_info:
+    post:
+      summary: 查询 BT 任务实时详情
+      operationId: btInfo
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/BTInfoParams" }
+      responses:
+        "200":
+          description: BT 详情快照
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/BTDetail" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+  /lgdm.v1.DownloadService/stream_messages:
+    post:
+      summary: 订阅消息流（进度事件 + 控制消息）
+      operationId: streamMessages
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Empty" }
+      responses:
+        "200":
+          description: NDJSON 流，每行一个消息
+          content:
+            application/x-ndjson:
+              schema: { $ref: "#/components/schemas/Message" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "405": { $ref: "#/components/responses/MethodNotAllowed" }
+        "500": { $ref: "#/components/responses/InternalError" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  responses:
+    BadRequest:
+      description: 请求体不是合法 JSON
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: token 缺失或无效
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    MethodNotAllowed:
+      description: 只接受 POST
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InternalError:
+      description: 业务侧调用失败
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    Empty:
+      type: object
+    Error:
+      type: object
+      required: [ok, error]
+      properties:
+        ok: { type: boolean }
+        error: { type: string }
+    TaskRef:
+      type: object
+      required: [id]
+      properties:
+        id: { type: string }
+    BoolResult:
+      type: object
+      properties:
+        value: { type: boolean }
+    ProbeParams:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string }
+    ProbeResult:
+      type: object
+      properties:
+        total_size: { type: integer, format: int64 }
+    ListParams:
+      type: object
+      properties:
+        filter: { type: string }
+        sort: { type: string }
+    ListResult:
+      type: object
+      properties:
+        tasks:
+          type: array
+          items: { $ref: "#/components/schemas/Task" }
+    AddTaskInput:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string }
+        save_path: { type: string }
+        protocol: { type: string }
+        chunk_count: { type: integer }
+        min_chunk_size: { type: integer, format: int64 }
+        auth: { $ref: "#/components/schemas/AuthOptions" }
+    AuthOptions:
+      type: object
+      properties:
+        username: { type: string }
+        password: { type: string }
+        user_agent: { type: string }
+        cookies: { type: string }
+        referer: { type: string }
+        ftp_passive: { type: boolean }
+        proxy_mode: { type: string }
+        proxy_url: { type: string }
+        proxy_bypass: { type: string }
+        proxy_auto_config_url: { type: string }
+    Settings:
+      type: object
+      properties:
+        default_save_dir: { type: string }
+        default_threads: { type: integer }
+        min_chunk_size: { type: integer, format: int64 }
+        user_agent: { type: string }
+        cookies: { type: string }
+        ftp_passive: { type: boolean }
+        prealloc: { type: boolean }
+        task_sort: { type: string }
+        proxy_mode: { type: string }
+        proxy_url: { type: string }
+        proxy_bypass: { type: string }
+        proxy_auto_config_url: { type: string }
+        download_limit_kib: { type: integer }
+        light_mode: { type: boolean }
+        max_concurrent: { type: integer }
+        auto_start: { type: boolean }
+        language: { type: string }
+        bt_port: { type: integer }
+        bt_max_peers: { type: integer }
+        bt_download_limit_kib: { type: integer }
+        bt_upload_limit_kib: { type: integer }
+        bt_dht: { type: boolean }
+        bt_pex: { type: boolean }
+        bt_seed_ratio: { type: number }
+        bt_max_seeding: { type: integer }
+        bt_max_concurrent: { type: integer }
+        bt_trackers: { type: string }
+    Task:
+      type: object
+      properties:
+        id: { type: string }
+        url: { type: string }
+        save_path: { type: string }
+        protocol: { type: string }
+        total_size: { type: integer, format: int64 }
+        downloaded: { type: integer, format: int64 }
+        support_range: { type: boolean }
+        etag: { type: string }
+        last_modified: { type: string }
+        digest_algorithm: { type: string }
+        digest: { type: string }
+        is_allocated: { type: boolean }
+        chunk_count: { type: integer }
+        min_chunk_size: { type: integer, format: int64 }
+        chunk_progress:
+          type: array
+          items: { type: integer, format: int64 }
+        chunk_ranges:
+          type: array
+          items: { type: integer, format: int64 }
+        status: { type: string }
+        auth_data: { type: string }
+        error_message: { type: string }
+        error_kind: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+        bt_file: { type: string }
+    BTInfoParams:
+      type: object
+      required: [task_id]
+      properties:
+        task_id: { type: string }
+    FileProgress:
+      type: object
+      properties:
+        path: { type: string }
+        length: { type: integer, format: int64 }
+        completed: { type: integer, format: int64 }
+    BTDetail:
+      type: object
+      properties:
+        name: { type: string }
+        info_hash: { type: string }
+        total: { type: integer, format: int64 }
+        downloaded: { type: integer, format: int64 }
+        uploaded: { type: integer, format: int64 }
+        speed_bps: { type: number }
+        upload_bps: { type: number }
+        peers: { type: integer }
+        total_peers: { type: integer }
+        seeders: { type: integer }
+        leechers: { type: integer }
+        piece_length: { type: integer, format: int64 }
+        pieces: { type: integer }
+        pieces_done: { type: integer }
+        piece_buckets:
+          type: array
+          items: { type: integer }
+        seeding: { type: boolean }
+        complete: { type: boolean }
+        files:
+          type: array
+          items: { $ref: "#/components/schemas/FileProgress" }
+        trackers:
+          type: array
+          items: { type: string }
+    Event:
+      type: object
+      properties:
+        why: { type: string }
+        task: { $ref: "#/components/schemas/Task" }
+        speed_bps: { type: number }
+    Message:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [event, show, show_add_task, language, close]
+        event: { $ref: "#/components/schemas/Event" }
+        show_add_task: { $ref: "#/components/schemas/ShowAddTaskParams" }
+        language: { type: string }
+    ShowAddTaskParams:
+      type: object
+      properties:
+        url: { type: string }
+        name: { type: string }
+        ua: { type: string }
+        cookies: { type: string }
