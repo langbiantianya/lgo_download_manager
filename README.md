@@ -1154,6 +1154,14 @@ flatpak/                       # Flatpak 用的 AppStream metainfo
 握手用 token（`Authorization: Bearer <token>`，gRPC 走 metadata），每次调用
 都校验。
 
+panic 的处理两种传输是对齐的：业务侧 handler 里一旦 panic，传输层兜住它，
+不让 panic 带走整个进程。这条对 gRPC 尤其要紧——grpc-go 默认**不 recover**，
+panic 会一路冒到 server 的 goroutine 顶层把进程带走，而业务进程里还跑着所有
+下载任务。现在 gRPC 侧转成 `Internal` 错误，http 侧转成 500 +
+`{"ok":false,"error":…}`，客户端拿到的都是一个明确的错误，而不是一条被掐断
+的连接。UI 侧的回调钩子里 panic 也一样兜住：会话被标记成断开，上层按
+「UI 崩了」处理，界面不会无声无息地消失。
+
 业务侧只用一个进程对应一个 UI 会话；UI 断开时业务侧 `cmd.Wait()` 触发会话
 清理，可由托盘「显示窗口」再次拉起。
 
