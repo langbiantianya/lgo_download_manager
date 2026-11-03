@@ -1142,6 +1142,63 @@ func TestContractDivergenceEmptySlice(t *testing.T) {
 	}
 }
 
+// TestContractStreamMethodNotCallable 断言流式方法不能走通用 Call，且两种
+// 传输的失败形态一致（都立刻报错，不发请求）。
+//
+// 这条守的是终审发现的一条跨任务累积出来的分歧：
+//
+//   - 契约层曾把 stream_messages 登记成普通方法（api.Spec 给了它一个假的
+//     &api.Empty{} 占位），于是「按 api.Spec 通用驱动 Transport.Call」的
+//     调用方会写出跑不通的代码；
+//   - gRPC 侧立刻回「未知方法」（秒失败）；
+//   - http 侧没有特判，把请求真发出去，然后卡在解码 NDJSON 上，**挂满整个
+//     RPC 超时**（默认 30s）。
+//
+// 两种传输的形态与时间特征完全不可互换：一个通用调用方在 gRPC 上秒失败、
+// 在 http 上挂满超时。修法是契约层正确表达「流式方法不是普通 RPC」
+// （api.StreamMethods / api.IsStreamMethod），两个传输的 Call 都立刻报错。
+//
+// 这条用例断言：两种传输都**立刻**失败、都不发请求、错误信息都带方法名
+// 与「用 Stream()」的指引。
+func TestContractStreamMethodNotCallable(t *testing.T) {
+	for _, transport := range []string{rpc.TransportGRPC, rpc.TransportHTTP} {
+		t.Run(transport, func(t *testing.T) {
+			env := newContractEnv(t, transport, nil)
+			tr := dialTransport(t, env.transport, env.endpoint, contractToken)
+			defer func() { _ = tr.Close() }()
+
+			// 给一个短 deadline：没有守卫时 http 侧会把请求发出去后卡在
+			// 解码 NDJSON 上，靠这个 deadline 才能**快速**失败——否则
+			// 整个测试会挂死，而不是变红。
+			ctx, cancel := context.WithTimeout(env.ctx, 2*time.Second)
+			defer cancel()
+
+			start := time.Now()
+			err := tr.Call(ctx, api.MethodStreamMessages, &api.Empty{}, &api.Empty{})
+			elapsed := time.Since(start)
+
+			if err == nil {
+				t.Fatalf("%s：流式方法走 Call 应当报错", transport)
+			}
+			if !strings.Contains(err.Error(), api.MethodStreamMessages) {
+				t.Errorf("%s：错误信息应当带上方法名: %v", transport, err)
+			}
+			if !strings.Contains(err.Error(), "Stream()") {
+				t.Errorf("%s：错误信息应当指引改用 Stream(): %v", transport, err)
+			}
+			// 关键：**立刻**失败。http 侧曾经把请求发出去后卡在解码 NDJSON
+			// 上，耗满整个 RPC 超时——那与「秒失败」对调用方是完全不同的
+			// 语义，通用调用方在两种传输下的表现不可互换。
+			//
+			// 判据用 deadline 的一半：有守卫时是毫秒级，远小于 1s；没有
+			// 守卫时至少耗满 2s 的 deadline。
+			if elapsed > time.Second {
+				t.Errorf("%s：应当立刻失败，实际耗时 %v（错误是 %v）", transport, elapsed, err)
+			}
+		})
+	}
+}
+
 // TestContractInputTypeMismatchRejected 断言入参的 Go 类型不对时，两种
 // 传输都报错。
 //

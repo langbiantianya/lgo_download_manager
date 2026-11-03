@@ -102,6 +102,15 @@ func (c *Client) Call(ctx context.Context, method string, in, out any) error {
 	if err := c.checkOpen(); err != nil {
 		return err
 	}
+	// 流式方法不能走 Call：它的响应是一条条消息组成的长连接，没有
+	// 「请求类型 → 响应类型」的一对一。立刻报错，不发请求——
+	// 否则会把请求发出去，然后卡在解码 NDJSON 上直到调用方超时。
+	//
+	// 与 grpcx 的行为一致（那边也立刻回「未知方法」）：同一个调用方在
+	// 两种传输下的表现必须可互换。
+	if api.IsStreamMethod(method) {
+		return fmt.Errorf("httpx: %s: 消息流请用 Stream()，不能用 Call()", method)
+	}
 	if err := checkCallTypes(method, in, out); err != nil {
 		return err
 	}

@@ -94,10 +94,9 @@ func newMux(h Handler, token string) *http.ServeMux {
 			fn(w, r)
 		}
 	}
-	for _, m := range api.AllMethods {
-		if m == api.MethodStreamMessages {
-			continue
-		}
+	// 只注册能走 Call 的方法。流式方法单独注册（见下）——它不是普通
+	// RPC，没有「请求类型 → 响应类型」的一对一。
+	for _, m := range api.CallMethods {
 		mux.HandleFunc(servicePrefix+m, authed(func(w http.ResponseWriter, r *http.Request) {
 			serveCall(w, r, h, m)
 		}))
@@ -125,7 +124,7 @@ func newMux(h Handler, token string) *http.ServeMux {
 
 // serveCall 处理一次调用。
 func serveCall(w http.ResponseWriter, r *http.Request, h Handler, method string) {
-	// method 一定来自 api.AllMethods，api.Spec 对它们必有 spec。
+	// method 一定来自 api.CallMethods，api.Spec 对它们必有 spec。
 	spec := api.Spec(method)
 	in := spec.NewIn()
 	if r.Body != nil {

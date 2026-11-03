@@ -281,6 +281,9 @@ func (c *Client) Call(ctx context.Context, method string, in, out any) error {
 		return nil
 
 	default:
+		if api.IsStreamMethod(method) {
+			return fmt.Errorf("grpcx: %s: 消息流请用 Stream()，不能用 Call()", method)
+		}
 		return fmt.Errorf("grpcx: 未知方法 %q", method)
 	}
 }

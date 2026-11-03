@@ -175,7 +175,7 @@ func testAddTaskDialogAddAndStart(t *testing.T, transport string) {
 }
 
 // TestAddTaskDialog_RapidDoubleClickAddsOneTask 回归快速双击：
-// AddTask/Start 的同步 IPC 尚未返回时，Fyne 仍会排队后续点击/回车；
+// AddTask/Start 的同步调用尚未返回时，Fyne 仍会排队后续点击/回车；
 // 第一次提交必须立刻关门闩并禁用按钮，不能让排队事件再创建同 URL、
 // 同保存路径的任务。
 func TestAddTaskDialog_RapidDoubleClickAddsOneTask(t *testing.T) {

@@ -17,7 +17,7 @@ import (
 )
 
 // countingService 记录 List 调用次数——列表的过滤结果必须有缓存，
-// 否则每个事件、每个可见行都会产生一次阻塞的 List IPC 往返。
+// 否则每个事件、每个可见行都会产生一次阻塞的 List 往返。
 // 其余 rpc.Client 方法由 nopClient 提供。
 type countingService struct {
 	nopClient

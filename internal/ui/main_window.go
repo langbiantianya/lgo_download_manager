@@ -210,7 +210,7 @@ func (m *MainWindow) buildToolbar() fyne.CanvasObject {
 		// 对已经不在运行的任务 Pause 会返回 error,这里忽略即可。
 		// 同时为每个被请求暂停的 row 设置乐观状态,让 UI 立刻反映。
 		//
-		// 请求并发发起:每一次 Pause 都是一次阻塞的 IPC 往返,串行做的话
+		// 请求并发发起:每一次 Pause 都是一次阻塞的往返,串行做的话
 		// 任务一多,工具栏按钮要卡上好几秒才恢复响应。
 		paused := api.StatusPaused
 		for _, tk := range m.taskList.allTasks() {

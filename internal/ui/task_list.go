@@ -47,7 +47,7 @@ type taskList struct {
 
 	// cacheMu 保护过滤结果缓存。Length()/UpdateItem()/空状态判断都会
 	// 查询过滤结果，没有缓存时每个事件、每一个可见行都要走一次
-	// svc.List（阻塞 IPC，最长 30s 超时）。
+	// svc.List（阻塞调用，最长 30s 超时）。
 	cacheMu    sync.Mutex
 	cache      []*api.Task
 	cacheKey   string
@@ -100,7 +100,7 @@ func (tl *taskList) filtered() []*api.Task {
 	}
 	tl.cacheMu.Unlock()
 
-	// 取数在锁外进行：svc.List 是阻塞 IPC，不应阻塞事件派发路径。
+	// 取数在锁外进行：svc.List 是阻塞调用，不应阻塞事件派发路径。
 	fv, _ := tl.filter.Get()
 	tasks, _ := tl.svc.List(api.StatusFilter(fv), GlobalSettings.TaskSort)
 	sv, _ := tl.searchQ.Get()

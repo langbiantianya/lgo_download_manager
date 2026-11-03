@@ -298,7 +298,7 @@ bin\lgdm-x64.exe                     bin\lgdm-arm64.exe
   PrepareToInstall`），避免 exe 被占用。
 - **升级保留数据，卸载删数据**：卸载会删掉安装目录、`lgom` 注册表键、快捷方式，
   以及用户数据目录 `%LOCALAPPDATA%\lgo_download_manager`（任务库
-  `lgdm.sqlite`、`-wal`/`-shm`、UI IPC 的 `ui-*.sock`）；覆盖安装/升级不碰它。
+  `lgdm.sqlite`、`-wal`/`-shm`、UI 通道的 `ui-*.sock`）；覆盖安装/升级不碰它。
 
 静默安装/卸载（脚本化部署用）：
 
@@ -733,6 +733,10 @@ curl -i -X POST http://127.0.0.1:17830/lgdm.v1.DownloadService/list \
 - **枚举与空切片在两种传输下不完全一致**：proto3 的枚举带不了未知取值（gRPC
   侧静默降级为 UNSPECIFIED），空切片与「未设置」也分不开。这些差异记在
   `internal/rpc/contract_test.go` 的分歧表里。
+- **两种传输的响应外壳不同**：gRPC 的 RPC 必须返回具名 message，所以 `add` /
+  `get_settings` / `bt_info` 的响应在外面包了一层（`AddTaskResponse{task:…}`、
+  `GetSettingsResponse{settings:…}`、`BTDetailResponse{detail:…}`）；http 传输
+  直接返回裸 DTO。写跨传输的通用客户端时不能假设响应体结构相同。
 
 ## 浏览器扩展接力
 
@@ -1019,7 +1023,7 @@ BT 任务的「任务详情」窗口**不**沿用 HTTP 任务那套通用字段�
 这正是「只显示完整进度」看不出来的东西。桶值跟着 `bt_info` 的快照一起
 下发（每桶 1 字节），所以这张图每秒都跟着实际下载进度变化。
 
-面板每秒钟向业务进程取一次实时快照（IPC 方法 `bt_info`），窗口打开期间
+面板每秒钟向业务进程取一次实时快照（`bt_info` 方法），窗口打开期间
 持续刷新。这些数据是易变的（peer 数每秒都在变），刻意**不**进
 `store.Task`——那是落库的静态快照；BT 任务的句柄由 scheduler 单独登记，
 任务暂停 / 结束且不做种时句柄被摘除，面板随之显示「会话已结束」。
@@ -1031,7 +1035,7 @@ BT 任务的「任务详情」窗口**不**沿用 HTTP 任务那套通用字段�
   手滑点一下就没了；
 - 「任务详情」窗口每个任务最多一个：再点一次「详情」按钮会把已经开着的
   那个置前，不会开出第二个一模一样的窗口（BT 面板每秒轮询一次，多开一个
-  既重复显示又白费一次 IPC）；不同任务各自一个，互不影响；
+  既重复显示又白费一次调用）；不同任务各自一个，互不影响；
 - 设置改动：限速立刻生效；监听端口 / DHT / PEX / 连接数上限这类客户端
   构造期参数在没有 BT 任务运行时立即重建客户端生效，否则延后到最后一个
   BT 任务结束（做种中的任务也算「在运行」）。
@@ -1158,7 +1162,7 @@ flatpak/                       # Flatpak 用的 AppStream metainfo
 「新建任务」使用独立 Fyne 窗口（不是 modal popup）：用户可以在主窗口
 和对话框之间切换，文件大小预览由 `svc.Probe` 异步探测；URL 变化时自动
 从路径末段提取文件名填入保存路径。点击「开始下载」会依次调
-`svc.AddTask` → `svc.Start`（二者都经 IPC 落到业务进程），成功后关闭
+`svc.AddTask` → `svc.Start`（二者都经 UI 通道落到业务进程），成功后关闭
 对话框。AddTask / Start 任一返回错误时弹错误对话框，保留窗口供修正。
 
 URL 是磁力链接 / `.torrent` 时对话框会切换语义：标签变成「保存目录」，

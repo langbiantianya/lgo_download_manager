@@ -128,6 +128,15 @@ func TestOpenAPIPathSchemasMatchAPISpec(t *testing.T) {
 	paths := specPaths(t, doc)
 	for _, m := range api.AllMethods {
 		spec := api.Spec(m)
+		if api.IsStreamMethod(m) {
+			// 流式方法没有普通 RPC 规格（api.Spec 对它返回 nil）——
+			// 它的请求体是空的、响应是 NDJSON 的消息行，单独断言。
+			if spec != nil {
+				t.Fatalf("流式方法 %q 不该有普通 RPC 规格", m)
+			}
+			assertStreamPathSchemas(t, paths, m)
+			continue
+		}
 		if spec == nil {
 			t.Fatalf("api.Spec(%q) 是 nil", m)
 		}
@@ -162,15 +171,54 @@ func TestOpenAPIPathSchemasMatchAPISpec(t *testing.T) {
 			t.Fatalf("路径 %q 缺少 200 响应定义", p)
 		}
 		wantOut := dtoTypeName(spec.NewOut())
-		if m == api.MethodStreamMessages {
+		if api.IsStreamMethod(m) {
 			// 流式端点的响应是 NDJSON 的消息行（api.Message），不是
-			// api.Spec 里的 NewOut（那是 api.Empty）。显式特判。
+			// api.Spec 里的 NewOut——流式方法压根没有普通 RPC 规格
+			// （api.Spec 对它返回 nil）。显式特判。
 			wantOut = "Message"
 		}
 		gotOut := contentSchemaNames(t, ok200["content"])
 		if !sameSet([]string{wantOut}, gotOut) {
 			t.Fatalf("路径 %q 的 200 响应 schema 不对：规范里是 %v，应当是 %q", p, gotOut, wantOut)
 		}
+	}
+}
+
+// assertStreamPathSchemas 断言流式端点的规范形状。
+//
+// 流式方法没有普通 RPC 规格：请求体是空的（没有 requestBody 定义），
+// 响应是 NDJSON 的消息行（schema 指向 Message 而不是某个请求/响应对）。
+func assertStreamPathSchemas(t *testing.T, paths map[string]any, method string) {
+	t.Helper()
+	p := servicePrefix + method
+	item, ok := paths[p].(map[string]any)
+	if !ok {
+		t.Fatalf("路径 %q 的定义不是对象", p)
+	}
+	post, ok := item["post"].(map[string]any)
+	if !ok {
+		t.Fatalf("路径 %q 缺少 post 定义", p)
+	}
+	// 请求体是空的（Empty）——服务端不读它，但规范里如实声明了形状。
+	rb, ok := post["requestBody"].(map[string]any)
+	if !ok {
+		t.Fatalf("流式端点 %q 缺少 requestBody 定义", p)
+	}
+	gotIn := contentSchemaNames(t, rb["content"])
+	if !sameSet([]string{"Empty"}, gotIn) {
+		t.Fatalf("路径 %q 的请求体 schema 不对：规范里是 %v，应当是 [Empty]", p, gotIn)
+	}
+	responses, ok := post["responses"].(map[string]any)
+	if !ok {
+		t.Fatalf("路径 %q 缺少 responses 定义", p)
+	}
+	ok200, ok := responses["200"].(map[string]any)
+	if !ok {
+		t.Fatalf("路径 %q 缺少 200 响应定义", p)
+	}
+	gotOut := contentSchemaNames(t, ok200["content"])
+	if !sameSet([]string{"Message"}, gotOut) {
+		t.Fatalf("路径 %q 的 200 响应 schema 不对：规范里是 %v，应当是 [Message]", p, gotOut)
 	}
 }
 

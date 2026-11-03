@@ -453,7 +453,9 @@ func TestCallTypeMismatchDoesNotSendRequest(t *testing.T) {
 	c := &Client{http: &http.Client{Transport: rt}}
 	ctx := context.Background()
 
-	for _, m := range api.AllMethods {
+	// 只遍历能走 Call 的方法：流式方法没有「请求/响应类型」的对，
+	// 它的类型校验另有归属（见 TestCallRejectsStreamMethod）。
+	for _, m := range api.CallMethods {
 		t.Run(m, func(t *testing.T) {
 			spec := api.Spec(m)
 			if spec == nil {

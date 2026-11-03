@@ -84,7 +84,8 @@ func RunChild() int {
 	// 任务行/设置页)。
 	//
 	// 本进程的 ilocale 已由「设置 → 语言」在写回前先行切换（见
-	// buildLanguageSelect）——契约层的语言控制消息不带语言标签，等不到。
+	// buildLanguageSelect）——契约层的语言控制消息**带着**语言标签，但
+	// rpc.Client 的 onLanguage 钩子不接收它，所以等不到。
 	// 首启的语言不走这条路径，由握手时的 settings 应用
 	// （见 applyHandshakeLanguage）。
 	c.SetOnLanguage(func() {

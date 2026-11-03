@@ -16,6 +16,16 @@ import (
 func TestSpecCoversAllMethods(t *testing.T) {
 	for _, m := range AllMethods {
 		s := Spec(m)
+		if IsStreamMethod(m) {
+			// 流式方法没有普通 RPC 规格——它的响应是一条条消息组成的
+			// 长连接，没有「请求类型 → 响应类型」的一对一。给它们一个
+			// 假的 NewOut 等于让契约层撒谎（按 Spec 通用驱动 Call 的调用
+			// 方会以为能拿回一个普通对象）。
+			if s != nil {
+				t.Fatalf("流式方法 %q 不该有普通 RPC 规格", m)
+			}
+			continue
+		}
 		if s == nil {
 			t.Fatalf("方法 %q 缺少规格", m)
 		}
@@ -25,6 +35,45 @@ func TestSpecCoversAllMethods(t *testing.T) {
 	}
 	if Spec("nope") != nil {
 		t.Fatal("未知方法应返回 nil")
+	}
+}
+
+// TestCallMethodsAndStreamMethodsPartitionAllMethods 断言契约的方法表被
+// 「可 Call 的」与「流式的」完整划分，不重不漏。
+//
+// 漏掉一个方法 → 某个端点没人注册；重叠 → 一个方法被登记两次，语义含混。
+func TestCallMethodsAndStreamMethodsPartitionAllMethods(t *testing.T) {
+	seen := make(map[string]bool, len(AllMethods))
+	for _, m := range AllMethods {
+		if seen[m] {
+			t.Fatalf("AllMethods 里有重复项 %q", m)
+		}
+		seen[m] = true
+	}
+	for _, m := range CallMethods {
+		if !seen[m] {
+			t.Errorf("CallMethods 里的 %q 不在 AllMethods 里", m)
+			continue
+		}
+		if IsStreamMethod(m) {
+			t.Errorf("%q 同时出现在 CallMethods 与 StreamMethods 里", m)
+		}
+		if Spec(m) == nil {
+			t.Errorf("CallMethods 里的 %q 缺少规格", m)
+		}
+	}
+	for _, m := range StreamMethods {
+		if !seen[m] {
+			t.Errorf("StreamMethods 里的 %q 不在 AllMethods 里", m)
+			continue
+		}
+		if Spec(m) != nil {
+			t.Errorf("流式方法 %q 不该有普通 RPC 规格", m)
+		}
+	}
+	if len(CallMethods)+len(StreamMethods) != len(AllMethods) {
+		t.Errorf("CallMethods(%d) + StreamMethods(%d) != AllMethods(%d)",
+			len(CallMethods), len(StreamMethods), len(AllMethods))
 	}
 }
 
@@ -133,8 +182,9 @@ func TestSpecAndAllMethodsAreMutuallyConsistent(t *testing.T) {
 			t.Fatalf("方法 %q 有规格但不在 AllMethods 里——契约测试与 OpenAPI 一致性测试遍历不到它", m)
 		}
 	}
-	if len(specs) != len(AllMethods) {
-		t.Fatalf("规格数 %d 与方法数 %d 不一致", len(specs), len(AllMethods))
+	// 规格数 = 可 Call 的方法数（流式方法没有普通 RPC 规格）。
+	if len(specs) != len(CallMethods) {
+		t.Fatalf("规格数 %d 与可 Call 的方法数 %d 不一致", len(specs), len(CallMethods))
 	}
 }
 

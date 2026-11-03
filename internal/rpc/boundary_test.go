@@ -29,6 +29,7 @@ func TestRPCLayerIsIndependent(t *testing.T) {
 		"lgo_download_manager/internal/engine",
 		"lgo_download_manager/internal/ui",
 		"lgo_download_manager/internal/uimgr",
+		"lgo_download_manager/internal/appservice",
 	}
 	for _, d := range deps {
 		d = strings.TrimSpace(d)

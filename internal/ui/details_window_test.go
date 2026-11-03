@@ -142,7 +142,7 @@ func TestDetailsWindowPerTaskIsIndependent(t *testing.T) {
 }
 
 // TestBTDetailsWindowIsSingletonPerTask 校验 BT 任务同样只开一个详情
-// 窗口——BT 面板每秒轮询一次,多开一个窗口既重复显示又白费一次 IPC。
+// 窗口——BT 面板每秒轮询一次,多开一个窗口既重复显示又白费一次调用。
 func TestBTDetailsWindowIsSingletonPerTask(t *testing.T) {
 	test.NewApp()
 	defer test.NewApp()

@@ -24,7 +24,7 @@ import (
 )
 
 // btPollInterval 是 BT 详情面板的刷新周期。peer 数与上下行速度每秒都在
-// 变,1s 足够看清变化;再密只是徒增 IPC 往返。
+// 变,1s 足够看清变化;再密只是徒增往返。
 const btPollInterval = time.Second
 
 // btDetailsPanel 是「任务详情」窗口里的 BT 专属面板。

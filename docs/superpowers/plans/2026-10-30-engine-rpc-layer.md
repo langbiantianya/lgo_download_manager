@@ -11795,7 +11795,8 @@ git commit -m "refactor(ui): 改用 rpc.Client 与契约 DTO，解除对业务�
   `SetSelected` 会同步触发 OnChanged，若只抑制 locale 写入，`persist()` 仍会执行
   ——**每次打开设置页都会多发一次 `SaveSettings`**（这是旧实现就有的行为，本次
   顺手修掉）。用户实际切换时先 `ilocale.Set` 再持久化：契约层的 language 控制
-  消息不带载荷（见 `api.Message`），不能等回调再切。
+  消息**带着**语言标签（`api.Message.Language`），但 `rpc.Client` 的 onLanguage
+  钩子不接收它（见 `internal/rpc/client.go`），所以等不到。
   护栏：`TestLanguageSelectSwitchAppliesLocaleBeforePersist`（真实驱动
   `SetSelected`，断言 locale 已切 + `persist` 恰好一次）、
   `TestBuildLanguageSelect_DoesNotOverrideLocaleOnInit`。
@@ -11882,6 +11883,30 @@ Expected: 全部通过
 git add -A
 git commit -m "refactor(ipc): 删除自定义 JSON 帧协议"
 ```
+
+#### 终审后的补充：流式方法在契约层有一等表达（2026-11-03）
+
+整分支终审发现一条跨任务累积出来的接口不一致，已修：
+
+- **问题**：`api.AllMethods` 把 `stream_messages` 登记成普通方法，`api.Spec`
+  给了它一个假的 `&api.Empty{}` 占位。于是「按 `api.Spec` 通用驱动
+  `Transport.Call`」的调用方会写出跑不通的代码，而且**两种传输的表现完全
+  不可互换**：gRPC 侧立刻回「未知方法」（秒失败），http 侧没有特判、把请求
+  真发出去，然后卡在解码 NDJSON 上**挂满整个 RPC 超时**（默认 30s）。
+  同一个调用方在 gRPC 上秒失败、在 http 上挂满超时。
+- **修法**（契约层正确表达，不再撒谎）：
+  - `internal/api` 新增 `StreamMethods`（流式方法）、`CallMethods`（可走
+    `Call` 的方法）、`IsStreamMethod(method)`；`specs` 里**删掉**
+    `stream_messages` 的条目，于是 `api.Spec("stream_messages")` 返回 nil。
+  - 两个传输的 `Call` 对流式方法都**立刻**返回错误（不发请求），错误信息
+    指引改用 `Stream()`。gRPC 侧原先的 `default` 分支文案也统一了。
+  - `httpx` 服务端的路由注册改用 `api.CallMethods`（流式端点单独注册）。
+  - OpenAPI 一致性测试对流式端点单独断言（请求体是 `Empty`、响应是
+    `Message`），不再靠「spec 给个假 NewOut」绕过。
+- **护栏**：`TestContractStreamMethodNotCallable`（契约层）断言两种传输都
+  **立刻**失败、错误都带方法名与「用 Stream()」的指引。判据用 2s deadline
+  的一半——没有守卫时 http 侧会耗满 deadline，断言触发。
+  证伪：去掉 httpx 的守卫 → 红（"http：应当立刻失败，实际耗时 2.000868409s"）。
 
 #### Task 11 实施记录（已完成）
 

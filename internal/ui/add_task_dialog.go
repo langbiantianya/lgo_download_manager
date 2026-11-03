@@ -137,7 +137,7 @@ type addTaskPreset struct {
 	Cookies string
 }
 
-// ShowAddTaskDialogForURL 由 MsgShowAddTask 回调调用:把 IPC 负载转成
+// ShowAddTaskDialogForURL 由 show_add_task 控制消息回调调用:把载荷转成
 // 对话框预填值并打开。预期在 Fyne 事件线程上执行。
 //
 // URL 自带的 UA / Cookies 仅在该次提交中有效——它们由 showAddTaskDialog
@@ -354,7 +354,7 @@ func showAddTaskDialogWithPreset(parent fyne.Window, svc rpc.Client, preset addT
 
 	// 「开始下载」回调——校验 + 创建任务 + 关闭窗口。
 	startDownload = func() {
-		// AddTask/Start 是同步 IPC 调用；窗口要等它们返回后才真正关闭。
+		// AddTask/Start 是同步调用；窗口要等它们返回后才真正关闭。
 		// Fyne 在 UI 线程阻塞期间仍可排队后续点击/回车事件，若只靠窗口
 		// 关闭来去重，这些事件会在关闭后继续执行并创建多个相同任务。
 		// 每个对话框用独立原子门闩，第一次提交后立即禁用按钮并吞掉
