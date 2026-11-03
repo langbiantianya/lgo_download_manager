@@ -174,3 +174,120 @@ func fieldNames(t reflect.Type) []string {
 	sort.Strings(out)
 	return out
 }
+
+// TestConvertCarriesEveryFieldValue 守住「转换函数把**值**也搬对了」。
+//
+// TestDTOFieldParity 只比字段名集合：它抓得住「DTO 少了一个字段」，抓不住
+// 「字段都在但转换函数忘搬了值」——后者会让某个设置在 UI 里显示成零值，
+// 静默地改掉用户的行为。
+//
+// 这里对每一对「来源类型 → 契约类型」，用反射给来源的每个字段填一个
+// 非零值，跑一遍转换，再逐字段断言契约侧拿到了同一个值。
+func TestConvertCarriesEveryFieldValue(t *testing.T) {
+	cases := []struct {
+		name    string
+		convert func() (src any, dst any)
+	}{
+		{"Settings", func() (any, any) {
+			s := store.Settings{
+				DefaultSaveDir: "/tmp/d", DefaultThreads: 7, MinChunkSize: 4096,
+				UserAgent: "UA/1.0", Cookies: "a=b", FTPPassive: true, Prealloc: true,
+				TaskSort: store.SortCreatedDesc, ProxyMode: protocol.ProxyModeManual,
+				ProxyURL: "http://p:1", ProxyBypass: "localhost",
+				ProxyAutoConfigURL: "http://pac", DownloadLimitKiB: 512,
+				LightMode: true, MaxConcurrent: 9, AutoStart: true, Language: "ja",
+				BTPort: 6881, BTMaxPeers: 33, BTDownloadLimitKiB: 64,
+				BTUploadLimitKiB: 32, BTDHT: true, BTPEX: true, BTSeedRatio: 2,
+				BTMaxSeeding: 4, BTMaxConcurrent: 5, BTTrackers: "udp://t:1337",
+			}
+			return s, toAPISettings(s)
+		}},
+		{"Task", func() (any, any) {
+			t := store.Task{
+				ID: "id1", URL: "http://x/a", SavePath: "/tmp/a", Protocol: "HTTP",
+				TotalSize: 100, Downloaded: 40, SupportRange: true,
+				ETag: "etag", LastModified: "lm", DigestAlgorithm: "sha256", Digest: "dg",
+				IsAllocated: true, ChunkCount: 4, MinChunkSize: 1024,
+				ChunkProgress: []int64{1, 2}, ChunkRanges: []int64{0, 9},
+				Status: store.TaskStatus.Downloading, AuthData: "{}", ErrorMessage: "err",
+				ErrorKind: "kind", BTFile: "bt",
+			}
+			return t, toAPITask(&t)
+		}},
+		{"AuthOptions", func() (any, any) {
+			a := protocol.AuthOptions{
+				UserAgent: "UA/2.0", Cookies: "c=d", ProxyMode: protocol.ProxyModeManual,
+				ProxyURL: "http://q:2", ProxyBypass: "127.0.0.1", ProxyAutoConfigURL: "http://pac2",
+			}
+			return a, toAPIAuthOptions(a)
+		}},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			src, dst := c.convert()
+			assertSameFieldValues(t, reflect.TypeOf(src), reflect.ValueOf(src), reflect.ValueOf(dst))
+		})
+	}
+}
+
+// assertSameFieldValues 逐字段断言 dst 的每个字段与 src 的同名同类型字段
+// 取值相同。
+//
+// 字段名可能不完全一致（例如协议枚举要转换），所以只在**两边同类型**时
+// 比较；类型不同的字段由各自的转换函数负责（枚举那几个另有专项测试）。
+func assertSameFieldValues(t *testing.T, typ reflect.Type, src, dst reflect.Value) {
+	t.Helper()
+	// dst 可能是指针（Task 的转换返回 *api.Task）。
+	dstVal := dst
+	for dstVal.Kind() == reflect.Ptr {
+		dstVal = dstVal.Elem()
+	}
+	for i := 0; i < typ.NumField(); i++ {
+		f := typ.Field(i)
+		if f.PkgPath != "" {
+			continue // 非导出字段
+		}
+		sf := src.Field(i)
+		df := dstVal.FieldByName(f.Name)
+		if !df.IsValid() {
+			t.Errorf("契约侧没有字段 %s", f.Name)
+			continue
+		}
+		if sf.Type() != df.Type() {
+			continue // 类型不同（枚举等），不在这里比
+		}
+		if !reflect.DeepEqual(sf.Interface(), df.Interface()) {
+			t.Errorf("字段 %s 的值没搬过来: 来源 = %v，契约 = %v",
+				f.Name, sf.Interface(), df.Interface())
+		}
+	}
+}
+
+// TestStatusFilterValuesMatchStore 守住筛选条件的取值一致。
+//
+// api.StatusFilter 与 store.StatusFilter 是两套独立的定义，取值必须逐字
+// 相同：漂移了不会报错，只会让筛选**静默失效**——传过去的值在 store 那边
+// 匹配不到任何任务，UI 上表现为「点了筛选但列表没变」。
+//
+// Status 已有 TestStatusValuesMatchStore 这类锁定，StatusFilter 之前没有。
+func TestStatusFilterValuesMatchStore(t *testing.T) {
+	pairs := []struct {
+		name string
+		api  api.StatusFilter
+		st   store.StatusFilter
+	}{
+		{"all", api.FilterAll, store.FilterAll},
+		{"pending", api.FilterPending, store.FilterPending},
+		{"downloading", api.FilterDownloading, store.FilterDownloading},
+		{"paused", api.FilterPaused, store.FilterPaused},
+		{"completed", api.FilterCompleted, store.FilterCompleted},
+		{"failed", api.FilterFailed, store.FilterFailed},
+		{"filelost", api.FilterFileLost, store.FilterFileLost},
+	}
+	for _, p := range pairs {
+		if string(p.api) != string(p.st) {
+			t.Errorf("%s: api = %q，store = %q —— 两侧漂移", p.name, p.api, p.st)
+		}
+	}
+}

@@ -1098,3 +1098,55 @@ func collectRefs(v any, out map[string]bool) {
 		}
 	}
 }
+
+// TestOpenAPIRequiredFieldsMatchContract 守住规范里 required 列表与契约
+// DTO 的一致性。
+//
+// 现有的一致性测试（TestOpenAPISchemaTypesMatchDTO）只查「属性在不在、
+// 类型对不对」，**不查 required**。于是规范里把某个必填字段从 required
+// 里删掉，测试照样绿——而那意味着文档说「可以不填」，实际代码却因为
+// 字段缺失而报错。
+//
+// 期望值写成**字面量**而不是从 DTO 派生：derived 的写法会跟着实现一起
+// 变，改错了也抓不到。
+func TestOpenAPIRequiredFieldsMatchContract(t *testing.T) {
+	doc := parseSpec(t)
+	schemas := specSchemas(t, doc)
+
+	cases := []struct {
+		schema string
+		want   []string
+	}{
+		{"TaskRef", []string{"id"}},
+		{"ProbeParams", []string{"url"}},
+		{"AddTaskInput", []string{"url"}},
+		{"BTInfoParams", []string{"task_id"}},
+		{"Error", []string{"ok", "error"}},
+	}
+	for _, c := range cases {
+		t.Run(c.schema, func(t *testing.T) {
+			s, ok := schemas[c.schema].(map[string]any)
+			if !ok {
+				t.Fatalf("规范缺少 schema %q", c.schema)
+			}
+			raw, ok := s["required"].([]any)
+			if !ok {
+				t.Fatalf("schema %q 没有 required 列表", c.schema)
+			}
+			got := make([]string, 0, len(raw))
+			for _, v := range raw {
+				str, ok := v.(string)
+				if !ok {
+					t.Fatalf("schema %q 的 required 里有非字符串项: %v", c.schema, v)
+				}
+				got = append(got, str)
+			}
+			sort.Strings(got)
+			want := append([]string(nil), c.want...)
+			sort.Strings(want)
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("schema %q 的 required = %v，期望 %v", c.schema, got, want)
+			}
+		})
+	}
+}
