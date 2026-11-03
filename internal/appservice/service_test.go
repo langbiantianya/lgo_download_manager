@@ -355,3 +355,38 @@ func TestCallWithoutSchedulerStillServesSettings(t *testing.T) {
 		t.Fatalf("get_settings 不需要调度器，应当成功: %v", err)
 	}
 }
+
+// TestEventsWithoutSchedulerDoesNotPanic 守住「服务没配调度器时打开消息流
+// 不崩」。
+//
+// 与 TestCallWithoutSchedulerReturnsError 是同一类问题的另一半：Call 入口
+// 有 needsScheduler 守卫，事件流这条路**曾经没有**——s.sc.Subscribe() 会直接
+// nil panic。panic 会顺着传输层冒到服务端，把一次配置问题变成进程挂掉。
+//
+// 修法是返回一条已关闭的通道：调用方读它立刻收到 ok=false，正是「事件流
+// 结束」的语义。
+func TestEventsWithoutSchedulerDoesNotPanic(t *testing.T) {
+	s := New(nil, nil)
+
+	ch, unsub := s.Events()
+	defer unsub()
+
+	// 通道必须立刻结束，而不是阻塞或 panic。
+	select {
+	case ev, ok := <-ch:
+		if ok {
+			t.Fatalf("没有调度器时不该有事件，却收到 %+v", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("事件流没有结束——不该阻塞调用方")
+	}
+}
+
+// TestEventsUnsubWithoutSchedulerIsSafe 确认退订函数在无调度器时也是空操作
+// （不是 panic）。
+func TestEventsUnsubWithoutSchedulerIsSafe(t *testing.T) {
+	s := New(nil, nil)
+	_, unsub := s.Events()
+	unsub()
+	unsub() // 退订应当幂等
+}

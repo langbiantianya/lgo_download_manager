@@ -121,6 +121,17 @@ func (s *Service) Controls() <-chan api.Message { return s.controls }
 
 // Events 订阅调度器事件流。退订函数由调度器提供。
 func (s *Service) Events() (<-chan api.Event, func()) {
+	// 没有调度器时不能 Subscribe——那会 nil panic。返回一条**已关闭**的
+	// 通道：调用方读它会立刻收到零值与 ok=false，正好是「事件流结束」的
+	// 语义；退订函数是个空操作。
+	//
+	// 与 Call 入口的 needsScheduler 守卫是同一个道理：New(nil, nil) 是合法
+	// 构造，收到真实调用时必须返回错误或空流，不能崩。
+	if s.sc == nil {
+		ch := make(chan api.Event)
+		close(ch)
+		return ch, func() {}
+	}
 	ch, unsub := s.sc.Subscribe()
 	out := make(chan api.Event, cap(ch))
 	stop := make(chan struct{})
