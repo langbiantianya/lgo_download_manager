@@ -111,3 +111,56 @@ go run scripts/ftp_test_server/ftpd.go --root /tmp/ftp_test_root
 
 - `internal/protocol/TEST_REPORT.md`
 - `internal/engine/TEST_REPORT.md`
+
+## 值得优先关注的用例
+
+`internal/ui/chunk_details_e2e_test.go` 在不支持 `Accept-Ranges` 的 httptest 服务
+上运行真实的调度器和引擎，验证单流回退，并断言每条分片进度条最终
+`Value = 1.0`。
+
+`internal/handoff/handoff_test.go` 覆盖浏览器接力端口：扩展来源放行，网页、
+`null` 来源和缺少 `X-LGOM-Client` 的请求拒绝；候选端口被占时顺延；全部占用时报错；
+只绑定 `127.0.0.1`；请求体校验、错误回传和 `handoff.json` 内容。
+
+`internal/scheduler/scheduler_test.go` 中的 `TestStartIsAsync` 使用不可达端口验证：
+
+- `Start()` 在 500ms 内返回；
+- 任务最终进入 `Failed`，且 `ErrorMessage` 非空。
+
+`TestMaxConcurrent_*` 覆盖：
+
+- `_QueuesNewTasksBeyondCap`：达到上限后静默排队，不占 slot；
+- `_PromotesFIFOOnCompletion`：槽位释放后按 `created_at` 升序拉起；
+- `_RaiseCapPromotesPending`：调大上限后立即 promote。
+
+这些用例使用 `blockingServer` 让 HTTP probe 停留在 prepare 阶段，以便精确断言
+上限和拉起时机。
+
+BitTorrent 相关：
+
+- `internal/bittorrent/bittorrent_test.go` 的 `TestDownloadFromLoopbackPeer` 是本机
+  做种端到真实 lgdm Manager 下载的端到端用例，验证进度、文件列表、内容、
+  `.part` 重命名和实际上传。其它用例覆盖种子解析、重复 infohash 拒绝、缓存元数据
+  恢复。
+- `internal/scheduler/bittorrent_test.go` 覆盖设置到客户端配置的映射、tracker 拆分、
+  任务目录推导、BT/普通任务删除语义、按种子文件换算分片，以及 `flushAll` 不清空
+  BT 分片进度的回归。
+
+需要绑定回环端口的测试（BT 端到端、`internal/handoff`、部分 engine 用例）在无法
+监听 socket 的环境中会 `t.Skip`，因此受限沙箱中的全量测试仍可运行其它单元用例。
+
+## 其他模块测试
+
+```sh
+go test -v ./internal/rpc/...
+go test -v ./internal/store/
+go test -v ./internal/bittorrent/
+```
+
+浏览器扩展测试：
+
+```sh
+cd lgom-extension
+npm test
+npm run check
+```
