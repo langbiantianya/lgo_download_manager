@@ -7,34 +7,36 @@
 package ui
 
 import (
+	"image/color"
 	"testing"
 	"time"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/test"
 )
 
-// mosaicTiles 在 m.mu 内取一份当前瓦片快照：测试与事件派发/补渲染
-// goroutine 可能并发访问马赛克。
-func mosaicTiles(m *chunkMosaic) []fyne.CanvasObject {
+// mosaicCovered 在 m.mu 内取一份当前瓦片覆盖比例快照。
+func mosaicCovered(m *chunkMosaic) []float64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return append([]fyne.CanvasObject(nil), m.wrap.Objects...)
+	return append([]float64(nil), m.covered...)
 }
 
 // mosaicAllGreen 报告所有瓦片是否都已染成 success（下载完成）。
 func mosaicAllGreen(m *chunkMosaic) bool {
-	for _, obj := range mosaicTiles(m) {
-		rect, ok := obj.(*canvas.Rectangle)
-		if !ok {
-			return false
-		}
-		if rect.FillColor != successColor() {
+	for _, frac := range mosaicCovered(m) {
+		if frac < 1 {
 			return false
 		}
 	}
-	return true
+	m.mu.Lock()
+	want := m.palette.success
+	height := int(m.raster.MinSize().Height)
+	m.mu.Unlock()
+	if height <= 0 {
+		return false
+	}
+	got := color.NRGBAModel.Convert(m.generate(560, height).At(5, 5)).(color.NRGBA)
+	return got == want
 }
 
 // mosaicTestInput 构造 4 个等长分块的范围与进度。
@@ -68,16 +70,19 @@ func TestMosaicUpdateSkipsIdenticalInput(t *testing.T) {
 	progress, ranges := mosaicTestInput(total, blockSize/2)
 	m.update(progress, ranges, total)
 
-	before := mosaicTiles(m)
+	before := mosaicCovered(m)
 	if len(before) != 4 {
 		t.Fatalf("瓦片数 = %d, 期望 4", len(before))
 	}
+	m.mu.Lock()
+	appliedAt := m.appliedAt
+	m.mu.Unlock()
 	m.update(progress, ranges, total)
-	after := mosaicTiles(m)
-	for i := range before {
-		if before[i] != after[i] {
-			t.Fatalf("相同输入不应重建瓦片：第 %d 块发生了变化", i)
-		}
+	m.mu.Lock()
+	after := m.appliedAt
+	m.mu.Unlock()
+	if !after.Equal(appliedAt) {
+		t.Fatal("相同输入不应重建瓦片")
 	}
 }
 

@@ -9,7 +9,9 @@ package ui
 import (
 	"encoding/json"
 	"fmt"
+	"image"
 	"image/color"
+	"math"
 	"path/filepath"
 	"slices"
 	"sync"
@@ -37,9 +39,12 @@ const maxTiles = 1024
 // 小方块会排列成一面瓦片墙。
 const tileSize = 12
 
+// chunkMosaicColumns keeps the raster layout stable across redraws. The actual
+// canvas width determines the tile pixel size on high-DPI displays.
+const chunkMosaicColumns = 46
+
 // mosaicThrottle 是两次瓦片重建之间的最小间隔。进度事件远密于此，
-// 而每次重建都要新建最多 maxTiles 个 canvas.Rectangle 并触发两次
-// Refresh()，是详情窗口的主要开销。
+// 而每次重建都要重算最多 maxTiles 个瓦片的覆盖比例。
 const mosaicThrottle = 400 * time.Millisecond
 
 // chunkMosaic 将文件渲染为一面由小方块组成的瓦片墙。
@@ -48,22 +53,21 @@ const mosaicThrottle = 400 * time.Millisecond
 // 瓦片染为绿色；部分完成的范围使用主题的主色；空白范围
 // 使用输入框背景色。
 //
-// 瓦片是 GridWrap 内的真实 canvas.Rectangle widget。
-// 我们在每次更新时重建 wrap，使每个瓦片都是新创建的——
-// 这规避了 fyne-io/fyne#3216：在 GridWrap 子节点上单独
-// 调用 Refresh() 可能会被静默丢弃。
+// 整面墙由一张 canvas.Raster 绘制。BT 详情页已经采用同样的方案；
+// 它避免了为最多 1024 个瓦片分别创建 Rectangle、renderer 与纹理对象。
 type chunkMosaic struct {
-	widget.BaseWidget
-	wrap    *fyne.Container
+	raster  *canvas.Raster
 	taskID  string
 	total   int64
 	blockSz int64
 	blocks  int
+	covered []float64
+	palette chunkMosaicPalette
 
 	// mu 串行化全部内部状态与 widget 树变更。
 	// update/resizeForTotal 会被事件派发 goroutine 与窗口自身并发调用
 	// （测试与关闭路径直接调用，不经过 fyne.Do），没有这把锁就会
-	// 并发重建 m.wrap.Objects 并踩到 Fyne 的 renderer 缓存。
+	// 并发改写覆盖数据并踩到 Fyne 的绘制缓存。
 	mu sync.Mutex
 
 	// seq 每次 update() 递增；补渲染捕获自己的值，若期间已有更新的
@@ -84,6 +88,12 @@ type chunkMosaic struct {
 	pendingRanges []int64
 	pendingTotal  int64
 	flushTimer    *time.Timer
+}
+
+type chunkMosaicPalette struct {
+	empty   color.NRGBA
+	primary color.NRGBA
+	success color.NRGBA
 }
 
 // showChunkDetails 打开一个窗口，展示任务的下载进度。
@@ -134,7 +144,7 @@ func showChunkDetails(t *api.Task, svc rpc.Client, parent fyne.Window) *btDetail
 		widget.NewSeparator(),
 		widget.NewLabel(ilocale.T("details.section.chunks")),
 	)
-	content := container.NewVBox(header, mosaic.wrap)
+	content := container.NewVBox(header, mosaic.content())
 	scroll := container.NewScroll(content)
 	scroll.SetMinSize(fyne.NewSize(560, 360))
 
@@ -146,15 +156,19 @@ func showChunkDetails(t *api.Task, svc rpc.Client, parent fyne.Window) *btDetail
 	// 先订阅业务事件流拿到 unsub，再登记窗口（登记时会挂上 SetOnClosed），
 	// 保证窗口关闭时取消订阅。
 	ch, unsub := svc.Subscribe()
-	registerDetailsWindow(t.ID, w, unsub)
+	events := newUIEventPump(fyne.Do, func(ev api.Event) {
+		mosaic.update(ev.Task.ChunkProgress, ev.Task.ChunkRanges, ev.Task.TotalSize)
+	})
+	registerDetailsWindow(t.ID, w, func() {
+		events.stop()
+		unsub()
+	})
 	go func() {
 		for ev := range ch {
 			if ev.Task == nil || ev.Task.ID != t.ID {
 				continue
 			}
-			fyne.Do(func() {
-				mosaic.update(ev.Task.ChunkProgress, ev.Task.ChunkRanges, ev.Task.TotalSize)
-			})
+			events.enqueue(ev)
 		}
 	}()
 	return nil
@@ -164,14 +178,17 @@ func showChunkDetails(t *api.Task, svc rpc.Client, parent fyne.Window) *btDetail
 // 分配瓦片网格。
 func newChunkMosaic(taskID string) *chunkMosaic {
 	m := &chunkMosaic{
-		taskID: taskID,
-		wrap:   container.NewGridWrap(fyne.NewSize(tileSize, tileSize)),
+		taskID:  taskID,
+		palette: currentChunkMosaicPalette(),
 	}
-	m.ExtendBaseWidget(m)
+	m.raster = canvas.NewRaster(m.generate)
+	m.raster.SetMinSize(fyne.NewSize(560, tileSize))
 	return m
 }
 
-// resizeForTotal 根据文件大小重建 wrap，并使用正确数量的瓦片。
+func (m *chunkMosaic) content() fyne.CanvasObject { return m.raster }
+
+// resizeForTotal 根据文件大小重建分片覆盖数据与最小显示高度。
 func (m *chunkMosaic) resizeForTotal(total int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -186,9 +203,9 @@ func (m *chunkMosaic) resizeLocked(total int64) {
 		m.total = 0
 		m.blocks = 0
 		m.blockSz = 0
-		m.wrap.Objects = nil
-		m.wrap.Refresh()
-		m.Refresh()
+		m.covered = nil
+		m.raster.SetMinSize(fyne.NewSize(560, tileSize))
+		m.raster.Refresh()
 		return
 	}
 	blocks := int(total / blockSize)
@@ -206,15 +223,14 @@ func (m *chunkMosaic) resizeLocked(total int64) {
 	}
 	m.total = total
 	m.blocks = blocks
-	m.wrap.Objects = m.makeTiles(make([]float64, blocks))
-	m.wrap.Refresh()
-	m.Refresh()
+	m.covered = make([]float64, blocks)
+	m.updateMinSizeLocked()
+	m.raster.Refresh()
 }
 
-// update 根据给定的分块布局和进度，使用新绘制的瓦片重建 wrap。
+// update 根据给定的分块布局和进度重绘整张瓦片图。
 //
-// 进度事件远比肉眼可辨的刷新率密集，而每次重建都要新建最多 maxTiles 个
-// canvas.Rectangle 并触发两次 Refresh()。因此这里做两件事：
+// 进度事件远比肉眼可辨的刷新率密集。因此这里做两件事：
 //   - 输入与上一次实际渲染完全相同 → 直接返回；
 //   - 距上次重建不足 mosaicThrottle → 只记下最新输入，
 //     窗口结束后由 flushPending 补渲染（最终状态不会丢失）。
@@ -283,6 +299,7 @@ func (m *chunkMosaic) applyLocked(chunkProgress, chunkRanges []int64, totalSize 
 	m.appliedTotal = totalSize
 	m.appliedProg = append(m.appliedProg[:0], chunkProgress...)
 	m.appliedRanges = append(m.appliedRanges[:0], chunkRanges...)
+	m.palette = currentChunkMosaicPalette()
 
 	if totalSize != m.total {
 		m.total = totalSize
@@ -298,8 +315,8 @@ func (m *chunkMosaic) applyLocked(chunkProgress, chunkRanges []int64, totalSize 
 		// 回退方案：基于 progress 数组长度假定 N 个均匀分块。
 		threads := len(progress)
 		if threads == 0 {
-			m.wrap.Objects = m.makeTiles(make([]float64, m.blocks))
-			m.wrap.Refresh()
+			m.covered = make([]float64, m.blocks)
+			m.raster.Refresh()
 			return
 		}
 		base := totalSize / int64(threads)
@@ -316,7 +333,11 @@ func (m *chunkMosaic) applyLocked(chunkProgress, chunkRanges []int64, totalSize 
 		}
 	}
 
-	covered := make([]float64, m.blocks)
+	covered := m.covered
+	if len(covered) != m.blocks {
+		covered = make([]float64, m.blocks)
+		m.covered = covered
+	}
 	for b := 0; b < m.blocks; b++ {
 		tileStart := int64(b) * m.blockSz
 		tileEnd := tileStart + m.blockSz
@@ -357,43 +378,95 @@ func (m *chunkMosaic) applyLocked(chunkProgress, chunkRanges []int64, totalSize 
 		covered[b] = frac
 	}
 
-	m.wrap.Objects = m.makeTiles(covered)
-	m.wrap.Refresh()
-	m.Refresh()
+	m.raster.Refresh()
 }
 
-// makeTiles 新建一组 canvas.Rectangle 子节点——每个瓦片一个——
-func (m *chunkMosaic) makeTiles(covered []float64) []fyne.CanvasObject {
-	// 根据每块瓦片的覆盖比例选择颜色。重建而非就地修改可规避
-	// fyne-io/fyne#3216。
-	objs := make([]fyne.CanvasObject, len(covered))
-	th := fyne.CurrentApp().Settings().Theme()
+func (m *chunkMosaic) updateMinSizeLocked() {
+	rows := (m.blocks + chunkMosaicColumns - 1) / chunkMosaicColumns
+	if rows <= 0 {
+		rows = 1
+	}
+	height := rows * tileSize
+	m.raster.SetMinSize(fyne.NewSize(560, float32(height)))
+}
+
+// generate paints all tiles into one bitmap. This runs on Fyne's draw thread,
+// so it only reads the palette snapshot prepared on the event thread.
+func (m *chunkMosaic) generate(w, h int) image.Image {
+	if w < 0 {
+		w = 0
+	}
+	if h < 0 {
+		h = 0
+	}
+	img := image.NewNRGBA(image.Rect(0, 0, w, h))
+
+	m.mu.Lock()
+	covered := append([]float64(nil), m.covered...)
+	palette := m.palette
+	m.mu.Unlock()
+
+	fillNRGBA(img, img.Bounds(), palette.empty)
+	if len(covered) == 0 || w <= 0 || h <= 0 {
+		return img
+	}
+
+	scale := float64(w) / 560
+	if scale < 1 {
+		scale = 1
+	}
+	cell := int(math.Round(tileSize * scale))
+	if cell < 2 {
+		cell = 2
+	}
+	gap := int(math.Round(scale))
+	if gap < 1 {
+		gap = 1
+	}
+	tile := cell - gap
+
 	for i, frac := range covered {
-		r := canvas.NewRectangle(tileColor(th, frac))
-		r.StrokeColor = th.Color(theme.ColorNameForeground, fyne.CurrentApp().Settings().ThemeVariant())
-		r.StrokeWidth = 0.5
-		objs[i] = r
+		col := i % chunkMosaicColumns
+		row := i / chunkMosaicColumns
+		x := col * cell
+		y := row * cell
+		if x+tile > w || y+tile > h {
+			break
+		}
+		fill := palette.empty
+		switch {
+		case frac >= 1:
+			fill = palette.success
+		case frac > 0:
+			fill = palette.primary
+		}
+		fillNRGBA(img, image.Rect(x, y, x+tile, y+tile), fill)
 	}
-	return objs
+	return img
 }
 
-// tileColor 根据瓦片的覆盖比例选择颜色。完全下载完成的瓦片
-// 使用 success（绿色）；部分完成的瓦片使用主题的主色；
-// 空瓦片使用输入框背景色。
-func tileColor(th fyne.Theme, frac float64) color.Color {
-	switch {
-	case frac >= 1:
-		return th.Color(theme.ColorNameSuccess, fyne.CurrentApp().Settings().ThemeVariant())
-	case frac > 0:
-		return th.Color(theme.ColorNamePrimary, fyne.CurrentApp().Settings().ThemeVariant())
-	default:
-		return th.Color(theme.ColorNameInputBackground, fyne.CurrentApp().Settings().ThemeVariant())
+func fillNRGBA(img *image.NRGBA, rect image.Rectangle, c color.NRGBA) {
+	rect = rect.Intersect(img.Bounds())
+	for y := rect.Min.Y; y < rect.Max.Y; y++ {
+		row := img.Pix[y*img.Stride:]
+		for x := rect.Min.X; x < rect.Max.X; x++ {
+			off := x * 4
+			row[off] = c.R
+			row[off+1] = c.G
+			row[off+2] = c.B
+			row[off+3] = c.A
+		}
 	}
 }
 
-// CreateRenderer 返回一个最小化的 renderer。瓦片由 m.wrap
-func (m *chunkMosaic) CreateRenderer() fyne.WidgetRenderer {
-	return widget.NewSimpleRenderer(container.NewWithoutLayout())
+func currentChunkMosaicPalette() chunkMosaicPalette {
+	variant := fyne.CurrentApp().Settings().ThemeVariant()
+	th := fyne.CurrentApp().Settings().Theme()
+	return chunkMosaicPalette{
+		empty:   color.NRGBAModel.Convert(th.Color(theme.ColorNameInputBackground, variant)).(color.NRGBA),
+		primary: color.NRGBAModel.Convert(th.Color(theme.ColorNamePrimary, variant)).(color.NRGBA),
+		success: color.NRGBAModel.Convert(th.Color(theme.ColorNameSuccess, variant)).(color.NRGBA),
+	}
 }
 
 func min64(a, b int64) int64 {

@@ -66,7 +66,8 @@ type MainWindow struct {
 	// 无限循环直到 UI 进程 panic。这里在重建期间统一 short-circuit。
 	suppressPersist bool
 
-	unsub func()
+	unsub  func()
+	events *uiEventPump
 
 	// diskTicker 周期性刷新状态栏的磁盘空间；关闭 diskDone 即退出该循环。
 	diskTicker *time.Ticker
@@ -360,6 +361,10 @@ func (m *MainWindow) onCloseRequested() {
 
 // Close 清理事件订阅与后台周期任务（进程退出路径）。
 func (m *MainWindow) Close() {
+	if m.events != nil {
+		m.events.stop()
+		m.events = nil
+	}
 	if m.unsub != nil {
 		m.unsub()
 		m.unsub = nil
@@ -401,12 +406,13 @@ func (m *MainWindow) stopDiskTicker() {
 func (m *MainWindow) subscribe() {
 	ch, unsub := m.svc.Subscribe()
 	m.unsub = unsub
+	events := newUIEventPump(fyne.Do, func(ev api.Event) {
+		m.taskList.onEvent(ev)
+	})
+	m.events = events
 	go func() {
 		for ev := range ch {
-			ev := ev
-			fyne.Do(func() {
-				m.taskList.onEvent(ev)
-			})
+			events.enqueue(ev)
 		}
 	}()
 }

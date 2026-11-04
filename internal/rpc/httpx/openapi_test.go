@@ -7,12 +7,14 @@
 package httpx
 
 import (
+	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -543,6 +545,35 @@ func TestDocsEndpointsNeedNoToken(t *testing.T) {
 		}
 		if rec.Body.Len() == 0 {
 			t.Fatalf("%s 的响应体是空的", c.path)
+		}
+	}
+}
+
+func TestDocsAssetsSupportGzip(t *testing.T) {
+	mux := docsMux()
+	for _, a := range docsAssets {
+		req := httptest.NewRequest(http.MethodGet, docsPrefix+a.name, nil)
+		req.Header.Set("Accept-Encoding", "gzip")
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s: status = %d", docsPrefix+a.name, rec.Code)
+		}
+		if got := rec.Header().Get("Content-Encoding"); got != "gzip" {
+			t.Fatalf("GET %s: Content-Encoding = %q, want gzip", docsPrefix+a.name, got)
+		}
+		zr, err := gzip.NewReader(rec.Body)
+		if err != nil {
+			t.Fatalf("GET %s: gzip reader: %v", docsPrefix+a.name, err)
+		}
+		raw, err := io.ReadAll(zr)
+		_ = zr.Close()
+		if err != nil {
+			t.Fatalf("GET %s: decompress: %v", docsPrefix+a.name, err)
+		}
+		if len(raw) == 0 {
+			t.Fatalf("GET %s: decompressed asset is empty", docsPrefix+a.name)
 		}
 	}
 }

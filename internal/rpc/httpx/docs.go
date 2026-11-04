@@ -7,19 +7,28 @@
 package httpx
 
 import (
-	_ "embed"
+	"bytes"
+	"compress/gzip"
+	"embed"
 	"encoding/json"
+	"io"
 	"net/http"
-	"os"
 	"strings"
 	"sync"
 
-	swaggerFiles "github.com/swaggo/files"
 	"go.yaml.in/yaml/v3"
 )
 
 //go:embed openapi.yaml
 var openapiYAML []byte
+
+// The documentation UI is only needed by a developer opening /docs/. Keep the
+// pre-compressed assets in read-only embedded storage instead of importing the
+// whole swaggo/files package, whose init copies every Swagger asset into an
+// in-memory filesystem in both the business and UI processes.
+//
+//go:embed docs_assets/*.gz
+var docsAssetsFS embed.FS
 
 // openAPIJSON 缓存规范转成的 JSON 形式。转换只做一次：规范是嵌入的常量，
 // 结果不会变，重复解析纯属浪费。
@@ -129,24 +138,33 @@ func serveDocsSubtree(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "没有这个文档资源 "+rest)
 }
 
-// serveDocsAsset 把白名单里的静态资源吐出来。资源本体在 swaggo/files 的
-// 内存文件系统里（编译进二进制，不依赖公网）。用 http.ServeContent 而不是
-// 直接 Write，是为了顺带带上 Content-Length、Last-Modified 与 Range 支持。
+// serveDocsAsset 把白名单里的静态资源吐出来。资源以 gzip 形式嵌入二进制，
+// 不依赖公网。支持 gzip 的浏览器直接收到压缩内容；其它客户端按需流式解压，
+// 不会在进程内保留一份解压后的完整静态文件。
 func serveDocsAsset(w http.ResponseWriter, r *http.Request, a docsAsset) {
-	f, err := swaggerFiles.FS.OpenFile(swaggerFiles.CTX, "/"+a.name, os.O_RDONLY, 0o644)
+	data, err := docsAssetsFS.ReadFile("docs_assets/" + a.name + ".gz")
 	if err != nil {
 		// 资源读不出来是打包时出的问题，不是调用方的错。
 		writeError(w, http.StatusInternalServerError, "读不出文档资源 "+a.name)
 		return
 	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "读不出文档资源 "+a.name)
+	w.Header().Set("Content-Type", a.contentType)
+	w.Header().Set("Vary", "Accept-Encoding")
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		_, _ = w.Write(data)
 		return
 	}
-	w.Header().Set("Content-Type", a.contentType)
-	http.ServeContent(w, r, a.name, info.ModTime(), f)
+
+	zr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "解压文档资源 "+a.name)
+		return
+	}
+	defer zr.Close()
+	if _, err := io.Copy(w, zr); err != nil {
+		return
+	}
 }
 
 // writeSwaggerPage 写出离线的 Swagger UI 页面。

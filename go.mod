@@ -129,7 +129,6 @@ require (
 
 require (
 	github.com/dop251/goja v0.0.0-20261028213108-85be1416108e
-	github.com/swaggo/files v1.0.1
 	golang.org/x/sys v0.48.0
 	golang.org/x/text v0.43.0
 	google.golang.org/grpc v1.85.0
@@ -162,7 +161,7 @@ require (
 //
 // 之前这里还配过针对 golang.org/x/tools v0.47.0 / v0.51.0 的 exclude，用来
 // 拦 http-swagger → swaggo/swag → x/tools → x/net 这条抬升链。Swagger 文档
-// 页改用 swaggo/files 自写 handler 后，http-swagger 与 swaggo/swag 已退出
+// 页改用自带静态资源后，http-swagger、swaggo/swag 与 swaggo/files 都已退出
 // 依赖图，x/tools 不再被本仓库的任何包 import，它的 requirement 也不再参与
 // 本仓库的版本选择——实测删掉这两条 exclude 后，go list -m all 的完整模块
 // 列表与保留 exclude 时逐行相同，两条 exclude 已是死代码，故删除。

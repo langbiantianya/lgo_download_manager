@@ -15,7 +15,6 @@ package ui
 import (
 	"crypto/rand"
 	"fmt"
-	"image/color"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,10 +23,7 @@ import (
 	"testing"
 	"time"
 
-	"fyne.io/fyne/v2"
-	"fyne.io/fyne/v2/canvas"
 	"fyne.io/fyne/v2/test"
-	"fyne.io/fyne/v2/theme"
 
 	"lgo_download_manager/internal/api"
 	"lgo_download_manager/internal/rpc"
@@ -40,9 +36,7 @@ import (
 // 进度等于总字节数。我们断言 mosaic 的 update() 会将每块瓦片都绘制
 // 为 success 颜色。
 //
-// 瓦片颜色通过在每次更新时重建 canvas.Rectangle 子节点来设置，
-// 从而规避 fyne-io/fyne#3216（在 GridWrap 单个子节点上调用 Refresh
-// 可能会被静默丢弃）。
+// 整张图由单个 canvas.Raster 绘制，避免为每块瓦片创建 widget。
 func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 	const size = 4 * 1024 * 1024
 	payload := make([]byte, size)
@@ -128,25 +122,10 @@ func TestMosaicTilesTurnGreenOnDownload(t *testing.T) {
 	if m.blocks != 4 {
 		t.Fatalf("expected 4 blocks, got %d", m.blocks)
 	}
-	if got := len(m.wrap.Objects); got != 4 {
+	if got := len(mosaicCovered(m)); got != 4 {
 		t.Fatalf("expected 4 tiles, got %d", got)
 	}
-	for i, obj := range m.wrap.Objects {
-		rect, ok := obj.(*canvas.Rectangle)
-		if !ok {
-			t.Fatalf("tile %d is %T, want *canvas.Rectangle", i, obj)
-		}
-		// 流式下载完全完成后 → 每块瓦片都应是 success（绿色）。
-		if rect.FillColor != successColor() {
-			t.Errorf("tile %d FillColor = %v, want Success (%v)",
-				i, rect.FillColor, successColor())
-		}
+	if !mosaicAllGreen(m) {
+		t.Fatalf("after completion covered = %v, want all green", mosaicCovered(m))
 	}
-}
-
-// successColor 解析主题的 success 颜色，以便我们比较瓦片
-func successColor() color.Color {
-	th := fyne.CurrentApp().Settings().Theme()
-	// 的 FillColor（color.Color）与其是否相等。
-	return th.Color(theme.ColorNameSuccess, fyne.CurrentApp().Settings().ThemeVariant())
 }
