@@ -600,7 +600,10 @@ func (d *httpDriver) Probe(ctx context.Context) (*DriverCapabilities, error) {
 	if rangeCaps.LastModified != "" {
 		caps.LastModified = rangeCaps.LastModified
 	}
-	if caps.Filename == "" {
+	// Range GET 才代表后续下载实际会拿到的响应。若 HEAD 与 GET
+	// 对 Content-Disposition 给出不同结果，以后者为准；GET 未提供时
+	// 仍保留 HEAD 的建议名。
+	if rangeCaps.Filename != "" {
 		caps.Filename = rangeCaps.Filename
 	}
 	// 只有 HEAD 的 200 响应才可信地代表完整表示摘要。1 字节 Range

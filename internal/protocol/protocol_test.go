@@ -913,6 +913,34 @@ func TestHTTPProbeHEAD(t *testing.T) {
 	d.Close()
 }
 
+func TestHTTPProbePrefersContentDispositionFromRangeGET(t *testing.T) {
+	const size int64 = 32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+		if r.Method == http.MethodGet && r.Header.Get("Range") == "bytes=0-0" {
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes 0-0/%d", size))
+			w.Header().Set("Content-Length", "1")
+			w.Header().Set("Content-Disposition", `attachment; filename="actual-download.zip"`)
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write([]byte{0})
+			return
+		}
+		w.Header().Set("Content-Disposition", `attachment; filename="head-only.bin"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	d := makeHTTPDriver(srv.URL)
+	caps, err := d.Probe(context.Background())
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	if caps.Filename != "actual-download.zip" {
+		t.Fatalf("Filename = %q, want Range GET filename", caps.Filename)
+	}
+	d.Close()
+}
+
 func TestHTTPProbeCapturesValidatorsAndUsesIfRange(t *testing.T) {
 	const (
 		size         = 4096

@@ -17,8 +17,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -32,6 +34,7 @@ import (
 	"lgo_download_manager/internal/prealloc"
 	"lgo_download_manager/internal/protocol"
 	"lgo_download_manager/internal/store"
+	"lgo_download_manager/internal/urlkind"
 )
 
 const FlushInterval = 2 * time.Second
@@ -518,7 +521,6 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		handedOver = s.startBittorrent(taskID, tk, rj, prepareCtx)
 		return
 	}
-	downloadPath := tk.SavePath + ".part"
 	driver, err := protocol.New(tk.URL, kind, protocol.Auth{AuthOptions: auth})
 	if err != nil {
 		s.fail(tk, err)
@@ -548,6 +550,16 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		s.releaseSlot(taskID)
 		return
 	}
+	// URL 只能提供路径末段（例如 Actions Artifact ID），真实文件名通常
+	// 只存在于最终下载响应的 Content-Disposition。若当前路径仍是 URL
+	// 自动推导值，就在这里采用响应建议名；用户自选的名称保持不变。
+	if err := s.adoptResponseFilename(tk, caps.Filename); err != nil {
+		_ = driver.Close()
+		s.fail(tk, err)
+		s.releaseSlot(taskID)
+		return
+	}
+	downloadPath := tk.SavePath + ".part"
 	resumeDataMissing, err := resumeDownloadDataMissing(tk, downloadPath)
 	if err != nil {
 		_ = driver.Close()
@@ -828,6 +840,92 @@ func (s *Scheduler) startAsync(taskID string, tk *store.Task) {
 		s.completeFromEngine(tk.ID, rjRef)
 	}()
 }
+
+// adoptResponseFilename 在探测得到响应文件名后更新自动推导的任务路径。
+// 目录始终保留；只替换文件名，避免覆盖用户选择的保存位置。已经存在的
+// .part 会先原子改名到新路径，再提交数据库更新，确保断点续传不丢失。
+func (s *Scheduler) adoptResponseFilename(tk *store.Task, suggested string) error {
+	name := urlkind.SanitizeFilename(suggested)
+	if name == "" || !isAutoDerivedSavePath(tk.SavePath, tk.URL) {
+		return nil
+	}
+	derived := urlkind.Filename(tk.URL)
+	if derived == "" {
+		derived = "download.bin"
+	}
+	if name == derived {
+		return nil
+	}
+	candidate := availableTaskPath(filepath.Dir(tk.SavePath), name)
+	if candidate == tk.SavePath {
+		return nil
+	}
+
+	oldPart := tk.SavePath + ".part"
+	newPart := candidate + ".part"
+	movedPart := false
+	if _, err := os.Lstat(oldPart); err == nil {
+		if err := os.Rename(oldPart, newPart); err != nil {
+			return fmt.Errorf("scheduler: move partial file for response filename: %w", err)
+		}
+		movedPart = true
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("scheduler: inspect partial file before response rename: %w", err)
+	}
+	if err := s.st.UpdateTaskSavePath(tk.ID, candidate); err != nil {
+		if movedPart {
+			if rollbackErr := os.Rename(newPart, oldPart); rollbackErr != nil {
+				return fmt.Errorf("scheduler: persist response filename: %w (rollback partial file: %v)", err, rollbackErr)
+			}
+		}
+		return fmt.Errorf("scheduler: persist response filename: %w", err)
+	}
+	tk.SavePath = candidate
+	return nil
+}
+
+// isAutoDerivedSavePath 判断当前文件名是否仍来自 URL 推导（包括为避免
+// 冲突而添加的 "(N)"）。用户手动指定的不同文件名应保持不变。
+func isAutoDerivedSavePath(savePath, rawURL string) bool {
+	current := filepath.Base(savePath)
+	derived := urlkind.Filename(rawURL)
+	if derived == "" {
+		derived = "download.bin"
+	}
+	if current == derived {
+		return true
+	}
+	return autoCollisionSuffix.ReplaceAllString(current, "$1") == derived
+}
+
+// availableTaskPath 返回一个不占用最终文件或 .part 文件的目标路径。
+// 响应文件名与其他任务碰撞时沿用界面层的 "(N)" 规则。
+func availableTaskPath(dir, name string) string {
+	taken := func(path string) bool {
+		if _, err := os.Lstat(path); err == nil {
+			return true
+		}
+		if _, err := os.Lstat(path + ".part"); err == nil {
+			return true
+		}
+		return false
+	}
+	candidate := filepath.Join(dir, name)
+	if !taken(candidate) {
+		return candidate
+	}
+	ext := filepath.Ext(name)
+	stem := strings.TrimSuffix(name, ext)
+	for n := 1; n < 10000; n++ {
+		candidate = filepath.Join(dir, stem+"("+strconv.Itoa(n)+")"+ext)
+		if !taken(candidate) {
+			return candidate
+		}
+	}
+	return filepath.Join(dir, name)
+}
+
+var autoCollisionSuffix = regexp.MustCompile(`\(\d+\)(\.|$)`)
 
 const maxProbeAttempts = 3
 

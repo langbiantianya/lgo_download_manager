@@ -110,6 +110,171 @@ done:
 	}
 }
 
+func TestSchedulerAdoptsResponseFilenameAfterRedirect(t *testing.T) {
+	payload := []byte("artifact payload")
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/artifacts/") {
+			http.Redirect(w, r, srv.URL+"/download", http.StatusFound)
+			return
+		}
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Disposition", `attachment; filename*=UTF-8''actual-name.zip`)
+		if rng := r.Header.Get("Range"); rng != "" {
+			start, end := parseBytesRange(t, rng, int64(len(payload)))
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+			w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(payload[start : end+1])
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		w.WriteHeader(http.StatusOK)
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(payload)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sc, cleanup := newTestScheduler(t, st, 1)
+	defer cleanup()
+
+	tk, err := sc.Add(AddTaskInput{
+		URL:        srv.URL + "/artifacts/13298463970",
+		SavePath:   filepath.Join(dir, "13298463970"),
+		Protocol:   protocol.ProtoHTTP,
+		ChunkCount: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.Start(tk.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	var persisted *store.Task
+	waitFor(t, 5*time.Second, func() bool {
+		persisted, err = st.GetTask(tk.ID)
+		return err == nil && (persisted.Status == store.TaskStatus.Completed ||
+			persisted.Status == store.TaskStatus.Failed)
+	})
+	if persisted.Status != store.TaskStatus.Completed {
+		t.Fatalf("status = %s, want Completed; error = %s", persisted.Status, persisted.ErrorMessage)
+	}
+	wantPath := filepath.Join(dir, "actual-name.zip")
+	if persisted.SavePath != wantPath {
+		t.Fatalf("SavePath = %q, want %q", persisted.SavePath, wantPath)
+	}
+	got, err := os.ReadFile(wantPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, payload) {
+		t.Fatalf("downloaded file mismatch: got %q, want %q", got, payload)
+	}
+}
+
+func TestSchedulerPreservesCustomFilename(t *testing.T) {
+	payload := []byte("payload")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Disposition", `attachment; filename="server-name.zip"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		if r.Method != http.MethodHead {
+			_, _ = w.Write(payload)
+		}
+	}))
+	defer srv.Close()
+
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sc, cleanup := newTestScheduler(t, st, 1)
+	defer cleanup()
+
+	customPath := filepath.Join(dir, "my-custom-name.bin")
+	tk, err := sc.Add(AddTaskInput{
+		URL:        srv.URL + "/download",
+		SavePath:   customPath,
+		Protocol:   protocol.ProtoHTTP,
+		ChunkCount: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.Start(tk.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	var persisted *store.Task
+	waitFor(t, 5*time.Second, func() bool {
+		persisted, err = st.GetTask(tk.ID)
+		return err == nil && (persisted.Status == store.TaskStatus.Completed ||
+			persisted.Status == store.TaskStatus.Failed)
+	})
+	if persisted.Status != store.TaskStatus.Completed {
+		t.Fatalf("status = %s, want Completed; error = %s", persisted.Status, persisted.ErrorMessage)
+	}
+	if persisted.SavePath != customPath {
+		t.Fatalf("custom SavePath was overwritten: got %q, want %q", persisted.SavePath, customPath)
+	}
+	if got, err := os.ReadFile(customPath); err != nil || !bytes.Equal(got, payload) {
+		t.Fatalf("custom path content mismatch: got %q, err=%v", got, err)
+	}
+}
+
+func TestAdoptResponseFilenameMovesPartialFile(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(filepath.Join(dir, "lgdm.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	sc := New(st)
+	tk, err := sc.Add(AddTaskInput{
+		URL:      "https://example.com/artifacts/123456",
+		SavePath: filepath.Join(dir, "123456"),
+		Protocol: protocol.ProtoHTTPS,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPart := tk.SavePath + ".part"
+	if err := os.WriteFile(oldPart, []byte("partial"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := sc.adoptResponseFilename(tk, "artifact.tar.gz"); err != nil {
+		t.Fatal(err)
+	}
+
+	wantPath := filepath.Join(dir, "artifact.tar.gz")
+	if tk.SavePath != wantPath {
+		t.Fatalf("SavePath = %q, want %q", tk.SavePath, wantPath)
+	}
+	if _, err := os.Stat(oldPart); !os.IsNotExist(err) {
+		t.Fatalf("old partial file still exists: %v", err)
+	}
+	if got, err := os.ReadFile(wantPath + ".part"); err != nil || string(got) != "partial" {
+		t.Fatalf("moved partial file = %q, err=%v", got, err)
+	}
+	persisted, err := st.GetTask(tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.SavePath != wantPath {
+		t.Fatalf("persisted SavePath = %q, want %q", persisted.SavePath, wantPath)
+	}
+}
+
 // TestSchedulerResume 验证一个带有部分 chunk_progress 偏移的任务
 // 在恢复后可以从中断处继续完成。
 func TestSchedulerResume(t *testing.T) {

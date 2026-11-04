@@ -619,6 +619,17 @@ func (s *Store) UpdateTaskMeta(id string, totalSize int64, supportRange, isAlloc
 	return err
 }
 
+// UpdateTaskSavePath 持久化服务器在响应元数据中建议的新文件名。
+// 调用方负责保证路径是安全的单段文件名，并在更新前完成必要的本地
+// 文件迁移。
+func (s *Store) UpdateTaskSavePath(id, savePath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`UPDATE tasks SET save_path=?, updated_at=? WHERE id=?`,
+		savePath, time.Now().UTC(), id)
+	return err
+}
+
 // UpdateTaskValidators 持久化 HTTP 资源版本元数据。ETag/Last-Modified
 // 不参与高频进度刷盘，只在 Probe 结果变化时更新。
 func (s *Store) UpdateTaskValidators(id, etag, lastModified string) error {
