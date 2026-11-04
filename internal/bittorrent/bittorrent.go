@@ -38,8 +38,8 @@
 //     打包脚本因此按 CC 推导同目录、同目标的 C++ 编译器并显式传给 Go。
 //
 //  2. 链接时加 -extldflags=-static,把 C++ 运行时(static libstdc++/libc++、
-//     libgcc/libunwind、winpthread)静态进 exe。安装包只装 lgdm.exe 一个文件,
-//     不带那些 DLL;动态链的话程序能启动、一建 BT 客户端就以 0xc0000135
+//     libgcc/libunwind、winpthread)静态进 exe。安装包不带那些 DLL;动态链的话
+//     程序能启动、一建 BT 客户端就以 0xc0000135
 //     (STATUS_DLL_NOT_FOUND)退出 —— BT 客户端是懒创建的,这个坑只在开任务时炸。
 package bittorrent
 

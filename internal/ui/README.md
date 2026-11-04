@@ -1,7 +1,9 @@
-# UI 子进程
+# UI 进程
 
 `internal/ui` 使用 Fyne 实现主窗口、任务列表、设置、任务详情和新建任务对话框。
-UI 作为独立子进程运行，通过 [RPC](../rpc/README.md) 访问业务进程。
+正式安装包通过 `cmd/lgdm-ui` 构建独立的 `lgdm-ui` 进程，经
+[RPC](../rpc/README.md) 访问业务进程。它不链接 store、scheduler、协议或
+BitTorrent；业务进程找不到同目录的 `lgdm-ui` 时，才回退到业务二进制自我复刻。
 
 ## 新建任务
 

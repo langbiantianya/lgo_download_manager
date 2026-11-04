@@ -14,9 +14,14 @@ Windows 打包脚本会自动寻找并成对配置 `CC` / `CXX`，完整的安�
 ## 本机构建
 
 ```sh
-go build -o bin/lgdm.exe .   # Windows 手工调试
-go build -o bin/lgdm .       # Linux / macOS 手工调试
+go build -o bin/lgdm.exe .                    # Windows 业务进程
+go build -o bin/lgdm-ui.exe ./cmd/lgdm-ui     # Windows 独立 UI
+go build -o bin/lgdm .                        # Linux / macOS 业务进程
+go build -o bin/lgdm-ui ./cmd/lgdm-ui         # Linux / macOS 独立 UI
 ```
+
+业务进程优先启动同目录的 `lgdm-ui`；只构建 `lgdm` 时仍会回退到旧的自我复刻
+模式，便于调试旧安装包。正式打包始终同时发布两个程序。
 
 正式安装包由各平台脚本生成，统一写入版本信息并校验目标架构：
 

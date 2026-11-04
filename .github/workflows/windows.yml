@@ -21,7 +21,7 @@ permissions:
 #   1. setup C/C++ toolchain —— 显式配好**同目标**的 gcc 与 g++(uTP 是 C++ 源码,
 #      Go 的默认 CXX 写死 "g++" 且不从 CC 推导;详见该步骤里的注释);
 #   2. package —— 编译并出 MSI / EXE(C++ 运行时静态进 exe);
-#   3. check imports —— 确认产物不动态依赖 C/C++ 运行时(安装包只发 lgdm.exe)。
+#   3. check imports —— 确认两个 exe 都不动态依赖 C/C++ 运行时。
 
 jobs:
   windows-x64:
@@ -77,7 +77,7 @@ jobs:
           pwsh -NoProfile -File scripts/package_native.ps1 `
             -Arch x64 -Format both
 
-      # 产物只依赖系统 DLL 吗?安装包只装 lgdm.exe 一个文件、不带第三方 DLL ——
+      # 产物只依赖系统 DLL 吗?安装包只装 lgdm.exe 与 lgdm-ui.exe、不带第三方 DLL ——
       # 产物一旦动态导入 C/C++ 运行时(libstdc++/libc++/libunwind 等),装上去
       # 一开 BT 任务就会以 0xc0000135(STATUS_DLL_NOT_FOUND)退出(BT 客户端是懒
       # 创建的,平时看不出来)。这里当场拦住,别把「装上就崩」的包发出去。
@@ -136,7 +136,7 @@ jobs:
           pwsh -NoProfile -File scripts/package_native.ps1 `
             -Arch arm64 -Format both
 
-      # 同 x64:产物不能动态依赖 C/C++ 运行时(安装包只发 lgdm.exe 一个文件)。
+      # 同 x64:业务程序与独立 UI 都不能动态依赖 C/C++ 运行时。
       - name: check imports (no C/C++ runtime)
         shell: pwsh
         run: |

@@ -4,15 +4,16 @@
 //
 // Copyright (c) 2026 langbiantianya
 
-// lgdm（lgo_download_manager）单一可执行文件承载两种角色：
+// lgdm（lgo_download_manager）默认作为业务主进程运行：
 //
 //  1. 业务主进程（默认）：SQLite store + 下载 scheduler + 托盘 +
 //     URL 转发 socket server + UI 管理器（拉起 UI 子进程）。
-//  2. Fyne UI 子进程：由业务进程自我复刻启动，通过 gRPC 或 net/http 传输
-//     连回业务进程运行 Fyne 界面，关闭即由操作系统回收所有内存。
+//  2. Fyne UI 子进程：优先使用同目录的独立 lgdm-ui；为了兼容旧安装包和
+//     单目标 go build，找不到独立程序时仍可回退到本进程的自我复刻模式。
 //
-// 角色分派通过 rpc.EnvUIChild 环境变量完成：业务进程拉起子进程时会把
-// EnvUIChild=1 与监听地址/token/传输协议名一并注入。
+// UI 子进程通过 gRPC 或 net/http 连回业务进程，关闭即由操作系统回收其
+// 内存。回退角色通过 rpc.EnvUIChild 环境变量分派：业务进程拉起子进程时
+// 会把 EnvUIChild=1 与监听地址/token/传输协议名一并注入。
 //
 // 浏览器接力有两条通道，扩展侧按这个优先级尝试：
 //
@@ -61,10 +62,6 @@ const defaultDBFile = "lgdm.sqlite"
 // 扩展是探测 handoff.PortCandidates 那几个固定端口来发现业务进程的。
 const handoffInfoFile = "handoff.json"
 
-// envLogDebug 跨进程传递 --debug 选择:业务进程启动时若用户指定了
-// --debug,则把该信号写进 LGDM_DEBUG,UI 子进程继承同一份配置。
-const envLogDebug = "LGDM_DEBUG"
-
 // startupMode 描述业务进程的启动参数。autostart 决定登录启动时是否立即
 // 展示窗口，不能参与后续 URL 请求的交互决策；只有显式 noGUI 才改变请求
 // 的落地方式。
@@ -104,12 +101,12 @@ func main() {
 	// 把 --debug 通过环境变量传给即将拉起的 UI 子进程,
 	// 让子进程日志也走 stderr,而不是悄悄落到文件里。
 	if *debug {
-		os.Setenv(envLogDebug, "1")
+		os.Setenv(logging.EnvDebug, "1")
 	}
 
 	// UI 子进程在 spawn 时也会走到这里(被业务进程自我复刻拉起),
 	// 它没有自己的 --debug,但父进程已经把 LGDM_DEBUG 传过来。
-	childDebug := os.Getenv(envLogDebug) == "1"
+	childDebug := os.Getenv(logging.EnvDebug) == "1"
 	debugEnabled := childDebug || *debug
 	// 日志与 db 落在同一目录:用户传 --config 时跟 --config,否则跟 defaultConfigPath()。
 	// 这样运维上 db 与 log 总在同一处,便于打包收集。
@@ -117,6 +114,8 @@ func main() {
 	if logDir == "" {
 		logDir = "."
 	}
+	// 独立 lgdm-ui 没有业务命令行参数，靠这个环境变量找到同一份轮转日志。
+	os.Setenv(logging.EnvLogDir, logDir)
 	// Windows 上二进制是用 -H windowsgui 编译的——运行时没有 console。
 	// 当用户从 cmd/PowerShell 加 --debug 启动时,我们要把进程挂回父
 	// console,让日志直接落到终端而不是凭空消失;若 attach 失败
@@ -235,7 +234,7 @@ func main() {
 	svc := appservice.New(st, sc)
 	svc.SetSettings(cur)
 
-	// UI 管理器：负责拉起/管理 Fyne UI 子进程（自我复刻）并对外提供
+	// UI 管理器：优先拉起独立 lgdm-ui（缺失时自我复刻），并对外提供
 	// 业务接口服务。必须先于 handleDownloadURL 创建,后者把 URL 转发给
 	// UI 弹弹对话框。
 	uim := uimgr.New(svc)

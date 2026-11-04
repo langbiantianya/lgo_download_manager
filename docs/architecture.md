@@ -10,7 +10,7 @@ flowchart TB
         URL["lgom:// 外部协议"]
     end
 
-    subgraph UIProcess["UI 子进程"]
+    subgraph UIProcess["独立 UI 进程 (lgdm-ui)"]
         Fyne["Fyne UI<br/>窗口 / 设置 / 任务详情"]
         RPCClient["rpc.Client"]
         Fyne <--> RPCClient
@@ -95,22 +95,25 @@ flowchart TB
 ## 进程模型
 
 ```text
-                业务进程（默认）
+             业务进程 lgdm（默认）
     store / scheduler / protocol / bittorrent
     托盘 / urllauncher / handoff / uimgr
                        │
-                       │ 自我复刻 + LDM_UI_CHILD=1
+                       │ 优先拉起同目录 lgdm-ui
                        ▼
-                UI 子进程（Fyne）
+              独立 UI 进程（Fyne）
                   rpc.Client
                        │
           internal/rpc：gRPC 或 net/http
           Unix socket 或 TCP + token
+
+  旧安装包或只构建 lgdm 时：回退为自我复刻 + LDM_UI_CHILD=1
 ```
 
-业务进程持有 SQLite、下载调度器、系统托盘和浏览器接力服务。UI 是独立子进程，
-通过 `internal/rpc` 调用业务接口并接收事件流。UI 退出不影响下载任务，托盘可以
-再次拉起 UI。
+业务进程持有 SQLite、下载调度器、系统托盘和浏览器接力服务。`uimgr` 优先启动
+同目录的独立 `lgdm-ui`，通过 `internal/rpc` 调用业务接口并接收事件流。独立 UI
+不链接 store、scheduler、协议或 BitTorrent，避免为业务包级初始化重复占用内存。
+UI 退出不影响下载任务，托盘可以再次拉起 UI。独立程序缺失时仍回退到旧行为。
 
 ## 分层
 
@@ -128,7 +131,8 @@ flowchart TB
 ## 模块目录
 
 ```text
-main.go
+cmd/lgdm-ui                独立 Fyne UI 入口
+main.go                    业务进程入口
   ├── internal/store         SQLite 持久化
   ├── internal/scheduler     任务生命周期、状态、并发与 BT 编排
   ├── internal/engine        HTTP 分片规划、Range 下载与重试

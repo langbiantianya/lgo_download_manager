@@ -10,6 +10,7 @@
 ;     "<install>\lgdm.exe" "%1"。浏览器/资源管理器把 URL 作为 argv[1]
 ;     交给新进程;若主实例已在运行,新进程会通过命名管道把 URL 转发
 ;     过去再退出(见 internal/urllauncher/urllauncher_windows.go)。
+;   - 同时安装 lgdm.exe 与同目录的 lgdm-ui.exe；uimgr 优先拉起独立 UI。
 ;   - 安装/升级/卸载前都要结束正在运行的 lgdm(托盘常驻,exe 被占用会
 ;     让文件替换失败):安装时 [Code] 的 PrepareToInstall 直接 taskkill,
 ;     配合 CloseApplications 的 Restart Manager 兜底;卸载时 UninstallRun
@@ -33,16 +34,19 @@
   #define MyArchAllowed "arm64"
   #define MyArchInstallMode "arm64"
   #define MyAppSourceExe "lgdm-arm64.exe"
+  #define MyAppSourceUIExe "lgdm-ui-arm64.exe"
 #else
   #define MyArchAllowed "x64compatible"
   #define MyArchInstallMode "x64compatible"
   #define MyAppSourceExe "lgdm-x64.exe"
+  #define MyAppSourceUIExe "lgdm-ui-x64.exe"
 #endif
 
 #define MyAppName "lgo_download_manager"
-; 装到目标机器上的文件名固定是 lgdm.exe(协议注册表里的命令行、托盘/UI 自复制
-; 都按这个名字找),架构只体现在 bin\ 里的待打包文件名上。
+; 装到目标机器上的文件名固定是 lgdm.exe / lgdm-ui.exe(协议注册表命令行与
+; uimgr 的同目录查找都按这两个名字找),架构只体现在 bin\ 里的待打包文件名上。
 #define MyAppExeName "lgdm.exe"
+#define MyAppUIExeName "lgdm-ui.exe"
 #define MyAppPublisher "langbiantianya"
 #define MyAppURL "https://github.com/langbiantianya/lgo_download_manager"
 ; AppId 是卸载/升级的身份标识;Inno 里 "{{" 转义成字面量 "{"。
@@ -112,6 +116,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 
 [Files]
 Source: "{#SourcePath}\..\bin\{#MyAppSourceExe}"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
+Source: "{#SourcePath}\..\bin\{#MyAppSourceUIExe}"; DestDir: "{app}"; DestName: "{#MyAppUIExeName}"; Flags: ignoreversion
 Source: "{#SourcePath}\..\assets\lgdm.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SourcePath}\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -136,8 +141,9 @@ Root: HKCU; Subkey: "Software\Classes\lgom\shell\open\command"; ValueType: strin
 Filename: "{app}\{#MyAppExeName}"; Description: "运行 {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; 卸载前结束正在运行的实例(exe 被占用会导致文件删不掉)。
+; 卸载前结束业务进程与 UI 子进程(exe 被占用会导致文件删不掉)。
 Filename: "{cmd}"; Parameters: "/C taskkill /IM {#MyAppExeName} /F"; Flags: runhidden; RunOnceId: "StopLdmBeforeUninstall"
+Filename: "{cmd}"; Parameters: "/C taskkill /IM {#MyAppUIExeName} /F"; Flags: runhidden; RunOnceId: "StopLdmUIBeforeUninstall"
 
 [UninstallDelete]
 ; 用户数据目录(lgdm.sqlite 任务库 + wal/shm + UI IPC 的 ui-*.sock)。
@@ -155,6 +161,8 @@ var
   ResultCode: Integer;
 begin
   Exec(ExpandConstant('{cmd}'), '/C taskkill /IM {#MyAppExeName} /F',
+    '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{cmd}'), '/C taskkill /IM {#MyAppUIExeName} /F',
     '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := '';
 end;

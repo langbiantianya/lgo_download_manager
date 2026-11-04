@@ -71,7 +71,8 @@ finish-args:
 modules:
   # ---------------------------------------------------------------
   # 应用二进制:scripts/build_flatpak.sh 在宿主机上按目标架构
-  # go build 出 bin/lgo_download_manager-<arch>,这里只把它装进 /app/bin。
+  # go build 出 bin/lgo_download_manager-<arch> 与 bin/lgdm-ui-<arch>,
+  # 这里把它们装进同一个 /app/bin,供 uimgr 优先拉起独立 UI。
   # only-arches 保证每个架构只取自己那一份(dest-filename 统一成
   # 装进沙箱后的名字,两条 build-commands 因此完全一致)。
   # ---------------------------------------------------------------
@@ -80,20 +81,28 @@ modules:
     only-arches: [x86_64]
     build-commands:
       - install -Dm755 lgo_download_manager /app/bin/lgo_download_manager
+      - install -Dm755 lgdm-ui /app/bin/lgdm-ui
     sources:
       - type: file
         path: bin/lgo_download_manager-x86_64
         dest-filename: lgo_download_manager
+      - type: file
+        path: bin/lgdm-ui-x86_64
+        dest-filename: lgdm-ui
 
   - name: lgdm
     buildsystem: simple
     only-arches: [aarch64]
     build-commands:
       - install -Dm755 lgo_download_manager /app/bin/lgo_download_manager
+      - install -Dm755 lgdm-ui /app/bin/lgdm-ui
     sources:
       - type: file
         path: bin/lgo_download_manager-aarch64
         dest-filename: lgo_download_manager
+      - type: file
+        path: bin/lgdm-ui-aarch64
+        dest-filename: lgdm-ui
 
   # ---------------------------------------------------------------
   # 桌面集成:.desktop / AppStream metainfo / 图标。

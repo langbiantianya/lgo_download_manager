@@ -19,8 +19,12 @@
 
 ```sh
 go build -o bin/lgdm .
+go build -o bin/lgdm-ui ./cmd/lgdm-ui
 ./bin/lgdm
 ```
+
+`lgdm` 会优先启动同目录的 `lgdm-ui`；省略第二个构建命令时仍可用，但会回退到
+旧的自我复刻模式。
 
 无界面运行：
 

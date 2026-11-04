@@ -7,11 +7,12 @@
 // Package uimgr 管理 Fyne UI 子进程的生命周期，并在业务主进程里对外
 // 提供业务接口服务。
 //
-// 它运行在业务主进程中：负责生成监听地址与 token、spawn UI 子进程
-// （自我复刻）、用 rpc.Serve 起传输层服务（gRPC 或 net/http），并把
-// 控制消息（显示窗口 / 弹对话框 / 语言变更 / 退出）推进业务服务的控制
-// 通道。业务调用本身由 internal/appservice 承担——本包不再自己实现
-// 线协议，只做「进程与通道」的装配。
+// 它运行在业务主进程中：负责生成监听地址与 token、优先 spawn 同目录的
+// 独立 lgdm-ui（旧安装包则回退到业务二进制自我复刻）、用 rpc.Serve 起
+// 传输层服务（gRPC 或 net/http），并把控制消息（显示窗口 / 弹对话框 /
+// 语言变更 / 退出）推进业务服务的控制通道。业务调用本身由
+// internal/appservice 承担——本包不再自己实现线协议，只做「进程与通道」
+// 的装配。
 package uimgr
 
 import (
@@ -23,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -214,8 +216,8 @@ func (m *Manager) Open() {
 	}
 }
 
-// Start 生成监听地址与 token、起传输层服务并拉起 UI 子进程（同一可
-// 执行文件的自我复刻）。
+// Start 生成监听地址与 token、起传输层服务并拉起 UI 子进程。正式安装包
+// 使用同目录的独立 lgdm-ui；找不到时才回退到当前业务二进制的自我复刻。
 //
 // 顺序很关键：先让传输层监听就绪，再拉子进程。UI 子进程连不上业务
 // 进程就直接退出（rpc.Dial 不重试），先拉子进程的话它会「出生即死」。
@@ -250,6 +252,7 @@ func (m *Manager) Start() error {
 		m.mu.Unlock()
 		return fmt.Errorf("uimgr: resolve self executable: %w", err)
 	}
+	uiExecutable := resolveUIExecutable(self)
 	ctx, cancel := context.WithCancel(context.Background())
 	m.gen++
 	gen := m.gen
@@ -276,7 +279,7 @@ func (m *Manager) Start() error {
 		return fmt.Errorf("uimgr: 监听 %s 未就绪: %w", addr, err)
 	}
 
-	cmd := exec.Command(self)
+	cmd := exec.Command(uiExecutable)
 	cmd.Env = append(os.Environ(),
 		rpc.EnvUIChild+"=1",
 		rpc.EnvUIListen+"="+addr,
@@ -307,6 +310,24 @@ func (m *Manager) Start() error {
 	}()
 
 	return nil
+}
+
+// resolveUIExecutable 优先返回与业务程序同目录的独立 UI 可执行文件。
+//
+// 独立文件不存在（旧安装包、直接 go build .、只构建了业务目标的开发环境）
+// 时返回业务程序自身，保留 LDM_UI_CHILD 自我复刻回退。只接受普通文件，
+// 防止同名的目录让 exec 失败。
+func resolveUIExecutable(self string) string {
+	name := "lgdm-ui"
+	if runtime.GOOS == "windows" {
+		name += ".exe"
+	}
+	candidate := filepath.Join(filepath.Dir(self), name)
+	info, err := os.Stat(candidate)
+	if err == nil && info.Mode().IsRegular() {
+		return candidate
+	}
+	return self
 }
 
 // serve 在监听地址上启动传输层服务。它是会话 gen 的唯一结束者：

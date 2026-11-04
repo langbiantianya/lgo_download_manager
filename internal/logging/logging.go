@@ -40,6 +40,13 @@ const (
 	timeFormat    = "2006-01-02T15:04:05.000Z07:00" // slog HandlerOptions 默认 time 键格式
 )
 
+const (
+	// EnvDebug 让业务进程把 --debug 选择传给 UI 子进程。
+	EnvDebug = "LGDM_DEBUG"
+	// EnvLogDir 让独立 lgdm-ui 与业务进程写同一套轮转日志。
+	EnvLogDir = "LGDM_LOG_DIR"
+)
+
 var logFilePattern = regexp.MustCompile(`^lgdm\.log\.(\d{8})$`)
 
 // globalState 在进程内保存当前 logger 与文件 sink。Init 可被多次调用

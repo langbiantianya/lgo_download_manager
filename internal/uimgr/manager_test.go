@@ -9,7 +9,9 @@ package uimgr
 import (
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +23,46 @@ import (
 	"lgo_download_manager/internal/scheduler"
 	"lgo_download_manager/internal/store"
 )
+
+func TestResolveUIExecutablePrefersSibling(t *testing.T) {
+	dir := t.TempDir()
+	self := filepath.Join(dir, "lgdm")
+	uiName := "lgdm-ui"
+	if runtime.GOOS == "windows" {
+		uiName += ".exe"
+	}
+	uiExe := filepath.Join(dir, uiName)
+	if err := os.WriteFile(uiExe, []byte("ui"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := resolveUIExecutable(self); got != uiExe {
+		t.Fatalf("resolveUIExecutable() = %q, want %q", got, uiExe)
+	}
+}
+
+func TestResolveUIExecutableFallsBackToSelf(t *testing.T) {
+	self := filepath.Join(t.TempDir(), "lgdm")
+	if got := resolveUIExecutable(self); got != self {
+		t.Fatalf("resolveUIExecutable() = %q, want fallback %q", got, self)
+	}
+}
+
+func TestResolveUIExecutableIgnoresDirectory(t *testing.T) {
+	dir := t.TempDir()
+	self := filepath.Join(dir, "lgdm")
+	uiName := "lgdm-ui"
+	if runtime.GOOS == "windows" {
+		uiName += ".exe"
+	}
+	if err := os.Mkdir(filepath.Join(dir, uiName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := resolveUIExecutable(self); got != self {
+		t.Fatalf("resolveUIExecutable() = %q, want fallback %q", got, self)
+	}
+}
 
 // newTestService 起一个带真实 store 与调度器的业务服务。
 func newTestService(t *testing.T) (*appservice.Service, *store.Store) {

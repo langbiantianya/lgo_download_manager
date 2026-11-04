@@ -23,7 +23,7 @@
       - 注册 HKCU\Software\Classes\lgom,命令行 "<install>\lgdm.exe" "%1";
       - 装好后浏览器/资源管理器里的 lgom://download?url=... 会拉起 lgdm 并开始下载;
         lgdm 已在运行时,新进程把 URL 经命名管道转发给主实例后退出;
-      - 安装/升级/卸载前会结束正在运行的 lgdm 实例,避免 exe 被占用;
+      - 安装/升级/卸载前会结束正在运行的 lgdm 与 lgdm-ui,避免 exe 被占用;
       - 卸载时连同用户数据目录一起删除,覆盖安装/升级不动它。
 
     依赖的工具如果缺失,脚本会尝试用 winget 安装(可用 -SkipToolInstall 关闭,
@@ -68,13 +68,13 @@
     为什么还要静态链接:
       C++ 那套默认会把 C++ 运行时**动态链进 exe** —— MinGW 的
       libstdc++-6.dll / libgcc_s_seh-1.dll / libwinpthread-1.dll,或 LLVM-MinGW
-      的 libc++.dll / libunwind.dll。而安装包只装 lgdm.exe 一个文件
+      的 libc++.dll / libunwind.dll。而安装包只装 lgdm.exe 与 lgdm-ui.exe
       (见 installer/lgdm.wxs 与 installer/installer.iss),不带这些 DLL。
       BT 客户端是懒创建的,所以这些 DLL 只在**建客户端时**才被加载:程序能
       启动、一开 BT 任务就以 0xc0000135(STATUS_DLL_NOT_FOUND)退出。
 
       因此链接时加 `-extldflags=-static`:C++ 运行时静态进 exe,产物就只依赖
-      系统 DLL(与 v0.0.4 那个「干净单文件」的基线一致)。
+      系统 DLL。
 
 .PARAMETER Format
     打包格式:msi / exe / both(默认 both)。
@@ -144,9 +144,10 @@ Set-StrictMode -Version Latest
 $RepoRoot = Split-Path -Parent $PSScriptRoot
 if (-not $OutputDir) { $OutputDir = Join-Path $RepoRoot 'dist' }
 
-# 装到目标机器上的文件名固定是 lgdm.exe(协议注册表命令行、托盘/UI 自复制都按
-# 这个名字找);架构只体现在 bin\ 里待打包的文件名上。
+# 装到目标机器上的文件名固定是 lgdm.exe / lgdm-ui.exe(协议注册表命令行与
+# uimgr 的同目录查找都按这两个名字找);架构只体现在 bin\ 里待打包的文件名上。
 $AppExeName = 'lgdm.exe'
+$AppUIExeName = 'lgdm-ui.exe'
 $BinDir = Join-Path $RepoRoot 'bin'
 $IconPath = Join-Path $RepoRoot 'assets\lgdm.ico'
 $WxsPath = Join-Path $RepoRoot 'installer\lgdm.wxs'
@@ -231,6 +232,7 @@ function Get-ArchSpec([string]$Slug) {
             WixArch = 'arm64'
             PE      = $PeMachineArm64
             ExePath = (Join-Path $BinDir 'lgdm-arm64.exe')
+            UIExePath = (Join-Path $BinDir 'lgdm-ui-arm64.exe')
         }
     }
     return [pscustomobject]@{
@@ -239,6 +241,7 @@ function Get-ArchSpec([string]$Slug) {
         WixArch = 'x64'
         PE      = $PeMachineX64
         ExePath = (Join-Path $BinDir 'lgdm-x64.exe')
+        UIExePath = (Join-Path $BinDir 'lgdm-ui-x64.exe')
     }
 }
 
@@ -260,11 +263,13 @@ function Get-PEMachine([string]$Path) {
 }
 
 function Assert-PEMachine([pscustomobject]$Spec) {
-    $machine = Get-PEMachine $Spec.ExePath
-    if ($machine -eq $Spec.PE) { return }
-    $msg = "{0} 的 PE 架构是 0x{1:X4},期望 0x{2:X4}({3});请检查工具链 target,或去掉 -SkipBuild 重新编译。" -f `
-        $Spec.ExePath, $machine, $Spec.PE, $Spec.Slug
-    throw $msg
+    foreach ($path in @($Spec.ExePath, $Spec.UIExePath)) {
+        $machine = Get-PEMachine $path
+        if ($machine -eq $Spec.PE) { continue }
+        $msg = "{0} 的 PE 架构是 0x{1:X4},期望 0x{2:X4}({3});请检查工具链 target,或去掉 -SkipBuild 重新编译。" -f `
+            $path, $machine, $Spec.PE, $Spec.Slug
+        throw $msg
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -502,8 +507,8 @@ function Invoke-Build([pscustomobject]$Spec, [string]$CC, [string]$CXX) {
     # --debug 启动时由内部 AttachConsole 把日志挂回终端,行为不变。
     #
     # -extldflags=-static:C++ 运行时(static libstdc++/libc++、libgcc/libunwind、
-    # winpthread)静态进 exe。安装包只装 lgdm.exe 一个文件,不带那些 DLL ——
-    # 动态链的话,程序能启动、一建 BT 客户端就以 0xc0000135 退出。
+    # winpthread)静态进 exe。安装包不带那些 DLL —— 动态链的话,程序能启动、
+    # 一建 BT 客户端就以 0xc0000135 退出。
     $ldflags = @(
         '-s', '-w',
         '-H', 'windowsgui',
@@ -511,6 +516,13 @@ function Invoke-Build([pscustomobject]$Spec, [string]$CC, [string]$CXX) {
         '-X', "lgo_download_manager/internal/version.Version=$v",
         '-X', "lgo_download_manager/internal/version.Commit=$commit",
         '-X', "lgo_download_manager/internal/version.Date=$date"
+    ) -join ' '
+    # 独立 UI 只链接 Fyne 与 RPC 客户端，不需要版本包；仍使用 windowsgui
+    # 与静态 C 运行时，保证从资源管理器拉起时不闪控制台、产物不依赖 DLL。
+    $uiLdflags = @(
+        '-s', '-w',
+        '-H', 'windowsgui',
+        '-extldflags=-static'
     ) -join ' '
 
     $env:GOOS = 'windows'
@@ -525,6 +537,7 @@ function Invoke-Build([pscustomobject]$Spec, [string]$CC, [string]$CXX) {
     if ($CXX) { $env:CXX = (Format-CCForGo $CXX) }
     try {
         Invoke-Native 'go' @('build', '-trimpath', '-ldflags', $ldflags, '-o', $Spec.ExePath, '.') $RepoRoot
+        Invoke-Native 'go' @('build', '-trimpath', '-ldflags', $uiLdflags, '-o', $Spec.UIExePath, './cmd/lgdm-ui') $RepoRoot
     } finally {
         Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
         if ($CC) { Remove-Item Env:CC -ErrorAction SilentlyContinue }
@@ -536,6 +549,8 @@ function Invoke-Build([pscustomobject]$Spec, [string]$CC, [string]$CXX) {
     $cxxLabel = if ($CXX) { Split-Path -Leaf $CXX } else { 'go default (g++)' }
     Write-Note ("built {0} ({1} MB, GOARCH={2}, CC={3}, CXX={4}, version {5}, commit {6})" -f
         $Spec.ExePath, $size, $Spec.Goarch, $ccLabel, $cxxLabel, $v, $commit)
+    $uiSize = [math]::Round((Get-Item -LiteralPath $Spec.UIExePath).Length / 1MB, 1)
+    Write-Note ("built {0} ({1} MB, standalone UI)" -f $Spec.UIExePath, $uiSize)
 }
 
 # ---------------------------------------------------------------------------
@@ -794,8 +809,12 @@ BT 的 uTP 传输层是 C++ 源码(anacrolix/go-libutp),Go 用 CXX 编 .cpp,
         }
         Write-Step ("go build ({0})" -f $spec.Slug)
         Invoke-Build $spec $cc $cxx
-    } elseif (-not (Test-Path -LiteralPath $spec.ExePath)) {
-        throw ("-SkipBuild 指定为跳过编译,但 {0} 不存在" -f $spec.ExePath)
+    } else {
+        foreach ($path in @($spec.ExePath, $spec.UIExePath)) {
+            if (-not (Test-Path -LiteralPath $path)) {
+                throw ("-SkipBuild 指定为跳过编译,但 {0} 不存在" -f $path)
+            }
+        }
     }
     Assert-PEMachine $spec
     $specs += $spec

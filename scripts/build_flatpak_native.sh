@@ -8,13 +8,14 @@
 # 用法:
 #   ./scripts/build_flatpak_native.sh                     # 在本机架构上出包
 #   ./scripts/build_flatpak_native.sh --arch=aarch64      # 只能在 aarch64 机器上跑
-#   ./scripts/build_flatpak_native.sh --skip-build        # 复用 bin/lgo_download_manager-<架构>
+#   ./scripts/build_flatpak_native.sh --skip-build        # 复用已有业务/UI 二进制
 #   ./scripts/build_flatpak_native.sh --install           # 出包后装进用户安装
 #   ./scripts/build_flatpak_native.sh --version=v1.0.0
 #
 # 产物:
 #   dist/lgdm-<版本>-<架构>.flatpak        安装包(flatpak install <文件>)
-#   bin/lgo_download_manager-<架构>        打进包里的二进制
+#   bin/lgo_download_manager-<架构>        业务进程
+#   bin/lgdm-ui-<架构>                     独立 UI 进程
 #   dist/flatpak/<架构>/{build-dir,repo,state}/   flatpak-builder 的构建目录/仓库/缓存
 #   dist/flatpak/<架构>/sysroot/           编译用的 sysroot(指向本架构的 flatpak SDK)
 #
@@ -46,6 +47,7 @@ MANIFEST="${REPO_ROOT}/org.langbiantianya.LGDM.yml"
 APP_ID="org.langbiantianya.LGDM"
 BRANCH="stable"
 BIN_NAME="lgo_download_manager"
+UI_BIN_NAME="lgdm-ui"
 DIST_DIR="${REPO_ROOT}/dist"
 
 ARCH_ARG=""
@@ -391,12 +393,15 @@ log_step "宿主架构 ${HOST_ARCH};构建 ${ARCH};版本 ${VERSION}"
 # ---------------------------------------------------------------------------
 
 BIN_PATH="${REPO_ROOT}/bin/${BIN_NAME}-${ARCH}"
+UI_BIN_PATH="${REPO_ROOT}/bin/${UI_BIN_NAME}-${ARCH}"
 BUILD_ROOT="${DIST_DIR}/flatpak/${ARCH}"
 OUT_PATH="${DIST_DIR}/lgdm-${VERSION}-${ARCH}.flatpak"
 
 if $SKIP_BUILD; then
-    [[ -f "$BIN_PATH" ]] || die "--skip-build 指定为跳过编译,但 $BIN_PATH 不存在"
-    log_ok "复用已有二进制 $BIN_PATH"
+    for path in "$BIN_PATH" "$UI_BIN_PATH"; do
+        [[ -f "$path" ]] || die "--skip-build 指定为跳过编译,但 $path 不存在"
+    done
+    log_ok "复用已有二进制 $BIN_PATH、$UI_BIN_PATH"
 else
     real_cc="$(resolve_cc)"
     real_cxx="$(resolve_cxx "$real_cc")"
@@ -414,8 +419,9 @@ else
     LDFLAGS+=" -X lgo_download_manager/internal/version.Version=${VERSION}"
     LDFLAGS+=" -X lgo_download_manager/internal/version.Commit=${COMMIT}"
     LDFLAGS+=" -X lgo_download_manager/internal/version.Date=${DATE}"
+    UI_LDFLAGS="-s -w"
 
-    log_step "go build → bin/${BIN_NAME}-${ARCH}(CC=$(basename "$real_cc"),CXX=$(basename "$real_cxx"),sysroot=${BUILD_ROOT}/sysroot)"
+    log_step "go build → bin/${BIN_NAME}-${ARCH}, bin/${UI_BIN_NAME}-${ARCH}(CC=$(basename "$real_cc"),CXX=$(basename "$real_cxx"),sysroot=${BUILD_ROOT}/sysroot)"
     mkdir -p "${REPO_ROOT}/bin"
     # PKG_CONFIG_SYSROOT_DIR/PKG_CONFIG_LIBDIR 让 pkg-config 只在 sysroot 里找,
     # 并把 -I/-L 前缀改写成 sysroot 下的路径;PKG_CONFIG_PATH 清空,避免宿主的
@@ -427,22 +433,25 @@ else
     # 更新的 libstdc++,在沙箱里起不来。
     (
         cd "$REPO_ROOT"
-        GOOS=linux GOARCH="$(goarch_of "$ARCH")" CGO_ENABLED=1 CC="$cc" CXX="$cxx" \
-        PKG_CONFIG_SYSROOT_DIR="${BUILD_ROOT}/sysroot" \
-        PKG_CONFIG_LIBDIR="$pkg_libdir" \
-        PKG_CONFIG_PATH= \
-            go build -trimpath -ldflags "$LDFLAGS" -o "$BIN_PATH" .
+        export GOOS=linux GOARCH="$(goarch_of "$ARCH")" CGO_ENABLED=1 CC="$cc" CXX="$cxx"
+        export PKG_CONFIG_SYSROOT_DIR="${BUILD_ROOT}/sysroot"
+        export PKG_CONFIG_LIBDIR="$pkg_libdir"
+        export PKG_CONFIG_PATH=
+        go build -trimpath -ldflags "$LDFLAGS" -o "$BIN_PATH" .
+        go build -trimpath -ldflags "$UI_LDFLAGS" -o "$UI_BIN_PATH" ./cmd/lgdm-ui
     )
-    log_ok "二进制 $BIN_PATH"
+    log_ok "二进制 $BIN_PATH、$UI_BIN_PATH"
 fi
 
-actual="$(binary_arch "$BIN_PATH")"
-if [[ "$actual" == "unknown" ]]; then
-    log_warn "识别不出 $BIN_PATH 的架构,跳过架构校验"
-elif [[ "$actual" != "$ARCH" ]]; then
-    die "$BIN_PATH 的架构是 ${actual},与目标 ${ARCH} 不符;
+for path in "$BIN_PATH" "$UI_BIN_PATH"; do
+    actual="$(binary_arch "$path")"
+    if [[ "$actual" == "unknown" ]]; then
+        log_warn "识别不出 $path 的架构,跳过架构校验"
+    elif [[ "$actual" != "$ARCH" ]]; then
+        die "$path 的架构是 ${actual},与目标 ${ARCH} 不符;
       重新编译,或删掉 bin/ 下不匹配的旧文件"
-fi
+    fi
+done
 
 rm -f "$OUT_PATH"
 # 上一次构建被 Ctrl-C / kill 掉时,flatpak-builder 的 rofiles-fuse 会留下

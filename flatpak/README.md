@@ -41,7 +41,7 @@ Fedora 等发行版自带的 flathub 可能过滤非本机架构 ref，需要添
 | --- | --- | --- |
 | `--arch` | `x86_64,aarch64` | 逗号分隔，接受 `amd64`/`x64`、`arm64`/`aarch64` |
 | `--version` | `git describe --tags --always --dirty` | 写入二进制与安装包文件名 |
-| `--skip-build` | 关 | 复用已有的 `bin/lgo_download_manager-<架构>`，校验 ELF 架构 |
+| `--skip-build` | 关 | 复用已有的业务与 UI 二进制，校验 ELF 架构 |
 | `--install` | 关 | 出包后安装本机架构那份 |
 | `--cc-x86_64` / `--cc-aarch64` | 自动查找 | 指定对应架构 C 编译器 |
 
@@ -51,14 +51,16 @@ Fedora 等发行版自带的 flathub 可能过滤非本机架构 ref，需要添
 dist/lgdm-<版本>-x86_64.flatpak
 dist/lgdm-<版本>-aarch64.flatpak
 bin/lgo_download_manager-<架构>
+bin/lgdm-ui-<架构>
 dist/flatpak/<架构>/build-dir/
 dist/flatpak/<架构>/repo/
 dist/flatpak/<架构>/state/
 dist/flatpak/<架构>/sysroot/
 ```
 
-Flatpak bundle 与架构绑定，不能合并。manifest 用 `only-arches` module 安装对应
-二进制，`flatpak-builder --arch=X` 缺文件会直接报错，避免串架构。安装与卸载：
+Flatpak bundle 与架构绑定，不能合并。manifest 用 `only-arches` module 把
+`lgo_download_manager` 与独立 UI `lgdm-ui` 安装到同一个 `/app/bin`；
+`flatpak-builder --arch=X` 缺任一文件都会直接报错，避免串架构。安装与卸载：
 
 ```sh
 flatpak install --user dist/lgdm-<版本>-<架构>.flatpak

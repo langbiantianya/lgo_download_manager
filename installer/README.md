@@ -88,7 +88,7 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 | `-Version` | `git describe --tags --always --dirty` | 写入二进制与包文件名 |
 | `-WinVersion` | 从 `-Version` 推导 | MSI `ProductVersion` / `VersionInfoVersion` 的 `X.Y.Z.W` |
 | `-OutputDir` | `<repo>\dist` | 产物目录 |
-| `-SkipBuild` | 关 | 复用 `bin\lgdm-<arch>.exe`，仍校验 PE 架构 |
+| `-SkipBuild` | 关 | 复用 `bin\lgdm-<arch>.exe` 与 `bin\lgdm-ui-<arch>.exe`，仍校验 PE 架构 |
 | `-SkipToolInstall` | 关 | 工具缺失时直接报错 |
 | `-WixPath` / `-IsccPath` | 自动查找 | 指定 `wix.exe` / `ISCC.exe` |
 | `-CCX64` / `-CCArm64` | 自动查找 | 指定对应架构的 C 编译器 |
@@ -108,11 +108,13 @@ pwsh -File scripts\package.ps1 -Version v1.0.0 -WinVersion 1.0.0.0
 dist\lgdm-setup-<版本>-x64.msi       dist\lgdm-setup-<版本>-arm64.msi
 dist\lgdm-setup-<版本>-x64.exe       dist\lgdm-setup-<版本>-arm64.exe
 bin\lgdm-x64.exe                     bin\lgdm-arm64.exe
+bin\lgdm-ui-x64.exe                  bin\lgdm-ui-arm64.exe
 ```
 
 MSI 一个包只能承载一种架构，因此每个架构单独出包；同一架构的 MSI 与 EXE 功能对等，
-任选一个即可。安装后二进制统一改名为 `lgdm.exe`，协议注册、快捷方式和进程查找都
-依赖这个名称。`dist/`、`bin/` 和中间产物 `*.wixpdb` 已被 Git 忽略。
+任选一个即可。安装后分别命名为 `lgdm.exe` 与同目录的 `lgdm-ui.exe`：前者承载
+业务与托盘，后者只承载 Fyne UI。`dist/`、`bin/` 和中间产物 `*.wixpdb` 已被
+Git 忽略。
 
 ## C/C++ 工具链
 
@@ -125,8 +127,8 @@ Windows 上 Fyne 必须开启 cgo，BT 依赖的 anacrolix/torrent 在 cgo 下�
 1. 需要真正的 C++ 编译器。Go 不会从 `CC` 推导 `CXX`，默认 CXX 是 `g++`。只有
    clang / LLVM-MinGW 而没有 `g++` 时会报 executable not found。
 2. C++ 运行时必须静态链接。默认动态链接 `libc++.dll`、`libunwind.dll` 或 MinGW 的
-   `libstdc++-6.dll`、`libgcc_s_seh-1.dll`、`libwinpthread-1.dll`，安装包只发
-   `lgdm.exe`，程序能启动但一开 BT 就会以 `0xc0000135` 退出。
+   `libstdc++-6.dll`、`libgcc_s_seh-1.dll`、`libwinpthread-1.dll`，安装包不带
+   这些 DLL；业务程序能启动，但一开 BT 就会以 `0xc0000135` 退出。
 
 打包脚本会按 `CC` 同目录、同目标推导 C++ 编译器，例如
 `x86_64-w64-mingw32-clang` → `x86_64-w64-mingw32-clang++`，裸 `gcc.exe` →
@@ -144,6 +146,7 @@ $env:CGO_ENABLED='1'
 $env:CC='C:\...\llvm-mingw-<ver>-ucrt-x86_64\bin\aarch64-w64-mingw32-clang.exe'
 $env:CXX='C:\...\llvm-mingw-<ver>-ucrt-x86_64\bin\aarch64-w64-mingw32-clang++.exe'
 go build -trimpath -ldflags '-extldflags=-static' -o bin\lgdm-arm64.exe .
+go build -trimpath -ldflags '-extldflags=-static' -o bin\lgdm-ui-arm64.exe ./cmd/lgdm-ui
 ```
 
 Windows 绝对路径不能写成 `/c/...`，否则 Go 会报 `CC environment variable is
@@ -160,8 +163,9 @@ relative; must be absolute path`。路径带空格时脚本会自动加引号；
   不安装服务，不改 PATH。MSI 使用 `Scope="perUser"`，EXE 固定使用 HKCU。
 - 注册 `HKCU\Software\Classes\lgom`，命令行是
   `"<install>\lgdm.exe" "%1"`，`DefaultIcon` 指向 `lgdm.ico`。
+- 同时安装同目录的 `lgdm-ui.exe`；业务进程优先拉起它，缺失时才使用自我复刻回退。
 - 创建开始菜单快捷方式；EXE 安装包还提供桌面快捷方式选项，MSI 直接创建。
-- 安装、升级、卸载前结束正在运行的 `lgdm.exe`。
+- 安装、升级、卸载前结束正在运行的 `lgdm.exe` 与 `lgdm-ui.exe`。
 - 升级保留 `%LOCALAPPDATA%\lgo_download_manager` 中的数据库、日志和 socket；
   卸载会删除安装目录、协议键、快捷方式以及该用户数据目录。
 
@@ -205,7 +209,7 @@ msiexec /x {ProductCode} /qn
 | `缺少 Win...且系统里没有 winget` | 使用 `package_native.ps1`，它不依赖 winget；也可手工指定工具路径 |
 | `找不到 wix.exe,也没有 dotnet` | 安装 .NET SDK，或用 `-WixPath` |
 | `下载校验失败 ... 期望 SHA256` | 上游资产或 URL 改变；确认后更新脚本常量 |
-| `WIX0103: Cannot find ... bin\lgdm-<arch>.exe` | 对应架构未构建；去掉 `-SkipBuild` 或先构建 |
+| `WIX0103: Cannot find ... bin\lgdm{,-ui}-<arch>.exe` | 对应架构的业务或 UI 程序未构建；去掉 `-SkipBuild` 或先构建 |
 | 安装报 1633 | 架构不匹配；改用对应架构产物 |
 | `build constraints exclude all Go files ... gles2` | cgo 被关闭；使用脚本或设置 `CGO_ENABLED=1` |
 | `CC environment variable is relative` | 改用 `C:\...` 绝对路径 |
@@ -222,3 +226,5 @@ msiexec /x {ProductCode} /qn
 ```powershell
 pwsh -File scripts\check_imports.ps1 -Exe bin\lgdm-x64.exe
 ```
+
+传入 `lgdm-<arch>.exe` 时，脚本会同时检查 `lgdm-ui-<arch>.exe`。

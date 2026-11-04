@@ -61,13 +61,13 @@
     为什么还要静态链接:
       C++ 那套默认会把 C++ 运行时**动态链进 exe** —— MinGW 的
       libstdc++-6.dll / libgcc_s_seh-1.dll / libwinpthread-1.dll,或 LLVM-MinGW
-      的 libc++.dll / libunwind.dll。而安装包只装 lgdm.exe 一个文件
+      的 libc++.dll / libunwind.dll。而安装包只装 lgdm.exe 与 lgdm-ui.exe
       (见 installer/lgdm.wxs 与 installer/installer.iss),不带这些 DLL。
       BT 客户端是懒创建的,所以这些 DLL 只在**建客户端时**才被加载:程序能
       启动、一开 BT 任务就以 0xc0000135(STATUS_DLL_NOT_FOUND)退出。
 
       因此链接时加 `-extldflags=-static`:C++ 运行时静态进 exe,产物就只依赖
-      系统 DLL(与 v0.0.4 那个「干净单文件」的基线一致)。
+      系统 DLL。
       (uTP 照常保留 —— 静态链的是运行时,不是把它换成纯 Go 实现。)
 
 .PARAMETER Arch
@@ -242,6 +242,7 @@ if ($slug -eq 'arm64') {
     $wixArch = 'arm64'
     $peMachine = $PeMachineArm64
     $exePath = Join-Path $BinDir 'lgdm-arm64.exe'
+    $uiExePath = Join-Path $BinDir 'lgdm-ui-arm64.exe'
     # 宿主(arm64)的 mingw 目标三元组前缀;确认过的目标架构由它写死在名字里。
     $mingwPrefix = 'aarch64-w64-mingw32'
     # 必须是 mingw-w64 / GNU 目标的编译器:Fyne 的 cgo 依赖走 gcc 风格命令行,
@@ -255,6 +256,7 @@ if ($slug -eq 'arm64') {
     $wixArch = 'x64'
     $peMachine = $PeMachineX64
     $exePath = Join-Path $BinDir 'lgdm-x64.exe'
+    $uiExePath = Join-Path $BinDir 'lgdm-ui-x64.exe'
     $mingwPrefix = 'x86_64-w64-mingw32'
     $ccArchPattern = '^(x86_64|amd64).*(mingw|gnu)'
 }
@@ -276,10 +278,12 @@ function Get-PEMachine([string]$Path) {
 }
 
 function Assert-PEMachine {
-    $machine = Get-PEMachine $exePath
-    if ($machine -eq $peMachine) { return }
-    throw ("{0} 的 PE 架构是 0x{1:X4},期望 0x{2:X4}({3});请去掉 -SkipBuild 重新编译。" -f `
-        $exePath, $machine, $peMachine, $slug)
+    foreach ($path in @($exePath, $uiExePath)) {
+        $machine = Get-PEMachine $path
+        if ($machine -eq $peMachine) { continue }
+        throw ("{0} 的 PE 架构是 0x{1:X4},期望 0x{2:X4}({3});请去掉 -SkipBuild 重新编译。" -f `
+            $path, $machine, $peMachine, $slug)
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -636,8 +640,8 @@ function Invoke-Build($CCPath, $CXXPath) {
     # 把日志挂回终端,行为不变。
     #
     # -extldflags=-static:C++ 运行时(static libstdc++/libc++、libgcc/libunwind、
-    # winpthread)静态进 exe。安装包只装 lgdm.exe 一个文件,不带那些 DLL ——
-    # 动态链的话,程序能启动、一建 BT 客户端就以 0xc0000135 退出。
+    # winpthread)静态进 exe。安装包不带那些 DLL —— 动态链的话,程序能启动、
+    # 一建 BT 客户端就以 0xc0000135 退出。
     $ldflags = @(
         '-s', '-w',
         '-H', 'windowsgui',
@@ -645,6 +649,13 @@ function Invoke-Build($CCPath, $CXXPath) {
         '-X', "lgo_download_manager/internal/version.Version=$v",
         '-X', "lgo_download_manager/internal/version.Commit=$commit",
         '-X', "lgo_download_manager/internal/version.Date=$date"
+    ) -join ' '
+    # 独立 UI 不需要业务侧依赖，也不需要版本包；保留 windowsgui 与静态 C
+    # 运行时，安装包仍然只有两个 exe、不额外携带 DLL。
+    $uiLdflags = @(
+        '-s', '-w',
+        '-H', 'windowsgui',
+        '-extldflags=-static'
     ) -join ' '
 
     # GOARCH 显式给出并与宿主一致;CGO_ENABLED=1 是必须的 —— GOARCH 一旦被
@@ -659,6 +670,7 @@ function Invoke-Build($CCPath, $CXXPath) {
     if ($CXXPath) { $env:CXX = (Format-CCForGo $CXXPath) }
     try {
         Invoke-Native 'go' @('build', '-trimpath', '-ldflags', $ldflags, '-o', $exePath, '.') $RepoRoot
+        Invoke-Native 'go' @('build', '-trimpath', '-ldflags', $uiLdflags, '-o', $uiExePath, './cmd/lgdm-ui') $RepoRoot
     } finally {
         Remove-Item Env:GOOS, Env:GOARCH, Env:CGO_ENABLED -ErrorAction SilentlyContinue
         if ($CCPath) { Remove-Item Env:CC -ErrorAction SilentlyContinue }
@@ -670,6 +682,8 @@ function Invoke-Build($CCPath, $CXXPath) {
     $cxxLabel = if ($CXXPath) { Split-Path -Leaf $CXXPath } else { 'go default (g++)' }
     Write-Note ("built {0} ({1} MB, GOARCH={2}, CC={3}, CXX={4}, version {5}, commit {6})" -f
         $exePath, $size, $goarch, $ccLabel, $cxxLabel, $v, $commit)
+    $uiSize = [math]::Round((Get-Item -LiteralPath $uiExePath).Length / 1MB, 1)
+    Write-Note ("built {0} ({1} MB, standalone UI)" -f $uiExePath, $uiSize)
 }
 
 # ---------------------------------------------------------------------------
@@ -875,8 +889,12 @@ if ($PrintToolchain) {
 if (-not $SkipBuild) {
     Write-Step "go build ($slug)"
     Invoke-Build $ccPath $cxxPath
-} elseif (-not (Test-Path -LiteralPath $exePath)) {
-    throw ("-SkipBuild 指定为跳过编译,但 {0} 不存在" -f $exePath)
+} else {
+    foreach ($path in @($exePath, $uiExePath)) {
+        if (-not (Test-Path -LiteralPath $path)) {
+            throw ("-SkipBuild 指定为跳过编译,但 {0} 不存在" -f $path)
+        }
+    }
 }
 Assert-PEMachine
 
