@@ -318,7 +318,7 @@ func (m *Manager) startClientLocked() error {
 	// 的组合(与每任务存储一致),不落任何额外文件。
 	// ClientBaseDir 留空是安全的:lgdm 的每个任务都带 spec.Storage,
 	// 客户端级默认存储实际上不会被用来落数据。
-	tc.DefaultStorage = storage.NewFileOpts(storage.NewFileClientOpts{
+	tc.DefaultStorage = newFileStorage(storage.NewFileClientOpts{
 		PieceCompletion: storage.NewMapPieceCompletion(),
 	})
 	if lg := logging.L(); lg != nil {
@@ -494,7 +494,7 @@ func (m *Manager) addSpec(ctx context.Context, spec *torrent.TorrentSpec, dir st
 	}
 	// 每个任务一份存储:数据落在 <dir>/<种子名>/ 之下,而 .part 文件
 	// 与正式文件同目录,因此任务目录自解释、可整体搬迁。
-	st := storage.NewFileOpts(storage.NewFileClientOpts{ClientBaseDir: dir})
+	st := newFileStorage(storage.NewFileClientOpts{ClientBaseDir: dir})
 	spec.Storage = st
 	for _, tr := range m.cfg.ExtraTrackers {
 		spec.Trackers = append(spec.Trackers, []string{tr})
@@ -864,6 +864,16 @@ func (h *Handle) Close() {
 }
 
 // ---- 内部工具 ----
+
+// newFileStorage 统一为 BT 数据文件启用 classic 文件 I/O。
+//
+// anacrolix 在支持的平台默认 mmap 整个下载文件,进程 RSS 会随已下载
+// 字节线性增长,大种子在下载期间可能占用数 GB。普通文件读写只使用
+// 小块缓冲,内存占用不再与下载体积绑定。
+func newFileStorage(opts storage.NewFileClientOpts) storage.ClientImplCloser {
+	opts.DisableMmap = true
+	return storage.NewFileOpts(opts)
+}
 
 // newLimiter 把 bytesPerSec(<=0 表示不限速)转成 rate.Limiter。
 // burst 至少能装下一个典型的 protobuf 块,避免限速把吞吐压到极低。
